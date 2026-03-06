@@ -28,8 +28,6 @@ Ecash (specifically [Cashu](https://cashu.space)) has properties that make it un
 - **Instant**: no on-chain confirmation needed. Token redemption is a single HTTP call to the mint.
 - **Micro-scale**: designed for sub-cent payments. 1 sat ≈ $0.001 is viable.
 - **No account required**: the user holds tokens locally. No registration, no login, no KYC.
-- **Offline-composable**: tokens can be created and split locally without contacting the mint.
-
 With stamps, a relay becomes a **post office**: it delivers your message for a small fee, without knowing who you are.
 
 ## Overview
