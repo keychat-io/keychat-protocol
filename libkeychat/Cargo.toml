@@ -1,0 +1,40 @@
+[package]
+name = "libkeychat"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Keychat protocol in Rust: identity, Signal E2E encryption, Nostr relay transport, hello/messaging"
+
+[dependencies]
+aes = "0.8.4"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bech32 = "0.11.1"
+bincode = "1.3.3"
+bip39 = { version = "2.2.2", features = ["rand", "std"] }
+bitcoin = "0.32.8"
+clap = { version = "4.5.32", features = ["derive"] }
+crossterm = "0.29.0"
+ctr = "0.9.2"
+dirs-next = "2.0.0"
+futures = "0.3.31"
+futures-util = "0.3.31"
+hex = "0.4.3"
+kc = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "kc" }
+lazy_static = "1.5.0"
+libsignal-protocol = { path = "/Users/kc/.cargo/git/checkouts/libsignal-d53efd7b5b78aacd/f9f0a47/rust/protocol" }
+nostr = { version = "0.39.0", default-features = false, features = ["std", "nip44"] }
+openmls = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls" }
+openmls_sqlite_storage = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls_sqlite_storage" }
+openmls_traits = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls_traits" }
+rand = "0.8.5"
+ratatui = "0.30.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+secp256k1 = { version = "0.29.1", features = ["global-context", "rand-std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+thiserror = "1.0.69"
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }

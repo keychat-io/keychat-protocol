@@ -1,8 +1,18 @@
 # Keychat Protocol
 
-Protocol specifications for the [Keychat](https://keychat.io) ecosystem.
+Protocol specifications, reference implementation, and NIPs for the [Keychat](https://keychat.io) ecosystem.
 
-## NIPs
+## Contents
+
+### [libkeychat](libkeychat/)
+
+A Rust implementation of the Keychat protocol — sovereign, end-to-end encrypted messaging over Nostr relays using Signal Protocol encryption.
+
+- **[SPEC.md](libkeychat/SPEC.md)** — Authoritative protocol specification (v0.4.0-draft)
+- **[Client Guide](libkeychat/docs/client-guide.md)** — KeychatClient API guide and usage examples
+- **[README](libkeychat/README.md)** — Library overview, features, and quickstart
+
+### [NIPs](nips/)
 
 Nostr Implementation Possibilities proposed by Keychat:
 
