@@ -1,6 +1,12 @@
 # Keychat Protocol
 
-Keychat protocol is a sovereign messaging stack that integrates five layers: **identity** (Nostr keypair, self-custodial with no server dependency), **transport** (Nostr relay network, open and self-hostable), **encryption** (Signal Protocol for 1-to-1 and small group chats, MLS for large group messaging), **addressing** (receiving and sending addresses are decoupled from identity and continuously rotate), and **stamps** (Cashu ecash tokens attached to messages as anonymous micropayments to relays).
+Keychat protocol is a sovereign messaging stack that integrates five layers:
+
+- **Identity** — Nostr keypair, self-custodial with no server dependency
+- **Transport** — Nostr relay network, open and self-hostable
+- **Encryption** — Signal Protocol for 1-to-1 and small group chats, MLS for large group messaging
+- **Addressing** — Receiving and sending addresses are decoupled from identity and continuously rotate
+- **Stamps** — Cashu ecash tokens attached to messages as anonymous micropayments to relays
 
 ## Contents
 
