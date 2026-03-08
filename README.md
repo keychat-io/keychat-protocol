@@ -11,7 +11,7 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
 ## Contents
 
 - **[libkeychat](libkeychat/)** — Rust implementation of the Keychat protocol: sovereign, end-to-end encrypted messaging over Nostr relays using Signal Protocol encryption
-- **[Keychat Spec](docs/SPEC.md)** — Authoritative protocol specification (v0.4.0-draft)
+- **[Keychat Spec](SPEC.md)** — Authoritative protocol specification (v0.4.0-draft)
 - **[Client Guide](libkeychat/docs/client-guide.md)** — KeychatClient API guide and usage examples
 
 ### [NIPs](nips/)
