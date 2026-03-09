@@ -35,7 +35,7 @@ And the receiving address itself keeps changing. Keychat repurposes the Double R
 
 Random sender addresses, rotating receiver addresses — every letter looks to the relay like one stranger writing to another, completely unlinkable. No one can collect your mail by watching a single address, and even the relay cannot construct a social graph of who communicates with whom.
 
-**Adding a friend: the one exception.** You know someone's identity (Nostr public key), but there are no rotating addresses between you yet. You prepare a special introduction letter (Hello) containing your identity, encryption keys, and a temporary receiving address, wrap it in a sealed package (NIP-17 Gift Wrap), and send it directly to the other party's **identity** — this is the only time identity serves as a receiving address. The recipient opens the package, establishes an encrypted channel (Signal session), and sends their first reply to your temporary address. From the moment you reply to their first letter, ratchet-derived receiving addresses take over and both parties enter the continuously rotating address flow.
+**Adding a friend: the one exception.** You know someone's identity (Nostr public key), but there are no rotating addresses between you yet. You prepare a special introduction letter (Hello) containing your identity, Signal Protocol keys (identity key, signed pre-key, one-time pre-key), and a temporary receiving address, wrap it in a sealed package (NIP-17 Gift Wrap), and send it directly to the other party's **identity** — this is the only time identity serves as a receiving address. The recipient opens the package, establishes an encrypted channel (Signal session), and sends their first reply to your temporary address. From the moment you reply to their first letter, ratchet-derived receiving addresses take over and both parties enter the continuously rotating address flow.
 
 ## IV. Transport: An Open Relay Network
 
@@ -47,7 +47,7 @@ Each letter can be posted to multiple relays simultaneously, and the recipient c
 
 Some relays charge postage. Keychat handles this with ecash stamps — anonymous micropayments using Cashu tokens.
 
-The analogy is literal: you buy a stamp (a small ecash token, typically a few satoshis) and attach it to the envelope. The relay validates the stamp before delivering the letter. Stamps are bearer instruments — the relay knows the stamp is valid, but not who bought it. The stamp is attached outside the Event as a transport-layer credential, not part of the letter content, and is not forwarded to the recipient.
+The analogy is literal: you buy a stamp (a small ecash token, typically a few satoshis) and attach it to the envelope. The relay validates the stamp before delivering the letter. Stamps are bearer instruments. The stamp is attached outside the Event as a transport-layer credential, not part of the letter content, and is not forwarded to the recipient.
 
 ```
 Free relay:   ["EVENT"]
