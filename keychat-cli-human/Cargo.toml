@@ -1,0 +1,25 @@
+[package]
+name = "keychat-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Keychat v2 interactive client — E2E encrypted messaging over Nostr"
+
+[dependencies]
+libkeychat = { path = "/Users/kc/libkeychat-v2" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+nostr = { version = "0.37", features = ["nip44"] }
+nostr-sdk = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+anyhow = "1"
+libsignal-protocol = { path = "/Users/kc/.cargo/git/checkouts/libsignal-d53efd7b5b78aacd/f9f0a47/rust/protocol" }
+dirs = "6"
+rustyline = "14"
+colored = "2"
+chrono = "0.4"
+rand = "0.8"
+tls_codec = { version = "0.4", features = ["derive", "serde"] }
+keyring = { version = "3.6", features = ["apple-native", "linux-native"] }

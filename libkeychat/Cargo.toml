@@ -1,0 +1,72 @@
+[package]
+name = "libkeychat"
+version = "0.1.0"
+edition = "2021"
+description = "Keychat Protocol v2 - Identity, Transport, Signal Sessions, Friend Request Flow"
+license = "MIT"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# Nostr
+nostr = { version = "0.37", features = ["nip44", "nip06"] }
+nostr-sdk = "0.37"
+
+# Identity / crypto
+bip39 = { version = "2", features = ["rand"] }
+bitcoin = { version = "0.32", features = ["rand-std"] }
+secp256k1 = { version = "0.29", features = ["rand-std", "global-context"] }
+
+# AES-256-CTR for media file encryption (§12.1)
+aes = "0.8"
+ctr = "0.9"
+
+# NIP-44 crypto primitives (used by nostr crate internally, we also need direct access)
+chacha20 = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+
+
+# Signal Protocol (Keychat fork with PQXDH, ratchet address derivation)
+libsignal-protocol = { path = "/Users/kc/.cargo/git/checkouts/libsignal-d53efd7b5b78aacd/f9f0a47/rust/protocol" }
+
+# Signal key generation (Curve25519) - also used by our own key utils
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = { version = "4", features = ["digest"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Post-quantum KEM (ML-KEM 1024 / Kyber)
+# Must match libsignal-protocol's pqcrypto-kyber version
+pqcrypto-kyber = { version = "0.7.6", default-features = false, features = ["std"] }
+pqcrypto-traits = "0.3"
+
+# MLS (RFC 9420) — Keychat OpenMLS fork
+openmls = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls" }
+openmls_traits = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls_traits" }
+openmls_sqlite_storage = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls_sqlite_storage" }
+openmls_basic_credential = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls_basic_credential" }
+openmls_rust_crypto = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls_rust_crypto" }
+kc = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "kc" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+hex = "0.4"
+base64 = "0.22"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
