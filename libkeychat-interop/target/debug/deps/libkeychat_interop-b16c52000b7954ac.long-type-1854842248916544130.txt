@@ -1,0 +1,1 @@
+impl std::future::Future<Output = Result<libkeychat_b::friend_request::FriendRequestAccepted, libkeychat_b::error::KeychatError>>

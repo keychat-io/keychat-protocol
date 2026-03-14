@@ -1,0 +1,20 @@
+[package]
+name = "libkeychat-interop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+impl_a = { path = "/Users/kc/libkeychat-v2", package = "libkeychat" }
+impl_b = { path = "/Users/kc/libkeychat-codex", package = "libkeychat-b" }
+libsignal-protocol = { path = "/Users/kc/.cargo/git/checkouts/libsignal-d53efd7b5b78aacd/f9f0a47/rust/protocol" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+base64 = "0.22"
+nostr = { version = "0.37", features = ["nip44"] }
+nostr-sdk = "0.37"
+anyhow = "1"
+openmls = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls" }
+openmls_traits = { git = "https://github.com/keychat-io/openmls.git", branch = "kc4", package = "openmls_traits" }
+tls_codec = { version = "0.4", features = ["derive", "serde"] }
+hex = "0.4"
+tempfile = "3"

@@ -1,0 +1,13 @@
+/Users/kc/libkeychat-interop/target/debug/deps/hpke_rs-bb1fc5a5298cc894.d: /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/lib.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/dh_kem.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kdf.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kem.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/prelude.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/util.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/../Readme.md
+
+/Users/kc/libkeychat-interop/target/debug/deps/libhpke_rs-bb1fc5a5298cc894.rlib: /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/lib.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/dh_kem.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kdf.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kem.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/prelude.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/util.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/../Readme.md
+
+/Users/kc/libkeychat-interop/target/debug/deps/libhpke_rs-bb1fc5a5298cc894.rmeta: /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/lib.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/dh_kem.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kdf.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kem.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/prelude.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/util.rs /Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/../Readme.md
+
+/Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/lib.rs:
+/Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/dh_kem.rs:
+/Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kdf.rs:
+/Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/kem.rs:
+/Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/prelude.rs:
+/Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/util.rs:
+/Users/kc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/hpke-rs-0.2.0/src/../Readme.md:
