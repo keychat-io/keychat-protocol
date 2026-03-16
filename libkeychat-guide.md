@@ -33,7 +33,7 @@ nostr-sdk = "0.37"
 │  │ (OpenMLS)│  │ (AES-CTR)│  │ (SQLCipher)      │  │
 │  └──────────┘  └──────────┘  └──────────────────┘  │
 ├─────────────────────────────────────────────────────┤
-│  libsignal-protocol  │  OpenMLS (kc4)  │  Nostr    │
+│  libsignal v0.88.3   │  OpenMLS (kc4)  │  Nostr    │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -65,6 +65,8 @@ After each encrypt/decrypt, the Double Ratchet produces new keys. These derive n
 - Track receiving addresses per peer
 - Subscribe to each address on the relay
 - Use `AddressManager` to handle this automatically
+
+> **Implementation note (libsignal v0.88.3)**: The official `libsignal` does not return ratchet keys directly from encrypt/decrypt. libkeychat uses a `CapturingSessionStore` wrapper that snapshots session state before operations and compares afterward to detect DH ratchet advances and extract the new ratchet key for address derivation.
 
 ---
 
@@ -168,7 +170,7 @@ if SignalParticipant::is_prekey_message(&ciphertext) {
     let prekey_msg = PreKeySignalMessage::try_from(ciphertext.as_slice())?;
     let peer_signal_id = hex::encode(prekey_msg.identity_key().serialize());
     
-    let remote_addr = ProtocolAddress::new(peer_signal_id.clone(), DeviceId::from(1));
+    let remote_addr = ProtocolAddress::new(peer_signal_id.clone(), DeviceId::new(1).unwrap());
     
     // Decrypt using the SignalParticipant from Step 3
     let result = fr_state.signal_participant
@@ -201,7 +203,7 @@ use libsignal_protocol::{ProtocolAddress, DeviceId};
 let msg = KCMessage::text("Hello!");
 let json = msg.to_json()?;
 
-let addr = ProtocolAddress::new(peer_signal_id.clone(), DeviceId::from(1));
+let addr = ProtocolAddress::new(peer_signal_id.clone(), DeviceId::new(1).unwrap());
 
 // Encrypt (returns address metadata for ratchet tracking)
 let ct = signal_participant.encrypt(&addr, json.as_bytes())?;
@@ -236,7 +238,7 @@ client.subscribe(vec![filter], None).await?;
 
 // In your event loop:
 let ciphertext = base64_decode(&event.content)?;
-let addr = ProtocolAddress::new(peer_signal_id, DeviceId::from(1));
+let addr = ProtocolAddress::new(peer_signal_id, DeviceId::new(1).unwrap());
 
 let result = signal_participant.decrypt(&addr, &ciphertext)?;
 
@@ -567,7 +569,7 @@ let event = EventBuilder::new(Kind::GiftWrap, &content)
 ```toml
 [dependencies]
 libkeychat = { git = "https://github.com/keychat-io/libkeychat" }
-libsignal-protocol = { git = "https://github.com/nickolay/libsignal", path = "rust/protocol" }
+# libsignal-protocol is pulled transitively via libkeychat (signalapp/libsignal v0.88.3)
 tokio = { version = "1", features = ["full"] }
 nostr = { version = "0.37", features = ["nip44"] }
 nostr-sdk = "0.37"
