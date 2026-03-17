@@ -398,6 +398,40 @@ let msg = build_lightning_message("lnbc10u1p...", 1000, None);
 validate_cashu_token("cashuABC...")?;
 ```
 
+## Ecash Stamps (Anti-Spam)
+
+```rust
+use libkeychat::stamp::*;
+
+// 1. Fetch relay fee rules (NIP-11)
+let info = fetch_relay_info("wss://relay.keychat.io").await?;
+if let Some(fees) = &info.fees {
+    for rule in &fees.publication {
+        println!("kinds {:?}: {} {} via {:?}", rule.kinds, rule.amount, rule.unit, rule.accepted_mints());
+    }
+}
+
+// 2. Create stamp manager with CDK wallet
+let wallet = cdk::wallet::Wallet::new("https://8333.space:3338/", ...);
+let stamp_mgr = StampManager::new(wallet);
+
+// 3. Cache relay fees (recommended at startup, TTL = 1 hour)
+stamp_mgr.fetch_and_cache_fees(&["wss://relay.keychat.io", "wss://relay.damus.io"]).await;
+
+// 4. Auto-stamp an event for a specific relay
+let wire_msg = stamp_mgr.stamp_event(&event, "wss://relay.keychat.io").await?;
+// Returns: '["EVENT", {...}, "cashuA..."]' (paid relay)
+// or:      '["EVENT", {...}]'             (free relay)
+
+// 5. Check fee for a specific relay + kind
+if let Some(rule) = stamp_mgr.get_fee_for_kind("wss://relay.keychat.io", Kind::from(1059)).await {
+    println!("Need {} {} stamp", rule.amount, rule.unit);
+}
+
+// 6. Without wallet (stamps disabled, always publishes without stamp)
+let stamp_mgr = StampManager::without_wallet();
+```
+
 ## Persistent Storage (SQLCipher)
 
 ```rust
