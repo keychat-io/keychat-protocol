@@ -13,6 +13,7 @@
 //! A publish succeeds if at least one relay accepts the event.
 
 use crate::error::{KeychatError, Result};
+#[cfg(feature = "cashu")]
 use crate::stamp::StampManager;
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
@@ -39,6 +40,7 @@ pub struct Transport {
     /// Track processed event IDs for deduplication across all relays
     processed_events: Arc<Mutex<HashSet<EventId>>>,
     /// Optional stamp manager for auto-attaching ecash stamps
+    #[cfg(feature = "cashu")]
     stamp_manager: Option<Arc<StampManager>>,
 }
 
@@ -52,16 +54,19 @@ impl Transport {
         Ok(Self {
             client,
             processed_events: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(feature = "cashu")]
             stamp_manager: None,
         })
     }
 
     /// Set the stamp manager for auto-attaching ecash stamps on publish.
+    #[cfg(feature = "cashu")]
     pub fn set_stamp_manager(&mut self, manager: Arc<StampManager>) {
         self.stamp_manager = Some(manager);
     }
 
     /// Get a reference to the stamp manager, if configured.
+    #[cfg(feature = "cashu")]
     pub fn stamp_manager(&self) -> Option<&Arc<StampManager>> {
         self.stamp_manager.as_ref()
     }
@@ -117,8 +122,8 @@ impl Transport {
     /// always published via the standard nostr-sdk path; stamp attachment
     /// requires using `publish_event_stamped` for raw WebSocket delivery.
     pub async fn publish_event(&self, event: Event) -> Result<EventId> {
+        #[cfg(feature = "cashu")]
         if let Some(stamp_mgr) = &self.stamp_manager {
-            // Log stamp status for awareness (actual stamp attachment uses publish_event_stamped)
             let fee = stamp_mgr
                 .get_fee_for_kind("wss://relay.keychat.io", event.kind)
                 .await;
@@ -144,6 +149,7 @@ impl Transport {
     /// Uses the StampManager to create a stamp if the relay requires one,
     /// then formats and returns the stamped message for raw WebSocket delivery.
     /// If stamping fails (e.g., no funds), publishes without stamp and logs a warning.
+    #[cfg(feature = "cashu")]
     pub async fn publish_event_stamped(
         &self,
         event: &Event,

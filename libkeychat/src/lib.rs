@@ -76,8 +76,11 @@ pub mod group;
 pub mod identity;
 pub mod media;
 pub mod message;
+#[cfg(feature = "mls")]
 pub mod mls;
+#[cfg(feature = "mls")]
 pub mod mls_extension;
+#[cfg(feature = "mls")]
 pub mod mls_provider;
 pub mod nip44;
 pub mod payment;
@@ -86,6 +89,7 @@ pub mod session;
 pub mod signal_keys;
 pub mod signal_session;
 pub mod signal_store;
+#[cfg(feature = "storage")]
 pub mod storage;
 pub mod transport;
 
@@ -114,9 +118,9 @@ pub use media::{
 pub use payment::{
     attach_ecash_stamp, build_cashu_message, build_lightning_message, validate_cashu_token,
 };
-pub use stamp::{
-    fetch_relay_info, CashuWallet, RelayFeeRule, RelayFees, RelayInfo, StampManager,
-};
+pub use stamp::{fetch_relay_info, RelayFeeRule, RelayFees, RelayInfo};
+#[cfg(feature = "cashu")]
+pub use stamp::{CashuWallet, StampManager};
 pub use group::{
     create_signal_group, receive_group_invite, receive_group_message, send_group_dissolve,
     send_group_invite, send_group_member_removed, send_group_message, send_group_name_changed,
@@ -130,6 +134,7 @@ pub use signal_keys::{
     verify_global_sign, FriendRequestSecrets, KyberPrekey, OneTimePrekey, SignalIdentity,
     SignedPrekey,
 };
+#[cfg(feature = "mls")]
 pub use mls::{
     broadcast_commit, derive_mls_temp_inbox, parse_key_package, publish_key_package,
     receive_mls_message, send_mls_message, MlsGroupInvitePayload, MlsMessageMetadata,
@@ -142,6 +147,7 @@ pub use signal_session::{
 pub use signal_store::{CapturingSessionStore, SignalProtocolStoreBundle};
 // Re-export libsignal types that clients need
 pub use libsignal_protocol::{DeviceId, PreKeySignalMessage, ProtocolAddress};
+#[cfg(feature = "storage")]
 pub use storage::{
     DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,
 };

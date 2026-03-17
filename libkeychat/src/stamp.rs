@@ -7,13 +7,18 @@
 //! 4. Auto-attach ecash stamps when publishing events to paid relays
 
 use crate::error::{KeychatError, Result};
+#[cfg(feature = "cashu")]
 use crate::payment::attach_ecash_stamp;
+#[cfg(feature = "cashu")]
 use nostr::{Event, Kind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "cashu")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(feature = "cashu")]
 use tokio::sync::RwLock;
+#[cfg(feature = "cashu")]
 use tracing::{debug, warn};
 
 // ─── NIP-11 Types ───────────────────────────────────────────────────────────
@@ -127,6 +132,7 @@ fn relay_url_to_http(url: &str) -> String {
 
 // ─── Fee Cache ──────────────────────────────────────────────────────────────
 
+#[cfg(feature = "cashu")]
 /// Cached fee rules for a single relay.
 #[derive(Debug, Clone)]
 struct CachedFees {
@@ -134,6 +140,7 @@ struct CachedFees {
     fetched_at: Instant,
 }
 
+#[cfg(feature = "cashu")]
 /// Cache for relay fee rules with configurable TTL.
 #[derive(Debug)]
 struct FeeCache {
@@ -141,6 +148,7 @@ struct FeeCache {
     ttl: Duration,
 }
 
+#[cfg(feature = "cashu")]
 impl FeeCache {
     fn new(ttl: Duration) -> Self {
         Self {
@@ -193,6 +201,7 @@ impl FeeCache {
 
 // ─── CDK Wallet Wrapper ─────────────────────────────────────────────────────
 
+#[cfg(feature = "cashu")]
 /// Wrapper around a CDK Cashu wallet for minting and sending ecash tokens.
 ///
 /// The caller is responsible for constructing the CDK `Wallet` with appropriate
@@ -202,6 +211,7 @@ pub struct CashuWallet {
     wallet: cdk::wallet::Wallet,
 }
 
+#[cfg(feature = "cashu")]
 impl CashuWallet {
     /// Wrap an existing CDK wallet.
     ///
@@ -306,6 +316,7 @@ impl CashuWallet {
     }
 }
 
+#[cfg(feature = "cashu")]
 impl std::fmt::Debug for CashuWallet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CashuWallet").finish_non_exhaustive()
@@ -314,9 +325,11 @@ impl std::fmt::Debug for CashuWallet {
 
 // ─── Stamp Manager ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "cashu")]
 /// Default fee cache TTL: 1 hour.
 const DEFAULT_FEE_CACHE_TTL: Duration = Duration::from_secs(3600);
 
+#[cfg(feature = "cashu")]
 /// Manages relay fee discovery, ecash wallet, and stamp creation.
 ///
 /// The StampManager is optional — if no wallet is configured, stamps are skipped
@@ -327,6 +340,7 @@ pub struct StampManager {
     wallet: Option<CashuWallet>,
 }
 
+#[cfg(feature = "cashu")]
 impl StampManager {
     /// Create a new StampManager with a pre-built CDK wallet.
     pub fn new(wallet: cdk::wallet::Wallet) -> Self {
@@ -635,6 +649,7 @@ mod tests {
         assert!(arr[1].is_object());
     }
 
+    #[cfg(feature = "cashu")]
     #[tokio::test]
     async fn stamp_manager_without_wallet() {
         let mgr = StampManager::without_wallet();
@@ -651,6 +666,7 @@ mod tests {
         assert!(balance.is_none());
     }
 
+    #[cfg(feature = "cashu")]
     #[tokio::test]
     async fn stamp_manager_fee_lookup() {
         let mgr = StampManager::without_wallet();

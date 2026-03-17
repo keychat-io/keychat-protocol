@@ -569,3 +569,42 @@ async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<nostr:
 }
 
 use base64::Engine as _;
+
+// ─── Ecash Stamp FFI (not yet wired in Dart — available for future use) ─────
+
+/// Fetch relay info (NIP-11) and return JSON with fee rules.
+/// Returns JSON: {"name":"...","fees":{"publication":[...]}} or error.
+/// Caller must free the returned string with keychat_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn keychat_fetch_relay_info(
+    relay_url: *const c_char,
+) -> *mut c_char {
+    let url = unsafe { CStr::from_ptr(relay_url) }.to_str().unwrap_or("");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    match rt.block_on(crate::stamp::fetch_relay_info(url)) {
+        Ok(info) => {
+            let json = serde_json::to_string(&info).unwrap_or_default();
+            CString::new(json).unwrap().into_raw()
+        }
+        Err(e) => {
+            let err = format!(r#"{{"error":"{}"}}"#, e);
+            CString::new(err).unwrap().into_raw()
+        }
+    }
+}
+
+/// Check if a relay requires a stamp for a given event kind.
+/// Returns JSON: {"required":true,"amount":1,"unit":"sat","mints":["..."]} or {"required":false}
+/// Caller must free the returned string with keychat_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn keychat_check_relay_fee(
+    ctx: *const KeychatContext,
+    relay_url: *const c_char,
+    event_kind: u16,
+) -> *mut c_char {
+    let _ctx = unsafe { &*ctx };
+    let url = unsafe { CStr::from_ptr(relay_url) }.to_str().unwrap_or("");
+    // For now return not-required since stamp manager is not in context yet
+    let result = format!(r#"{{"required":false,"relay":"{}","kind":{}}}"#, url, event_kind);
+    CString::new(result).unwrap().into_raw()
+}

@@ -8,6 +8,12 @@ license = "MIT"
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[features]
+default = ["mls", "storage", "cashu"]
+mls = ["dep:openmls", "dep:openmls_traits", "dep:openmls_basic_credential", "dep:openmls_rust_crypto", "dep:openmls_sqlite_storage", "dep:tls_codec", "dep:keccak"]
+storage = ["dep:rusqlite"]
+cashu = ["dep:cdk", "dep:cdk-common"]
+
 [dependencies]
 # Nostr
 nostr = { version = "0.37", features = ["nip44", "nip06"] }
@@ -47,14 +53,14 @@ pqcrypto-kyber = { version = "0.7.6", default-features = false, features = ["std
 pqcrypto-traits = "0.3"
 
 # MLS (RFC 9420) — Official OpenMLS v0.8.1
-openmls = "0.8.1"
-openmls_traits = "0.5.0"
-openmls_basic_credential = "0.5.0"
-openmls_rust_crypto = "0.5.1"
-openmls_sqlite_storage = "0.2.0"
-tls_codec = { version = "0.4", features = ["derive", "serde"] }
+openmls = { version = "0.8.1", optional = true }
+openmls_traits = { version = "0.5.0", optional = true }
+openmls_basic_credential = { version = "0.5.0", optional = true }
+openmls_rust_crypto = { version = "0.5.1", optional = true }
+openmls_sqlite_storage = { version = "0.2.0", optional = true }
+tls_codec = { version = "0.4", features = ["derive", "serde"], optional = true }
 # Pin keccak to pre-release matching sha3 0.11.0-rc.8's requirement
-keccak = "=0.2.0-rc.2"
+keccak = { version = "=0.2.0-rc.2", optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -69,12 +75,12 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Cashu Development Kit (ecash wallet for stamps)
-cdk = { version = "0.15.1", default-features = false, features = ["wallet"] }
-cdk-common = { version = "0.15.1", default-features = false }
+cdk = { version = "0.15.1", default-features = false, features = ["wallet"], optional = true }
+cdk-common = { version = "0.15.1", default-features = false, optional = true }
 
 # Utilities
 rand = "0.9"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
 hex = "0.4"
 base64 = "0.22"
 thiserror = "2"
