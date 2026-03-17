@@ -1,8 +1,12 @@
 [package]
-name = "keychat-cli"
+name = "keychat-cli-human"
 version = "0.1.0"
 edition = "2021"
-description = "Keychat v2 command-line client — E2E encrypted messaging over Nostr"
+description = "Keychat v2 interactive CLI client for humans"
+
+[[bin]]
+name = "keychat-cli"
+path = "src/main.rs"
 
 [dependencies]
 libkeychat = { path = "../libkeychat" }
@@ -21,6 +25,4 @@ colored = "2"
 chrono = "0.4"
 rand = "0.8"
 tls_codec = { version = "0.4", features = ["derive", "serde"] }
-axum = "0.8"
-tokio-stream = { version = "0.1", features = ["sync"] }
 keyring = { version = "3.6", features = ["apple-native", "linux-native"] }

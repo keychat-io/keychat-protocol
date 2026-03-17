@@ -1,12 +1,17 @@
 [package]
-name = "keychat-cli"
+name = "keychat-cli-agent"
 version = "0.1.0"
 edition = "2021"
-description = "Keychat v2 command-line client — E2E encrypted messaging over Nostr"
+description = "Keychat v2 agent daemon — HTTP API + SSE for AI frameworks"
+
+[[bin]]
+name = "keychat-agent"
+path = "src/main.rs"
 
 [dependencies]
 libkeychat = { path = "../libkeychat" }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 clap = { version = "4", features = ["derive"] }
 nostr = { version = "0.37", features = ["nip44"] }
 nostr-sdk = "0.37"
@@ -15,12 +20,10 @@ serde_json = "1"
 base64 = "0.22"
 hex = "0.4"
 anyhow = "1"
+axum = "0.8"
 dirs = "6"
-rustyline = "14"
 colored = "2"
 chrono = "0.4"
 rand = "0.8"
 tls_codec = { version = "0.4", features = ["derive", "serde"] }
-axum = "0.8"
-tokio-stream = { version = "0.1", features = ["sync"] }
 keyring = { version = "3.6", features = ["apple-native", "linux-native"] }
