@@ -16,6 +16,14 @@ use libsignal_protocol::{
     InMemSignedPreKeyStore, ProtocolAddress, SessionRecord, SessionStore, SignalProtocolError,
 };
 
+use crate::persistent_signal_store::{
+    IdentityStoreBackend, KyberPreKeyStoreBackend, PersistentIdentityKeyStore,
+    PersistentKyberPreKeyStore, PersistentPreKeyStore, PersistentSessionStore,
+    PersistentSignedPreKeyStore, PreKeyStoreBackend, SessionStoreBackend,
+    SignedPreKeyStoreBackend,
+};
+use crate::storage::SecureStorage;
+
 // ─── Protobuf parsing ───────────────────────────────────────────────────────
 //
 // SessionRecord serializes to a RecordStructure protobuf:
@@ -105,7 +113,7 @@ fn parse_ratchet_snapshot(record: &SessionRecord) -> Option<RatchetSnapshot> {
 /// - `last_alice_addrs`: ratchet key pairs from last decrypt (our new receiving addresses)
 #[derive(Clone)]
 pub struct CapturingSessionStore {
-    inner: InMemSessionStore,
+    inner: SessionStoreBackend,
     /// Peer name → ratchet key pair for bob's address ("{old_priv}-{their_pub}")
     pub bob_addresses: Arc<Mutex<BTreeMap<String, String>>>,
     /// Peer name → our receiving ratchet key ("{our_priv}-{their_pub}")
@@ -125,7 +133,18 @@ impl Default for CapturingSessionStore {
 impl CapturingSessionStore {
     pub fn new() -> Self {
         Self {
-            inner: InMemSessionStore::new(),
+            inner: SessionStoreBackend::InMemory(InMemSessionStore::new()),
+            bob_addresses: Arc::new(Mutex::new(BTreeMap::new())),
+            my_receiver_addresses: Arc::new(Mutex::new(BTreeMap::new())),
+            snapshots: Arc::new(Mutex::new(BTreeMap::new())),
+            last_alice_addrs: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Create a persistent session store backed by SecureStorage.
+    pub fn persistent(storage: Arc<Mutex<SecureStorage>>) -> Self {
+        Self {
+            inner: SessionStoreBackend::Persistent(PersistentSessionStore::new(storage)),
             bob_addresses: Arc::new(Mutex::new(BTreeMap::new())),
             my_receiver_addresses: Arc::new(Mutex::new(BTreeMap::new())),
             snapshots: Arc::new(Mutex::new(BTreeMap::new())),
@@ -223,23 +242,54 @@ impl SessionStore for CapturingSessionStore {
 #[derive(Clone)]
 pub struct SignalProtocolStoreBundle {
     pub session_store: CapturingSessionStore,
-    pub pre_key_store: InMemPreKeyStore,
-    pub signed_pre_key_store: InMemSignedPreKeyStore,
-    pub kyber_pre_key_store: InMemKyberPreKeyStore,
-    pub identity_store: InMemIdentityKeyStore,
+    pub pre_key_store: PreKeyStoreBackend,
+    pub signed_pre_key_store: SignedPreKeyStoreBackend,
+    pub kyber_pre_key_store: KyberPreKeyStoreBackend,
+    pub identity_store: IdentityStoreBackend,
 }
 
 impl SignalProtocolStoreBundle {
+    /// Create an in-memory store bundle (for tests and backward compatibility).
     pub fn new(
         identity_key_pair: libsignal_protocol::IdentityKeyPair,
         registration_id: u32,
     ) -> Self {
         Self {
             session_store: CapturingSessionStore::new(),
-            pre_key_store: InMemPreKeyStore::new(),
-            signed_pre_key_store: InMemSignedPreKeyStore::new(),
-            kyber_pre_key_store: InMemKyberPreKeyStore::new(),
-            identity_store: InMemIdentityKeyStore::new(identity_key_pair, registration_id),
+            pre_key_store: PreKeyStoreBackend::InMemory(InMemPreKeyStore::new()),
+            signed_pre_key_store: SignedPreKeyStoreBackend::InMemory(
+                InMemSignedPreKeyStore::new(),
+            ),
+            kyber_pre_key_store: KyberPreKeyStoreBackend::InMemory(InMemKyberPreKeyStore::new()),
+            identity_store: IdentityStoreBackend::InMemory(InMemIdentityKeyStore::new(
+                identity_key_pair,
+                registration_id,
+            )),
+        }
+    }
+
+    /// Create a persistent store bundle backed by SecureStorage (SQLCipher).
+    pub fn persistent(
+        storage: Arc<Mutex<SecureStorage>>,
+        identity_key_pair: libsignal_protocol::IdentityKeyPair,
+        registration_id: u32,
+    ) -> Self {
+        Self {
+            session_store: CapturingSessionStore::persistent(storage.clone()),
+            pre_key_store: PreKeyStoreBackend::Persistent(PersistentPreKeyStore::new(
+                storage.clone(),
+            )),
+            signed_pre_key_store: SignedPreKeyStoreBackend::Persistent(
+                PersistentSignedPreKeyStore::new(storage.clone()),
+            ),
+            kyber_pre_key_store: KyberPreKeyStoreBackend::Persistent(
+                PersistentKyberPreKeyStore::new(storage.clone()),
+            ),
+            identity_store: IdentityStoreBackend::Persistent(PersistentIdentityKeyStore::new(
+                storage,
+                identity_key_pair,
+                registration_id,
+            )),
         }
     }
 }

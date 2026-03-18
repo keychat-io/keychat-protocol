@@ -10,6 +10,7 @@
 //! 3. Detecting DH ratchet steps by comparing old vs new sender chain keys
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use futures::executor::block_on;
@@ -23,6 +24,7 @@ use libsignal_protocol::{
 
 use crate::error::{KeychatError, Result};
 use crate::signal_store::SignalProtocolStoreBundle;
+use crate::storage::SecureStorage;
 
 /// Result of Signal encryption with ratchet metadata.
 #[derive(Clone, Debug)]
@@ -81,7 +83,7 @@ pub fn generate_prekey_material() -> Result<SignalPreKeyMaterial> {
     let identity_key_pair = IdentityKeyPair::generate(&mut rng);
     let registration_id: u32 = ::rand::random_range(1..=u32::MAX);
 
-    let signed_prekey_id = SignedPreKeyId::from(1);
+    let signed_prekey_id = SignedPreKeyId::from(::rand::random_range(1..=u32::MAX));
     let signed_prekey_key_pair = KeyPair::generate(&mut rng);
     let signed_prekey_signature = identity_key_pair
         .private_key()
@@ -94,12 +96,12 @@ pub fn generate_prekey_material() -> Result<SignalPreKeyMaterial> {
         &signed_prekey_signature,
     );
 
-    let prekey_id = PreKeyId::from(1);
+    let prekey_id = PreKeyId::from(::rand::random_range(1..=u32::MAX));
     let prekey_key_pair = KeyPair::generate(&mut rng);
     let prekey = PreKeyRecord::new(prekey_id, &prekey_key_pair);
 
     // Generate Kyber1024 prekey for PQXDH
-    let kyber_prekey_id = KyberPreKeyId::from(1);
+    let kyber_prekey_id = KyberPreKeyId::from(::rand::random_range(1..=u32::MAX));
     let kyber_prekey = KyberPreKeyRecord::generate(
         kem::KeyType::Kyber1024,
         kyber_prekey_id,
@@ -116,6 +118,73 @@ pub fn generate_prekey_material() -> Result<SignalPreKeyMaterial> {
         kyber_prekey_id,
         kyber_prekey,
     })
+}
+
+/// Reconstruct `SignalPreKeyMaterial` from raw serialized bytes.
+///
+/// Used to restore a participant from persistent storage on restart.
+pub fn reconstruct_prekey_material(
+    identity_public: &[u8],
+    identity_private: &[u8],
+    registration_id: u32,
+    signed_prekey_id_val: u32,
+    signed_prekey_record_bytes: &[u8],
+    prekey_id_val: u32,
+    prekey_record_bytes: &[u8],
+    kyber_prekey_id_val: u32,
+    kyber_prekey_record_bytes: &[u8],
+) -> Result<SignalPreKeyMaterial> {
+    let identity_key_pair = IdentityKeyPair::try_from(
+        [identity_public, identity_private].concat().as_slice(),
+    )
+    .map_err(|e| KeychatError::Signal(format!("failed to reconstruct identity key pair: {e}")))?;
+
+    let signed_prekey = SignedPreKeyRecord::deserialize(signed_prekey_record_bytes)
+        .map_err(|e| KeychatError::Signal(format!("failed to deserialize signed prekey: {e}")))?;
+    let prekey = PreKeyRecord::deserialize(prekey_record_bytes)
+        .map_err(|e| KeychatError::Signal(format!("failed to deserialize prekey: {e}")))?;
+    let kyber_prekey = KyberPreKeyRecord::deserialize(kyber_prekey_record_bytes)
+        .map_err(|e| KeychatError::Signal(format!("failed to deserialize kyber prekey: {e}")))?;
+
+    Ok(SignalPreKeyMaterial {
+        identity_key_pair,
+        registration_id,
+        signed_prekey_id: SignedPreKeyId::from(signed_prekey_id_val),
+        signed_prekey,
+        prekey_id: PreKeyId::from(prekey_id_val),
+        prekey,
+        kyber_prekey_id: KyberPreKeyId::from(kyber_prekey_id_val),
+        kyber_prekey,
+    })
+}
+
+/// Serialize `SignalPreKeyMaterial` fields into raw bytes for storage.
+///
+/// Returns (identity_public, identity_private, registration_id,
+///          signed_prekey_id, signed_prekey_record,
+///          prekey_id, prekey_record,
+///          kyber_prekey_id, kyber_prekey_record).
+#[allow(clippy::type_complexity)]
+pub fn serialize_prekey_material(
+    keys: &SignalPreKeyMaterial,
+) -> Result<(Vec<u8>, Vec<u8>, u32, u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>)> {
+    Ok((
+        keys.identity_key_pair.identity_key().serialize().to_vec(),
+        keys.identity_key_pair.private_key().serialize().to_vec(),
+        keys.registration_id,
+        u32::from(keys.signed_prekey_id),
+        keys.signed_prekey.serialize().map_err(|e| {
+            KeychatError::Signal(format!("failed to serialize signed prekey: {e}"))
+        })?,
+        u32::from(keys.prekey_id),
+        keys.prekey.serialize().map_err(|e| {
+            KeychatError::Signal(format!("failed to serialize prekey: {e}"))
+        })?,
+        u32::from(keys.kyber_prekey_id),
+        keys.kyber_prekey.serialize().map_err(|e| {
+            KeychatError::Signal(format!("failed to serialize kyber prekey: {e}"))
+        })?,
+    ))
 }
 
 /// Helper: create DeviceId from u32 (must be 1..=127).
@@ -154,6 +223,49 @@ impl SignalParticipant {
     ) -> Result<Self> {
         let mut store =
             SignalProtocolStoreBundle::new(keys.identity_key_pair, keys.registration_id);
+
+        block_on(async {
+            store
+                .pre_key_store
+                .save_pre_key(keys.prekey_id, &keys.prekey)
+                .await
+                .map_err(KeychatError::from)?;
+            store
+                .signed_pre_key_store
+                .save_signed_pre_key(keys.signed_prekey_id, &keys.signed_prekey)
+                .await
+                .map_err(KeychatError::from)?;
+            store
+                .kyber_pre_key_store
+                .save_kyber_pre_key(keys.kyber_prekey_id, &keys.kyber_prekey)
+                .await
+                .map_err(KeychatError::from)?;
+            Ok::<(), KeychatError>(())
+        })?;
+
+        Ok(Self {
+            address: ProtocolAddress::new(name, make_device_id(device_id_val)),
+            store,
+            keys,
+            tracked_peers: BTreeMap::new(),
+        })
+    }
+
+    /// Create a persistent participant backed by SecureStorage (SQLCipher).
+    ///
+    /// Session state, pre-keys, and identity keys are stored in the database
+    /// and survive restarts.
+    pub fn persistent(
+        name: String,
+        device_id_val: u32,
+        keys: SignalPreKeyMaterial,
+        storage: Arc<Mutex<SecureStorage>>,
+    ) -> Result<Self> {
+        let mut store = SignalProtocolStoreBundle::persistent(
+            storage,
+            keys.identity_key_pair,
+            keys.registration_id,
+        );
 
         block_on(async {
             store

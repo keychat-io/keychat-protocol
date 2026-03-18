@@ -5,12 +5,15 @@
 //! - **Accept**: Process prekey bundle (X3DH), send friendApprove with signalPrekeyAuth
 //! - **Messaging**: Send/receive Signal-encrypted KCMessages via kind:1059 Mode 1
 
+use std::sync::{Arc, Mutex};
+
 use crate::error::{KeychatError, Result};
 use crate::giftwrap::{create_gift_wrap, unwrap_gift_wrap};
 use crate::identity::{EphemeralKeypair, Identity};
 use crate::message::{KCFriendRequestPayload, KCMessage, KCMessageKind, SignalPrekeyAuth};
 use crate::signal_keys::{compute_global_sign, verify_global_sign};
-use crate::signal_session::SignalParticipant;
+use crate::signal_session::{generate_prekey_material, SignalParticipant};
+use crate::storage::SecureStorage;
 
 use base64::Engine;
 use libsignal_protocol::{kem, DeviceId, KyberPreKeyId, PreKeyBundle, ProtocolAddress};
@@ -268,6 +271,204 @@ pub async fn accept_friend_request(
     let ct = my_signal.encrypt(&remote_address, approve_json.as_bytes())?;
 
     // Build kind:1059 Mode 1 event → peer's firstInbox
+    let event = build_mode1_event(&ct.bytes, &payload.first_inbox).await?;
+
+    Ok(FriendRequestAccepted {
+        signal_participant: my_signal,
+        event,
+        message: approve_msg,
+        sender_address: ct.sender_address,
+    })
+}
+
+/// Send a friend request with persistent Signal participant (§6.2).
+///
+/// Same as `send_friend_request` but uses pre-generated keys and creates a
+/// `SignalParticipant::persistent()` backed by SQLCipher.
+/// The caller should save `keys` to the DB before calling this.
+pub async fn send_friend_request_persistent(
+    my_identity: &Identity,
+    peer_nostr_pubkey: &str,
+    display_name: &str,
+    device_id: &str,
+    keys: crate::signal_session::SignalPreKeyMaterial,
+    storage: Arc<Mutex<SecureStorage>>,
+    signal_device_id: u32,
+) -> Result<(Event, FriendRequestState)> {
+    let peer_nostr_pubkey_hex = crate::identity::normalize_pubkey(peer_nostr_pubkey)?;
+    let signal_participant =
+        SignalParticipant::persistent(my_identity.pubkey_hex(), signal_device_id, keys, storage)?;
+    let first_inbox_keys = EphemeralKeypair::generate();
+    let first_inbox_hex = first_inbox_keys.pubkey_hex();
+
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let signal_identity_key_hex = signal_participant.identity_public_key_hex();
+    let global_sign = compute_global_sign(
+        my_identity.secret_key(),
+        &my_identity.pubkey_hex(),
+        &signal_identity_key_hex,
+        time,
+    )?;
+
+    let payload = KCFriendRequestPayload {
+        message: None,
+        name: display_name.to_string(),
+        nostr_identity_key: my_identity.pubkey_hex(),
+        signal_identity_key: signal_identity_key_hex,
+        first_inbox: first_inbox_hex,
+        device_id: device_id.to_string(),
+        signal_signed_prekey_id: signal_participant.signed_prekey_id(),
+        signal_signed_prekey: signal_participant.signed_prekey_public_hex()?,
+        signal_signed_prekey_signature: signal_participant.signed_prekey_signature_hex()?,
+        signal_one_time_prekey_id: signal_participant.prekey_id(),
+        signal_one_time_prekey: signal_participant.prekey_public_hex()?,
+        signal_kyber_prekey_id: signal_participant.kyber_prekey_id(),
+        signal_kyber_prekey: signal_participant.kyber_prekey_public_hex()?,
+        signal_kyber_prekey_signature: signal_participant.kyber_prekey_signature_hex()?,
+        global_sign,
+        time: Some(time),
+        version: 2,
+        relay: None,
+        avatar: None,
+        lightning: None,
+    };
+
+    let request_id = format!("fr-{}", uuid_v4());
+    let kc_message = KCMessage::friend_request(request_id.clone(), payload);
+    let kc_json = kc_message.to_json()?;
+
+    let peer_pubkey = PublicKey::from_hex(&peer_nostr_pubkey_hex)
+        .map_err(|e| KeychatError::Signal(format!("invalid peer pubkey: {e}")))?;
+
+    let gift_wrap_event = create_gift_wrap(my_identity.keys(), &peer_pubkey, &kc_json).await?;
+
+    let state = FriendRequestState {
+        signal_participant,
+        first_inbox_keys,
+        request_id,
+        peer_nostr_pubkey: peer_nostr_pubkey_hex,
+    };
+
+    Ok((gift_wrap_event, state))
+}
+
+/// Accept a friend request with persistent Signal participant (§7.3, §7.4).
+///
+/// Same as `accept_friend_request` but uses pre-generated keys and creates a
+/// `SignalParticipant::persistent()` backed by SQLCipher.
+/// The caller should save `keys` to the DB before calling this.
+pub async fn accept_friend_request_persistent(
+    my_identity: &Identity,
+    friend_request: &FriendRequestReceived,
+    display_name: &str,
+    keys: crate::signal_session::SignalPreKeyMaterial,
+    storage: Arc<Mutex<SecureStorage>>,
+    signal_device_id: u32,
+) -> Result<FriendRequestAccepted> {
+    let payload = &friend_request.payload;
+
+    let mut my_signal = SignalParticipant::persistent(
+        my_identity.pubkey_hex(),
+        signal_device_id,
+        keys,
+        storage,
+    )?;
+
+    // Build PreKeyBundle from friend request payload
+    let remote_identity_key_bytes = hex::decode(&payload.signal_identity_key)
+        .map_err(|e| KeychatError::Signal(format!("hex decode signal identity: {e}")))?;
+    let remote_identity_key =
+        libsignal_protocol::IdentityKey::decode(&remote_identity_key_bytes)
+            .map_err(|e| KeychatError::Signal(format!("invalid signal identity key: {e}")))?;
+
+    let remote_signed_prekey_bytes = hex::decode(&payload.signal_signed_prekey)
+        .map_err(|e| KeychatError::Signal(format!("hex decode signed prekey: {e}")))?;
+    let remote_signed_prekey =
+        libsignal_protocol::PublicKey::deserialize(&remote_signed_prekey_bytes)
+            .map_err(|e| KeychatError::Signal(format!("invalid signed prekey: {e}")))?;
+
+    let remote_signed_prekey_sig = hex::decode(&payload.signal_signed_prekey_signature)
+        .map_err(|e| KeychatError::Signal(format!("hex decode sig: {e}")))?;
+
+    let remote_one_time_prekey_bytes = hex::decode(&payload.signal_one_time_prekey)
+        .map_err(|e| KeychatError::Signal(format!("hex decode one-time prekey: {e}")))?;
+    let remote_one_time_prekey =
+        libsignal_protocol::PublicKey::deserialize(&remote_one_time_prekey_bytes)
+            .map_err(|e| KeychatError::Signal(format!("invalid one-time prekey: {e}")))?;
+
+    if payload.signal_kyber_prekey.is_empty() {
+        return Err(KeychatError::Signal(
+            "Kyber prekey is required for PQXDH session establishment".into(),
+        ));
+    }
+
+    let kyber_prekey_bytes = hex::decode(&payload.signal_kyber_prekey)
+        .map_err(|e| KeychatError::Signal(format!("hex decode kyber prekey: {e}")))?;
+    let kyber_public_key = kem::PublicKey::deserialize(&kyber_prekey_bytes)
+        .map_err(|e| KeychatError::Signal(format!("invalid kyber prekey: {e}")))?;
+    let kyber_sig = hex::decode(&payload.signal_kyber_prekey_signature)
+        .map_err(|e| KeychatError::Signal(format!("hex decode kyber sig: {e}")))?;
+
+    // Parse remote device_id from payload, default to 1
+    let remote_device_id: u32 = payload.device_id.parse().unwrap_or(1);
+
+    let prekey_bundle = PreKeyBundle::new(
+        1,
+        DeviceId::new(remote_device_id as u8).unwrap_or(DeviceId::new(1).unwrap()),
+        Some((
+            libsignal_protocol::PreKeyId::from(payload.signal_one_time_prekey_id),
+            remote_one_time_prekey,
+        )),
+        libsignal_protocol::SignedPreKeyId::from(payload.signal_signed_prekey_id),
+        remote_signed_prekey,
+        remote_signed_prekey_sig,
+        KyberPreKeyId::from(payload.signal_kyber_prekey_id),
+        kyber_public_key,
+        kyber_sig,
+        remote_identity_key,
+    )
+    .map_err(|e| KeychatError::Signal(format!("failed to build prekey bundle: {e}")))?;
+
+    let remote_address = ProtocolAddress::new(
+        payload.signal_identity_key.clone(),
+        DeviceId::new(remote_device_id as u8).unwrap_or(DeviceId::new(1).unwrap()),
+    );
+    my_signal.process_prekey_bundle(&remote_address, &prekey_bundle)?;
+
+    let request_id = friend_request.message.id.clone().unwrap_or_default();
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let my_signal_id_hex = my_signal.identity_public_key_hex();
+    let sig = compute_global_sign(
+        my_identity.secret_key(),
+        &my_identity.pubkey_hex(),
+        &my_signal_id_hex,
+        time,
+    )?;
+
+    let mut approve_msg = KCMessage::friend_approve(request_id, None);
+    approve_msg.signal_prekey_auth = Some(SignalPrekeyAuth {
+        nostr_id: my_identity.pubkey_hex(),
+        signal_id: my_signal_id_hex,
+        time,
+        name: display_name.to_string(),
+        sig,
+        avatar: None,
+        lightning: None,
+    });
+
+    let approve_json = approve_msg.to_json()?;
+
+    // Encrypt with Signal — session changes automatically persisted to SQLCipher
+    let ct = my_signal.encrypt(&remote_address, approve_json.as_bytes())?;
+
     let event = build_mode1_event(&ct.bytes, &payload.first_inbox).await?;
 
     Ok(FriendRequestAccepted {

@@ -82,6 +82,7 @@ pub mod mls;
 pub mod mls_extension;
 #[cfg(feature = "mls")]
 pub mod mls_provider;
+pub mod persistent_signal_store;
 pub mod nip44;
 pub mod payment;
 pub mod stamp;
@@ -101,7 +102,8 @@ pub use chat::{
 };
 pub use error::{KeychatError, Result};
 pub use friend_request::{
-    accept_friend_request, receive_friend_request, receive_signal_message, send_friend_request,
+    accept_friend_request, accept_friend_request_persistent, receive_friend_request,
+    receive_signal_message, send_friend_request, send_friend_request_persistent,
     send_signal_message, FriendRequestAccepted, FriendRequestReceived, FriendRequestState,
 };
 pub use giftwrap::{create_gift_wrap, unwrap_gift_wrap, UnwrappedMessage};
@@ -141,13 +143,17 @@ pub use mls::{
     MlsParticipant, MlsProvider, KIND_MLS_KEY_PACKAGE, MLS_CIPHERSUITE,
 };
 pub use signal_session::{
-    derive_nostr_address_from_ratchet, SignalCiphertext, SignalDecryptResult, SignalParticipant,
+    derive_nostr_address_from_ratchet, generate_prekey_material, reconstruct_prekey_material,
+    serialize_prekey_material, SignalCiphertext, SignalDecryptResult, SignalParticipant,
     SignalPreKeyMaterial,
 };
 pub use signal_store::{CapturingSessionStore, SignalProtocolStoreBundle};
 // Re-export libsignal types that clients need
-pub use libsignal_protocol::{DeviceId, PreKeySignalMessage, ProtocolAddress};
-#[cfg(feature = "storage")]
+pub use libsignal_protocol::{
+    DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair, KyberPreKeyId,
+    KyberPreKeyRecord, PreKeyId, PreKeyRecord, PreKeySignalMessage, PrivateKey as SignalPrivateKey,
+    ProtocolAddress, SignedPreKeyId, SignedPreKeyRecord,
+};
 pub use storage::{
     DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,
 };

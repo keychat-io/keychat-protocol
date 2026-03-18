@@ -32,6 +32,17 @@ impl OpenMlsRustPersistentCrypto {
             storage,
         }
     }
+
+    /// Open a file-backed MLS storage at `path`.
+    pub fn open(path: &str) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let connection = Connection::open(path)?;
+        let mut storage = SqliteStorageProvider::new(connection);
+        storage.run_migrations()?;
+        Ok(Self {
+            crypto: RustCrypto::default(),
+            storage,
+        })
+    }
 }
 
 impl Default for OpenMlsRustPersistentCrypto {

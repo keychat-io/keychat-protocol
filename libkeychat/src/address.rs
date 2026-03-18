@@ -6,6 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::error::{KeychatError, Result};
+use crate::storage::{DerivedAddressSerialized, PeerAddressStateSerialized};
 
 /// Default sliding window size for receiving addresses per peer.
 pub const DEFAULT_WINDOW_SIZE: usize = 3;
@@ -267,6 +268,45 @@ impl AddressManager {
     /// Get the window size.
     pub fn window_size(&self) -> usize {
         self.window_size
+    }
+
+    /// Reconstruct an AddressManager from serialized peer state.
+    pub fn from_serialized(peer_id: &str, state: PeerAddressStateSerialized) -> Self {
+        let mut mgr = AddressManager::new();
+        let peer_state = PeerAddressState {
+            receiving_addresses: state
+                .receiving_addresses
+                .into_iter()
+                .map(|a| DerivedAddress {
+                    address: a.address,
+                    secret_key: a.secret_key,
+                    ratchet_key: a.ratchet_key,
+                })
+                .collect(),
+            sending_address: state.sending_address,
+            peer_first_inbox: state.peer_first_inbox,
+            peer_nostr_pubkey: state.peer_nostr_pubkey,
+        };
+        mgr.peers.insert(peer_id.to_string(), peer_state);
+        mgr
+    }
+
+    /// Export a peer's address state as a serializable format.
+    pub fn to_serialized(&self, peer_id: &str) -> Option<PeerAddressStateSerialized> {
+        self.peers.get(peer_id).map(|state| PeerAddressStateSerialized {
+            receiving_addresses: state
+                .receiving_addresses
+                .iter()
+                .map(|a| DerivedAddressSerialized {
+                    address: a.address.clone(),
+                    secret_key: a.secret_key.clone(),
+                    ratchet_key: a.ratchet_key.clone(),
+                })
+                .collect(),
+            sending_address: state.sending_address.clone(),
+            peer_first_inbox: state.peer_first_inbox.clone(),
+            peer_nostr_pubkey: state.peer_nostr_pubkey.clone(),
+        })
     }
 }
 

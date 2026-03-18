@@ -122,6 +122,37 @@ impl SecureStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_peer_signal ON peer_mappings(signal_id);
 
+            CREATE TABLE IF NOT EXISTS signal_participants (
+                peer_signal_id TEXT PRIMARY KEY,
+                device_id INTEGER NOT NULL,
+                identity_public BLOB NOT NULL,
+                identity_private BLOB NOT NULL,
+                registration_id INTEGER NOT NULL,
+                signed_prekey_id INTEGER NOT NULL,
+                signed_prekey_record BLOB NOT NULL,
+                prekey_id INTEGER NOT NULL,
+                prekey_record BLOB NOT NULL,
+                kyber_prekey_id INTEGER NOT NULL,
+                kyber_prekey_record BLOB NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_friend_requests (
+                request_id TEXT PRIMARY KEY,
+                device_id INTEGER NOT NULL,
+                identity_public BLOB NOT NULL,
+                identity_private BLOB NOT NULL,
+                registration_id INTEGER NOT NULL,
+                signed_prekey_id INTEGER NOT NULL,
+                signed_prekey_record BLOB NOT NULL,
+                prekey_id INTEGER NOT NULL,
+                prekey_record BLOB NOT NULL,
+                kyber_prekey_id INTEGER NOT NULL,
+                kyber_prekey_record BLOB NOT NULL,
+                first_inbox_secret TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
             COMMIT;",
         )
         .map_err(|e| KeychatError::Storage(format!("Failed to create schema: {e}")))?;
@@ -527,6 +558,30 @@ impl SecureStorage {
         Ok(result)
     }
 
+    /// Delete a peer mapping.
+    pub fn delete_peer_mapping(&self, nostr_pubkey: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM peer_mappings WHERE nostr_pubkey = ?1",
+                rusqlite::params![nostr_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete peer mapping: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete peer addresses.
+    pub fn delete_peer_addresses(&self, peer_signal_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM peer_addresses WHERE peer_signal_id = ?1",
+                rusqlite::params![peer_signal_id],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to delete peer addresses: {e}"))
+            })?;
+        Ok(())
+    }
+
     /// List all peers.
     pub fn list_peers(&self) -> Result<Vec<PeerMapping>> {
         let mut stmt = self
@@ -544,6 +599,282 @@ impl SecureStorage {
                 })
             })
             .map_err(|e| KeychatError::Storage(format!("Failed to list peers: {e}")))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(
+                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
+            );
+        }
+        Ok(results)
+    }
+
+    // ─── Signal Participant Key Material ────────────────────
+
+    /// Serialized Signal pre-key material for persistence.
+    /// Used to reconstruct `SignalParticipant::persistent()` on restart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_signal_participant(
+        &self,
+        peer_signal_id: &str,
+        device_id: u32,
+        identity_public: &[u8],
+        identity_private: &[u8],
+        registration_id: u32,
+        signed_prekey_id: u32,
+        signed_prekey_record: &[u8],
+        prekey_id: u32,
+        prekey_record: &[u8],
+        kyber_prekey_id: u32,
+        kyber_prekey_record: &[u8],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO signal_participants \
+                 (peer_signal_id, device_id, identity_public, identity_private, \
+                  registration_id, signed_prekey_id, signed_prekey_record, \
+                  prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%s','now'))",
+                rusqlite::params![
+                    peer_signal_id,
+                    device_id,
+                    identity_public,
+                    identity_private,
+                    registration_id,
+                    signed_prekey_id,
+                    signed_prekey_record,
+                    prekey_id,
+                    prekey_record,
+                    kyber_prekey_id,
+                    kyber_prekey_record,
+                ],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to save signal participant: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Load signal participant key material.
+    /// Returns (device_id, identity_public, identity_private, registration_id,
+    ///          signed_prekey_id, signed_prekey_record, prekey_id, prekey_record,
+    ///          kyber_prekey_id, kyber_prekey_record).
+    #[allow(clippy::type_complexity)]
+    pub fn load_signal_participant(
+        &self,
+        peer_signal_id: &str,
+    ) -> Result<
+        Option<(
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+            u32,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+        )>,
+    > {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT device_id, identity_public, identity_private, registration_id, \
+                 signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, \
+                 kyber_prekey_id, kyber_prekey_record \
+                 FROM signal_participants WHERE peer_signal_id = ?1",
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let result = stmt
+            .query_row(rusqlite::params![peer_signal_id], |row: &rusqlite::Row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, u32>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, u32>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to load signal participant: {e}"))
+            })?;
+
+        Ok(result)
+    }
+
+    /// List all signal participant peer_signal_ids.
+    pub fn list_signal_participants(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer_signal_id FROM signal_participants")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to list signal participants: {e}"))
+            })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(
+                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
+            );
+        }
+        Ok(results)
+    }
+
+    /// Delete a signal participant.
+    pub fn delete_signal_participant(&self, peer_signal_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM signal_participants WHERE peer_signal_id = ?1",
+                rusqlite::params![peer_signal_id],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to delete signal participant: {e}"))
+            })?;
+        Ok(())
+    }
+
+    // ─── Pending Friend Requests ──────────────────────────
+
+    /// Save a pending friend request's key material.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_pending_fr(
+        &self,
+        request_id: &str,
+        device_id: u32,
+        identity_public: &[u8],
+        identity_private: &[u8],
+        registration_id: u32,
+        signed_prekey_id: u32,
+        signed_prekey_record: &[u8],
+        prekey_id: u32,
+        prekey_record: &[u8],
+        kyber_prekey_id: u32,
+        kyber_prekey_record: &[u8],
+        first_inbox_secret: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO pending_friend_requests \
+                 (request_id, device_id, identity_public, identity_private, \
+                  registration_id, signed_prekey_id, signed_prekey_record, \
+                  prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record, \
+                  first_inbox_secret, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%s','now'))",
+                rusqlite::params![
+                    request_id,
+                    device_id,
+                    identity_public,
+                    identity_private,
+                    registration_id,
+                    signed_prekey_id,
+                    signed_prekey_record,
+                    prekey_id,
+                    prekey_record,
+                    kyber_prekey_id,
+                    kyber_prekey_record,
+                    first_inbox_secret,
+                ],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to save pending FR: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Load a pending friend request.
+    /// Returns (device_id, identity_public, identity_private, registration_id,
+    ///          signed_prekey_id, signed_prekey_record, prekey_id, prekey_record,
+    ///          kyber_prekey_id, kyber_prekey_record, first_inbox_secret).
+    #[allow(clippy::type_complexity)]
+    pub fn load_pending_fr(
+        &self,
+        request_id: &str,
+    ) -> Result<
+        Option<(
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+            u32,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            String,
+        )>,
+    > {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT device_id, identity_public, identity_private, registration_id, \
+                 signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, \
+                 kyber_prekey_id, kyber_prekey_record, first_inbox_secret \
+                 FROM pending_friend_requests WHERE request_id = ?1",
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let result = stmt
+            .query_row(rusqlite::params![request_id], |row: &rusqlite::Row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, u32>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, u32>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to load pending FR: {e}"))
+            })?;
+
+        Ok(result)
+    }
+
+    /// Delete a pending friend request.
+    pub fn delete_pending_fr(&self, request_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_friend_requests WHERE request_id = ?1",
+                rusqlite::params![request_id],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to delete pending FR: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// List all pending friend request IDs.
+    pub fn list_pending_frs(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT request_id FROM pending_friend_requests")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to list pending FRs: {e}"))
+            })?;
 
         let mut results = Vec::new();
         for row in rows {

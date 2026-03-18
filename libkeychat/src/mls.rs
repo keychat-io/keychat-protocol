@@ -52,6 +52,13 @@ impl MlsProvider {
         }
     }
 
+    /// Open a file-backed MLS provider at `path`.
+    pub fn open(path: &str) -> Result<Self> {
+        let provider = OpenMlsRustPersistentCrypto::open(path)
+            .map_err(|e| KeychatError::Storage(format!("MLS storage open failed: {e}")))?;
+        Ok(Self { provider })
+    }
+
     /// Access the inner OpenMLS provider.
     pub fn inner(&self) -> &OpenMlsRustPersistentCrypto {
         &self.provider
@@ -95,6 +102,28 @@ impl MlsParticipant {
             signature_key: signer.to_public_vec().into(),
         };
         // Store the signing key in the provider's storage
+        signer
+            .store(provider.inner().storage())
+            .expect("failed to store signature keypair");
+
+        Self {
+            nostr_id,
+            provider,
+            credential: credential_with_key,
+            signer,
+        }
+    }
+
+    /// Create an MLS participant with a custom provider (e.g. file-backed).
+    pub fn with_provider(nostr_id: impl Into<String>, provider: MlsProvider) -> Self {
+        let nostr_id = nostr_id.into();
+        let credential = BasicCredential::new(nostr_id.as_bytes().to_vec());
+        let signer = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
+            .expect("failed to generate MLS signature keypair");
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.to_public_vec().into(),
+        };
         signer
             .store(provider.inner().storage())
             .expect("failed to store signature keypair");
