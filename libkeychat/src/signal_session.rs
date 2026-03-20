@@ -400,11 +400,20 @@ impl SignalParticipant {
             self.track_peer(remote);
             let alice_addrs = self.store.session_store.take_alice_addrs(remote.name());
 
+            // On first PreKey decrypt, bob_addresses is empty because there's
+            // no "old" snapshot to compare against. But the DH ratchet DID step:
+            // the initial sender chain (signed pre-key) was replaced. We can
+            // manually compute bob_address using signed_pre_key_private + their_public.
+            let mut bob_derived_address = self.derive_bob_address(remote)?;
+            if bob_derived_address.is_none() {
+                bob_derived_address = self.derive_bob_address_from_prekey(remote)?;
+            }
+
             return Ok(SignalDecryptResult {
                 plaintext,
                 message_key_hash,
                 alice_addrs,
-                bob_derived_address: self.derive_bob_address(remote)?,
+                bob_derived_address,
             });
         }
 
@@ -505,6 +514,44 @@ impl SignalParticipant {
     fn track_peer(&mut self, remote: &ProtocolAddress) {
         self.tracked_peers
             .insert(remote.name().to_owned(), remote.clone());
+    }
+
+    /// Derive bob_address for the first PreKey decrypt using the signed pre-key
+    /// as the "old" sender chain key.
+    ///
+    /// During PreKey decrypt, initialize_bob_session sets sender chain = signed pre-key,
+    /// then get_or_create_chain_key does a DH ratchet step replacing it. The old sender
+    /// private key (signed pre-key) + their ephemeral public = bob_address.
+    fn derive_bob_address_from_prekey(&self, remote: &ProtocolAddress) -> Result<Option<String>> {
+        // Get their_public from my_receiver_addresses ("{new_sender_priv}-{their_pub}")
+        let receiver_addr = self
+            .store
+            .session_store
+            .my_receiver_addresses
+            .lock()
+            .unwrap()
+            .get(remote.name())
+            .cloned();
+
+        let their_pub = match receiver_addr {
+            Some(ref addr) => match addr.split_once('-') {
+                Some((_, pub_hex)) => pub_hex.to_owned(),
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+
+        // Get signed pre-key private key (was the initial sender chain)
+        let signed_priv = hex::encode(
+            self.keys
+                .signed_prekey
+                .private_key()
+                .map_err(|e| KeychatError::Signal(format!("signed prekey private: {e}")))?
+                .serialize(),
+        );
+
+        let seed = format!("{}-{}", signed_priv, their_pub);
+        derive_nostr_address_from_ratchet(&seed).map(Some)
     }
 
     fn derive_bob_address(&self, remote: &ProtocolAddress) -> Result<Option<String>> {
@@ -691,5 +738,31 @@ mod tests {
         let sender_id = SignalParticipant::extract_prekey_sender_identity(&ct);
         assert!(sender_id.is_some());
         assert_eq!(sender_id.unwrap(), alice.identity_public_key_hex());
+    }
+
+    #[test]
+    fn prekey_decrypt_produces_bob_derived_address() {
+        let mut alice = SignalParticipant::new("alice", 1).unwrap();
+        let mut bob = SignalParticipant::new("bob", 1).unwrap();
+
+        let bob_bundle = bob.prekey_bundle().unwrap();
+        let bob_addr = ProtocolAddress::new(bob.identity_public_key_hex(), make_device_id(1));
+        let alice_addr =
+            ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
+
+        alice
+            .process_prekey_bundle(&bob_addr, &bob_bundle)
+            .unwrap();
+
+        let ct = alice.encrypt_bytes(&bob_addr, b"Hello Bob!").unwrap();
+        assert!(SignalParticipant::is_prekey_message(&ct));
+
+        // Bob decrypts the PreKey message — should produce bob_derived_address
+        let result = bob.decrypt(&alice_addr, &ct).unwrap();
+        assert_eq!(result.plaintext, b"Hello Bob!");
+        assert!(
+            result.bob_derived_address.is_some(),
+            "PreKey decrypt should produce bob_derived_address after ratchet step"
+        );
     }
 }
