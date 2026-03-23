@@ -1,3 +1,4 @@
+mod address;
 mod client;
 mod error;
 mod event_loop;
