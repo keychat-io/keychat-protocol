@@ -120,4 +120,56 @@ impl KeychatClient {
         }
         Ok(())
     }
+
+    /// Register an event listener for receiving async events from the event loop.
+    pub async fn set_event_listener(&self, listener: Box<dyn EventListener>) {
+        let mut inner = self.inner.write().await;
+        inner.event_listener = Some(listener);
+    }
+
+    /// Start the event loop: subscribe to relay notifications and dispatch
+    /// incoming events to the registered EventListener.
+    ///
+    /// Uses `Arc<Self>` so the event loop task can hold a reference.
+    pub async fn start_event_loop(self: Arc<Self>) -> Result<(), KeychatUniError> {
+        // Collect pubkeys to subscribe to
+        let pubkeys = self.collect_subscribe_pubkeys().await;
+        if pubkeys.is_empty() {
+            return Err(KeychatUniError::NotInitialized {
+                msg: "no pubkeys to subscribe to — set identity first".into(),
+            });
+        }
+
+        // Subscribe via Transport
+        {
+            let inner = self.inner.read().await;
+            let transport = inner.transport.as_ref().ok_or(
+                KeychatUniError::NotInitialized { msg: "not connected".into() }
+            )?;
+            transport.subscribe(pubkeys, None).await?;
+        } // lock dropped
+
+        // Create stop channel
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut inner = self.inner.write().await;
+            inner.event_loop_stop = Some(stop_tx);
+        }
+
+        // Spawn the event loop task
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            self_clone.run_event_loop(stop_rx).await;
+        });
+
+        Ok(())
+    }
+
+    /// Stop the event loop.
+    pub async fn stop_event_loop(&self) {
+        let mut inner = self.inner.write().await;
+        if let Some(stop_tx) = inner.event_loop_stop.take() {
+            let _ = stop_tx.send(true);
+        }
+    }
 }
