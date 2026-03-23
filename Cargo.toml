@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "libkeychat",
+    "keychat-cli-human",
+    "keychat-cli-agent",
+    "keychat-uniffi",
+]
+resolver = "2"

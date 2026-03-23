@@ -1,0 +1,21 @@
+[package]
+name = "keychat-uniffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli"] }
+libkeychat = { path = "../libkeychat", features = ["storage", "mls"] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
