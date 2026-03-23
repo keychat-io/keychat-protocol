@@ -1,1 +1,8 @@
 target/
+
+# Workspace uses root Cargo.lock only
+libkeychat/Cargo.lock
+keychat-cli-human/Cargo.lock
+keychat-cli-agent/Cargo.lock
+keychat-uniffi/Cargo.lock
+keychat-uniffi/generated/
