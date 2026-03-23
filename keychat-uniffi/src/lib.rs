@@ -1,5 +1,6 @@
 mod client;
 mod error;
+mod friend_request;
 mod types;
 
 pub use client::KeychatClient;
