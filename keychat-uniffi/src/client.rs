@@ -84,4 +84,40 @@ impl KeychatClient {
             .map(|id| id.pubkey_hex())
             .ok_or(KeychatUniError::NotInitialized { msg: "no identity set".into() })
     }
+
+    pub async fn connect(&self, relay_urls: Vec<String>) -> Result<(), KeychatUniError> {
+        // 1. Clone identity from lock, drop lock before async
+        let identity = {
+            let inner = self.inner.read().await;
+            inner.identity.clone().ok_or(
+                KeychatUniError::NotInitialized { msg: "call create_identity first".into() }
+            )?
+        };
+        // Lock dropped here
+
+        // 2. Create transport, add relays, connect (all async, no lock held)
+        let transport = Transport::new(identity.keys()).await?;
+        for url in &relay_urls {
+            transport.add_relay(url).await?;
+        }
+        transport.connect().await;
+
+        // 3. Re-acquire lock to store transport
+        let mut inner = self.inner.write().await;
+        inner.transport = Some(transport);
+        Ok(())
+    }
+
+    pub async fn disconnect(&self) -> Result<(), KeychatUniError> {
+        // Take transport out, drop lock, then disconnect
+        let transport = {
+            let mut inner = self.inner.write().await;
+            inner.transport.take()
+        };
+        // Lock dropped here
+        if let Some(t) = transport {
+            t.disconnect().await?;
+        }
+        Ok(())
+    }
 }
