@@ -7,9 +7,7 @@ use aes::Aes256;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use sha2::{Digest, Sha256};
 
-use crate::message::{
-    FileCategory, KCFilePayload, KCFilesPayload, KCMessage, KCMessageKind,
-};
+use crate::message::{FileCategory, KCFilePayload, KCFilesPayload, KCMessage, KCMessageKind};
 use crate::Result;
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
@@ -43,17 +41,23 @@ fn pkcs7_pad(data: &[u8], block_size: usize) -> Vec<u8> {
 /// Remove PKCS7 padding. Returns an error if padding is invalid.
 fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>> {
     if data.is_empty() {
-        return Err(crate::KeychatError::MediaCrypto("Empty data for PKCS7 unpad".into()));
+        return Err(crate::KeychatError::MediaCrypto(
+            "Empty data for PKCS7 unpad".into(),
+        ));
     }
     let pad_byte = *data.last().unwrap();
     let pad_len = pad_byte as usize;
     if pad_len == 0 || pad_len > 16 || pad_len > data.len() {
-        return Err(crate::KeychatError::MediaCrypto("Invalid PKCS7 padding".into()));
+        return Err(crate::KeychatError::MediaCrypto(
+            "Invalid PKCS7 padding".into(),
+        ));
     }
     // Verify all padding bytes are correct
     for &b in &data[data.len() - pad_len..] {
         if b != pad_byte {
-            return Err(crate::KeychatError::MediaCrypto("Invalid PKCS7 padding".into()));
+            return Err(crate::KeychatError::MediaCrypto(
+                "Invalid PKCS7 padding".into(),
+            ));
         }
     }
     Ok(data[..data.len() - pad_len].to_vec())
@@ -328,14 +332,13 @@ mod tests {
     fn encrypt_decrypt_known_test_vector() {
         // Fixed key and IV for deterministic test
         let key: [u8; 32] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
         ];
         let iv: [u8; 16] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
         let plaintext = b"Hello, Keychat!";
 

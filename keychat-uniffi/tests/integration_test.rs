@@ -11,7 +11,12 @@ struct TestListener {
 impl TestListener {
     fn new() -> (Self, Arc<AtomicU32>) {
         let count = Arc::new(AtomicU32::new(0));
-        (TestListener { count: count.clone() }, count)
+        (
+            TestListener {
+                count: count.clone(),
+            },
+            count,
+        )
     }
 }
 
@@ -38,9 +43,7 @@ macro_rules! async_test {
                     .enable_all()
                     .build()
                     .unwrap();
-                rt.block_on(async {
-                    $body
-                });
+                rt.block_on(async { $body });
             })
             .join()
             .unwrap();
@@ -62,7 +65,9 @@ async_test!(create_client_and_identity, {
     assert_eq!(pubkey, result.pubkey_hex);
 
     // Drop client before runtime shutdown
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(import_identity_from_mnemonic, {
@@ -81,7 +86,9 @@ async_test!(import_identity_from_mnemonic, {
     tokio::task::spawn_blocking(move || {
         drop(client1);
         drop(client2);
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 });
 
 async_test!(get_pubkey_before_identity_fails, {
@@ -91,9 +98,14 @@ async_test!(get_pubkey_before_identity_fails, {
     let client = KeychatClient::new(db_path, "test-key".into()).unwrap();
 
     let result = client.get_pubkey_hex().await;
-    assert!(result.is_err(), "get_pubkey_hex should fail without identity");
+    assert!(
+        result.is_err(),
+        "get_pubkey_hex should fail without identity"
+    );
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(set_event_listener_works, {
@@ -105,7 +117,9 @@ async_test!(set_event_listener_works, {
 
     client.set_event_listener(Box::new(listener)).await;
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(two_clients_different_identities, {
@@ -125,7 +139,9 @@ async_test!(two_clients_different_identities, {
     tokio::task::spawn_blocking(move || {
         drop(alice);
         drop(bob);
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 });
 
 async_test!(empty_receiving_addresses_without_sessions, {
@@ -136,9 +152,14 @@ async_test!(empty_receiving_addresses_without_sessions, {
     client.create_identity().await.unwrap();
 
     let addrs = client.get_all_receiving_addresses().await;
-    assert!(addrs.is_empty(), "should have no receiving addresses without sessions");
+    assert!(
+        addrs.is_empty(),
+        "should have no receiving addresses without sessions"
+    );
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(connect_without_identity_fails, {
@@ -150,5 +171,7 @@ async_test!(connect_without_identity_fails, {
     let result = client.connect(vec!["wss://relay.example.com".into()]).await;
     assert!(result.is_err(), "connect should fail without identity");
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });

@@ -66,21 +66,33 @@ pub fn sys(msg: &str) {
 
 pub fn sent(text: &str) {
     let t = Local::now().format("%H:%M:%S");
-    println!("{} {} {}", format!("[{}]", t).dimmed(), "You:".green().bold(), text);
+    println!(
+        "{} {} {}",
+        format!("[{}]", t).dimmed(),
+        "You:".green().bold(),
+        text
+    );
 }
 
 pub fn received(name: &str, text: &str) {
     let t = Local::now().format("%H:%M:%S");
-    println!("{} {} {}", format!("[{}]", t).dimmed(), format!("{}:", name).blue().bold(), text);
+    println!(
+        "{} {} {}",
+        format!("[{}]", t).dimmed(),
+        format!("{}:", name).blue().bold(),
+        text
+    );
 }
 
 pub fn group_msg(group_name: &str, sender: &str, text: &str) {
     let t = Local::now().format("%H:%M:%S");
-    println!("{} {} {} {}",
+    println!(
+        "{} {} {} {}",
         format!("[{}]", t).dimmed(),
         format!("[{}]", group_name).magenta(),
         format!("{}:", sender).blue().bold(),
-        text);
+        text
+    );
 }
 
 pub fn err(msg: &str) {

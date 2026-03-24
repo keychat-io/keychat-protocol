@@ -77,9 +77,7 @@ impl ChatSession {
 
         // Encrypt
         let json = message.to_json()?;
-        let enc = self
-            .signal
-            .encrypt(remote_address, json.as_bytes())?;
+        let enc = self.signal.encrypt(remote_address, json.as_bytes())?;
 
         // Update addresses after encrypt
         let update = self
@@ -116,9 +114,7 @@ impl ChatSession {
 
         let is_prekey = SignalParticipant::is_prekey_message(&ciphertext);
 
-        let decrypt_result = self
-            .signal
-            .decrypt(remote_address, &ciphertext)?;
+        let decrypt_result = self.signal.decrypt(remote_address, &ciphertext)?;
 
         let plaintext_str = String::from_utf8(decrypt_result.plaintext)
             .map_err(|e| KeychatError::Signal(format!("invalid UTF-8: {e}")))?;
@@ -235,16 +231,8 @@ mod tests {
         // Register peers — use real pubkeys for firstInbox (must be valid Nostr pubkeys)
         let bob_inbox = EphemeralKeypair::generate();
         let alice_inbox = EphemeralKeypair::generate();
-        alice.add_peer(
-            &alice_peer_id,
-            Some(bob_inbox.pubkey_hex()),
-            None,
-        );
-        bob.add_peer(
-            &bob_peer_id,
-            Some(alice_inbox.pubkey_hex()),
-            None,
-        );
+        alice.add_peer(&alice_peer_id, Some(bob_inbox.pubkey_hex()), None);
+        bob.add_peer(&bob_peer_id, Some(alice_inbox.pubkey_hex()), None);
 
         // Alice sends (PrekeyMessage)
         let msg = KCMessage::text("Hello from ChatSession!");
@@ -280,10 +268,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(alice_received.kind, KCMessageKind::Text);
-        assert_eq!(
-            alice_received.text.as_ref().unwrap().content,
-            "Hi back!"
-        );
+        assert_eq!(alice_received.text.as_ref().unwrap().content, "Hi back!");
         assert!(!alice_meta.is_prekey_message);
     }
 
@@ -375,13 +360,8 @@ mod tests {
                 .send_message(&alice_peer_id, &bob_addr, &msg)
                 .await
                 .unwrap();
-            let (received, _, _) = bob
-                .receive_message(&bob_peer_id, &alice_addr, &ev)
-                .unwrap();
-            assert_eq!(
-                received.text.as_ref().unwrap().content,
-                format!("msg{i}")
-            );
+            let (received, _, _) = bob.receive_message(&bob_peer_id, &alice_addr, &ev).unwrap();
+            assert_eq!(received.text.as_ref().unwrap().content, format!("msg{i}"));
         }
 
         // Verify we haven't accumulated many addresses (ratchet doesn't
@@ -408,7 +388,10 @@ mod tests {
         bob.add_peer(&bob_peer_id, Some(alice_inbox_hex.clone()), None);
 
         // Before any messages, resolve should use firstInbox
-        let addr_before = alice.addresses.resolve_send_address(&alice_peer_id).unwrap();
+        let addr_before = alice
+            .addresses
+            .resolve_send_address(&alice_peer_id)
+            .unwrap();
         assert_eq!(addr_before, bob_inbox_hex);
 
         // msg1: Alice → Bob
@@ -434,7 +417,10 @@ mod tests {
             alice.clear_peer_first_inbox(&alice_peer_id);
 
             // Now resolve should use ratchet-derived address, not firstInbox
-            let addr_after = alice.addresses.resolve_send_address(&alice_peer_id).unwrap();
+            let addr_after = alice
+                .addresses
+                .resolve_send_address(&alice_peer_id)
+                .unwrap();
             assert_ne!(
                 addr_after, bob_inbox_hex,
                 "should use ratchet address after clearing firstInbox"

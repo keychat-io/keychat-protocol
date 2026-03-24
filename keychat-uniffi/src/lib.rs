@@ -22,10 +22,12 @@ use nostr::nips::nip19::{FromBech32, ToBech32};
 /// Example: "c002c688..." → "npub1cqq..."
 #[uniffi::export]
 pub fn npub_from_hex(hex: String) -> Result<String, KeychatUniError> {
-    let pk = libkeychat::PublicKey::from_hex(&hex)
-        .map_err(|e| KeychatUniError::Identity { msg: format!("invalid hex pubkey: {e}") })?;
-    pk.to_bech32()
-        .map_err(|e| KeychatUniError::Identity { msg: format!("bech32 encode failed: {e}") })
+    let pk = libkeychat::PublicKey::from_hex(&hex).map_err(|e| KeychatUniError::Identity {
+        msg: format!("invalid hex pubkey: {e}"),
+    })?;
+    pk.to_bech32().map_err(|e| KeychatUniError::Identity {
+        msg: format!("bech32 encode failed: {e}"),
+    })
 }
 
 /// Convert an npub (bech32) string to hex public key.
@@ -33,8 +35,9 @@ pub fn npub_from_hex(hex: String) -> Result<String, KeychatUniError> {
 /// Example: "npub1cqq..." → "c002c688..."
 #[uniffi::export]
 pub fn hex_from_npub(npub: String) -> Result<String, KeychatUniError> {
-    let pk = libkeychat::PublicKey::from_bech32(&npub)
-        .map_err(|e| KeychatUniError::Identity { msg: format!("invalid npub: {e}") })?;
+    let pk = libkeychat::PublicKey::from_bech32(&npub).map_err(|e| KeychatUniError::Identity {
+        msg: format!("invalid npub: {e}"),
+    })?;
     Ok(pk.to_hex())
 }
 

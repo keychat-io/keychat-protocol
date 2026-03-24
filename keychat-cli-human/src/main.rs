@@ -11,14 +11,21 @@ mod ui;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "keychat", version, about = "Keychat v2 — E2E encrypted messaging over Nostr (human client)")]
+#[command(
+    name = "keychat",
+    version,
+    about = "Keychat v2 — E2E encrypted messaging over Nostr (human client)"
+)]
 struct Cli {
     /// Path to config/data directory
     #[arg(long, default_value_t = default_data_dir())]
     data_dir: String,
 
     /// Nostr relay URL(s), comma-separated
-    #[arg(long, default_value = "wss://relay.keychat.io,wss://relay.damus.io,wss://relay.primal.net,wss://relay.ditto.pub")]
+    #[arg(
+        long,
+        default_value = "wss://relay.keychat.io,wss://relay.damus.io,wss://relay.primal.net,wss://relay.ditto.pub"
+    )]
     relay: String,
 
     /// Database encryption key (in production, use OS keychain)

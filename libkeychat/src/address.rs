@@ -81,14 +81,14 @@ impl AddressManager {
         peer_first_inbox: Option<String>,
         peer_nostr_pubkey: Option<String>,
     ) {
-        self.peers.entry(peer_id.to_string()).or_insert_with(|| {
-            PeerAddressState {
+        self.peers
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerAddressState {
                 receiving_addresses: VecDeque::new(),
                 sending_address: None,
                 peer_first_inbox,
                 peer_nostr_pubkey,
-            }
-        });
+            });
     }
 
     /// Called after encrypting a message. Processes ratchet metadata to
@@ -293,20 +293,22 @@ impl AddressManager {
 
     /// Export a peer's address state as a serializable format.
     pub fn to_serialized(&self, peer_id: &str) -> Option<PeerAddressStateSerialized> {
-        self.peers.get(peer_id).map(|state| PeerAddressStateSerialized {
-            receiving_addresses: state
-                .receiving_addresses
-                .iter()
-                .map(|a| DerivedAddressSerialized {
-                    address: a.address.clone(),
-                    secret_key: a.secret_key.clone(),
-                    ratchet_key: a.ratchet_key.clone(),
-                })
-                .collect(),
-            sending_address: state.sending_address.clone(),
-            peer_first_inbox: state.peer_first_inbox.clone(),
-            peer_nostr_pubkey: state.peer_nostr_pubkey.clone(),
-        })
+        self.peers
+            .get(peer_id)
+            .map(|state| PeerAddressStateSerialized {
+                receiving_addresses: state
+                    .receiving_addresses
+                    .iter()
+                    .map(|a| DerivedAddressSerialized {
+                        address: a.address.clone(),
+                        secret_key: a.secret_key.clone(),
+                        ratchet_key: a.ratchet_key.clone(),
+                    })
+                    .collect(),
+                sending_address: state.sending_address.clone(),
+                peer_first_inbox: state.peer_first_inbox.clone(),
+                peer_nostr_pubkey: state.peer_nostr_pubkey.clone(),
+            })
     }
 }
 
@@ -381,9 +383,7 @@ mod tests {
         let alice_addr =
             ProtocolAddress::new(alice.identity_public_key_hex(), DeviceId::new(1).unwrap());
 
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
 
         (alice, bob, alice_addr, bob_addr)
     }
@@ -395,9 +395,7 @@ mod tests {
         let (mut alice, mut bob, alice_addr, bob_addr) = setup_session();
 
         // Encrypt to get a sender_address (ratchet key)
-        let result = alice
-            .encrypt(&bob_addr, b"hello")
-            .unwrap();
+        let result = alice.encrypt(&bob_addr, b"hello").unwrap();
 
         if let Some(ref ratchet_key) = result.sender_address {
             let addr1 = derive_nostr_address_from_ratchet(ratchet_key).unwrap();
@@ -468,14 +466,13 @@ mod tests {
         }
 
         let state = mgr.get_peer("peer1").unwrap();
-        assert_eq!(
-            state.receiving_addresses.len(),
-            3,
-            "window should cap at 3"
-        );
+        assert_eq!(state.receiving_addresses.len(), 3, "window should cap at 3");
 
         // Should contain the last 3 distinct addresses
-        let unique_count = all_sender_addrs.iter().collect::<std::collections::HashSet<_>>().len();
+        let unique_count = all_sender_addrs
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         // At minimum we should have some addresses (ratchet may not always produce unique ones)
         assert!(state.receiving_addresses.len() <= 3);
     }
@@ -543,7 +540,10 @@ mod tests {
 
             let state = mgr.get_peer("peer1").unwrap();
             assert_eq!(state.receiving_addresses.len(), 1);
-            assert_eq!(state.receiving_addresses[0].address, update.new_receiving[0]);
+            assert_eq!(
+                state.receiving_addresses[0].address,
+                update.new_receiving[0]
+            );
         }
     }
 
@@ -604,10 +604,16 @@ mod tests {
             let update = mgr
                 .on_decrypt(&peer_id, Some(bob_addr_derived), dr2.alice_addrs.as_deref())
                 .unwrap();
-            assert_eq!(update.new_sending.as_deref(), Some(bob_addr_derived.as_str()));
+            assert_eq!(
+                update.new_sending.as_deref(),
+                Some(bob_addr_derived.as_str())
+            );
 
             let state = mgr.get_peer(&peer_id).unwrap();
-            assert_eq!(state.sending_address.as_deref(), Some(bob_addr_derived.as_str()));
+            assert_eq!(
+                state.sending_address.as_deref(),
+                Some(bob_addr_derived.as_str())
+            );
         }
     }
 
@@ -746,7 +752,10 @@ mod tests {
             mgr.clear_peer_first_inbox("peer1");
 
             let resolved = mgr.resolve_send_address("peer1").unwrap();
-            assert_eq!(resolved, *addr, "ratchet address should be used after clearing inbox");
+            assert_eq!(
+                resolved, *addr,
+                "ratchet address should be used after clearing inbox"
+            );
         }
     }
 
@@ -778,8 +787,10 @@ mod tests {
             let mut c = SignalParticipant::new("carol", 1).unwrap();
             let mut d = SignalParticipant::new("dave", 1).unwrap();
             let d_bundle = d.prekey_bundle().unwrap();
-            let d_addr = ProtocolAddress::new(d.identity_public_key_hex(), DeviceId::new(1).unwrap());
-            let c_addr = ProtocolAddress::new(c.identity_public_key_hex(), DeviceId::new(1).unwrap());
+            let d_addr =
+                ProtocolAddress::new(d.identity_public_key_hex(), DeviceId::new(1).unwrap());
+            let c_addr =
+                ProtocolAddress::new(c.identity_public_key_hex(), DeviceId::new(1).unwrap());
             c.process_prekey_bundle(&d_addr, &d_bundle).unwrap();
             (c, d, c_addr, d_addr)
         };
@@ -936,20 +947,16 @@ mod tests {
         );
 
         // Verify: firstInbox should be cleared on both sides
-        assert!(
-            alice_mgr
-                .get_peer(&alice_peer_id)
-                .unwrap()
-                .peer_first_inbox
-                .is_none()
-        );
-        assert!(
-            bob_mgr
-                .get_peer(&bob_peer_id)
-                .unwrap()
-                .peer_first_inbox
-                .is_none()
-        );
+        assert!(alice_mgr
+            .get_peer(&alice_peer_id)
+            .unwrap()
+            .peer_first_inbox
+            .is_none());
+        assert!(bob_mgr
+            .get_peer(&bob_peer_id)
+            .unwrap()
+            .peer_first_inbox
+            .is_none());
 
         // Verify: sending addresses should be set
         assert!(alice_mgr.resolve_send_address(&alice_peer_id).is_ok());
@@ -968,8 +975,10 @@ mod tests {
             let mut a = SignalParticipant::new("alice2", 1).unwrap();
             let mut c = SignalParticipant::new("charlie", 1).unwrap();
             let c_bundle = c.prekey_bundle().unwrap();
-            let c_addr = ProtocolAddress::new(c.identity_public_key_hex(), DeviceId::new(1).unwrap());
-            let a_addr = ProtocolAddress::new(a.identity_public_key_hex(), DeviceId::new(1).unwrap());
+            let c_addr =
+                ProtocolAddress::new(c.identity_public_key_hex(), DeviceId::new(1).unwrap());
+            let a_addr =
+                ProtocolAddress::new(a.identity_public_key_hex(), DeviceId::new(1).unwrap());
             a.process_prekey_bundle(&c_addr, &c_bundle).unwrap();
             (a, c, a_addr, c_addr)
         };
@@ -995,7 +1004,8 @@ mod tests {
         let bob_state = mgr.get_peer("bob").unwrap();
         let charlie_state = mgr.get_peer("charlie").unwrap();
 
-        if !bob_state.receiving_addresses.is_empty() && !charlie_state.receiving_addresses.is_empty()
+        if !bob_state.receiving_addresses.is_empty()
+            && !charlie_state.receiving_addresses.is_empty()
         {
             assert_ne!(
                 bob_state.receiving_addresses[0].address,

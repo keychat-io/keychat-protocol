@@ -235,7 +235,9 @@ impl CashuWallet {
     pub fn new(
         mint_url: &str,
         seed: [u8; 64],
-        localstore: Arc<dyn cdk_common::database::WalletDatabase<cdk_common::database::Error> + Send + Sync>,
+        localstore: Arc<
+            dyn cdk_common::database::WalletDatabase<cdk_common::database::Error> + Send + Sync,
+        >,
     ) -> Result<Self> {
         let wallet = cdk::wallet::Wallet::new(
             mint_url,
@@ -389,10 +391,7 @@ impl StampManager {
         for (url, result) in results {
             match result {
                 Ok(info) => {
-                    let rules = info
-                        .fees
-                        .map(|f| f.publication)
-                        .unwrap_or_default();
+                    let rules = info.fees.map(|f| f.publication).unwrap_or_default();
                     debug!("cached {} fee rules for {url}", rules.len());
                     cache.insert(url, rules);
                 }
@@ -406,7 +405,11 @@ impl StampManager {
     }
 
     /// Get the fee rule for a specific relay and event kind.
-    pub async fn get_fee_for_kind(&self, relay_url: &str, event_kind: Kind) -> Option<RelayFeeRule> {
+    pub async fn get_fee_for_kind(
+        &self,
+        relay_url: &str,
+        event_kind: Kind,
+    ) -> Option<RelayFeeRule> {
         let cache = self.fee_cache.read().await;
         cache.get_fee_for_kind(relay_url, event_kind.as_u16())
     }
@@ -415,11 +418,7 @@ impl StampManager {
     ///
     /// Returns `Ok(None)` if the relay is free (no fee rule), or if no wallet is configured.
     /// Returns `Ok(Some(token))` with a Cashu token string if a stamp is needed.
-    pub async fn create_stamp(
-        &self,
-        relay_url: &str,
-        event_kind: Kind,
-    ) -> Result<Option<String>> {
+    pub async fn create_stamp(&self, relay_url: &str, event_kind: Kind) -> Result<Option<String>> {
         // Check if relay requires a fee for this kind
         let fee_rule = match self.get_fee_for_kind(relay_url, event_kind).await {
             Some(rule) => rule,
@@ -606,7 +605,9 @@ mod tests {
 
         // Should be expired immediately
         assert!(!cache.has_valid("wss://relay.example.com"));
-        assert!(cache.get_fee_for_kind("wss://relay.example.com", 1059).is_none());
+        assert!(cache
+            .get_fee_for_kind("wss://relay.example.com", 1059)
+            .is_none());
     }
 
     #[test]

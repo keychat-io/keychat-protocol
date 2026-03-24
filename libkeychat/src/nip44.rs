@@ -17,8 +17,13 @@ pub fn encrypt(
     receiver_pubkey: &PublicKey,
     plaintext: &str,
 ) -> Result<String> {
-    nip44::encrypt(sender_secret_key, receiver_pubkey, plaintext, nip44::Version::V2)
-        .map_err(|e| KeychatError::Nip44Encrypt(e.to_string()))
+    nip44::encrypt(
+        sender_secret_key,
+        receiver_pubkey,
+        plaintext,
+        nip44::Version::V2,
+    )
+    .map_err(|e| KeychatError::Nip44Encrypt(e.to_string()))
 }
 
 /// Decrypt NIP-44 ciphertext.
@@ -44,11 +49,9 @@ mod tests {
         let receiver = Keys::generate();
         let plaintext = "Hello, Keychat!";
 
-        let ciphertext =
-            encrypt(sender.secret_key(), &receiver.public_key(), plaintext).unwrap();
+        let ciphertext = encrypt(sender.secret_key(), &receiver.public_key(), plaintext).unwrap();
 
-        let decrypted =
-            decrypt(receiver.secret_key(), &sender.public_key(), &ciphertext).unwrap();
+        let decrypted = decrypt(receiver.secret_key(), &sender.public_key(), &ciphertext).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -78,11 +81,13 @@ mod tests {
         let receiver = Keys::generate();
         let wrong_receiver = Keys::generate();
 
-        let ciphertext =
-            encrypt(sender.secret_key(), &receiver.public_key(), "secret").unwrap();
+        let ciphertext = encrypt(sender.secret_key(), &receiver.public_key(), "secret").unwrap();
 
-        let result =
-            decrypt(wrong_receiver.secret_key(), &sender.public_key(), &ciphertext);
+        let result = decrypt(
+            wrong_receiver.secret_key(),
+            &sender.public_key(),
+            &ciphertext,
+        );
         assert!(result.is_err());
     }
 
@@ -94,10 +99,8 @@ mod tests {
         // NIP-44 requires minimum 1 byte plaintext; empty might error
         // but non-empty short strings should work fine
         let plaintext = "x";
-        let ciphertext =
-            encrypt(sender.secret_key(), &receiver.public_key(), plaintext).unwrap();
-        let decrypted =
-            decrypt(receiver.secret_key(), &sender.public_key(), &ciphertext).unwrap();
+        let ciphertext = encrypt(sender.secret_key(), &receiver.public_key(), plaintext).unwrap();
+        let decrypted = decrypt(receiver.secret_key(), &sender.public_key(), &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -107,10 +110,8 @@ mod tests {
         let receiver = Keys::generate();
         let plaintext = "Hello 🔑💬 Keychat! 你好世界";
 
-        let ciphertext =
-            encrypt(sender.secret_key(), &receiver.public_key(), plaintext).unwrap();
-        let decrypted =
-            decrypt(receiver.secret_key(), &sender.public_key(), &ciphertext).unwrap();
+        let ciphertext = encrypt(sender.secret_key(), &receiver.public_key(), plaintext).unwrap();
+        let decrypted = decrypt(receiver.secret_key(), &sender.public_key(), &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 }

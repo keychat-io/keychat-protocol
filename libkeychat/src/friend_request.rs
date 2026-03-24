@@ -121,9 +121,8 @@ pub fn receive_friend_request(
 ) -> Result<FriendRequestReceived> {
     let unwrapped = unwrap_gift_wrap(my_identity.keys(), gift_wrap_event)?;
 
-    let message = KCMessage::try_parse(&unwrapped.content).ok_or_else(|| {
-        KeychatError::Signal("failed to parse KCMessage from Gift Wrap".into())
-    })?;
+    let message = KCMessage::try_parse(&unwrapped.content)
+        .ok_or_else(|| KeychatError::Signal("failed to parse KCMessage from Gift Wrap".into()))?;
 
     if message.kind != KCMessageKind::FriendRequest {
         return Err(KeychatError::Signal(format!(
@@ -132,9 +131,10 @@ pub fn receive_friend_request(
         )));
     }
 
-    let payload = message.friend_request.clone().ok_or_else(|| {
-        KeychatError::Signal("friendRequest message missing payload".into())
-    })?;
+    let payload = message
+        .friend_request
+        .clone()
+        .ok_or_else(|| KeychatError::Signal("friendRequest message missing payload".into()))?;
 
     let time = payload
         .time
@@ -371,12 +371,8 @@ pub async fn accept_friend_request_persistent(
 ) -> Result<FriendRequestAccepted> {
     let payload = &friend_request.payload;
 
-    let mut my_signal = SignalParticipant::persistent(
-        my_identity.pubkey_hex(),
-        signal_device_id,
-        keys,
-        storage,
-    )?;
+    let mut my_signal =
+        SignalParticipant::persistent(my_identity.pubkey_hex(), signal_device_id, keys, storage)?;
 
     // Build PreKeyBundle from friend request payload
     let remote_identity_key_bytes = hex::decode(&payload.signal_identity_key)
@@ -542,7 +538,9 @@ fn uuid_v4() -> String {
         u16::from_be_bytes([bytes[4], bytes[5]]),
         u16::from_be_bytes([bytes[6], bytes[7]]),
         u16::from_be_bytes([bytes[8], bytes[9]]),
-        u64::from_be_bytes([0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]])
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ])
     )
 }
 
@@ -556,14 +554,10 @@ mod tests {
         let bob_id = Identity::generate().unwrap().identity;
 
         // Step 1: Alice sends friend request
-        let (gift_wrap, alice_state) = send_friend_request(
-            &alice_id,
-            &bob_id.pubkey_hex(),
-            "Alice",
-            "device-alice",
-        )
-        .await
-        .unwrap();
+        let (gift_wrap, alice_state) =
+            send_friend_request(&alice_id, &bob_id.pubkey_hex(), "Alice", "device-alice")
+                .await
+                .unwrap();
 
         assert_eq!(gift_wrap.kind, Kind::GiftWrap);
         assert_ne!(gift_wrap.pubkey, alice_id.public_key());
@@ -575,7 +569,9 @@ mod tests {
         assert_eq!(received.message.kind, KCMessageKind::FriendRequest);
 
         // Step 3: Bob accepts
-        let accepted = accept_friend_request(&bob_id, &received, "Bob").await.unwrap();
+        let accepted = accept_friend_request(&bob_id, &received, "Bob")
+            .await
+            .unwrap();
         assert_eq!(accepted.event.kind, Kind::GiftWrap);
         assert_eq!(accepted.message.kind, KCMessageKind::FriendApprove);
         assert!(accepted.message.signal_prekey_auth.is_some());
@@ -585,7 +581,8 @@ mod tests {
             .decode(&accepted.event.content)
             .unwrap();
         let bob_signal_id = accepted.signal_participant.identity_public_key_hex();
-        let bob_signal_addr = ProtocolAddress::new(bob_signal_id.clone(), DeviceId::new(1).unwrap());
+        let bob_signal_addr =
+            ProtocolAddress::new(bob_signal_id.clone(), DeviceId::new(1).unwrap());
 
         let mut alice_signal = alice_state.signal_participant;
         let decrypt_result = alice_signal
@@ -644,22 +641,21 @@ mod tests {
         let alice_id = Identity::generate().unwrap().identity;
         let bob_id = Identity::generate().unwrap().identity;
 
-        let (gift_wrap, _) = send_friend_request(
-            &alice_id,
-            &bob_id.pubkey_hex(),
-            "Alice",
-            "dev-1",
-        )
-        .await
-        .unwrap();
+        let (gift_wrap, _) = send_friend_request(&alice_id, &bob_id.pubkey_hex(), "Alice", "dev-1")
+            .await
+            .unwrap();
 
         let received = receive_friend_request(&bob_id, &gift_wrap).unwrap();
         let p = &received.payload;
 
         // Tampered time
-        let result =
-            verify_global_sign(&p.nostr_identity_key, &p.signal_identity_key, p.time.unwrap() + 1, &p.global_sign)
-                .unwrap();
+        let result = verify_global_sign(
+            &p.nostr_identity_key,
+            &p.signal_identity_key,
+            p.time.unwrap() + 1,
+            &p.global_sign,
+        )
+        .unwrap();
         assert!(!result);
 
         // Tampered signal key
@@ -679,14 +675,9 @@ mod tests {
         let bob_id = Identity::generate().unwrap().identity;
         let charlie_id = Identity::generate().unwrap().identity;
 
-        let (gift_wrap, _) = send_friend_request(
-            &alice_id,
-            &bob_id.pubkey_hex(),
-            "Alice",
-            "dev-1",
-        )
-        .await
-        .unwrap();
+        let (gift_wrap, _) = send_friend_request(&alice_id, &bob_id.pubkey_hex(), "Alice", "dev-1")
+            .await
+            .unwrap();
 
         let result = receive_friend_request(&charlie_id, &gift_wrap);
         assert!(result.is_err());
@@ -697,17 +688,14 @@ mod tests {
         let alice_id = Identity::generate().unwrap().identity;
         let bob_id = Identity::generate().unwrap().identity;
 
-        let (gift_wrap, _) = send_friend_request(
-            &alice_id,
-            &bob_id.pubkey_hex(),
-            "Alice",
-            "dev-1",
-        )
-        .await
-        .unwrap();
+        let (gift_wrap, _) = send_friend_request(&alice_id, &bob_id.pubkey_hex(), "Alice", "dev-1")
+            .await
+            .unwrap();
 
         let received = receive_friend_request(&bob_id, &gift_wrap).unwrap();
-        let accepted = accept_friend_request(&bob_id, &received, "Bob").await.unwrap();
+        let accepted = accept_friend_request(&bob_id, &received, "Bob")
+            .await
+            .unwrap();
 
         let ciphertext = base64::engine::general_purpose::STANDARD
             .decode(&accepted.event.content)

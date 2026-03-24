@@ -15,7 +15,6 @@
 //!   GET  /events                      — SSE stream (all agents, tagged with agent_id)
 //!   GET  /health                      — Liveness check
 
-use nostr::nips::nip19::ToBech32;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -26,21 +25,18 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use nostr::nips::nip19::ToBech32;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 use crate::chat;
 use crate::multi_agent::{AgentEvent, AgentInfo, MultiAgentManager};
 
-pub async fn run(
-    root_dir: String,
-    relay_urls: Vec<String>,
-    listen: String,
-) -> anyhow::Result<()> {
+pub async fn run(root_dir: String, relay_urls: Vec<String>, listen: String) -> anyhow::Result<()> {
     let root_path = std::path::Path::new(&root_dir);
     std::fs::create_dir_all(root_path)?;
 
@@ -91,29 +87,27 @@ async fn sse_handler(
     State(mgr): State<Arc<MultiAgentManager>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
     let rx = mgr.event_tx().subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
-        match result {
-            Ok(event) => {
-                let json = serde_json::to_string(&event).unwrap_or_default();
-                let sse_event = match &event.event {
-                    crate::chat::IncomingEvent::Message(_) =>
-                        SseEvent::default().event("message").data(json),
-                    crate::chat::IncomingEvent::FriendRequest { .. } =>
-                        SseEvent::default().event("friend_request").data(json),
-                };
-                Some(Ok(sse_event))
-            }
-            Err(_) => None,
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => {
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            let sse_event = match &event.event {
+                crate::chat::IncomingEvent::Message(_) => {
+                    SseEvent::default().event("message").data(json)
+                }
+                crate::chat::IncomingEvent::FriendRequest { .. } => {
+                    SseEvent::default().event("friend_request").data(json)
+                }
+            };
+            Some(Ok(sse_event))
         }
+        Err(_) => None,
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 // ─── Agent management ───────────────────────────────────────────────────────
 
-async fn list_agents(
-    State(mgr): State<Arc<MultiAgentManager>>,
-) -> Json<Vec<AgentInfo>> {
+async fn list_agents(State(mgr): State<Arc<MultiAgentManager>>) -> Json<Vec<AgentInfo>> {
     Json(mgr.list_agents().await)
 }
 
@@ -137,12 +131,22 @@ async fn create_agent(
     Json(req): Json<CreateAgentRequest>,
 ) -> impl IntoResponse {
     match mgr.create_agent(&req.id, &req.name).await {
-        Ok(npub) => (StatusCode::CREATED, Json(CreateAgentResponse {
-            ok: true, npub: Some(npub), error: None,
-        })),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(CreateAgentResponse {
-            ok: false, npub: None, error: Some(e.to_string()),
-        })),
+        Ok(npub) => (
+            StatusCode::CREATED,
+            Json(CreateAgentResponse {
+                ok: true,
+                npub: Some(npub),
+                error: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(CreateAgentResponse {
+                ok: false,
+                npub: None,
+                error: Some(e.to_string()),
+            }),
+        ),
     }
 }
 
@@ -159,9 +163,16 @@ macro_rules! get_agent {
     ($mgr:expr, $id:expr) => {
         match $mgr.get_agent(&$id).await {
             Some(state) => state,
-            None => return (StatusCode::NOT_FOUND, Json(ApiResponse {
-                ok: false, error: Some(format!("Agent '{}' not found", $id)),
-            })).into_response(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse {
+                        ok: false,
+                        error: Some(format!("Agent '{}' not found", $id)),
+                    }),
+                )
+                    .into_response()
+            }
         }
     };
 }
@@ -188,7 +199,8 @@ async fn agent_identity(
         npub: bech32,
         name: state.name.clone(),
         relays: state.relay_urls.clone(),
-    }).into_response()
+    })
+    .into_response()
 }
 
 #[derive(Serialize)]
@@ -204,11 +216,14 @@ async fn agent_peers(
 ) -> impl IntoResponse {
     let state = get_agent!(mgr, id);
     let peers = state.peers.read().await;
-    let list: Vec<PeerInfo> = peers.values().map(|p| PeerInfo {
-        npub: p.nostr_pubkey.clone(),
-        name: p.name.clone(),
-        signal_id: p.signal_id.clone(),
-    }).collect();
+    let list: Vec<PeerInfo> = peers
+        .values()
+        .map(|p| PeerInfo {
+            npub: p.nostr_pubkey.clone(),
+            name: p.name.clone(),
+            signal_id: p.signal_id.clone(),
+        })
+        .collect();
     Json(list).into_response()
 }
 
@@ -225,10 +240,22 @@ async fn agent_send(
 ) -> impl IntoResponse {
     let state = get_agent!(mgr, id);
     match chat::send_text_to(&state, &req.to, &req.message).await {
-        Ok(()) => (StatusCode::OK, Json(ApiResponse { ok: true, error: None })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse {
-            ok: false, error: Some(e.to_string()),
-        })).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                ok: true,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -244,10 +271,22 @@ async fn agent_add_friend(
 ) -> impl IntoResponse {
     let state = get_agent!(mgr, id);
     match chat::add_friend(&state, &req.npub).await {
-        Ok(()) => (StatusCode::OK, Json(ApiResponse { ok: true, error: None })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse {
-            ok: false, error: Some(e.to_string()),
-        })).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                ok: true,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -259,10 +298,22 @@ async fn agent_approve_friend(
     let state = get_agent!(mgr, id);
     let (tx, _) = tokio::sync::broadcast::channel(1);
     match chat::approve_friend(&state, &req.npub, &tx).await {
-        Ok(()) => (StatusCode::OK, Json(ApiResponse { ok: true, error: None })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse {
-            ok: false, error: Some(e.to_string()),
-        })).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                ok: true,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -273,10 +324,22 @@ async fn agent_reject_friend(
 ) -> impl IntoResponse {
     let state = get_agent!(mgr, id);
     match chat::reject_friend(&state, &req.npub).await {
-        Ok(()) => (StatusCode::OK, Json(ApiResponse { ok: true, error: None })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiResponse {
-            ok: false, error: Some(e.to_string()),
-        })).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                ok: true,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -292,10 +355,16 @@ async fn agent_pending_friends(
 ) -> impl IntoResponse {
     let state = get_agent!(mgr, id);
     let pending = chat::list_pending_friends(&state).await;
-    Json(pending.into_iter().map(|p| PendingFriendInfo {
-        npub: p.sender_npub,
-        name: p.sender_name,
-    }).collect::<Vec<_>>()).into_response()
+    Json(
+        pending
+            .into_iter()
+            .map(|p| PendingFriendInfo {
+                npub: p.sender_npub,
+                name: p.sender_name,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
 #[derive(Serialize)]
@@ -328,9 +397,16 @@ async fn agent_set_owner(
     let new_owner_hex = match &req.new_owner {
         Some(pk) => match libkeychat::normalize_pubkey(pk) {
             Ok(hex) => Some(hex),
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
-                ok: false, error: Some(format!("Invalid pubkey: {}", e)),
-            })).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse {
+                        ok: false,
+                        error: Some(format!("Invalid pubkey: {}", e)),
+                    }),
+                )
+                    .into_response()
+            }
         },
         None => None,
     };
@@ -338,22 +414,47 @@ async fn agent_set_owner(
     *state.owner.write().await = new_owner_hex.clone();
 
     let mut config = crate::config::Config::load(&state.data_dir)
-        .ok().flatten().unwrap_or_default();
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     config.owner = new_owner_hex.clone();
     if let Err(e) = config.save(&state.data_dir) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
-            ok: false, error: Some(format!("Failed to save config: {}", e)),
-        })).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                ok: false,
+                error: Some(format!("Failed to save config: {}", e)),
+            }),
+        )
+            .into_response();
     }
 
     match &new_owner_hex {
         Some(hex) => {
-            eprintln!("👑 Agent '{}' owner changed to {}", id, &hex[..16.min(hex.len())]);
-            (StatusCode::OK, Json(ApiResponse { ok: true, error: None })).into_response()
+            eprintln!(
+                "👑 Agent '{}' owner changed to {}",
+                id,
+                &hex[..16.min(hex.len())]
+            );
+            (
+                StatusCode::OK,
+                Json(ApiResponse {
+                    ok: true,
+                    error: None,
+                }),
+            )
+                .into_response()
         }
         None => {
             eprintln!("👑 Agent '{}' owner cleared", id);
-            (StatusCode::OK, Json(ApiResponse { ok: true, error: None })).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse {
+                    ok: true,
+                    error: None,
+                }),
+            )
+                .into_response()
         }
     }
 }
@@ -382,17 +483,32 @@ async fn agent_backup_mnemonic(
         Some(o) if o == req.owner_npub => {
             let npub = state.npub();
             match crate::config::load_mnemonic(&npub) {
-                Ok(m) => (StatusCode::OK, Json(BackupResponse {
-                    mnemonic: Some(m), error: None,
-                })).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(BackupResponse {
-                    mnemonic: None, error: Some(e.to_string()),
-                })).into_response(),
+                Ok(m) => (
+                    StatusCode::OK,
+                    Json(BackupResponse {
+                        mnemonic: Some(m),
+                        error: None,
+                    }),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(BackupResponse {
+                        mnemonic: None,
+                        error: Some(e.to_string()),
+                    }),
+                )
+                    .into_response(),
             }
         }
-        _ => (StatusCode::FORBIDDEN, Json(BackupResponse {
-            mnemonic: None, error: Some("Only the owner can backup the mnemonic".to_string()),
-        })).into_response(),
+        _ => (
+            StatusCode::FORBIDDEN,
+            Json(BackupResponse {
+                mnemonic: None,
+                error: Some("Only the owner can backup the mnemonic".to_string()),
+            }),
+        )
+            .into_response(),
     }
 }
 

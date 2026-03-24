@@ -9,8 +9,8 @@
 //! Each agent has its own Nostr client, Signal sessions, and address manager.
 //! Adding a new agent: POST /agents or create a directory — daemon auto-detects.
 
-use nostr::nips::nip19::ToBech32;
 use anyhow::{Context, Result};
+use nostr::nips::nip19::ToBech32;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,8 +100,10 @@ impl MultiAgentManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(secrets_dir.join("mnemonic"),
-                std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(
+                secrets_dir.join("mnemonic"),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
         }
         let _ = config::store_mnemonic(&pubkey_hex, &gen.mnemonic);
 
@@ -110,8 +112,10 @@ impl MultiAgentManager {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(secrets_dir.join("dbkey"),
-                std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(
+                secrets_dir.join("dbkey"),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
         }
         let _ = config::store_db_key(&pubkey_hex, &db_key);
 
@@ -156,8 +160,10 @@ impl MultiAgentManager {
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(&dbkey_file,
-                                std::fs::Permissions::from_mode(0o600))?;
+                            std::fs::set_permissions(
+                                &dbkey_file,
+                                std::fs::Permissions::from_mode(0o600),
+                            )?;
                         }
                     }
 
@@ -176,7 +182,9 @@ impl MultiAgentManager {
             }
         };
 
-        let pubkey_hex = config.pubkey_hex.as_deref()
+        let pubkey_hex = config
+            .pubkey_hex
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("config.json missing pubkey_hex"))?;
 
         // Load secrets (env → file → keychain)
@@ -189,7 +197,14 @@ impl MultiAgentManager {
         let npub = identity.pubkey_hex();
 
         let app_state = Arc::new(
-            AppState::new(identity, config.clone(), &self.relay_urls, &agent_dir, &db_key).await?
+            AppState::new(
+                identity,
+                config.clone(),
+                &self.relay_urls,
+                &agent_dir,
+                &db_key,
+            )
+            .await?,
         );
 
         // Start background listener
@@ -230,29 +245,41 @@ impl MultiAgentManager {
             state: app_state,
         };
 
-        self.agents.write().await.insert(agent_id.to_string(), handle);
+        self.agents
+            .write()
+            .await
+            .insert(agent_id.to_string(), handle);
         eprintln!("  ✅ Agent '{}' started (npub: {})", agent_id, &npub[..16]);
         Ok(())
     }
 
     /// Get a reference to an agent's state.
     pub async fn get_agent(&self, agent_id: &str) -> Option<Arc<AppState>> {
-        self.agents.read().await.get(agent_id).map(|h| h.state.clone())
+        self.agents
+            .read()
+            .await
+            .get(agent_id)
+            .map(|h| h.state.clone())
     }
 
     /// List all running agents.
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
-        self.agents.read().await.values().map(|h| {
-            let bech32 = nostr::prelude::PublicKey::from_hex(&h.npub)
-                .map(|pk| pk.to_bech32().unwrap_or_else(|_| h.npub.clone()))
-                .unwrap_or_else(|_| h.npub.clone());
-            AgentInfo {
-                id: h.id.clone(),
-                npub_hex: h.npub.clone(),
-                npub: bech32,
-                name: h.name.clone(),
-            }
-        }).collect()
+        self.agents
+            .read()
+            .await
+            .values()
+            .map(|h| {
+                let bech32 = nostr::prelude::PublicKey::from_hex(&h.npub)
+                    .map(|pk| pk.to_bech32().unwrap_or_else(|_| h.npub.clone()))
+                    .unwrap_or_else(|_| h.npub.clone());
+                AgentInfo {
+                    id: h.id.clone(),
+                    npub_hex: h.npub.clone(),
+                    npub: bech32,
+                    name: h.name.clone(),
+                }
+            })
+            .collect()
     }
 
     /// Watch for new agent directories and auto-start them.
@@ -261,9 +288,13 @@ impl MultiAgentManager {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-            let Ok(entries) = std::fs::read_dir(&agents_dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+                continue;
+            };
             for entry in entries.filter_map(|e| e.ok()) {
-                if !entry.path().is_dir() { continue; }
+                if !entry.path().is_dir() {
+                    continue;
+                }
                 let agent_id = entry.file_name().to_string_lossy().to_string();
 
                 // Skip if already running

@@ -18,8 +18,8 @@ use std::os::raw::c_char;
 use std::ptr;
 
 use crate::{
-    accept_friend_request, receive_friend_request, send_friend_request,
-    AddressManager, Identity, KCMessage, SignalParticipant,
+    accept_friend_request, receive_friend_request, send_friend_request, AddressManager, Identity,
+    KCMessage, SignalParticipant,
 };
 use libsignal_protocol::{DeviceId, ProtocolAddress};
 use nostr::prelude::*;
@@ -105,7 +105,9 @@ fn null_str() -> *mut c_char {
 }
 
 unsafe fn from_cstr(p: *const c_char) -> &'static str {
-    if p.is_null() { return ""; }
+    if p.is_null() {
+        return "";
+    }
     CStr::from_ptr(p).to_str().unwrap_or("")
 }
 
@@ -188,7 +190,9 @@ pub unsafe extern "C" fn keychat_destroy(ctx: *mut KeychatContext) {
 /// Get the nostr public key (hex). Caller must free with `keychat_free_string()`.
 #[no_mangle]
 pub unsafe extern "C" fn keychat_get_npub(ctx: *const KeychatContext) -> *mut c_char {
-    if ctx.is_null() { return null_str(); }
+    if ctx.is_null() {
+        return null_str();
+    }
     to_cstring(&(*ctx).identity.pubkey_hex())
 }
 
@@ -209,16 +213,20 @@ pub unsafe extern "C" fn keychat_send_friend_request(
     display_name: *const c_char,
 ) -> KeychatFriendRequestResult {
     let err_result = KeychatFriendRequestResult {
-        event_json: null_str(), first_inbox: null_str(), error: -1,
+        event_json: null_str(),
+        first_inbox: null_str(),
+        error: -1,
     };
-    if ctx.is_null() { return err_result; }
+    if ctx.is_null() {
+        return err_result;
+    }
     let ctx = &mut *ctx;
     let peer = from_cstr(peer_npub);
     let name = from_cstr(display_name);
 
-    let result = ctx.rt.block_on(send_friend_request(
-        &ctx.identity, peer, name, "ffi",
-    ));
+    let result = ctx
+        .rt
+        .block_on(send_friend_request(&ctx.identity, peer, name, "ffi"));
     match result {
         Ok((event, fr_state)) => {
             let event_json = match event.as_json() {
@@ -251,10 +259,14 @@ pub unsafe extern "C" fn keychat_receive_friend_request(
     event_json: *const c_char,
 ) -> KeychatFriendReceived {
     let err = KeychatFriendReceived {
-        sender_npub: null_str(), sender_name: null_str(),
-        sender_signal_id: null_str(), error: -1,
+        sender_npub: null_str(),
+        sender_name: null_str(),
+        sender_signal_id: null_str(),
+        error: -1,
     };
-    if ctx.is_null() { return err; }
+    if ctx.is_null() {
+        return err;
+    }
     let ctx = &mut *ctx;
     let json = from_cstr(event_json);
 
@@ -274,7 +286,10 @@ pub unsafe extern "C" fn keychat_receive_friend_request(
     let first_inbox = fr.payload.first_inbox.clone();
 
     // Auto-accept
-    let accepted = match ctx.rt.block_on(accept_friend_request(&ctx.identity, &fr, "ffi")) {
+    let accepted = match ctx
+        .rt
+        .block_on(accept_friend_request(&ctx.identity, &fr, "ffi"))
+    {
         Ok(a) => a,
         Err(_) => return err,
     };
@@ -315,9 +330,13 @@ pub unsafe extern "C" fn keychat_send_text(
     text: *const c_char,
 ) -> KeychatSendResult {
     let err = KeychatSendResult {
-        event_json: null_str(), new_addresses_json: null_str(), error: -1,
+        event_json: null_str(),
+        new_addresses_json: null_str(),
+        error: -1,
     };
-    if ctx.is_null() { return err; }
+    if ctx.is_null() {
+        return err;
+    }
     let ctx = &mut *ctx;
     let npub = from_cstr(peer_npub);
     let content = from_cstr(text);
@@ -339,12 +358,15 @@ pub unsafe extern "C" fn keychat_send_text(
         Err(_) => return err,
     };
 
-    let to_address = peer.address_manager.resolve_send_address(&peer.signal_id)
+    let to_address = peer
+        .address_manager
+        .resolve_send_address(&peer.signal_id)
         .unwrap_or_else(|_| peer.nostr_pubkey.clone());
 
-    let update = peer.address_manager.on_encrypt(
-        &peer.signal_id, ct.sender_address.as_deref(),
-    ).unwrap_or_default();
+    let update = peer
+        .address_manager
+        .on_encrypt(&peer.signal_id, ct.sender_address.as_deref())
+        .unwrap_or_default();
 
     // Build Mode 1 event
     let event = match ctx.rt.block_on(build_mode1_event(&ct.bytes, &to_address)) {
@@ -375,10 +397,15 @@ pub unsafe extern "C" fn keychat_receive_event(
     event_json: *const c_char,
 ) -> KeychatMessage {
     let err = KeychatMessage {
-        sender_npub: null_str(), content: null_str(), kind: null_str(),
-        new_addresses_json: null_str(), error: -1,
+        sender_npub: null_str(),
+        content: null_str(),
+        kind: null_str(),
+        new_addresses_json: null_str(),
+        error: -1,
     };
-    if ctx.is_null() { return err; }
+    if ctx.is_null() {
+        return err;
+    }
     let ctx = &mut *ctx;
     let json = from_cstr(event_json);
 
@@ -388,22 +415,24 @@ pub unsafe extern "C" fn keychat_receive_event(
     };
 
     // Try base64 decode
-    let ciphertext = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, &event.content
-    ) {
-        Ok(ct) => ct,
-        Err(_) => return err,
-    };
+    let ciphertext =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &event.content) {
+            Ok(ct) => ct,
+            Err(_) => return err,
+        };
 
     // Try each peer
     for peer in &mut ctx.peers {
         let addr = ProtocolAddress::new(peer.signal_id.clone(), DeviceId::new(1).unwrap());
         if let Ok(result) = peer.signal.decrypt(&addr, &ciphertext) {
-            let update = peer.address_manager.on_decrypt(
-                &peer.signal_id,
-                result.bob_derived_address.as_deref(),
-                result.alice_addrs.as_deref(),
-            ).unwrap_or_default();
+            let update = peer
+                .address_manager
+                .on_decrypt(
+                    &peer.signal_id,
+                    result.bob_derived_address.as_deref(),
+                    result.alice_addrs.as_deref(),
+                )
+                .unwrap_or_default();
 
             let text = String::from_utf8_lossy(&result.plaintext);
             let (content, kind) = if let Some(msg) = KCMessage::try_parse(&text) {
@@ -499,14 +528,20 @@ fn libkeychat_try_pending_response(ctx: &mut KeychatContext, ciphertext: &[u8]) 
 /// Caller must free with `keychat_free_string()`.
 #[no_mangle]
 pub unsafe extern "C" fn keychat_list_peers(ctx: *const KeychatContext) -> *mut c_char {
-    if ctx.is_null() { return null_str(); }
-    let peers: Vec<serde_json::Value> = (*ctx).peers.iter().map(|p| {
-        serde_json::json!({
-            "npub": p.nostr_pubkey,
-            "name": p.name,
-            "signal_id": p.signal_id,
+    if ctx.is_null() {
+        return null_str();
+    }
+    let peers: Vec<serde_json::Value> = (*ctx)
+        .peers
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "npub": p.nostr_pubkey,
+                "name": p.name,
+                "signal_id": p.signal_id,
+            })
         })
-    }).collect();
+        .collect();
     to_cstring(&serde_json::to_string(&peers).unwrap_or_default())
 }
 
@@ -517,12 +552,16 @@ pub unsafe extern "C" fn keychat_resolve_send_address(
     ctx: *mut KeychatContext,
     peer_npub: *const c_char,
 ) -> *mut c_char {
-    if ctx.is_null() { return null_str(); }
+    if ctx.is_null() {
+        return null_str();
+    }
     let ctx = &mut *ctx;
     let npub = from_cstr(peer_npub);
     match find_peer(ctx, npub) {
         Some(peer) => {
-            let addr = peer.address_manager.resolve_send_address(&peer.signal_id)
+            let addr = peer
+                .address_manager
+                .resolve_send_address(&peer.signal_id)
                 .unwrap_or_else(|_| peer.nostr_pubkey.clone());
             to_cstring(&addr)
         }
@@ -555,11 +594,9 @@ async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<nostr:
     use nostr::prelude::*;
 
     let sender = EphemeralKeypair::generate();
-    let content = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD, ciphertext
-    );
-    let to_pubkey = PublicKey::from_hex(to_address)
-        .map_err(|e| format!("invalid to_address: {e}"))?;
+    let content = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ciphertext);
+    let to_pubkey =
+        PublicKey::from_hex(to_address).map_err(|e| format!("invalid to_address: {e}"))?;
 
     EventBuilder::new(Kind::GiftWrap, &content)
         .tag(Tag::public_key(to_pubkey))
@@ -576,9 +613,7 @@ use base64::Engine as _;
 /// Returns JSON: {"name":"...","fees":{"publication":[...]}} or error.
 /// Caller must free the returned string with keychat_free_string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn keychat_fetch_relay_info(
-    relay_url: *const c_char,
-) -> *mut c_char {
+pub unsafe extern "C" fn keychat_fetch_relay_info(relay_url: *const c_char) -> *mut c_char {
     let url = unsafe { CStr::from_ptr(relay_url) }.to_str().unwrap_or("");
     let rt = tokio::runtime::Runtime::new().unwrap();
     match rt.block_on(crate::stamp::fetch_relay_info(url)) {
@@ -605,6 +640,9 @@ pub unsafe extern "C" fn keychat_check_relay_fee(
     let _ctx = unsafe { &*ctx };
     let url = unsafe { CStr::from_ptr(relay_url) }.to_str().unwrap_or("");
     // For now return not-required since stamp manager is not in context yet
-    let result = format!(r#"{{"required":false,"relay":"{}","kind":{}}}"#, url, event_kind);
+    let result = format!(
+        r#"{{"required":false,"relay":"{}","kind":{}}}"#,
+        url, event_kind
+    );
     CString::new(result).unwrap().into_raw()
 }

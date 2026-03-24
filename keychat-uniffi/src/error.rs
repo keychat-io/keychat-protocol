@@ -47,12 +47,8 @@ impl From<KeychatError> for KeychatUniError {
             KeychatError::InvalidCiphertext => KeychatUniError::Signal {
                 msg: "invalid ciphertext".into(),
             },
-            KeychatError::Serialization(e) => KeychatUniError::Signal {
-                msg: e.to_string(),
-            },
-            KeychatError::Hex(e) => KeychatUniError::Signal {
-                msg: e.to_string(),
-            },
+            KeychatError::Serialization(e) => KeychatUniError::Signal { msg: e.to_string() },
+            KeychatError::Hex(e) => KeychatUniError::Signal { msg: e.to_string() },
         }
     }
 }

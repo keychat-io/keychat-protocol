@@ -8,7 +8,6 @@
 //!   GET  /peers        — List contacts
 //!   GET  /health       — Liveness check
 
-use nostr::nips::nip19::ToBech32;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -19,6 +18,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use nostr::nips::nip19::ToBech32;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -56,7 +56,9 @@ pub async fn run(
     let (identity, config) = match Config::load(data_path)? {
         Some(mut config) => {
             config.auto_accept_friends = auto_accept;
-            let pubkey_hex = config.pubkey_hex.as_deref()
+            let pubkey_hex = config
+                .pubkey_hex
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("config.json missing pubkey_hex"))?;
             let mnemonic = crate::config::load_mnemonic(pubkey_hex)?;
             let identity = libkeychat::Identity::from_mnemonic_str(&mnemonic)?;
@@ -81,8 +83,10 @@ pub async fn run(
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&mnemonic_file,
-                        std::fs::Permissions::from_mode(0o600))?;
+                    std::fs::set_permissions(
+                        &mnemonic_file,
+                        std::fs::Permissions::from_mode(0o600),
+                    )?;
                 }
                 // Also try keychain (best-effort, may fail in headless)
                 let _ = crate::config::store_mnemonic(&gen.identity.pubkey_hex(), &m);
@@ -101,8 +105,7 @@ pub async fn run(
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&db_key_file,
-                        std::fs::Permissions::from_mode(0o600))?;
+                    std::fs::set_permissions(&db_key_file, std::fs::Permissions::from_mode(0o600))?;
                 }
                 let _ = crate::config::store_db_key(&pubkey_hex, &generated_db_key);
             }
@@ -125,17 +128,15 @@ pub async fn run(
     // Resolve DB key: CLI arg > keychain > error
     let db_key = match db_key {
         Some(k) => k,
-        None => crate::config::load_db_key(&npub)
-            .unwrap_or_else(|_| {
-                // Legacy fallback for existing installations
-                eprintln!("  ⚠️  DB key not in keychain, using default (insecure)");
-                "keychat-cli-default-key".to_string()
-            }),
+        None => crate::config::load_db_key(&npub).unwrap_or_else(|_| {
+            // Legacy fallback for existing installations
+            eprintln!("  ⚠️  DB key not in keychain, using default (insecure)");
+            "keychat-cli-default-key".to_string()
+        }),
     };
 
-    let app_state = Arc::new(
-        AppState::new(identity, config, &relay_urls, data_path, &db_key).await?
-    );
+    let app_state =
+        Arc::new(AppState::new(identity, config, &relay_urls, data_path, &db_key).await?);
 
     let (event_tx, _) = broadcast::channel::<IncomingEvent>(256);
 
@@ -189,18 +190,18 @@ async fn sse_handler(
     State(state): State<Arc<DaemonState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
     let rx = state.event_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
-        match result {
-            Ok(event) => {
-                let json = serde_json::to_string(&event).unwrap_or_default();
-                let sse_event = match &event {
-                    IncomingEvent::Message(_) => SseEvent::default().event("message").data(json),
-                    IncomingEvent::FriendRequest { .. } => SseEvent::default().event("friend_request").data(json),
-                };
-                Some(Ok(sse_event))
-            }
-            Err(_) => None,
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => {
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            let sse_event = match &event {
+                IncomingEvent::Message(_) => SseEvent::default().event("message").data(json),
+                IncomingEvent::FriendRequest { .. } => {
+                    SseEvent::default().event("friend_request").data(json)
+                }
+            };
+            Some(Ok(sse_event))
         }
+        Err(_) => None,
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -225,10 +226,19 @@ async fn send_handler(
     Json(req): Json<SendRequest>,
 ) -> impl IntoResponse {
     match chat::send_text_to(&state.app, &req.to, &req.message).await {
-        Ok(()) => (StatusCode::OK, Json(SendResponse { ok: true, error: None })),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SendResponse {
+                ok: true,
+                error: None,
+            }),
+        ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(SendResponse { ok: false, error: Some(e.to_string()) }),
+            Json(SendResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
         ),
     }
 }
@@ -245,10 +255,19 @@ async fn add_friend_handler(
     Json(req): Json<AddFriendRequest>,
 ) -> impl IntoResponse {
     match chat::add_friend(&state.app, &req.npub).await {
-        Ok(()) => (StatusCode::OK, Json(SendResponse { ok: true, error: None })),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SendResponse {
+                ok: true,
+                error: None,
+            }),
+        ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(SendResponse { ok: false, error: Some(e.to_string()) }),
+            Json(SendResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
         ),
     }
 }
@@ -263,9 +282,7 @@ struct IdentityResponse {
     relays: Vec<String>,
 }
 
-async fn identity_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> Json<IdentityResponse> {
+async fn identity_handler(State(state): State<Arc<DaemonState>>) -> Json<IdentityResponse> {
     let hex = state.app.npub();
     let bech32 = nostr::prelude::PublicKey::from_hex(&hex)
         .map(|pk| pk.to_bech32().unwrap_or_else(|_| hex.clone()))
@@ -287,15 +304,16 @@ struct PeerInfo {
     signal_id: String,
 }
 
-async fn peers_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> Json<Vec<PeerInfo>> {
+async fn peers_handler(State(state): State<Arc<DaemonState>>) -> Json<Vec<PeerInfo>> {
     let peers = state.app.peers.read().await;
-    let list: Vec<PeerInfo> = peers.values().map(|p| PeerInfo {
-        npub: p.nostr_pubkey.clone(),
-        name: p.name.clone(),
-        signal_id: p.signal_id.clone(),
-    }).collect();
+    let list: Vec<PeerInfo> = peers
+        .values()
+        .map(|p| PeerInfo {
+            npub: p.nostr_pubkey.clone(),
+            name: p.name.clone(),
+            signal_id: p.signal_id.clone(),
+        })
+        .collect();
     Json(list)
 }
 
@@ -311,10 +329,19 @@ async fn approve_friend_handler(
     Json(req): Json<ApproveFriendRequest>,
 ) -> impl IntoResponse {
     match chat::approve_friend(&state.app, &req.npub, &state.event_tx).await {
-        Ok(()) => (StatusCode::OK, Json(SendResponse { ok: true, error: None })),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SendResponse {
+                ok: true,
+                error: None,
+            }),
+        ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(SendResponse { ok: false, error: Some(e.to_string()) }),
+            Json(SendResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
         ),
     }
 }
@@ -324,10 +351,19 @@ async fn reject_friend_handler(
     Json(req): Json<ApproveFriendRequest>,
 ) -> impl IntoResponse {
     match chat::reject_friend(&state.app, &req.npub).await {
-        Ok(()) => (StatusCode::OK, Json(SendResponse { ok: true, error: None })),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SendResponse {
+                ok: true,
+                error: None,
+            }),
+        ),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(SendResponse { ok: false, error: Some(e.to_string()) }),
+            Json(SendResponse {
+                ok: false,
+                error: Some(e.to_string()),
+            }),
         ),
     }
 }
@@ -344,10 +380,15 @@ async fn pending_friends_handler(
     State(state): State<Arc<DaemonState>>,
 ) -> Json<Vec<PendingFriendInfo>> {
     let pending = chat::list_pending_friends(&state.app).await;
-    Json(pending.into_iter().map(|p| PendingFriendInfo {
-        npub: p.sender_npub,
-        name: p.sender_name,
-    }).collect())
+    Json(
+        pending
+            .into_iter()
+            .map(|p| PendingFriendInfo {
+                npub: p.sender_npub,
+                name: p.sender_name,
+            })
+            .collect(),
+    )
 }
 
 // ─── Owner ──────────────────────────────────────────────────────────────────
@@ -357,9 +398,7 @@ struct OwnerResponse {
     owner: Option<String>,
 }
 
-async fn owner_handler(
-    State(state): State<Arc<DaemonState>>,
-) -> Json<OwnerResponse> {
+async fn owner_handler(State(state): State<Arc<DaemonState>>) -> Json<OwnerResponse> {
     let owner = state.app.owner.read().await.clone();
     Json(OwnerResponse { owner })
 }
@@ -387,9 +426,15 @@ async fn set_owner_handler(
     let new_owner_hex = match &req.new_owner {
         Some(pk) => match libkeychat::normalize_pubkey(pk) {
             Ok(hex) => Some(hex),
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(SendResponse {
-                ok: false, error: Some(format!("Invalid pubkey: {}", e)),
-            })),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SendResponse {
+                        ok: false,
+                        error: Some(format!("Invalid pubkey: {}", e)),
+                    }),
+                )
+            }
         },
         None => None,
     };
@@ -399,22 +444,43 @@ async fn set_owner_handler(
 
     // Persist to config
     let mut config = crate::config::Config::load(&state.app.data_dir)
-        .ok().flatten().unwrap_or_default();
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     config.owner = new_owner_hex.clone();
     if let Err(e) = config.save(&state.app.data_dir) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(SendResponse {
-            ok: false, error: Some(format!("Failed to save config: {}", e)),
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SendResponse {
+                ok: false,
+                error: Some(format!("Failed to save config: {}", e)),
+            }),
+        );
     }
 
     match &new_owner_hex {
         Some(hex) => {
-            crate::ui::sys(&format!("👑 Owner changed to {}", &hex[..16.min(hex.len())]));
-            (StatusCode::OK, Json(SendResponse { ok: true, error: None }))
+            crate::ui::sys(&format!(
+                "👑 Owner changed to {}",
+                &hex[..16.min(hex.len())]
+            ));
+            (
+                StatusCode::OK,
+                Json(SendResponse {
+                    ok: true,
+                    error: None,
+                }),
+            )
         }
         None => {
             crate::ui::sys("👑 Owner cleared — next friend request will become owner");
-            (StatusCode::OK, Json(SendResponse { ok: true, error: None }))
+            (
+                StatusCode::OK,
+                Json(SendResponse {
+                    ok: true,
+                    error: None,
+                }),
+            )
         }
     }
 }
@@ -451,20 +517,29 @@ async fn backup_mnemonic_handler(
             // Owner verified — retrieve mnemonic from keychain
             let npub = state.app.npub();
             match crate::config::load_mnemonic(&npub) {
-                Ok(mnemonic) => (StatusCode::OK, Json(BackupResponse {
-                    mnemonic: Some(mnemonic),
-                    error: None,
-                })),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(BackupResponse {
-                    mnemonic: None,
-                    error: Some(e.to_string()),
-                })),
+                Ok(mnemonic) => (
+                    StatusCode::OK,
+                    Json(BackupResponse {
+                        mnemonic: Some(mnemonic),
+                        error: None,
+                    }),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(BackupResponse {
+                        mnemonic: None,
+                        error: Some(e.to_string()),
+                    }),
+                ),
             }
         }
-        _ => (StatusCode::FORBIDDEN, Json(BackupResponse {
-            mnemonic: None,
-            error: Some("Only the owner can backup the mnemonic".to_string()),
-        })),
+        _ => (
+            StatusCode::FORBIDDEN,
+            Json(BackupResponse {
+                mnemonic: None,
+                error: Some("Only the owner can backup the mnemonic".to_string()),
+            }),
+        ),
     }
 }
 

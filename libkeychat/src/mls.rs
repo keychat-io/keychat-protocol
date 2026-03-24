@@ -9,9 +9,9 @@
 //! - Group management: create, add/remove members, join, leave, dissolve, rename
 //! - KeyPackage publish/parse (kind 10443)
 
-use base64::Engine;
 use crate::mls_extension::NostrGroupDataExtension;
 use crate::mls_provider::OpenMlsRustPersistentCrypto;
+use base64::Engine;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
@@ -28,8 +28,7 @@ use crate::identity::EphemeralKeypair;
 use crate::message::{KCMessage, KCMessageKind};
 
 /// MLS ciphersuite used throughout Keychat.
-pub const MLS_CIPHERSUITE: Ciphersuite =
-    Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+pub const MLS_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// Extension type for Nostr group data.
 const NOSTR_GROUP_EXTENSION_TYPE: u16 = 0xF233;
@@ -94,9 +93,8 @@ impl MlsParticipant {
 
         // Use nostr_id as the credential identity (BasicCredential)
         let credential = BasicCredential::new(nostr_id.as_bytes().to_vec());
-        let signer =
-            SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
-                .expect("failed to generate MLS signature keypair");
+        let signer = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
+            .expect("failed to generate MLS signature keypair");
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
@@ -115,18 +113,49 @@ impl MlsParticipant {
     }
 
     /// Create an MLS participant with a custom provider (e.g. file-backed).
+    ///
+    /// If `signer_public_key` is provided, attempts to restore the existing
+    /// signing key from the provider's storage. This is required for MLS group
+    /// state to survive restarts. If restoration fails or no key is provided,
+    /// generates a fresh signing key.
     pub fn with_provider(nostr_id: impl Into<String>, provider: MlsProvider) -> Self {
+        Self::with_provider_and_signer(nostr_id, provider, None)
+    }
+
+    /// Create an MLS participant, optionally restoring a saved signing key.
+    ///
+    /// `signer_public_key`: the public key bytes from a previous session.
+    /// Pass `Some(bytes)` to restore, `None` to generate fresh keys.
+    pub fn with_provider_and_signer(
+        nostr_id: impl Into<String>,
+        provider: MlsProvider,
+        signer_public_key: Option<&[u8]>,
+    ) -> Self {
         let nostr_id = nostr_id.into();
         let credential = BasicCredential::new(nostr_id.as_bytes().to_vec());
-        let signer = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
-            .expect("failed to generate MLS signature keypair");
+
+        // Try to restore existing signer from storage
+        let signer = signer_public_key
+            .and_then(|pub_key| {
+                SignatureKeyPair::read(
+                    provider.inner().storage(),
+                    pub_key,
+                    MLS_CIPHERSUITE.signature_algorithm(),
+                )
+            })
+            .unwrap_or_else(|| {
+                // No saved key or restore failed — generate fresh
+                let s = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
+                    .expect("failed to generate MLS signature keypair");
+                s.store(provider.inner().storage())
+                    .expect("failed to store signature keypair");
+                s
+            });
+
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
         };
-        signer
-            .store(provider.inner().storage())
-            .expect("failed to store signature keypair");
 
         Self {
             nostr_id,
@@ -134,6 +163,11 @@ impl MlsParticipant {
             credential: credential_with_key,
             signer,
         }
+    }
+
+    /// Get the MLS signer's public key bytes (for persistence).
+    pub fn signer_public_key(&self) -> Vec<u8> {
+        self.signer.to_public_vec()
     }
 
     /// Generate a KeyPackage for others to add us to a group.
@@ -161,10 +195,10 @@ impl MlsParticipant {
         // Build group context extension with NostrGroupDataExtension
         let group_data = NostrGroupDataExtension::new(
             name.to_string(),
-            String::new(),                   // description
-            vec![self.nostr_id.clone()],     // admin_pubkeys
-            vec![],                          // relays
-            "active".to_string(),            // status
+            String::new(),               // description
+            vec![self.nostr_id.clone()], // admin_pubkeys
+            vec![],                      // relays
+            "active".to_string(),        // status
         );
 
         // Set the group_id bytes in the extension
@@ -182,20 +216,14 @@ impl MlsParticipant {
             .tls_serialize_detached()
             .map_err(|e| KeychatError::Mls(format!("TLS serialize error: {e}")))?;
 
-        let extension = Extension::Unknown(
-            NOSTR_GROUP_EXTENSION_TYPE,
-            UnknownExtension(ext_data),
-        );
-        let required_caps = Extension::RequiredCapabilities(
-            RequiredCapabilitiesExtension::new(
-                &[ExtensionType::Unknown(NOSTR_GROUP_EXTENSION_TYPE)],
-                &[],
-                &[],
-            ),
-        );
-        let group_context_extensions =
-            Extensions::from_vec(vec![extension, required_caps])
-                .map_err(|e| KeychatError::Mls(format!("extensions error: {e}")))?;
+        let extension = Extension::Unknown(NOSTR_GROUP_EXTENSION_TYPE, UnknownExtension(ext_data));
+        let required_caps = Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+            &[ExtensionType::Unknown(NOSTR_GROUP_EXTENSION_TYPE)],
+            &[],
+            &[],
+        ));
+        let group_context_extensions = Extensions::from_vec(vec![extension, required_caps])
+            .map_err(|e| KeychatError::Mls(format!("extensions error: {e}")))?;
 
         let group_create_config = MlsGroupCreateConfig::builder()
             .capabilities(capabilities)
@@ -255,15 +283,11 @@ impl MlsParticipant {
             .use_ratchet_tree_extension(true)
             .build();
 
-        let group = StagedWelcome::new_from_welcome(
-            self.provider.inner(),
-            &join_config,
-            welcome,
-            None,
-        )
-        .map_err(|e| KeychatError::Mls(format!("staged welcome error: {e}")))?
-        .into_group(self.provider.inner())
-        .map_err(|e| KeychatError::Mls(format!("welcome into group error: {e}")))?;
+        let group =
+            StagedWelcome::new_from_welcome(self.provider.inner(), &join_config, welcome, None)
+                .map_err(|e| KeychatError::Mls(format!("staged welcome error: {e}")))?
+                .into_group(self.provider.inner())
+                .map_err(|e| KeychatError::Mls(format!("welcome into group error: {e}")))?;
 
         let group_id = String::from_utf8(group.group_id().as_slice().to_vec())
             .map_err(|e| KeychatError::Mls(format!("group_id not utf8: {e}")))?;
@@ -304,12 +328,9 @@ impl MlsParticipant {
             .map_err(|e| KeychatError::Mls(format!("process message error: {e}")))?;
 
         // Extract sender credential identity
-        let sender_identity = processed
-            .credential()
-            .serialized_content()
-            .to_vec();
-        let sender_id = String::from_utf8(sender_identity)
-            .unwrap_or_else(|_| "unknown".to_string());
+        let sender_identity = processed.credential().serialized_content().to_vec();
+        let sender_id =
+            String::from_utf8(sender_identity).unwrap_or_else(|_| "unknown".to_string());
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => {
@@ -323,16 +344,20 @@ impl MlsParticipant {
                 // Return empty plaintext for commits (they're control messages)
                 Ok((Vec::new(), sender_id))
             }
-            ProcessedMessageContent::ProposalMessage(_) => {
-                Ok((Vec::new(), sender_id))
-            }
-            _ => Err(KeychatError::Mls("unexpected message content type".to_string())),
+            ProcessedMessageContent::ProposalMessage(_) => Ok((Vec::new(), sender_id)),
+            _ => Err(KeychatError::Mls(
+                "unexpected message content type".to_string(),
+            )),
         }
     }
 
     /// Remove members from the group by their leaf indices.
     /// Returns the serialized Commit.
-    pub fn remove_members(&self, group_id: &str, members_to_remove: &[LeafNodeIndex]) -> Result<Vec<u8>> {
+    pub fn remove_members(
+        &self,
+        group_id: &str,
+        members_to_remove: &[LeafNodeIndex],
+    ) -> Result<Vec<u8>> {
         let mut group = self.load_group(group_id)?;
 
         let (commit, _, _) = group
@@ -413,7 +438,13 @@ impl MlsParticipant {
     }
 
     /// Export the MLS export secret for a group (used for mlsTempInbox derivation).
-    pub fn export_secret(&self, group_id: &str, label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
+    pub fn export_secret(
+        &self,
+        group_id: &str,
+        label: &str,
+        context: &[u8],
+        len: usize,
+    ) -> Result<Vec<u8>> {
         let group = self.load_group(group_id)?;
         group
             .export_secret(self.provider.inner().crypto(), label, context, len)
@@ -423,7 +454,11 @@ impl MlsParticipant {
     /// Derive the MLS temp inbox address for a group (§11.2).
     pub fn derive_temp_inbox(&self, group_id: &str) -> Result<String> {
         let export_secret = self.export_secret(group_id, MLS_TEMP_INBOX_LABEL, &[], 32)?;
-        Ok(derive_mls_temp_inbox(&self.nostr_id, group_id, &export_secret))
+        Ok(derive_mls_temp_inbox(
+            &self.nostr_id,
+            group_id,
+            &export_secret,
+        ))
     }
 
     /// Get the list of members' credential identities in the group.
@@ -482,17 +517,12 @@ impl MlsParticipant {
             .tls_serialize_detached()
             .map_err(|e| KeychatError::Mls(format!("TLS serialize: {e}")))?;
 
-        let extension = Extension::Unknown(
-            NOSTR_GROUP_EXTENSION_TYPE,
-            UnknownExtension(ext_data),
-        );
-        let required_caps = Extension::RequiredCapabilities(
-            RequiredCapabilitiesExtension::new(
-                &[ExtensionType::Unknown(NOSTR_GROUP_EXTENSION_TYPE)],
-                &[],
-                &[],
-            ),
-        );
+        let extension = Extension::Unknown(NOSTR_GROUP_EXTENSION_TYPE, UnknownExtension(ext_data));
+        let required_caps = Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+            &[ExtensionType::Unknown(NOSTR_GROUP_EXTENSION_TYPE)],
+            &[],
+            &[],
+        ));
         let extensions = Extensions::from_vec(vec![extension, required_caps])
             .map_err(|e| KeychatError::Mls(format!("extensions error: {e}")))?;
 
@@ -653,8 +683,9 @@ pub fn receive_mls_message(
     let json_str = String::from_utf8(plaintext)
         .map_err(|e| KeychatError::Mls(format!("plaintext not utf8: {e}")))?;
 
-    let message = KCMessage::try_parse(&json_str)
-        .ok_or_else(|| KeychatError::Mls("failed to parse KCMessage from MLS plaintext".to_string()))?;
+    let message = KCMessage::try_parse(&json_str).ok_or_else(|| {
+        KeychatError::Mls("failed to parse KCMessage from MLS plaintext".to_string())
+    })?;
 
     let metadata = MlsMessageMetadata {
         sender_id,
@@ -665,10 +696,7 @@ pub fn receive_mls_message(
 }
 
 /// Wrap an MLS Commit as a kind:1059 event for broadcast.
-pub fn broadcast_commit(
-    commit_bytes: &[u8],
-    mls_temp_inbox: &str,
-) -> Result<nostr::Event> {
+pub fn broadcast_commit(commit_bytes: &[u8], mls_temp_inbox: &str) -> Result<nostr::Event> {
     let content = base64::engine::general_purpose::STANDARD.encode(commit_bytes);
     let ephemeral = EphemeralKeypair::generate();
 
@@ -810,17 +838,13 @@ mod tests {
 
         // Bob decrypts
         let (decrypted, sender) = bob.decrypt(group_id, &ciphertext).unwrap();
-        let decrypted_msg = KCMessage::try_parse(
-            &String::from_utf8(decrypted).unwrap()
-        ).unwrap();
+        let decrypted_msg = KCMessage::try_parse(&String::from_utf8(decrypted).unwrap()).unwrap();
         assert_eq!(decrypted_msg.text.unwrap().content, "Hello MLS group!");
         assert_eq!(sender, "alice_nostr_pubkey");
 
         // Charlie decrypts
         let (decrypted, sender) = charlie.decrypt(group_id, &ciphertext).unwrap();
-        let decrypted_msg = KCMessage::try_parse(
-            &String::from_utf8(decrypted).unwrap()
-        ).unwrap();
+        let decrypted_msg = KCMessage::try_parse(&String::from_utf8(decrypted).unwrap()).unwrap();
         assert_eq!(decrypted_msg.text.unwrap().content, "Hello MLS group!");
         assert_eq!(sender, "alice_nostr_pubkey");
     }
@@ -848,14 +872,20 @@ mod tests {
         // After the commit, Alice's temp inbox should change
         let inbox_after = alice.derive_temp_inbox(group_id).unwrap();
 
-        assert_ne!(inbox_before, inbox_after, "mlsTempInbox must change after epoch advance");
+        assert_ne!(
+            inbox_before, inbox_after,
+            "mlsTempInbox must change after epoch advance"
+        );
 
         // Bob processes the commit
         bob.process_commit(group_id, &commit).unwrap();
         let bob_inbox_after = bob.derive_temp_inbox(group_id).unwrap();
 
         // Both should derive the same new inbox
-        assert_eq!(inbox_after, bob_inbox_after, "all members must derive the same mlsTempInbox");
+        assert_eq!(
+            inbox_after, bob_inbox_after,
+            "all members must derive the same mlsTempInbox"
+        );
     }
 
     // ─── Test 3: Add member ────────────────────────────────────────────────
@@ -929,7 +959,10 @@ mod tests {
 
         // Charlie should NOT be able to decrypt (still on old epoch)
         let result = charlie.decrypt(group_id, &ciphertext);
-        assert!(result.is_err(), "removed member should not decrypt new messages");
+        assert!(
+            result.is_err(),
+            "removed member should not decrypt new messages"
+        );
     }
 
     // ─── Test 5: Self leave ────────────────────────────────────────────────
@@ -958,7 +991,10 @@ mod tests {
 
         // Bob tries to decrypt — should fail after removal
         let result = bob.decrypt(group_id, &ciphertext);
-        assert!(result.is_err(), "left member should not decrypt new messages");
+        assert!(
+            result.is_err(),
+            "left member should not decrypt new messages"
+        );
     }
 
     // ─── Test 6: Group dissolve ────────────────────────────────────────────

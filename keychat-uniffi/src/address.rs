@@ -11,9 +11,12 @@ impl KeychatClient {
         }
 
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "not connected".into() }
-        )?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         transport.subscribe(pubkeys, None).await?;
         Ok(())
     }

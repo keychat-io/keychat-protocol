@@ -15,9 +15,9 @@ use crate::signal_keys::{compute_global_sign, verify_global_sign};
 use crate::signal_session::SignalParticipant;
 
 use base64::Engine;
-use libsignal_protocol::ProtocolAddress;
 #[cfg(test)]
 use libsignal_protocol::DeviceId;
+use libsignal_protocol::ProtocolAddress;
 use nostr::prelude::*;
 
 // ─── MessageMetadata ─────────────────────────────────────────────────────────
@@ -53,9 +53,7 @@ pub enum MessageAction {
         prekey_auth: Option<SignalPrekeyAuth>,
     },
     /// A friend request was rejected.
-    FriendReject {
-        request_id: String,
-    },
+    FriendReject { request_id: String },
     /// Display files to the user.
     DisplayFiles {
         files: crate::message::KCFilesPayload,
@@ -66,9 +64,7 @@ pub enum MessageAction {
         fallback: Option<String>,
     },
     /// Non-KCMessage plaintext (not valid JSON or v != 2).
-    PlainText {
-        content: String,
-    },
+    PlainText { content: String },
 }
 
 // ─── SignalPrekeyAuth creation & verification ────────────────────────────────
@@ -388,7 +384,7 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
     use crate::message::{
-        KCCashuPayload, KCFilePayload, KCFilesPayload, KCTextPayload, FileCategory,
+        FileCategory, KCCashuPayload, KCFilePayload, KCFilesPayload, KCTextPayload,
     };
 
     /// Helper: establish a Signal session between Alice and Bob, returning both participants
@@ -446,11 +442,7 @@ mod tests {
             .decode(&event.content)
             .is_ok());
         // p-tag contains receiving address
-        let p_tag = event
-            .tags
-            .iter()
-            .find(|t| t.as_slice()[0] == "p")
-            .unwrap();
+        let p_tag = event.tags.iter().find(|t| t.as_slice()[0] == "p").unwrap();
         assert_eq!(p_tag.as_slice()[1], receiving_addr);
         // Real timestamp (not tweaked) — just verify it's recent
         let now = nostr::Timestamp::now().as_u64();
@@ -501,14 +493,10 @@ mod tests {
         msg.signal_prekey_auth = Some(auth.clone());
 
         let receiving_keys = EphemeralKeypair::generate();
-        let event = send_encrypted_message(
-            &mut alice,
-            &bob_addr,
-            &msg,
-            &receiving_keys.pubkey_hex(),
-        )
-        .await
-        .unwrap();
+        let event =
+            send_encrypted_message(&mut alice, &bob_addr, &msg, &receiving_keys.pubkey_hex())
+                .await
+                .unwrap();
 
         // Verify this is a PrekeyMessage at the binary level
         let raw_ct = base64::engine::general_purpose::STANDARD
@@ -810,8 +798,7 @@ mod tests {
             send_encrypted_message(&mut alice, &bob_addr, &text_msg, &recv.pubkey_hex())
                 .await
                 .unwrap();
-        let (dec_text, _) =
-            receive_encrypted_message(&mut bob, &alice_addr, &text_event).unwrap();
+        let (dec_text, _) = receive_encrypted_message(&mut bob, &alice_addr, &text_event).unwrap();
         assert_eq!(dec_text.kind, KCMessageKind::Text);
         assert_eq!(dec_text.text.unwrap().content, "Hello!");
 

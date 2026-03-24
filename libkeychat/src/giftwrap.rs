@@ -68,11 +68,8 @@ pub async fn create_gift_wrap_with_wrapper(
 
     // Layer 2: Seal (kind 13)
     // Encrypt the rumor JSON with sender's real private key → receiver's public key
-    let seal_content = crate::nip44::encrypt(
-        sender_keys.secret_key(),
-        receiver_pubkey,
-        &rumor_json,
-    )?;
+    let seal_content =
+        crate::nip44::encrypt(sender_keys.secret_key(), receiver_pubkey, &rumor_json)?;
 
     let seal = EventBuilder::new(Kind::from(13), &seal_content)
         .custom_created_at(now)
@@ -84,11 +81,8 @@ pub async fn create_gift_wrap_with_wrapper(
 
     // Layer 3: Gift Wrap (kind 1059)
     // Encrypt the seal JSON with ephemeral wrapper key → receiver's public key
-    let wrap_content = crate::nip44::encrypt(
-        wrapper_keys.secret_key(),
-        receiver_pubkey,
-        &seal_json,
-    )?;
+    let wrap_content =
+        crate::nip44::encrypt(wrapper_keys.secret_key(), receiver_pubkey, &seal_json)?;
 
     let gift_wrap = EventBuilder::new(Kind::GiftWrap, &wrap_content)
         .tag(Tag::public_key(*receiver_pubkey))
@@ -106,10 +100,7 @@ pub async fn create_gift_wrap_with_wrapper(
 ///   1. Decrypt Gift Wrap content (NIP-44 with receiver's key + wrapper's pubkey) → Seal
 ///   2. Verify Seal signature, decrypt Seal content (NIP-44 with receiver's key + sender's pubkey) → Rumor
 ///   3. Parse Rumor to get sender pubkey and plaintext content
-pub fn unwrap_gift_wrap(
-    receiver_keys: &Keys,
-    event: &Event,
-) -> Result<UnwrappedMessage> {
+pub fn unwrap_gift_wrap(receiver_keys: &Keys, event: &Event) -> Result<UnwrappedMessage> {
     // Verify this is a kind 1059 event
     if event.kind != Kind::GiftWrap {
         return Err(KeychatError::GiftWrap(format!(
@@ -119,12 +110,9 @@ pub fn unwrap_gift_wrap(
     }
 
     // Layer 3 → 2: Decrypt Gift Wrap to get Seal
-    let seal_json = crate::nip44::decrypt(
-        receiver_keys.secret_key(),
-        &event.pubkey,
-        &event.content,
-    )
-    .map_err(|e| KeychatError::GiftWrap(format!("failed to decrypt gift wrap: {e}")))?;
+    let seal_json =
+        crate::nip44::decrypt(receiver_keys.secret_key(), &event.pubkey, &event.content)
+            .map_err(|e| KeychatError::GiftWrap(format!("failed to decrypt gift wrap: {e}")))?;
 
     let seal: Event = Event::from_json(&seal_json)
         .map_err(|e| KeychatError::GiftWrap(format!("invalid seal event: {e}")))?;
@@ -144,12 +132,9 @@ pub fn unwrap_gift_wrap(
     let sender_pubkey = seal.pubkey;
 
     // Layer 2 → 1: Decrypt Seal to get Rumor
-    let rumor_json = crate::nip44::decrypt(
-        receiver_keys.secret_key(),
-        &sender_pubkey,
-        &seal.content,
-    )
-    .map_err(|e| KeychatError::GiftWrap(format!("failed to decrypt seal: {e}")))?;
+    let rumor_json =
+        crate::nip44::decrypt(receiver_keys.secret_key(), &sender_pubkey, &seal.content)
+            .map_err(|e| KeychatError::GiftWrap(format!("failed to decrypt seal: {e}")))?;
 
     // Parse rumor (unsigned event)
     let rumor: UnsignedEvent = UnsignedEvent::from_json(&rumor_json)
@@ -182,8 +167,9 @@ mod tests {
         let receiver = Keys::generate();
         let content = r#"{"v":2,"kind":"friendRequest","id":"test-uuid"}"#;
 
-        let gift_wrap =
-            create_gift_wrap(&sender, &receiver.public_key(), content).await.unwrap();
+        let gift_wrap = create_gift_wrap(&sender, &receiver.public_key(), content)
+            .await
+            .unwrap();
 
         // Verify outer event properties
         assert_eq!(gift_wrap.kind, Kind::GiftWrap);
@@ -210,13 +196,9 @@ mod tests {
         let receiver = Keys::generate();
         let wrong_receiver = Keys::generate();
 
-        let gift_wrap = create_gift_wrap(
-            &sender,
-            &receiver.public_key(),
-            "secret message",
-        )
-        .await
-        .unwrap();
+        let gift_wrap = create_gift_wrap(&sender, &receiver.public_key(), "secret message")
+            .await
+            .unwrap();
 
         let result = unwrap_gift_wrap(&wrong_receiver, &gift_wrap);
         assert!(result.is_err());
@@ -228,8 +210,9 @@ mod tests {
         let receiver = Keys::generate();
 
         let before = Timestamp::now();
-        let gift_wrap =
-            create_gift_wrap(&sender, &receiver.public_key(), "test").await.unwrap();
+        let gift_wrap = create_gift_wrap(&sender, &receiver.public_key(), "test")
+            .await
+            .unwrap();
         let after = Timestamp::now();
 
         let event_time = gift_wrap.created_at;
@@ -243,30 +226,24 @@ mod tests {
         let receiver = Keys::generate();
         let content = "hello";
 
-        let gift_wrap =
-            create_gift_wrap(&sender, &receiver.public_key(), content).await.unwrap();
+        let gift_wrap = create_gift_wrap(&sender, &receiver.public_key(), content)
+            .await
+            .unwrap();
 
         // Layer 3: Gift Wrap (kind 1059)
         assert_eq!(gift_wrap.kind, Kind::GiftWrap);
 
         // Decrypt to Layer 2: Seal (kind 13)
-        let seal_json = crate::nip44::decrypt(
-            receiver.secret_key(),
-            &gift_wrap.pubkey,
-            &gift_wrap.content,
-        )
-        .unwrap();
+        let seal_json =
+            crate::nip44::decrypt(receiver.secret_key(), &gift_wrap.pubkey, &gift_wrap.content)
+                .unwrap();
         let seal: Event = Event::from_json(&seal_json).unwrap();
         assert_eq!(seal.kind, Kind::from(13));
         assert_eq!(seal.pubkey, sender.public_key());
 
         // Decrypt to Layer 1: Rumor (kind 14)
-        let rumor_json = crate::nip44::decrypt(
-            receiver.secret_key(),
-            &seal.pubkey,
-            &seal.content,
-        )
-        .unwrap();
+        let rumor_json =
+            crate::nip44::decrypt(receiver.secret_key(), &seal.pubkey, &seal.content).unwrap();
         let rumor: UnsignedEvent = UnsignedEvent::from_json(&rumor_json).unwrap();
         assert_eq!(rumor.kind, Kind::from(14));
         assert_eq!(rumor.content, content);

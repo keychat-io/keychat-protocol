@@ -396,7 +396,6 @@ pub struct KCMessage {
 
     // ── Typed payload fields ──
     // The active one corresponds to `kind`.
-
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<KCTextPayload>,
 
@@ -419,7 +418,6 @@ pub struct KCMessage {
     pub friend_reject: Option<KCFriendRejectPayload>,
 
     // ── Envelope metadata ──
-
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
 
@@ -557,7 +555,9 @@ pub(crate) fn uuid_v4() -> String {
         u16::from_be_bytes([bytes[6], bytes[7]]),
         u16::from_be_bytes([bytes[8], bytes[9]]),
         // Last 6 bytes as a single u64 (only lower 48 bits used)
-        u64::from_be_bytes([0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]])
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ])
     )
 }
 

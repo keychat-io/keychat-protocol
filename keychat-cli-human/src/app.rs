@@ -20,7 +20,9 @@ pub async fn run(data_dir: String, relay_urls: Vec<String>, db_key: Option<Strin
     let (identity, config) = match Config::load(data_path)? {
         Some(config) => {
             ui::sys("Identity loaded");
-            let pubkey_hex = config.pubkey_hex.as_deref()
+            let pubkey_hex = config
+                .pubkey_hex
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("config.json missing pubkey_hex"))?;
             let mnemonic = crate::config::load_mnemonic(pubkey_hex)?;
             let identity = libkeychat::Identity::from_mnemonic_str(&mnemonic)?;
@@ -63,20 +65,21 @@ pub async fn run(data_dir: String, relay_urls: Vec<String>, db_key: Option<Strin
             .unwrap_or_else(|_| "keychat-cli-default-key".to_string()),
     };
 
-    let default_relays: Vec<String> = libkeychat::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect();
+    let default_relays: Vec<String> = libkeychat::DEFAULT_RELAYS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let relays = if relay_urls != default_relays {
-        relay_urls  // CLI override
+        relay_urls // CLI override
     } else if !config.relays.is_empty() {
-        config.relays.clone()  // saved config
+        config.relays.clone() // saved config
     } else {
-        default_relays  // library defaults
+        default_relays // library defaults
     };
 
     ui::identity(&identity.pubkey_hex(), &config.name, &relays);
 
-    let state = Arc::new(
-        AppState::new(identity, config, &relays, data_path, &db_key).await?
-    );
+    let state = Arc::new(AppState::new(identity, config, &relays, data_path, &db_key).await?);
 
     ui::sys(&format!("Connected to {} relay(s)", relays.len()));
     println!();
@@ -96,7 +99,12 @@ pub async fn run(data_dir: String, relay_urls: Vec<String>, db_key: Option<Strin
     let _ = rl.load_history(&hist);
 
     loop {
-        let target = state.active_chat.read().await.as_ref().map(|t| t.to_string());
+        let target = state
+            .active_chat
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.to_string());
         let prompt = ui::prompt(target.as_deref());
 
         match rl.readline(&prompt) {

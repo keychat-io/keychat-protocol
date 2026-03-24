@@ -52,17 +52,18 @@ impl Identity {
 
     /// Generate a new random identity with a specified word count (12 or 24).
     pub fn generate_with_word_count(word_count: usize) -> Result<IdentityWithMnemonic> {
-        let mnemonic = match word_count {
-            12 => Mnemonic::generate(12)
-                .map_err(|e| KeychatError::InvalidMnemonic(e.to_string()))?,
-            24 => Mnemonic::generate(24)
-                .map_err(|e| KeychatError::InvalidMnemonic(e.to_string()))?,
-            _ => {
-                return Err(KeychatError::InvalidMnemonic(
-                    "word count must be 12 or 24".into(),
-                ))
-            }
-        };
+        let mnemonic =
+            match word_count {
+                12 => Mnemonic::generate(12)
+                    .map_err(|e| KeychatError::InvalidMnemonic(e.to_string()))?,
+                24 => Mnemonic::generate(24)
+                    .map_err(|e| KeychatError::InvalidMnemonic(e.to_string()))?,
+                _ => {
+                    return Err(KeychatError::InvalidMnemonic(
+                        "word count must be 12 or 24".into(),
+                    ))
+                }
+            };
         let mnemonic_str = mnemonic.to_string();
         let identity = Self::from_mnemonic(mnemonic)?;
         Ok(IdentityWithMnemonic {
@@ -270,18 +271,18 @@ mod tests {
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
-    
+
     #[test]
     fn test_normalize_npub() {
         // Generate a keypair and test roundtrip
         let keys = Keys::generate();
         let hex = keys.public_key().to_hex();
         let npub = keys.public_key().to_bech32().unwrap();
-        
+
         assert_eq!(normalize_pubkey(&hex).unwrap(), hex);
         assert_eq!(normalize_pubkey(&npub).unwrap(), hex);
     }
-    
+
     #[test]
     fn test_normalize_invalid() {
         assert!(normalize_pubkey("npub1invalid").is_err());

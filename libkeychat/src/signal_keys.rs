@@ -104,11 +104,7 @@ fn xeddsa_sign(curve25519_private: &[u8; 32], message: &[u8]) -> Vec<u8> {
 /// Verify an XEdDSA signature.
 ///
 /// Converts the Curve25519 public key to an Ed25519 verifying key.
-pub fn xeddsa_verify(
-    curve25519_public: &[u8; 33],
-    message: &[u8],
-    signature: &[u8],
-) -> Result<()> {
+pub fn xeddsa_verify(curve25519_public: &[u8; 33], message: &[u8], signature: &[u8]) -> Result<()> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     // The 33-byte key has a 0x05 prefix; strip it to get 32 bytes.
@@ -118,9 +114,9 @@ pub fn xeddsa_verify(
 
     // Convert Montgomery point to Edwards point.
     let montgomery = curve25519_dalek::montgomery::MontgomeryPoint(montgomery_bytes);
-    let edwards = montgomery
-        .to_edwards(0)
-        .ok_or_else(|| KeychatError::KeyDerivation("Montgomery to Edwards conversion failed".into()))?;
+    let edwards = montgomery.to_edwards(0).ok_or_else(|| {
+        KeychatError::KeyDerivation("Montgomery to Edwards conversion failed".into())
+    })?;
 
     let verifying_key = VerifyingKey::from_bytes(&edwards.compress().to_bytes())
         .map_err(|e| KeychatError::KeyDerivation(format!("invalid Ed25519 public key: {}", e)))?;
@@ -237,7 +233,10 @@ pub fn compute_global_sign(
     use nostr::secp256k1::{Message, Secp256k1};
     use sha2::{Digest, Sha256};
 
-    let msg_str = format!("Keychat-{}-{}-{}", nostr_identity_key, signal_identity_key, time);
+    let msg_str = format!(
+        "Keychat-{}-{}-{}",
+        nostr_identity_key, signal_identity_key, time
+    );
     let hash = Sha256::digest(msg_str.as_bytes());
     let message = Message::from_digest_slice(&hash)
         .map_err(|e| KeychatError::KeyDerivation(format!("invalid message hash: {}", e)))?;
@@ -267,7 +266,10 @@ pub fn verify_global_sign(
     use nostr::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
     use sha2::{Digest, Sha256};
 
-    let msg_str = format!("Keychat-{}-{}-{}", nostr_pubkey_hex, signal_identity_key, time);
+    let msg_str = format!(
+        "Keychat-{}-{}-{}",
+        nostr_pubkey_hex, signal_identity_key, time
+    );
     let hash = Sha256::digest(msg_str.as_bytes());
     let message = Message::from_digest_slice(&hash)
         .map_err(|e| KeychatError::KeyDerivation(format!("invalid message hash: {}", e)))?;
@@ -381,7 +383,10 @@ mod tests {
         let id = generate_signal_identity();
         assert_eq!(id.private_key.len(), 32);
         assert_eq!(id.public_key.len(), 33);
-        assert_eq!(id.public_key[0], 0x05, "Signal Curve25519 public key must have 0x05 prefix");
+        assert_eq!(
+            id.public_key[0], 0x05,
+            "Signal Curve25519 public key must have 0x05 prefix"
+        );
     }
 
     #[test]
@@ -428,7 +433,11 @@ mod tests {
         let identity = generate_signal_identity();
         let kyber = generate_kyber_prekey(&identity.private_key);
         // ML-KEM 1024 public key is 1568 bytes
-        assert_eq!(kyber.public_key.len(), 1568, "ML-KEM 1024 public key should be 1568 bytes");
+        assert_eq!(
+            kyber.public_key.len(),
+            1568,
+            "ML-KEM 1024 public key should be 1568 bytes"
+        );
         assert!(!kyber.signature.is_empty());
         assert_eq!(kyber.id, 1);
     }
@@ -448,13 +457,8 @@ mod tests {
         let nostr_pub_hex = identity.pubkey_hex();
         let time = 1700000000u64;
 
-        let sig = compute_global_sign(
-            identity.secret_key(),
-            &nostr_pub_hex,
-            &signal_pub_hex,
-            time,
-        )
-        .unwrap();
+        let sig = compute_global_sign(identity.secret_key(), &nostr_pub_hex, &signal_pub_hex, time)
+            .unwrap();
 
         // Signature is 64 bytes → 128 hex chars
         assert_eq!(sig.len(), 128);
@@ -471,7 +475,8 @@ mod tests {
         let signal_pub_hex = hex::encode(signal_id.public_key);
         let nostr_pub_hex = identity.pubkey_hex();
 
-        let sig = compute_global_sign(identity.secret_key(), &nostr_pub_hex, &signal_pub_hex, 100).unwrap();
+        let sig = compute_global_sign(identity.secret_key(), &nostr_pub_hex, &signal_pub_hex, 100)
+            .unwrap();
 
         // Wrong time should fail verification
         let valid = verify_global_sign(&nostr_pub_hex, &signal_pub_hex, 999, &sig).unwrap();
@@ -537,11 +542,23 @@ mod tests {
         let json = msg.to_json().unwrap();
 
         // Must use camelCase
-        assert!(json.contains("nostrIdentityKey"), "missing nostrIdentityKey");
-        assert!(json.contains("signalIdentityKey"), "missing signalIdentityKey");
+        assert!(
+            json.contains("nostrIdentityKey"),
+            "missing nostrIdentityKey"
+        );
+        assert!(
+            json.contains("signalIdentityKey"),
+            "missing signalIdentityKey"
+        );
         assert!(json.contains("firstInbox"), "missing firstInbox");
-        assert!(json.contains("signalSignedPrekeyId"), "missing signalSignedPrekeyId");
-        assert!(json.contains("signalKyberPrekey\":"), "missing signalKyberPrekey");
+        assert!(
+            json.contains("signalSignedPrekeyId"),
+            "missing signalSignedPrekeyId"
+        );
+        assert!(
+            json.contains("signalKyberPrekey\":"),
+            "missing signalKyberPrekey"
+        );
         assert!(json.contains("globalSign"), "missing globalSign");
     }
 }

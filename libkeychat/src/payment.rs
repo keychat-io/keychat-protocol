@@ -34,11 +34,7 @@ pub fn build_cashu_message(
 }
 
 /// Build a Lightning invoice message.
-pub fn build_lightning_message(
-    invoice: &str,
-    amount: u64,
-    memo: Option<&str>,
-) -> KCMessage {
+pub fn build_lightning_message(invoice: &str, amount: u64, memo: Option<&str>) -> KCMessage {
     KCMessage {
         v: 2,
         id: Some(crate::message::uuid_v4()),
@@ -113,13 +109,7 @@ mod tests {
 
     #[test]
     fn build_cashu_message_no_optionals() {
-        let msg = build_cashu_message(
-            "https://mint.example.com",
-            "cashuAtoken",
-            50,
-            None,
-            None,
-        );
+        let msg = build_cashu_message("https://mint.example.com", "cashuAtoken", 50, None, None);
         let parsed = KCMessage::try_parse(&msg.to_json().unwrap()).unwrap();
         let cashu = parsed.cashu.unwrap();
         assert!(cashu.unit.is_none());
@@ -128,11 +118,7 @@ mod tests {
 
     #[test]
     fn build_lightning_message_has_invoice() {
-        let msg = build_lightning_message(
-            "lnbc1pvjluezsp5zyg3zyg3zyg3zyg",
-            1000,
-            Some("Pay me"),
-        );
+        let msg = build_lightning_message("lnbc1pvjluezsp5zyg3zyg3zyg3zyg", 1000, Some("Pay me"));
         let json = msg.to_json().unwrap();
         let parsed = KCMessage::try_parse(&json).unwrap();
         assert_eq!(parsed.kind, KCMessageKind::LightningInvoice);

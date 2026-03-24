@@ -57,7 +57,8 @@ impl Config {
 pub fn store_mnemonic(pubkey_hex: &str, mnemonic: &str) -> Result<()> {
     let entry = Entry::new(KEYRING_SERVICE, &format!("mnemonic:{}", pubkey_hex))
         .context("failed to create keychain entry for mnemonic")?;
-    entry.set_password(mnemonic)
+    entry
+        .set_password(mnemonic)
         .context("failed to store mnemonic in keychain")?;
     Ok(())
 }
@@ -92,7 +93,8 @@ pub fn load_mnemonic(pubkey_hex: &str) -> Result<String> {
     // 3. OS keychain
     let entry = Entry::new(KEYRING_SERVICE, &format!("mnemonic:{}", pubkey_hex))
         .context("failed to create keychain entry for mnemonic")?;
-    entry.get_password()
+    entry
+        .get_password()
         .context("mnemonic not found in keychain — identity may need to be re-imported")
 }
 
@@ -100,7 +102,8 @@ pub fn load_mnemonic(pubkey_hex: &str) -> Result<String> {
 pub fn store_db_key(pubkey_hex: &str, db_key: &str) -> Result<()> {
     let entry = Entry::new(KEYRING_SERVICE, &format!("dbkey:{}", pubkey_hex))
         .context("failed to create keychain entry for DB key")?;
-    entry.set_password(db_key)
+    entry
+        .set_password(db_key)
         .context("failed to store DB key in keychain")?;
     Ok(())
 }
@@ -130,8 +133,7 @@ pub fn load_db_key(pubkey_hex: &str) -> Result<String> {
     // 3. OS keychain
     let entry = Entry::new(KEYRING_SERVICE, &format!("dbkey:{}", pubkey_hex))
         .context("failed to create keychain entry for DB key")?;
-    entry.get_password()
-        .context("DB key not found in keychain")
+    entry.get_password().context("DB key not found in keychain")
 }
 
 /// Generate a random DB encryption key (hex-encoded 32 bytes).
