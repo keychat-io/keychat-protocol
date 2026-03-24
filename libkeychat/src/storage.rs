@@ -153,6 +153,12 @@ impl SecureStorage {
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
+            CREATE TABLE IF NOT EXISTS signal_groups (
+                group_id TEXT PRIMARY KEY,
+                data_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
             COMMIT;",
         )
         .map_err(|e| KeychatError::Storage(format!("Failed to create schema: {e}")))?;
@@ -925,11 +931,71 @@ impl SecureStorage {
         Ok(results)
     }
 
+    // ─── Signal Groups ───────────────────────────────────
+
+    /// Save a SignalGroup (serialized as JSON).
+    pub fn save_group(&self, group_id: &str, data_json: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO signal_groups (group_id, data_json, updated_at) \
+                 VALUES (?1, ?2, strftime('%s','now'))",
+                rusqlite::params![group_id, data_json],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to save group: {e}")))?;
+        Ok(())
+    }
+
+    /// Load a SignalGroup by group_id.
+    pub fn load_group(&self, group_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT data_json FROM signal_groups WHERE group_id = ?1")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let result = stmt
+            .query_row(rusqlite::params![group_id], |row: &rusqlite::Row| row.get(0))
+            .optional()
+            .map_err(|e| KeychatError::Storage(format!("Failed to load group: {e}")))?;
+
+        Ok(result)
+    }
+
+    /// Load all SignalGroups.
+    pub fn load_all_groups(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_id, data_json FROM signal_groups")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| KeychatError::Storage(format!("Failed to load groups: {e}")))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(
+                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
+            );
+        }
+        Ok(results)
+    }
+
+    /// Delete a SignalGroup.
+    pub fn delete_group(&self, group_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM signal_groups WHERE group_id = ?1",
+                rusqlite::params![group_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete group: {e}")))?;
+        Ok(())
+    }
+
     // ─── Inbound Friend Requests ─────────────────────────────
 
     /// Save a received (inbound) friend request.
-    /// Stores the full KCMessage and payload as JSON so the request
-    /// can be accepted/rejected after an app restart.
     pub fn save_inbound_fr(
         &self,
         request_id: &str,
@@ -1016,7 +1082,6 @@ impl SecureStorage {
     }
 
     /// Force a WAL checkpoint so all data is written to the main database file.
-    /// Call before closing when another connection will reopen the same file.
     pub fn checkpoint(&self) -> Result<()> {
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")

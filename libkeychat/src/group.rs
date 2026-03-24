@@ -43,7 +43,8 @@ pub struct RoomMember {
 // ─── GroupMember & SignalGroup (Part A) ──────────────────────────────────────
 
 /// A single group member.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GroupMember {
     pub signal_id: String,
     pub nostr_pubkey: String,
@@ -52,7 +53,8 @@ pub struct GroupMember {
 }
 
 /// A Signal small group (sendAll).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SignalGroup {
     /// Group ID (a Nostr pubkey, used as unique identifier).
     pub group_id: String,
@@ -151,6 +153,50 @@ impl GroupManager {
             .group_id
             .as_deref()
             .and_then(|gid| self.groups.get(gid))
+    }
+
+    // ─── Persistence ─────────────────────────────────────
+
+    /// Save a single group to SecureStorage.
+    pub fn save_group(&self, group_id: &str, storage: &crate::storage::SecureStorage) -> Result<()> {
+        let group = self.groups.get(group_id).ok_or_else(|| {
+            KeychatError::Signal(format!("group not found: {group_id}"))
+        })?;
+        let json = serde_json::to_string(group)
+            .map_err(|e| KeychatError::Storage(format!("Failed to serialize group: {e}")))?;
+        storage.save_group(group_id, &json)
+    }
+
+    /// Save all groups to SecureStorage.
+    pub fn save_all(&self, storage: &crate::storage::SecureStorage) -> Result<()> {
+        for (group_id, group) in &self.groups {
+            let json = serde_json::to_string(group)
+                .map_err(|e| KeychatError::Storage(format!("Failed to serialize group: {e}")))?;
+            storage.save_group(group_id, &json)?;
+        }
+        Ok(())
+    }
+
+    /// Load all groups from SecureStorage, replacing in-memory state.
+    pub fn load_all(&mut self, storage: &crate::storage::SecureStorage) -> Result<()> {
+        let rows = storage.load_all_groups()?;
+        self.groups.clear();
+        for (group_id, json) in rows {
+            let group: SignalGroup = serde_json::from_str(&json)
+                .map_err(|e| KeychatError::Storage(format!("Failed to deserialize group {group_id}: {e}")))?;
+            self.groups.insert(group_id, group);
+        }
+        Ok(())
+    }
+
+    /// Remove a group from memory and storage.
+    pub fn remove_group_persistent(
+        &mut self,
+        group_id: &str,
+        storage: &crate::storage::SecureStorage,
+    ) -> Result<Option<SignalGroup>> {
+        storage.delete_group(group_id)?;
+        Ok(self.groups.remove(group_id))
     }
 }
 
