@@ -158,10 +158,15 @@ impl GroupManager {
     // ─── Persistence ─────────────────────────────────────
 
     /// Save a single group to SecureStorage.
-    pub fn save_group(&self, group_id: &str, storage: &crate::storage::SecureStorage) -> Result<()> {
-        let group = self.groups.get(group_id).ok_or_else(|| {
-            KeychatError::Signal(format!("group not found: {group_id}"))
-        })?;
+    pub fn save_group(
+        &self,
+        group_id: &str,
+        storage: &crate::storage::SecureStorage,
+    ) -> Result<()> {
+        let group = self
+            .groups
+            .get(group_id)
+            .ok_or_else(|| KeychatError::Signal(format!("group not found: {group_id}")))?;
         let json = serde_json::to_string(group)
             .map_err(|e| KeychatError::Storage(format!("Failed to serialize group: {e}")))?;
         storage.save_group(group_id, &json)
@@ -182,8 +187,9 @@ impl GroupManager {
         let rows = storage.load_all_groups()?;
         self.groups.clear();
         for (group_id, json) in rows {
-            let group: SignalGroup = serde_json::from_str(&json)
-                .map_err(|e| KeychatError::Storage(format!("Failed to deserialize group {group_id}: {e}")))?;
+            let group: SignalGroup = serde_json::from_str(&json).map_err(|e| {
+                KeychatError::Storage(format!("Failed to deserialize group {group_id}: {e}"))
+            })?;
             self.groups.insert(group_id, group);
         }
         Ok(())
@@ -289,10 +295,8 @@ pub async fn send_group_message(
     let mut results = Vec::new();
 
     for member in group.other_members() {
-        let remote_address = ProtocolAddress::new(
-            member.signal_id.clone(),
-            DeviceId::new(1).unwrap(),
-        );
+        let remote_address =
+            ProtocolAddress::new(member.signal_id.clone(), DeviceId::new(1).unwrap());
 
         // Resolve sending address via AddressManager
         let to_address = address_manager.resolve_send_address(&member.signal_id)?;
@@ -401,8 +405,7 @@ fn build_group_admin_message(
         group_id: Some(group.group_id.clone()),
         ..KCMessage::empty()
     };
-    msg.extra
-        .insert("signalGroupAdmin".to_string(), payload);
+    msg.extra.insert("signalGroupAdmin".to_string(), payload);
     msg
 }
 
@@ -414,10 +417,8 @@ pub async fn send_group_invite(
     address_manager: &AddressManager,
 ) -> Result<Event> {
     let message = build_group_invite_message(group);
-    let remote_address = ProtocolAddress::new(
-        invitee_signal_id.to_string(),
-        DeviceId::new(1).unwrap(),
-    );
+    let remote_address =
+        ProtocolAddress::new(invitee_signal_id.to_string(), DeviceId::new(1).unwrap());
     let to_address = address_manager.resolve_send_address(invitee_signal_id)?;
     let json = message.to_json()?;
     let ct = signal.encrypt(&remote_address, json.as_bytes())?;
@@ -426,10 +427,7 @@ pub async fn send_group_invite(
 }
 
 /// Receive a group invite and create a local SignalGroup (Part C.3).
-pub fn receive_group_invite(
-    message: &KCMessage,
-    my_signal_id: &str,
-) -> Result<SignalGroup> {
+pub fn receive_group_invite(message: &KCMessage, my_signal_id: &str) -> Result<SignalGroup> {
     if message.kind != KCMessageKind::SignalGroupInvite {
         return Err(KeychatError::Signal(
             "expected signalGroupInvite kind".into(),
@@ -488,11 +486,8 @@ pub async fn send_group_member_removed(
         "action": "memberRemoved",
         "memberId": removed_member_signal_id,
     });
-    let message = build_group_admin_message(
-        KCMessageKind::SignalGroupMemberRemoved,
-        group,
-        payload,
-    );
+    let message =
+        build_group_admin_message(KCMessageKind::SignalGroupMemberRemoved, group, payload);
 
     send_to_all_members(signal, group, &message, address_manager).await
 }
@@ -507,11 +502,7 @@ pub async fn send_group_self_leave(
         "action": "selfLeave",
         "memberId": group.my_signal_id,
     });
-    let message = build_group_admin_message(
-        KCMessageKind::SignalGroupSelfLeave,
-        group,
-        payload,
-    );
+    let message = build_group_admin_message(KCMessageKind::SignalGroupSelfLeave, group, payload);
 
     send_to_all_members(signal, group, &message, address_manager).await
 }
@@ -533,11 +524,7 @@ pub async fn send_group_dissolve(
     let payload = serde_json::json!({
         "action": "dissolve",
     });
-    let message = build_group_admin_message(
-        KCMessageKind::SignalGroupDissolve,
-        group,
-        payload,
-    );
+    let message = build_group_admin_message(KCMessageKind::SignalGroupDissolve, group, payload);
 
     send_to_all_members(signal, group, &message, address_manager).await
 }
@@ -561,11 +548,7 @@ pub async fn send_group_name_changed(
         "action": "nameChanged",
         "newName": new_name,
     });
-    let message = build_group_admin_message(
-        KCMessageKind::SignalGroupNameChanged,
-        group,
-        payload,
-    );
+    let message = build_group_admin_message(KCMessageKind::SignalGroupNameChanged, group, payload);
 
     send_to_all_members(signal, group, &message, address_manager).await
 }
@@ -583,10 +566,8 @@ async fn send_to_all_members(
     let mut results = Vec::new();
 
     for member in group.other_members() {
-        let remote_address = ProtocolAddress::new(
-            member.signal_id.clone(),
-            DeviceId::new(1).unwrap(),
-        );
+        let remote_address =
+            ProtocolAddress::new(member.signal_id.clone(), DeviceId::new(1).unwrap());
         let to_address = address_manager.resolve_send_address(&member.signal_id)?;
         let ct = signal.encrypt(&remote_address, json.as_bytes())?;
         let ciphertext = ct.bytes;
@@ -627,11 +608,11 @@ fn uuid_v4() -> String {
         u16::from_be_bytes([bytes[4], bytes[5]]),
         u16::from_be_bytes([bytes[6], bytes[7]]),
         u16::from_be_bytes([bytes[8], bytes[9]]),
-        u64::from_be_bytes([0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]])
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ])
     )
 }
-
-
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -671,9 +652,7 @@ mod tests {
 
         // Alice ↔ Bob session
         let bob_bundle = bob.prekey_bundle().unwrap();
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
         let ct = alice.encrypt_bytes(&bob_addr, b"init-ab").unwrap();
         bob.decrypt_bytes(&alice_addr, &ct).unwrap();
         let ct2 = bob.encrypt_bytes(&alice_addr, b"ack-ab").unwrap();
@@ -734,7 +713,16 @@ mod tests {
             ],
         );
 
-        (alice, bob, charlie, alice_addr, bob_addr, charlie_addr, group, addr_mgr)
+        (
+            alice,
+            bob,
+            charlie,
+            alice_addr,
+            bob_addr,
+            charlie_addr,
+            group,
+            addr_mgr,
+        )
     }
 
     // ─── Test 1: Create group ────────────────────────────────────────────────
@@ -768,13 +756,7 @@ mod tests {
 
     #[test]
     fn create_group_id_is_valid_nostr_pubkey() {
-        let group = create_signal_group(
-            "Test",
-            "creator_id",
-            "creator_nostr",
-            "Creator",
-            vec![],
-        );
+        let group = create_signal_group("Test", "creator_id", "creator_nostr", "Creator", vec![]);
         // Should be a valid 64-char hex string (x-only pubkey)
         assert_eq!(group.group_id.len(), 64);
         assert!(hex::decode(&group.group_id).is_ok());
@@ -784,7 +766,10 @@ mod tests {
     fn create_group_unique_ids() {
         let g1 = create_signal_group("G1", "c", "cn", "C", vec![]);
         let g2 = create_signal_group("G2", "c", "cn", "C", vec![]);
-        assert_ne!(g1.group_id, g2.group_id, "each group should have a unique ID");
+        assert_ne!(
+            g1.group_id, g2.group_id,
+            "each group should have a unique ID"
+        );
     }
 
     // ─── Test 2: Send group message ──────────────────────────────────────────
@@ -995,11 +980,12 @@ mod tests {
             &ct,
         )
         .unwrap();
-        let ct2 = dave.encrypt(
-            &ProtocolAddress::new(alice.identity_public_key_hex(), DeviceId::new(1).unwrap()),
-            b"ack-ad",
-        )
-        .unwrap();
+        let ct2 = dave
+            .encrypt(
+                &ProtocolAddress::new(alice.identity_public_key_hex(), DeviceId::new(1).unwrap()),
+                b"ack-ad",
+            )
+            .unwrap();
         alice.decrypt_bytes(&dave_addr, &ct2.bytes).unwrap();
 
         // Add Dave to address manager
@@ -1019,7 +1005,9 @@ mod tests {
             .unwrap();
         let alice_addr_for_dave =
             ProtocolAddress::new(alice.identity_public_key_hex(), DeviceId::new(1).unwrap());
-        let plaintext = dave.decrypt_bytes(&alice_addr_for_dave, &ciphertext).unwrap();
+        let plaintext = dave
+            .decrypt_bytes(&alice_addr_for_dave, &ciphertext)
+            .unwrap();
         let plaintext_str = String::from_utf8(plaintext).unwrap();
         let invite_msg = KCMessage::try_parse(&plaintext_str).unwrap();
 
@@ -1073,8 +1061,16 @@ mod tests {
 
     #[tokio::test]
     async fn self_leave_group() {
-        let (mut alice, mut bob, _charlie, alice_addr, bob_addr, _charlie_addr, mut group, addr_mgr) =
-            setup_3member_group();
+        let (
+            mut alice,
+            mut bob,
+            _charlie,
+            alice_addr,
+            bob_addr,
+            _charlie_addr,
+            mut group,
+            addr_mgr,
+        ) = setup_3member_group();
 
         let bob_id = bob.identity_public_key_hex();
 
@@ -1146,10 +1142,9 @@ mod tests {
 
         let bob_id = bob.identity_public_key_hex();
 
-        let results =
-            send_group_name_changed(&mut alice, &group, "New Name", &addr_mgr)
-                .await
-                .unwrap();
+        let results = send_group_name_changed(&mut alice, &group, "New Name", &addr_mgr)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 2);
 
@@ -1175,8 +1170,16 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_cannot_remove_member() {
-        let (mut alice, mut bob, _charlie, _alice_addr, bob_addr, charlie_addr, mut group, addr_mgr) =
-            setup_3member_group();
+        let (
+            mut alice,
+            mut bob,
+            _charlie,
+            _alice_addr,
+            bob_addr,
+            charlie_addr,
+            mut group,
+            addr_mgr,
+        ) = setup_3member_group();
 
         let charlie_id = _charlie.identity_public_key_hex();
 
@@ -1184,13 +1187,9 @@ mod tests {
         let mut bob_group = group.clone();
         bob_group.my_signal_id = bob.identity_public_key_hex();
 
-        let result =
-            send_group_member_removed(&mut bob, &bob_group, &charlie_id, &addr_mgr).await;
+        let result = send_group_member_removed(&mut bob, &bob_group, &charlie_id, &addr_mgr).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("only admins"));
+        assert!(result.unwrap_err().to_string().contains("only admins"));
     }
 
     #[tokio::test]
@@ -1213,8 +1212,7 @@ mod tests {
         let mut bob_group = group.clone();
         bob_group.my_signal_id = bob.identity_public_key_hex();
 
-        let result =
-            send_group_name_changed(&mut bob, &bob_group, "Nope", &addr_mgr).await;
+        let result = send_group_name_changed(&mut bob, &bob_group, "Nope", &addr_mgr).await;
         assert!(result.is_err());
     }
 
@@ -1235,8 +1233,16 @@ mod tests {
 
     #[tokio::test]
     async fn message_dedup_same_id() {
-        let (mut alice, mut bob, mut charlie, alice_addr, _bob_addr, _charlie_addr, group, addr_mgr) =
-            setup_3member_group();
+        let (
+            mut alice,
+            mut bob,
+            mut charlie,
+            alice_addr,
+            _bob_addr,
+            _charlie_addr,
+            group,
+            addr_mgr,
+        ) = setup_3member_group();
 
         let bob_id = bob.identity_public_key_hex();
         let charlie_id = charlie.identity_public_key_hex();
@@ -1258,8 +1264,7 @@ mod tests {
             .decode(&bob_event.1.content)
             .unwrap();
         let pt_bob = bob.decrypt_bytes(&alice_addr, &ct_bob).unwrap();
-        let msg_bob: KCMessage =
-            serde_json::from_str(&String::from_utf8(pt_bob).unwrap()).unwrap();
+        let msg_bob: KCMessage = serde_json::from_str(&String::from_utf8(pt_bob).unwrap()).unwrap();
 
         // Charlie decrypts
         let ct_charlie = base64::engine::general_purpose::STANDARD
@@ -1397,7 +1402,10 @@ mod tests {
 
         let invite_msg = build_group_invite_message(&group);
         assert_eq!(invite_msg.kind, KCMessageKind::SignalGroupInvite);
-        assert_eq!(invite_msg.group_id.as_deref(), Some(group.group_id.as_str()));
+        assert_eq!(
+            invite_msg.group_id.as_deref(),
+            Some(group.group_id.as_str())
+        );
 
         let dave_group = receive_group_invite(&invite_msg, "dave").unwrap();
         assert_eq!(dave_group.group_id, group.group_id);
@@ -1457,7 +1465,13 @@ mod tests {
     async fn send_to_empty_group_produces_no_events() {
         let mut alice = SignalParticipant::new("alice", 1).unwrap();
         let addr_mgr = AddressManager::new();
-        let group = create_signal_group("Solo", &alice.identity_public_key_hex(), "an", "Alice", vec![]);
+        let group = create_signal_group(
+            "Solo",
+            &alice.identity_public_key_hex(),
+            "an",
+            "Alice",
+            vec![],
+        );
 
         let mut msg = KCMessage::text("Hello nobody");
         msg.group_id = Some(group.group_id.clone());
@@ -1516,6 +1530,9 @@ mod tests {
         let decrypted_msg: KCMessage =
             serde_json::from_str(&String::from_utf8(plaintext).unwrap()).unwrap();
 
-        assert_eq!(decrypted_msg.group_id.as_deref(), Some(group.group_id.as_str()));
+        assert_eq!(
+            decrypted_msg.group_id.as_deref(),
+            Some(group.group_id.as_str())
+        );
     }
 }

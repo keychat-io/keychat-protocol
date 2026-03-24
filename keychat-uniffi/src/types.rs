@@ -208,6 +208,25 @@ pub enum ClientEvent {
     },
 }
 
+#[derive(uniffi::Record)]
+pub struct PublishResultInfo {
+    pub event_id: String,
+    pub success_relays: Vec<String>,
+    pub failed_relays: Vec<FailedRelayInfo>,
+}
+
+#[derive(uniffi::Record)]
+pub struct FailedRelayInfo {
+    pub url: String,
+    pub error: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct RelayStatusInfo {
+    pub url: String,
+    pub status: String,
+}
+
 // ─── Callback Interface ──────────────────────────────────────────
 
 #[uniffi::export(callback_interface)]

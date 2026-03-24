@@ -19,8 +19,7 @@ use libsignal_protocol::{
 use crate::persistent_signal_store::{
     IdentityStoreBackend, KyberPreKeyStoreBackend, PersistentIdentityKeyStore,
     PersistentKyberPreKeyStore, PersistentPreKeyStore, PersistentSessionStore,
-    PersistentSignedPreKeyStore, PreKeyStoreBackend, SessionStoreBackend,
-    SignedPreKeyStoreBackend,
+    PersistentSignedPreKeyStore, PreKeyStoreBackend, SessionStoreBackend, SignedPreKeyStoreBackend,
 };
 use crate::storage::SecureStorage;
 
@@ -199,12 +198,7 @@ impl SessionStore for CapturingSessionStore {
         record: &SessionRecord,
     ) -> std::result::Result<(), SignalProtocolError> {
         let new_snap = parse_ratchet_snapshot(record);
-        let old_snap = self
-            .snapshots
-            .lock()
-            .unwrap()
-            .get(address.name())
-            .cloned();
+        let old_snap = self.snapshots.lock().unwrap().get(address.name()).cloned();
 
         if let Some(ref snap) = new_snap {
             // Always update my_receiver_addresses with current ratchet key pair
@@ -271,9 +265,7 @@ impl SignalProtocolStoreBundle {
         Self {
             session_store: CapturingSessionStore::new(),
             pre_key_store: PreKeyStoreBackend::InMemory(InMemPreKeyStore::new()),
-            signed_pre_key_store: SignedPreKeyStoreBackend::InMemory(
-                InMemSignedPreKeyStore::new(),
-            ),
+            signed_pre_key_store: SignedPreKeyStoreBackend::InMemory(InMemSignedPreKeyStore::new()),
             kyber_pre_key_store: KyberPreKeyStoreBackend::InMemory(InMemKyberPreKeyStore::new()),
             identity_store: IdentityStoreBackend::InMemory(InMemIdentityKeyStore::new(
                 identity_key_pair,

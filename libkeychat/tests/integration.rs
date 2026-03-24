@@ -2,10 +2,7 @@
 //!
 //! These tests verify the public API works correctly end-to-end.
 
-use libkeychat::{
-    create_gift_wrap, unwrap_gift_wrap,
-    Identity, EphemeralKeypair,
-};
+use libkeychat::{create_gift_wrap, unwrap_gift_wrap, EphemeralKeypair, Identity};
 
 #[test]
 fn identity_generate_and_reimport() {
@@ -60,19 +57,12 @@ fn nip44_encrypt_decrypt_roundtrip() {
     let receiver = Identity::generate().unwrap().identity;
 
     let plaintext = "Keychat Protocol v2 test message 🔐";
-    let ciphertext = libkeychat::nip44::encrypt(
-        sender.secret_key(),
-        &receiver.public_key(),
-        plaintext,
-    )
-    .unwrap();
+    let ciphertext =
+        libkeychat::nip44::encrypt(sender.secret_key(), &receiver.public_key(), plaintext).unwrap();
 
-    let decrypted = libkeychat::nip44::decrypt(
-        receiver.secret_key(),
-        &sender.public_key(),
-        &ciphertext,
-    )
-    .unwrap();
+    let decrypted =
+        libkeychat::nip44::decrypt(receiver.secret_key(), &sender.public_key(), &ciphertext)
+            .unwrap();
 
     assert_eq!(decrypted, plaintext);
 }
@@ -84,37 +74,19 @@ fn nip44_cross_direction_symmetry() {
     let bob = Identity::generate().unwrap().identity;
 
     // Alice encrypts to Bob
-    let ct1 = libkeychat::nip44::encrypt(
-        alice.secret_key(),
-        &bob.public_key(),
-        "hello from alice",
-    )
-    .unwrap();
+    let ct1 = libkeychat::nip44::encrypt(alice.secret_key(), &bob.public_key(), "hello from alice")
+        .unwrap();
 
     // Bob encrypts to Alice
-    let ct2 = libkeychat::nip44::encrypt(
-        bob.secret_key(),
-        &alice.public_key(),
-        "hello from bob",
-    )
-    .unwrap();
+    let ct2 = libkeychat::nip44::encrypt(bob.secret_key(), &alice.public_key(), "hello from bob")
+        .unwrap();
 
     // Bob decrypts Alice's message
-    let d1 = libkeychat::nip44::decrypt(
-        bob.secret_key(),
-        &alice.public_key(),
-        &ct1,
-    )
-    .unwrap();
+    let d1 = libkeychat::nip44::decrypt(bob.secret_key(), &alice.public_key(), &ct1).unwrap();
     assert_eq!(d1, "hello from alice");
 
     // Alice decrypts Bob's message
-    let d2 = libkeychat::nip44::decrypt(
-        alice.secret_key(),
-        &bob.public_key(),
-        &ct2,
-    )
-    .unwrap();
+    let d2 = libkeychat::nip44::decrypt(alice.secret_key(), &bob.public_key(), &ct2).unwrap();
     assert_eq!(d2, "hello from bob");
 }
 
@@ -125,13 +97,9 @@ async fn gift_wrap_full_roundtrip() {
 
     let content = r#"{"v":2,"id":"test-uuid-123","kind":"friendRequest","friendRequest":{"name":"Alice","nostrIdentityKey":"abc123"}}"#;
 
-    let gift_wrap = create_gift_wrap(
-        alice.keys(),
-        &bob.public_key(),
-        content,
-    )
-    .await
-    .unwrap();
+    let gift_wrap = create_gift_wrap(alice.keys(), &bob.public_key(), content)
+        .await
+        .unwrap();
 
     // Verify the outer event
     assert_eq!(gift_wrap.kind, nostr::Kind::GiftWrap);
@@ -151,13 +119,9 @@ async fn gift_wrap_wrong_receiver_fails() {
     let bob = Identity::generate().unwrap().identity;
     let eve = Identity::generate().unwrap().identity;
 
-    let gift_wrap = create_gift_wrap(
-        alice.keys(),
-        &bob.public_key(),
-        "secret for bob only",
-    )
-    .await
-    .unwrap();
+    let gift_wrap = create_gift_wrap(alice.keys(), &bob.public_key(), "secret for bob only")
+        .await
+        .unwrap();
 
     // Eve cannot unwrap
     let result = unwrap_gift_wrap(eve.keys(), &gift_wrap);
@@ -170,13 +134,9 @@ async fn gift_wrap_uses_real_timestamps() {
     let bob = Identity::generate().unwrap().identity;
 
     let before = nostr::Timestamp::now();
-    let gift_wrap = create_gift_wrap(
-        alice.keys(),
-        &bob.public_key(),
-        "timestamp test",
-    )
-    .await
-    .unwrap();
+    let gift_wrap = create_gift_wrap(alice.keys(), &bob.public_key(), "timestamp test")
+        .await
+        .unwrap();
     let after = nostr::Timestamp::now();
 
     // Real timestamp should be between before and after
@@ -197,7 +157,11 @@ fn group_create_and_invite_roundtrip() {
         "Alice",
         vec![
             ("bob_sig".into(), "bob_npub".into(), "Bob".into()),
-            ("charlie_sig".into(), "charlie_npub".into(), "Charlie".into()),
+            (
+                "charlie_sig".into(),
+                "charlie_npub".into(),
+                "Charlie".into(),
+            ),
         ],
     );
 
@@ -253,8 +217,8 @@ fn group_manager_lifecycle() {
 #[tokio::test]
 async fn group_send_receive_e2e() {
     use libkeychat::{
-        create_signal_group, receive_group_message, send_group_message,
-        AddressManager, GroupManager, KCMessage, KCMessageKind, SignalParticipant,
+        create_signal_group, receive_group_message, send_group_message, AddressManager,
+        GroupManager, KCMessage, KCMessageKind, SignalParticipant,
     };
     use libsignal_protocol::{DeviceId, ProtocolAddress};
 

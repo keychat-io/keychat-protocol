@@ -3,10 +3,11 @@
 //! Core protocol logic with proper address management (§9).
 //! Both REPL (app.rs) and daemon (daemon.rs) use these functions.
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use libkeychat::{
-    accept_friend_request, receive_friend_request,
-    send_friend_request, KCMessage, AddressManager, AddressUpdate,
+    accept_friend_request, accept_friend_request_persistent, receive_friend_request,
+    send_friend_request_persistent, serialize_prekey_material, AddressManager, AddressUpdate,
+    KCMessage,
 };
 use libkeychat::{DeviceId, PreKeySignalMessage, ProtocolAddress};
 use nostr::prelude::*;
@@ -20,7 +21,7 @@ fn normalize_pubkey(input: &str) -> Result<String> {
 }
 use tokio::sync::broadcast;
 
-use crate::state::{AppState, ChatTarget, Peer, OutboundFriendRequest, PendingFriendRequest};
+use crate::state::{AppState, ChatTarget, OutboundFriendRequest, Peer, PendingFriendRequest};
 use crate::ui;
 
 // ─── Event types ────────────────────────────────────────────────────────────
@@ -53,10 +54,18 @@ pub enum IncomingEvent {
 
 // ─── Send ───────────────────────────────────────────────────────────────────
 
+/// Persist address state to DB after address updates.
+fn save_address_state(state: &AppState, peer_signal_id: &str, addr_mgr: &AddressManager) {
+    if let Some(addr_state) = addr_mgr.to_serialized(peer_signal_id) {
+        let _ = state.db().save_peer_addresses(peer_signal_id, &addr_state);
+    }
+}
+
 /// Send a text message to a specific peer (by nostr pubkey).
 pub async fn send_text_to(state: &AppState, peer_npub: &str, text: &str) -> Result<()> {
     let mut peers = state.peers.write().await;
-    let peer = peers.get_mut(peer_npub)
+    let peer = peers
+        .get_mut(peer_npub)
         .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_npub))?;
 
     let msg = KCMessage::text(text);
@@ -67,14 +76,16 @@ pub async fn send_text_to(state: &AppState, peer_npub: &str, text: &str) -> Resu
     let ct = peer.signal.encrypt(&addr, json.as_bytes())?;
 
     // Resolve correct sending address (ratchet → firstInbox → npub fallback)
-    let to_address = peer.address_manager.resolve_send_address(&peer.signal_id)
+    let to_address = peer
+        .address_manager
+        .resolve_send_address(&peer.signal_id)
         .unwrap_or_else(|_| peer.nostr_pubkey.clone());
 
     // Update address state after encrypt
-    let update = peer.address_manager.on_encrypt(
-        &peer.signal_id,
-        ct.sender_address.as_deref(),
-    ).unwrap_or_default();
+    let update = peer
+        .address_manager
+        .on_encrypt(&peer.signal_id, ct.sender_address.as_deref())
+        .unwrap_or_default();
 
     // Build and send Mode 1 event
     let event = build_mode1_event(&ct.bytes, &to_address).await?;
@@ -103,9 +114,17 @@ pub async fn send_text(state: &AppState, text: &str) -> Result<()> {
 pub async fn add_friend(state: &AppState, peer_npub: &str) -> Result<()> {
     // Accept both npub (bech32) and hex formats
     let peer_hex = normalize_pubkey(peer_npub)?;
-    let (event, fr_state) = send_friend_request(
-        &state.identity, &peer_hex, &state.name, "keychat-cli",
-    ).await?;
+    let keys = libkeychat::signal_session::generate_prekey_material()?;
+    let (event, fr_state) = send_friend_request_persistent(
+        &state.identity,
+        &peer_hex,
+        &state.name,
+        "keychat-cli",
+        keys,
+        state.storage_arc(),
+        1,
+    )
+    .await?;
     state.client.send_event(event).await?;
 
     // Subscribe to firstInbox for the acceptance reply
@@ -123,11 +142,15 @@ pub async fn add_friend(state: &AppState, peer_npub: &str) -> Result<()> {
     );
 
     state.db().save_peer_mapping(
-        peer_npub, "pending",
+        peer_npub,
+        "pending",
         &format!("{}...", &peer_npub[..8.min(peer_npub.len())]),
     )?;
 
-    ui::sys(&format!("📨 Friend request sent to {}...", &peer_npub[..16.min(peer_npub.len())]));
+    ui::sys(&format!(
+        "📨 Friend request sent to {}...",
+        &peer_npub[..16.min(peer_npub.len())]
+    ));
     Ok(())
 }
 
@@ -151,25 +174,39 @@ pub async fn send_file(state: &AppState, path: &str) -> Result<()> {
     let encrypted = libkeychat::media::encrypt_file(&file_data);
     let file_msg = libkeychat::media::build_file_message(
         &format!("local://{}", file_name),
-        category, Some(&mime), file_data.len() as u64, &encrypted,
+        category,
+        Some(&mime),
+        file_data.len() as u64,
+        &encrypted,
     );
 
     let mut peers = state.peers.write().await;
-    let peer = peers.get_mut(&peer_npub).ok_or_else(|| anyhow::anyhow!("Peer not found"))?;
+    let peer = peers
+        .get_mut(&peer_npub)
+        .ok_or_else(|| anyhow::anyhow!("Peer not found"))?;
     let addr = ProtocolAddress::new(peer.signal_id.clone(), DeviceId::new(1).unwrap());
 
     let json = file_msg.to_json()?;
     let ct = peer.signal.encrypt(&addr, json.as_bytes())?;
-    let to_address = peer.address_manager.resolve_send_address(&peer.signal_id)
+    let to_address = peer
+        .address_manager
+        .resolve_send_address(&peer.signal_id)
         .unwrap_or_else(|_| peer.nostr_pubkey.clone());
-    let update = peer.address_manager.on_encrypt(&peer.signal_id, ct.sender_address.as_deref())
+    let update = peer
+        .address_manager
+        .on_encrypt(&peer.signal_id, ct.sender_address.as_deref())
         .unwrap_or_default();
+    save_address_state(state, &peer.signal_id, &peer.address_manager);
 
     let event = build_mode1_event(&ct.bytes, &to_address).await?;
     state.client.send_event(event).await?;
     subscribe_addresses(state, &update).await;
 
-    ui::sys(&format!("📁 Sent file: {} ({} bytes)", file_name, file_data.len()));
+    ui::sys(&format!(
+        "📁 Sent file: {} ({} bytes)",
+        file_name,
+        file_data.len()
+    ));
     Ok(())
 }
 
@@ -185,19 +222,30 @@ pub async fn send_voice(state: &AppState, path: &str) -> Result<()> {
     let data = std::fs::read(path)?;
     let encrypted = libkeychat::media::encrypt_file(&data);
     let voice_msg = libkeychat::media::build_voice_message(
-        "local://voice", data.len() as u64, 0.0, vec![], &encrypted,
+        "local://voice",
+        data.len() as u64,
+        0.0,
+        vec![],
+        &encrypted,
     );
 
     let mut peers = state.peers.write().await;
-    let peer = peers.get_mut(&peer_npub).ok_or_else(|| anyhow::anyhow!("Peer not found"))?;
+    let peer = peers
+        .get_mut(&peer_npub)
+        .ok_or_else(|| anyhow::anyhow!("Peer not found"))?;
     let addr = ProtocolAddress::new(peer.signal_id.clone(), DeviceId::new(1).unwrap());
 
     let json = voice_msg.to_json()?;
     let ct = peer.signal.encrypt(&addr, json.as_bytes())?;
-    let to_address = peer.address_manager.resolve_send_address(&peer.signal_id)
+    let to_address = peer
+        .address_manager
+        .resolve_send_address(&peer.signal_id)
         .unwrap_or_else(|_| peer.nostr_pubkey.clone());
-    let update = peer.address_manager.on_encrypt(&peer.signal_id, ct.sender_address.as_deref())
+    let update = peer
+        .address_manager
+        .on_encrypt(&peer.signal_id, ct.sender_address.as_deref())
         .unwrap_or_default();
+    save_address_state(state, &peer.signal_id, &peer.address_manager);
 
     let event = build_mode1_event(&ct.bytes, &to_address).await?;
     state.client.send_event(event).await?;
@@ -222,9 +270,54 @@ pub async fn start_listener(state: Arc<AppState>, event_tx: broadcast::Sender<In
     // (Mode 1 events use p-tag targeting)
     let filter2 = Filter::new()
         .kind(Kind::GiftWrap)
-        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), [state.keys.public_key().to_hex()])
+        .custom_tag(
+            SingleLetterTag::lowercase(Alphabet::P),
+            [state.keys.public_key().to_hex()],
+        )
         .since(Timestamp::now() - 300);
     let _ = state.client.subscribe(vec![filter2], None).await;
+
+    // Re-subscribe to all persisted receiving addresses from restored peers
+    {
+        let peers = state.peers.read().await;
+        for peer in peers.values() {
+            for addr in peer.address_manager.get_all_receiving_address_strings() {
+                subscribe_to_address(&state, &addr).await;
+            }
+        }
+        let count: usize = peers
+            .values()
+            .map(|p| p.address_manager.get_all_receiving_address_strings().len())
+            .sum();
+        if count > 0 {
+            eprintln!("[listener] re-subscribed to {} receiving addresses", count);
+        }
+    }
+
+    // Re-subscribe to MLS group temp inboxes
+    {
+        let mls_group_ids = state.db().list_mls_group_ids().unwrap_or_default();
+        let mls_inboxes: Vec<String> = {
+            let mls = state.mls.lock().unwrap();
+            if let Some(participant) = mls.as_ref() {
+                mls_group_ids
+                    .iter()
+                    .filter_map(|gid| participant.derive_temp_inbox(gid).ok())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for inbox in &mls_inboxes {
+            subscribe_to_address(&state, inbox).await;
+        }
+        if !mls_inboxes.is_empty() {
+            eprintln!(
+                "[listener] re-subscribed to {} MLS group inboxes",
+                mls_inboxes.len()
+            );
+        }
+    }
 
     let mut notifications = state.client.notifications();
     loop {
@@ -243,9 +336,15 @@ pub async fn start_listener(state: Arc<AppState>, event_tx: broadcast::Sender<In
 // ─── Friend request approval ────────────────────────────────────────────────
 
 /// Approve a pending inbound friend request (owner action).
-pub async fn approve_friend(state: &AppState, sender_npub: &str, event_tx: &broadcast::Sender<IncomingEvent>) -> Result<()> {
+pub async fn approve_friend(
+    state: &AppState,
+    sender_npub: &str,
+    event_tx: &broadcast::Sender<IncomingEvent>,
+) -> Result<()> {
     let mut pending = state.pending_friend_requests.write().await;
-    let idx = pending.iter().position(|p| p.sender_npub == sender_npub)
+    let idx = pending
+        .iter()
+        .position(|p| p.sender_npub == sender_npub)
         .ok_or_else(|| anyhow::anyhow!("No pending request from {}", sender_npub))?;
     let pfr = pending.remove(idx);
     drop(pending);
@@ -270,7 +369,9 @@ pub async fn approve_friend(state: &AppState, sender_npub: &str, event_tx: &broa
 /// Reject a pending inbound friend request.
 pub async fn reject_friend(state: &AppState, sender_npub: &str) -> Result<()> {
     let mut pending = state.pending_friend_requests.write().await;
-    let idx = pending.iter().position(|p| p.sender_npub == sender_npub)
+    let idx = pending
+        .iter()
+        .position(|p| p.sender_npub == sender_npub)
         .ok_or_else(|| anyhow::anyhow!("No pending request from {}", sender_npub))?;
     let pfr = pending.remove(idx);
     ui::sys(&format!("❌ Rejected {}", pfr.sender_name));
@@ -293,7 +394,9 @@ pub async fn handle_event(
     let eid = event.id.to_hex();
     {
         let db = state.db();
-        if db.is_event_processed(&eid)? { return Ok(()); }
+        if db.is_event_processed(&eid)? {
+            return Ok(());
+        }
         db.mark_event_processed(&eid)?;
     }
 
@@ -329,9 +432,9 @@ async fn handle_friend_request(
     let should_accept = if state.config.auto_accept_friends {
         let owner = state.owner.read().await;
         match owner.as_deref() {
-            None => true,        // No owner yet — first peer becomes owner
-            Some(o) if o == sender_hex => true,  // Owner is adding us (e.g., re-add after reset)
-            Some(_) => false,    // Someone else — needs owner approval
+            None => true,                       // No owner yet — first peer becomes owner
+            Some(o) if o == sender_hex => true, // Owner is adding us (e.g., re-add after reset)
+            Some(_) => false,                   // Someone else — needs owner approval
         }
     } else {
         false
@@ -366,7 +469,10 @@ async fn handle_friend_request(
             sender_name: fr.payload.name.clone(),
             auto_accepted: false,
         });
-        ui::sys(&format!("📨 Friend request from {} (needs owner approval)", fr.payload.name));
+        ui::sys(&format!(
+            "📨 Friend request from {} (needs owner approval)",
+            fr.payload.name
+        ));
     }
     Ok(())
 }
@@ -378,10 +484,41 @@ async fn do_accept_friend(
     event_tx: &broadcast::Sender<IncomingEvent>,
 ) -> Result<()> {
     let sender_hex = fr.sender_pubkey.to_hex();
-    let accepted = accept_friend_request(&state.identity, fr, &state.name).await?;
-    state.client.send_event(accepted.event).await?;
-
     let peer_signal_id = fr.payload.signal_identity_key.clone();
+
+    // Generate keys and create persistent participant (sessions auto-saved to DB)
+    let keys = libkeychat::signal_session::generate_prekey_material()?;
+    let device_id = 1u32;
+
+    // Save key material to DB
+    if let Ok((id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec)) =
+        serialize_prekey_material(&keys)
+    {
+        let _ = state.db().save_signal_participant(
+            &peer_signal_id,
+            device_id,
+            &id_pub,
+            &id_priv,
+            reg_id,
+            spk_id,
+            &spk_rec,
+            pk_id,
+            &pk_rec,
+            kpk_id,
+            &kpk_rec,
+        );
+    }
+
+    let accepted = accept_friend_request_persistent(
+        &state.identity,
+        fr,
+        &state.name,
+        keys,
+        state.storage_arc(),
+        device_id,
+    )
+    .await?;
+    state.client.send_event(accepted.event).await?;
 
     let mut addr_mgr = AddressManager::new();
     addr_mgr.add_peer(
@@ -390,10 +527,12 @@ async fn do_accept_friend(
         Some(sender_hex.clone()),
     );
 
-    let update = addr_mgr.on_encrypt(
-        &peer_signal_id,
-        accepted.sender_address.as_deref(),
-    ).unwrap_or_default();
+    let update = addr_mgr
+        .on_encrypt(&peer_signal_id, accepted.sender_address.as_deref())
+        .unwrap_or_default();
+    if let Some(addr_state) = addr_mgr.to_serialized(&peer_signal_id) {
+        let _ = state.db().save_peer_addresses(&peer_signal_id, &addr_state);
+    }
     subscribe_addresses(state, &update).await;
 
     let peer = Peer {
@@ -403,7 +542,9 @@ async fn do_accept_friend(
         signal: accepted.signal_participant,
         address_manager: addr_mgr,
     };
-    state.db().save_peer_mapping(&sender_hex, &peer_signal_id, &fr.payload.name)?;
+    state
+        .db()
+        .save_peer_mapping(&sender_hex, &peer_signal_id, &fr.payload.name)?;
     state.peers.write().await.insert(sender_hex.clone(), peer);
 
     let _ = event_tx.send(IncomingEvent::FriendRequest {
@@ -421,12 +562,11 @@ async fn try_decrypt_from_peers(
     event_tx: &broadcast::Sender<IncomingEvent>,
 ) -> Result<bool> {
     // Mode 1: content is base64(Signal ciphertext), p-tag is receiving address
-    let ciphertext = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, &event.content
-    ) {
-        Ok(ct) => ct,
-        Err(_) => return Ok(false),
-    };
+    let ciphertext =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &event.content) {
+            Ok(ct) => ct,
+            Err(_) => return Ok(false),
+        };
 
     let peer_keys: Vec<String> = state.peers.read().await.keys().cloned().collect();
     for npub in &peer_keys {
@@ -435,11 +575,15 @@ async fn try_decrypt_from_peers(
             let addr = ProtocolAddress::new(peer.signal_id.clone(), DeviceId::new(1).unwrap());
             if let Ok(result) = peer.signal.decrypt(&addr, &ciphertext) {
                 // Update address state after decrypt
-                let update = peer.address_manager.on_decrypt(
-                    &peer.signal_id,
-                    result.bob_derived_address.as_deref(),
-                    result.alice_addrs.as_deref(),
-                ).unwrap_or_default();
+                let update = peer
+                    .address_manager
+                    .on_decrypt(
+                        &peer.signal_id,
+                        result.bob_derived_address.as_deref(),
+                        result.alice_addrs.as_deref(),
+                    )
+                    .unwrap_or_default();
+                save_address_state(state, &peer.signal_id, &peer.address_manager);
 
                 // Subscribe to new receiving addresses
                 drop(peers);
@@ -450,7 +594,8 @@ async fn try_decrypt_from_peers(
                 if let Some(msg) = KCMessage::try_parse(&text) {
                     let group_info = if let Some(gid) = &msg.group_id {
                         let gm = state.signal_groups.read().await;
-                        let gname = gm.get_group(gid)
+                        let gname = gm
+                            .get_group(gid)
                             .map(|g| g.name.clone())
                             .unwrap_or_else(|| gid[..8].to_string());
                         Some((gid.clone(), gname))
@@ -458,9 +603,20 @@ async fn try_decrypt_from_peers(
                         None
                     };
 
-                    let incoming = kcmessage_to_incoming(&msg, npub, &{
-                        state.peers.read().await.get(npub).map(|p| p.name.clone()).unwrap_or_default()
-                    }, group_info.as_ref());
+                    let incoming = kcmessage_to_incoming(
+                        &msg,
+                        npub,
+                        &{
+                            state
+                                .peers
+                                .read()
+                                .await
+                                .get(npub)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_default()
+                        },
+                        group_info.as_ref(),
+                    );
 
                     if let Some((_, ref gname)) = group_info {
                         display_message(&msg, &incoming.sender_name, Some(gname));
@@ -481,12 +637,11 @@ async fn try_pending_fr_response(
     event: &Event,
     event_tx: &broadcast::Sender<IncomingEvent>,
 ) -> Result<bool> {
-    let ciphertext = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, &event.content
-    ) {
-        Ok(ct) => ct,
-        Err(_) => return Ok(false),
-    };
+    let ciphertext =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &event.content) {
+            Ok(ct) => ct,
+            Err(_) => return Ok(false),
+        };
 
     if !libkeychat::SignalParticipant::is_prekey_message(&ciphertext) {
         return Ok(false);
@@ -500,7 +655,13 @@ async fn try_pending_fr_response(
     let sender_identity = hex::encode(prekey_msg.identity_key().serialize());
     let remote_addr = ProtocolAddress::new(sender_identity.clone(), DeviceId::new(1).unwrap());
 
-    let pending_keys: Vec<String> = state.pending_outbound_frs.read().await.keys().cloned().collect();
+    let pending_keys: Vec<String> = state
+        .pending_outbound_frs
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect();
     for first_inbox in &pending_keys {
         let mut pending = state.pending_outbound_frs.write().await;
         if let Some(pfr) = pending.get_mut(first_inbox) {
@@ -525,18 +686,52 @@ async fn try_pending_fr_response(
                         let mut addr_mgr = AddressManager::new();
                         addr_mgr.add_peer(
                             &peer_signal_id,
-                            None,                           // we don't know their firstInbox
-                            Some(peer_nostr_id.clone()),    // peer's nostr pubkey
+                            None,                        // we don't know their firstInbox
+                            Some(peer_nostr_id.clone()), // peer's nostr pubkey
                         );
 
                         // Process decrypt address updates
-                        let update = addr_mgr.on_decrypt(
-                            &peer_signal_id,
-                            result.bob_derived_address.as_deref(),
-                            result.alice_addrs.as_deref(),
-                        ).unwrap_or_default();
+                        let update = addr_mgr
+                            .on_decrypt(
+                                &peer_signal_id,
+                                result.bob_derived_address.as_deref(),
+                                result.alice_addrs.as_deref(),
+                            )
+                            .unwrap_or_default();
+                        if let Some(addr_state) = addr_mgr.to_serialized(&peer_signal_id) {
+                            let _ = state.db().save_peer_addresses(&peer_signal_id, &addr_state);
+                        }
 
                         subscribe_addresses(state, &update).await;
+
+                        // Persist Signal key material
+                        let device_id = u32::from(signal.address().device_id());
+                        if let Ok((
+                            id_pub,
+                            id_priv,
+                            reg_id,
+                            spk_id,
+                            spk_rec,
+                            pk_id,
+                            pk_rec,
+                            kpk_id,
+                            kpk_rec,
+                        )) = serialize_prekey_material(signal.keys())
+                        {
+                            let _ = state.db().save_signal_participant(
+                                &peer_signal_id,
+                                device_id,
+                                &id_pub,
+                                &id_priv,
+                                reg_id,
+                                spk_id,
+                                &spk_rec,
+                                pk_id,
+                                &pk_rec,
+                                kpk_id,
+                                &kpk_rec,
+                            );
+                        }
 
                         let peer = Peer {
                             nostr_pubkey: peer_nostr_id.clone(),
@@ -545,8 +740,16 @@ async fn try_pending_fr_response(
                             signal,
                             address_manager: addr_mgr,
                         };
-                        state.db().save_peer_mapping(&peer_nostr_id, &peer_signal_id, &peer_name)?;
-                        state.peers.write().await.insert(peer_nostr_id.clone(), peer);
+                        state.db().save_peer_mapping(
+                            &peer_nostr_id,
+                            &peer_signal_id,
+                            &peer_name,
+                        )?;
+                        state
+                            .peers
+                            .write()
+                            .await
+                            .insert(peer_nostr_id.clone(), peer);
 
                         let _ = event_tx.send(IncomingEvent::FriendRequest {
                             sender: peer_nostr_id.clone(),
@@ -586,11 +789,9 @@ async fn subscribe_addresses(state: &AppState, update: &AddressUpdate) {
 /// Build a Mode 1 event (kind:1059, base64 ciphertext, p-tag to receiver).
 async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
     let sender = libkeychat::EphemeralKeypair::generate();
-    let content = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD, ciphertext
-    );
-    let to_pubkey = PublicKey::from_hex(to_address)
-        .map_err(|e| anyhow::anyhow!("invalid to_address: {e}"))?;
+    let content = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ciphertext);
+    let to_pubkey =
+        PublicKey::from_hex(to_address).map_err(|e| anyhow::anyhow!("invalid to_address: {e}"))?;
 
     let event = EventBuilder::new(Kind::GiftWrap, &content)
         .tag(Tag::public_key(to_pubkey))
@@ -603,22 +804,30 @@ async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event>
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn kcmessage_to_incoming(
-    msg: &KCMessage, sender_npub: &str, sender_name: &str,
+    msg: &KCMessage,
+    sender_npub: &str,
+    sender_name: &str,
     group_info: Option<&(String, String)>,
 ) -> IncomingMessage {
     let (content, kind) = if let Some(t) = &msg.text {
         (t.content.clone(), "text".to_string())
     } else if let Some(files) = &msg.files {
-        let descs: Vec<String> = files.items.iter().map(|f| {
-            match f.category {
-                libkeychat::FileCategory::Voice =>
-                    format!("🎤 Voice ({:.1}s)", f.audio_duration.unwrap_or(0.0)),
+        let descs: Vec<String> = files
+            .items
+            .iter()
+            .map(|f| match f.category {
+                libkeychat::FileCategory::Voice => {
+                    format!("🎤 Voice ({:.1}s)", f.audio_duration.unwrap_or(0.0))
+                }
                 _ => format!("📁 {} ({})", f.url, f.size.unwrap_or(0)),
-            }
-        }).collect();
+            })
+            .collect();
         (descs.join("; "), "file".to_string())
     } else if let Some(c) = &msg.cashu {
-        (format!("💰 {} sats from {}", c.amount, c.mint), "cashu".to_string())
+        (
+            format!("💰 {} sats from {}", c.amount, c.mint),
+            "cashu".to_string(),
+        )
     } else if let Some(l) = &msg.lightning {
         (format!("⚡ {} sats", l.amount), "lightning".to_string())
     } else {
@@ -640,21 +849,39 @@ fn kcmessage_to_incoming(
 }
 
 fn display_message(msg: &KCMessage, sender: &str, group: Option<&str>) {
+    // Show reply reference if present
+    if let Some(ref reply) = msg.reply_to {
+        let preview = if reply.content.len() > 40 {
+            format!("{}...", &reply.content[..40])
+        } else {
+            reply.content.clone()
+        };
+        let who = reply.user_name.as_deref().unwrap_or("?");
+        ui::sys(&format!("  ↩ {} \"{}\"", who, preview));
+    }
+
     match &msg.text {
         Some(t) => {
-            if let Some(g) = group { ui::group_msg(g, sender, &t.content); }
-            else { ui::received(sender, &t.content); }
+            if let Some(g) = group {
+                ui::group_msg(g, sender, &t.content);
+            } else {
+                ui::received(sender, &t.content);
+            }
         }
         None => {
             if let Some(files) = &msg.files {
                 for f in &files.items {
                     let desc = match f.category {
-                        libkeychat::FileCategory::Voice =>
-                            format!("🎤 Voice ({:.1}s)", f.audio_duration.unwrap_or(0.0)),
+                        libkeychat::FileCategory::Voice => {
+                            format!("🎤 Voice ({:.1}s)", f.audio_duration.unwrap_or(0.0))
+                        }
                         _ => format!("📁 {} ({})", f.url, f.size.unwrap_or(0)),
                     };
-                    if let Some(g) = group { ui::group_msg(g, sender, &desc); }
-                    else { ui::received(sender, &desc); }
+                    if let Some(g) = group {
+                        ui::group_msg(g, sender, &desc);
+                    } else {
+                        ui::received(sender, &desc);
+                    }
                 }
             } else if let Some(c) = &msg.cashu {
                 ui::received(sender, &format!("💰 Cashu: {} sats", c.amount));
@@ -668,7 +895,10 @@ fn display_message(msg: &KCMessage, sender: &str, group: Option<&str>) {
 }
 
 pub fn mime_from_ext(path: &str) -> String {
-    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     match ext.to_lowercase().as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
@@ -681,12 +911,18 @@ pub fn mime_from_ext(path: &str) -> String {
         "pdf" => "application/pdf",
         "txt" => "text/plain",
         _ => "application/octet-stream",
-    }.to_string()
+    }
+    .to_string()
 }
 
 pub fn category_from_mime(mime: &str) -> libkeychat::FileCategory {
-    if mime.starts_with("image/") { libkeychat::FileCategory::Image }
-    else if mime.starts_with("video/") { libkeychat::FileCategory::Video }
-    else if mime.starts_with("audio/") { libkeychat::FileCategory::Voice }
-    else { libkeychat::FileCategory::Other }
+    if mime.starts_with("image/") {
+        libkeychat::FileCategory::Image
+    } else if mime.starts_with("video/") {
+        libkeychat::FileCategory::Video
+    } else if mime.starts_with("audio/") {
+        libkeychat::FileCategory::Voice
+    } else {
+        libkeychat::FileCategory::Other
+    }
 }

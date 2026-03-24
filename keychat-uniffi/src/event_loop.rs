@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use libkeychat::{
     receive_friend_request, receive_group_invite, receive_signal_message,
-    serialize_prekey_material,
-    AddressManager, ChatSession, DeviceId,
-    Event, Kind, KCMessageKind, ProtocolAddress, PublicKey, RelayPoolNotification, Timestamp,
+    serialize_prekey_material, AddressManager, ChatSession, DeviceId, Event, KCMessageKind, Kind,
+    ProtocolAddress, PublicKey, RelayPoolNotification, Timestamp,
 };
 
 use crate::client::KeychatClient;
@@ -90,7 +89,10 @@ impl KeychatClient {
     /// 3. Existing session message
     async fn handle_incoming_event(&self, event: &Event) {
         let event_hex = event.id.to_hex();
-        tracing::info!("⬇️ RECV GiftWrap event_id={}", &event_hex[..16.min(event_hex.len())]);
+        tracing::info!(
+            "⬇️ RECV GiftWrap event_id={}",
+            &event_hex[..16.min(event_hex.len())]
+        );
 
         // Step 1: Try friend request (NIP-17 Gift Wrap → KCMessage friendRequest)
         {
@@ -120,21 +122,22 @@ impl KeychatClient {
 
                         // Persist inbound FR to SQLCipher
                         {
-                            let message_json = serde_json::to_string(&received.message)
-                                .unwrap_or_default();
-                            let payload_json = serde_json::to_string(&received.payload)
-                                .unwrap_or_default();
+                            let message_json =
+                                serde_json::to_string(&received.message).unwrap_or_default();
+                            let payload_json =
+                                serde_json::to_string(&received.payload).unwrap_or_default();
                             let storage = self.inner.read().await.storage.clone();
-                            let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
-                                let store = storage.lock().map_err(|e| format!("{e}"))?;
-                                store.save_inbound_fr(
-                                    &request_id,
-                                    &received.sender_pubkey_hex,
-                                    &message_json,
-                                    &payload_json,
-                                )?;
-                                Ok(())
-                            })();
+                            let result =
+                                (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+                                    let store = storage.lock().map_err(|e| format!("{e}"))?;
+                                    store.save_inbound_fr(
+                                        &request_id,
+                                        &received.sender_pubkey_hex,
+                                        &message_json,
+                                        &payload_json,
+                                    )?;
+                                    Ok(())
+                                })();
                             if let Err(e) = result {
                                 tracing::error!("persist inbound FR failed: {e}");
                             }
@@ -193,10 +196,8 @@ impl KeychatClient {
                     &peer_nostr_pubkey[..16.min(peer_nostr_pubkey.len())]
                 );
 
-                let remote_address = ProtocolAddress::new(
-                    signal_id_hex.clone(),
-                    DeviceId::new(1).unwrap(),
-                );
+                let remote_address =
+                    ProtocolAddress::new(signal_id_hex.clone(), DeviceId::new(1).unwrap());
 
                 // Try decrypt under write lock (need &mut signal_participant)
                 let result = {
@@ -228,7 +229,10 @@ impl KeychatClient {
                         );
                     }
                     None => {
-                        tracing::debug!("Step2: reqId={} no longer in pending", &request_id[..16.min(request_id.len())]);
+                        tracing::debug!(
+                            "Step2: reqId={} no longer in pending",
+                            &request_id[..16.min(request_id.len())]
+                        );
                     }
                 }
 
@@ -299,10 +303,10 @@ impl KeychatClient {
                                     peer_signal_hex.clone(),
                                     DeviceId::new(1).unwrap(),
                                 );
-                                if let Err(e) = state.signal_participant.relocate_session(
-                                    &from_addr,
-                                    &to_addr,
-                                ) {
+                                if let Err(e) = state
+                                    .signal_participant
+                                    .relocate_session(&from_addr, &to_addr)
+                                {
                                     tracing::error!(
                                         "failed to relocate session from {} to {}: {}",
                                         &signal_id_hex[..16.min(signal_id_hex.len())],
@@ -312,11 +316,7 @@ impl KeychatClient {
                                 }
                             }
 
-                            addresses.add_peer(
-                                &peer_signal_hex,
-                                None,
-                                Some(peer_nostr_id.clone()),
-                            );
+                            addresses.add_peer(&peer_signal_hex, None, Some(peer_nostr_id.clone()));
 
                             // Process decrypt result to register ratchet-derived addresses
                             // (mirroring V2 complete_friend_request behavior)
@@ -343,14 +343,13 @@ impl KeychatClient {
                             };
 
                             // Serialize keys BEFORE signal_participant is moved into ChatSession
-                            let serialized_keys = serialize_prekey_material(state.signal_participant.keys());
-                            let signal_device_id = u32::from(state.signal_participant.address().device_id());
+                            let serialized_keys =
+                                serialize_prekey_material(state.signal_participant.keys());
+                            let signal_device_id =
+                                u32::from(state.signal_participant.address().device_id());
 
-                            let session = ChatSession::new(
-                                state.signal_participant,
-                                addresses,
-                                identity,
-                            );
+                            let session =
+                                ChatSession::new(state.signal_participant, addresses, identity);
 
                             inner.sessions.insert(
                                 peer_signal_hex.clone(),
@@ -375,26 +374,58 @@ impl KeychatClient {
                                 if let Ok(store) = store_result {
                                     // Save peer mapping
                                     if let Err(e) = store.save_peer_mapping(
-                                        &peer_nostr_id, &peer_signal_hex, &peer_name,
+                                        &peer_nostr_id,
+                                        &peer_signal_hex,
+                                        &peer_name,
                                     ) {
                                         tracing::error!("persist peer_mapping failed: {e}");
                                     }
                                     // Save signal participant keys for session restore
-                                    if let Ok((id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec)) = &serialized_keys {
+                                    if let Ok((
+                                        id_pub,
+                                        id_priv,
+                                        reg_id,
+                                        spk_id,
+                                        spk_rec,
+                                        pk_id,
+                                        pk_rec,
+                                        kpk_id,
+                                        kpk_rec,
+                                    )) = &serialized_keys
+                                    {
                                         if let Err(e) = store.save_signal_participant(
-                                            &peer_signal_hex, signal_device_id,
-                                            id_pub, id_priv, *reg_id,
-                                            *spk_id, spk_rec, *pk_id, pk_rec, *kpk_id, kpk_rec,
+                                            &peer_signal_hex,
+                                            signal_device_id,
+                                            id_pub,
+                                            id_priv,
+                                            *reg_id,
+                                            *spk_id,
+                                            spk_rec,
+                                            *pk_id,
+                                            pk_rec,
+                                            *kpk_id,
+                                            kpk_rec,
                                         ) {
-                                            tracing::error!("persist signal_participant failed: {e}");
+                                            tracing::error!(
+                                                "persist signal_participant failed: {e}"
+                                            );
                                         }
                                     }
                                     // Save address state
-                                    if let Some(session_mutex) = inner.sessions.get(&peer_signal_hex) {
+                                    if let Some(session_mutex) =
+                                        inner.sessions.get(&peer_signal_hex)
+                                    {
                                         if let Ok(sess) = session_mutex.try_lock() {
-                                            if let Some(addr_state) = sess.addresses.to_serialized(&peer_signal_hex) {
-                                                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
-                                                    tracing::error!("persist peer_addresses failed: {e}");
+                                            if let Some(addr_state) =
+                                                sess.addresses.to_serialized(&peer_signal_hex)
+                                            {
+                                                if let Err(e) = store.save_peer_addresses(
+                                                    &peer_signal_hex,
+                                                    &addr_state,
+                                                ) {
+                                                    tracing::error!(
+                                                        "persist peer_addresses failed: {e}"
+                                                    );
                                                 }
                                             }
                                         }
@@ -447,10 +478,8 @@ impl KeychatClient {
                         inner.pending_outbound.remove(request_id);
                         drop(inner);
 
-                        self.emit_event(ClientEvent::FriendRequestRejected {
-                            peer_pubkey,
-                        })
-                        .await;
+                        self.emit_event(ClientEvent::FriendRequestRejected { peer_pubkey })
+                            .await;
 
                         return;
                     }
@@ -473,10 +502,8 @@ impl KeychatClient {
             tracing::debug!("Step3: trying {} existing sessions", session_entries.len());
 
             for (peer_signal_hex, session_mutex) in &session_entries {
-                let remote_address = ProtocolAddress::new(
-                    peer_signal_hex.clone(),
-                    DeviceId::new(1).unwrap(),
-                );
+                let remote_address =
+                    ProtocolAddress::new(peer_signal_hex.clone(), DeviceId::new(1).unwrap());
 
                 // Lock only this peer's session
                 let result = {
@@ -530,9 +557,12 @@ impl KeychatClient {
                                 let inner = self.inner.read().await;
                                 inner.storage.clone()
                             };
-                            let save_result = storage.lock()
-                                .map_err(|e| e.to_string())
-                                .and_then(|store| store.save_peer_addresses(peer_signal_hex, &addr_state).map_err(|e| e.to_string()));
+                            let save_result =
+                                storage.lock().map_err(|e| e.to_string()).and_then(|store| {
+                                    store
+                                        .save_peer_addresses(peer_signal_hex, &addr_state)
+                                        .map_err(|e| e.to_string())
+                                });
                             if let Err(e) = save_result {
                                 tracing::error!("persist address state failed: {e}");
                             }
@@ -572,10 +602,14 @@ impl KeychatClient {
                                         &sender_nostr_pubkey[..16.min(sender_nostr_pubkey.len())]
                                     );
 
-                                    // Store in GroupManager
+                                    // Store in GroupManager + persist
                                     {
                                         let mut inner = self.inner.write().await;
+                                        let gid = group.group_id.clone();
                                         inner.group_manager.add_group(group);
+                                        if let Ok(store) = inner.storage.clone().lock() {
+                                            let _ = inner.group_manager.save_group(&gid, &store);
+                                        }
                                     }
 
                                     self.emit_event(ClientEvent::GroupInviteReceived {
@@ -583,7 +617,8 @@ impl KeychatClient {
                                         group_type: "signal".into(),
                                         group_name,
                                         inviter_pubkey: sender_nostr_pubkey,
-                                    }).await;
+                                    })
+                                    .await;
                                 }
                                 Err(e) => {
                                     tracing::error!("failed to parse group invite: {e}");
@@ -606,11 +641,14 @@ impl KeychatClient {
                                 removed_member
                             );
 
-                            // Update GroupManager
+                            // Update GroupManager + persist
                             if let Some(ref member_id) = removed_member {
                                 let mut inner = self.inner.write().await;
                                 if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
                                     g.remove_member(member_id);
+                                }
+                                if let Ok(store) = inner.storage.clone().lock() {
+                                    let _ = inner.group_manager.save_group(&group_id, &store);
                                 }
                             }
 
@@ -619,7 +657,8 @@ impl KeychatClient {
                                 kind: "memberRemoved".into(),
                                 member_pubkey: removed_member,
                                 new_value: None,
-                            }).await;
+                            })
+                            .await;
                             return;
                         }
 
@@ -637,11 +676,14 @@ impl KeychatClient {
                                 left_member
                             );
 
-                            // Remove member from group
+                            // Remove member from group + persist
                             if let Some(ref member_id) = left_member {
                                 let mut inner = self.inner.write().await;
                                 if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
                                     g.remove_member(member_id);
+                                }
+                                if let Ok(store) = inner.storage.clone().lock() {
+                                    let _ = inner.group_manager.save_group(&group_id, &store);
                                 }
                             }
 
@@ -650,7 +692,8 @@ impl KeychatClient {
                                 kind: "selfLeave".into(),
                                 member_pubkey: left_member,
                                 new_value: None,
-                            }).await;
+                            })
+                            .await;
                             return;
                         }
 
@@ -662,15 +705,20 @@ impl KeychatClient {
                                 &group_id[..16.min(group_id.len())]
                             );
 
-                            // Remove group from manager
+                            // Remove group from manager + storage
                             {
                                 let mut inner = self.inner.write().await;
-                                inner.group_manager.remove_group(&group_id);
+                                if let Ok(store) = inner.storage.clone().lock() {
+                                    let _ = inner
+                                        .group_manager
+                                        .remove_group_persistent(&group_id, &store);
+                                } else {
+                                    inner.group_manager.remove_group(&group_id);
+                                }
                             }
 
-                            self.emit_event(ClientEvent::GroupDissolved {
-                                room_id: group_id,
-                            }).await;
+                            self.emit_event(ClientEvent::GroupDissolved { room_id: group_id })
+                                .await;
                             return;
                         }
 
@@ -688,11 +736,14 @@ impl KeychatClient {
                                 new_name
                             );
 
-                            // Update group name
+                            // Update group name + persist
                             if let Some(ref name) = new_name {
                                 let mut inner = self.inner.write().await;
                                 if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
                                     g.name = name.clone();
+                                }
+                                if let Ok(store) = inner.storage.clone().lock() {
+                                    let _ = inner.group_manager.save_group(&group_id, &store);
                                 }
                             }
 
@@ -701,7 +752,8 @@ impl KeychatClient {
                                 kind: "nameChanged".into(),
                                 member_pubkey: None,
                                 new_value: new_name,
-                            }).await;
+                            })
+                            .await;
                             return;
                         }
 

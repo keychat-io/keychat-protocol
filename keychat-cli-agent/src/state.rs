@@ -3,7 +3,7 @@
 use libkeychat::group::{GroupManager, SignalGroup};
 use libkeychat::mls::MlsParticipant;
 use libkeychat::storage::SecureStorage;
-use libkeychat::{AddressManager, Identity, SignalParticipant};
+use libkeychat::{reconstruct_prekey_material, AddressManager, Identity, SignalParticipant};
 use nostr::prelude::*;
 use nostr_sdk::{Client, ClientBuilder};
 use std::collections::HashMap;
@@ -13,10 +13,9 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 
-/// Wrapper to make SecureStorage Send+Sync via Mutex.
-/// rusqlite::Connection is safe to use from one thread at a time;
-/// the Mutex guarantees exclusive access.
-pub struct SendStorage(pub SecureStorage);
+/// Wrapper to make SecureStorage Send+Sync.
+/// rusqlite::Connection is Send but not Sync; Arc<Mutex<>> provides both.
+pub struct SendStorage(pub Arc<Mutex<SecureStorage>>);
 unsafe impl Send for SendStorage {}
 unsafe impl Sync for SendStorage {}
 
@@ -27,10 +26,14 @@ unsafe impl Sync for SendMls {}
 
 impl std::ops::Deref for SendMls {
     type Target = MlsParticipant;
-    fn deref(&self) -> &MlsParticipant { &self.0 }
+    fn deref(&self) -> &MlsParticipant {
+        &self.0
+    }
 }
 impl std::ops::DerefMut for SendMls {
-    fn deref_mut(&mut self) -> &mut MlsParticipant { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut MlsParticipant {
+        &mut self.0
+    }
 }
 
 /// A connected 1:1 peer.
@@ -64,7 +67,7 @@ pub struct AppState {
     pub identity: Identity,
     pub keys: Keys,
     pub client: Client,
-    pub storage: Mutex<SendStorage>,
+    pub storage: Arc<Mutex<SecureStorage>>,
     pub peers: Arc<RwLock<HashMap<String, Peer>>>,
     pub active_chat: Arc<RwLock<Option<ChatTarget>>>,
     pub relay_urls: Vec<String>,
@@ -110,7 +113,8 @@ impl AppState {
         db_key: &str,
     ) -> anyhow::Result<Self> {
         let keys = identity.keys().clone();
-        let opts = nostr_sdk::Options::new().connection_timeout(Some(std::time::Duration::from_secs(10)));
+        let opts =
+            nostr_sdk::Options::new().connection_timeout(Some(std::time::Duration::from_secs(10)));
         let client = ClientBuilder::new().signer(keys.clone()).opts(opts).build();
         for url in relay_urls {
             client.add_relay(url.as_str()).await?;
@@ -120,29 +124,105 @@ impl AppState {
         tokio::spawn(async move { connect_client.connect().await });
 
         let db_path = data_dir.join("keychat.db");
-        let storage = SecureStorage::open(db_path.to_str().unwrap(), db_key)?;
+        let storage = Arc::new(Mutex::new(SecureStorage::open(
+            db_path.to_str().unwrap(),
+            db_key,
+        )?));
 
-        // Load existing peers
+        // Load existing peers with persisted Signal key material + session state
         let mut peers = HashMap::new();
-        for pm in storage.list_peers()? {
-            let signal = SignalParticipant::new(&pm.signal_id, 1)?;
-            let addr_mgr = AddressManager::new();
-            peers.insert(pm.nostr_pubkey.clone(), Peer {
-                nostr_pubkey: pm.nostr_pubkey,
-                signal_id: pm.signal_id,
-                name: pm.name,
-                signal,
-                address_manager: addr_mgr,
-            });
+        {
+            let store = storage.lock().unwrap();
+            let peer_list = store.list_peers()?;
+            let all_addresses: HashMap<String, _> = store
+                .load_all_peer_addresses()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            drop(store);
+
+            for pm in peer_list {
+                // Load from DB then drop lock before persistent() which also locks
+                let loaded = {
+                    let store = storage.lock().unwrap();
+                    store.load_signal_participant(&pm.signal_id)
+                };
+                let signal = match loaded {
+                    Ok(Some((
+                        device_id,
+                        id_pub,
+                        id_priv,
+                        reg_id,
+                        spk_id,
+                        spk_rec,
+                        pk_id,
+                        pk_rec,
+                        kpk_id,
+                        kpk_rec,
+                    ))) => {
+                        match reconstruct_prekey_material(
+                            &id_pub, &id_priv, reg_id, spk_id, &spk_rec, pk_id, &pk_rec, kpk_id,
+                            &kpk_rec,
+                        ) {
+                            Ok(keys) => {
+                                match SignalParticipant::persistent(
+                                    pm.signal_id.clone(),
+                                    device_id,
+                                    keys,
+                                    storage.clone(),
+                                ) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "restore peer {}: create participant failed: {e}",
+                                            &pm.signal_id[..16.min(pm.signal_id.len())]
+                                        );
+                                        SignalParticipant::new(&pm.signal_id, 1)?
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "restore peer {}: reconstruct keys failed: {e}",
+                                    &pm.signal_id[..16.min(pm.signal_id.len())]
+                                );
+                                SignalParticipant::new(&pm.signal_id, 1)?
+                            }
+                        }
+                    }
+                    _ => SignalParticipant::new(&pm.signal_id, 1)?,
+                };
+
+                let addr_mgr = if let Some(addr_state) = all_addresses.get(&pm.signal_id) {
+                    AddressManager::from_serialized(&pm.signal_id, addr_state.clone())
+                } else {
+                    AddressManager::new()
+                };
+                peers.insert(
+                    pm.nostr_pubkey.clone(),
+                    Peer {
+                        nostr_pubkey: pm.nostr_pubkey,
+                        signal_id: pm.signal_id,
+                        name: pm.name,
+                        signal,
+                        address_manager: addr_mgr,
+                    },
+                );
+            }
         }
 
-        let mls = MlsParticipant::new(identity.pubkey_hex());
+        let mls_db_path = data_dir.join("mls.db");
+        let mls_provider = libkeychat::mls::MlsProvider::open(mls_db_path.to_str().unwrap())
+            .unwrap_or_else(|e| {
+                eprintln!("MLS storage open failed, falling back to in-memory: {e}");
+                libkeychat::mls::MlsProvider::new()
+            });
+        let mls = MlsParticipant::with_provider(identity.pubkey_hex(), mls_provider);
 
         let owner = config.owner.clone();
 
         // Initialize stamp manager (without wallet for now — wallet setup is optional)
         let stamp_manager = Arc::new(libkeychat::StampManager::without_wallet());
-        // Cache relay fees in background
         {
             let sm = stamp_manager.clone();
             let urls: Vec<String> = relay_urls.to_vec();
@@ -152,18 +232,25 @@ impl AppState {
             });
         }
 
+        // Load groups
+        let mut group_manager = GroupManager::new();
+        {
+            let store = storage.lock().unwrap();
+            let _ = group_manager.load_all(&store);
+        }
+
         Ok(Self {
             identity,
             keys,
             client,
-            storage: Mutex::new(SendStorage(storage)),
+            storage,
             peers: Arc::new(RwLock::new(peers)),
             active_chat: Arc::new(RwLock::new(None)),
             relay_urls: relay_urls.to_vec(),
             name: config.name.clone(),
             config,
             data_dir: data_dir.to_path_buf(),
-            signal_groups: Arc::new(RwLock::new(GroupManager::new())),
+            signal_groups: Arc::new(RwLock::new(group_manager)),
             mls: Arc::new(Mutex::new(Some(SendMls(mls)))),
             pending_outbound_frs: Arc::new(RwLock::new(HashMap::new())),
             pending_friend_requests: Arc::new(RwLock::new(Vec::new())),
@@ -176,12 +263,11 @@ impl AppState {
         self.identity.pubkey_hex()
     }
 
-    pub fn db(&self) -> impl std::ops::Deref<Target = SecureStorage> + '_ {
-        struct Guard<'a>(std::sync::MutexGuard<'a, SendStorage>);
-        impl<'a> std::ops::Deref for Guard<'a> {
-            type Target = SecureStorage;
-            fn deref(&self) -> &SecureStorage { &self.0.0 }
-        }
-        Guard(self.storage.lock().unwrap())
+    pub fn db(&self) -> std::sync::MutexGuard<'_, SecureStorage> {
+        self.storage.lock().unwrap()
+    }
+
+    pub fn storage_arc(&self) -> Arc<Mutex<SecureStorage>> {
+        self.storage.clone()
     }
 }

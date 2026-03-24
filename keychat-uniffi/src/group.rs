@@ -5,9 +5,8 @@
 //! is encrypted individually for every member.
 
 use libkeychat::{
-    create_signal_group, receive_group_invite,
-    send_group_dissolve, send_group_invite, send_group_member_removed,
-    send_group_message, send_group_name_changed, send_group_self_leave,
+    create_signal_group, receive_group_invite, send_group_dissolve, send_group_invite,
+    send_group_member_removed, send_group_message, send_group_name_changed, send_group_self_leave,
     GroupManager, KCMessage, SignalGroup,
 };
 use libkeychat::{DeviceId, ProtocolAddress};
@@ -30,9 +29,12 @@ impl KeychatClient {
     ) -> Result<SignalGroupInfo, KeychatUniError> {
         let inner = self.inner.read().await;
 
-        let identity = inner.identity.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "no identity set".into() }
-        )?;
+        let identity = inner
+            .identity
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "no identity set".into(),
+            })?;
         let my_nostr_pubkey = identity.pubkey_hex();
 
         // Use own Signal identity key as the admin's signal_id.
@@ -41,14 +43,18 @@ impl KeychatClient {
             let session = session_mutex.lock().await;
             session.signal.identity_public_key_hex()
         } else {
-            tracing::warn!("create_signal_group: no sessions available, using nostr pubkey as signal_id");
+            tracing::warn!(
+                "create_signal_group: no sessions available, using nostr pubkey as signal_id"
+            );
             my_nostr_pubkey.clone()
         };
 
         // Resolve each member's signal ID from peer_nostr_to_signal mapping
         let mut other_members = Vec::new();
         for member in &members {
-            let signal_id = inner.peer_nostr_to_signal.get(&member.nostr_pubkey)
+            let signal_id = inner
+                .peer_nostr_to_signal
+                .get(&member.nostr_pubkey)
                 .ok_or(KeychatUniError::PeerNotFound {
                     peer_id: member.nostr_pubkey.clone(),
                 })?
@@ -71,42 +77,58 @@ impl KeychatClient {
 
         tracing::info!(
             "created signal group: id={}, name={}, members={}",
-            &group_id[..16.min(group_id.len())], name, member_count
+            &group_id[..16.min(group_id.len())],
+            name,
+            member_count
         );
 
         // Send invite to each member via their 1:1 Signal session
-        let transport = inner.transport.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "not connected".into() }
-        )?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         let nostr_client = transport.client().clone();
 
         for member in &members {
-            let signal_id = inner.peer_nostr_to_signal.get(&member.nostr_pubkey).unwrap();
-            let session_mutex = inner.sessions.get(signal_id)
-                .ok_or(KeychatUniError::PeerNotFound { peer_id: signal_id.clone() })?
+            let signal_id = inner
+                .peer_nostr_to_signal
+                .get(&member.nostr_pubkey)
+                .unwrap();
+            let session_mutex = inner
+                .sessions
+                .get(signal_id)
+                .ok_or(KeychatUniError::PeerNotFound {
+                    peer_id: signal_id.clone(),
+                })?
                 .clone();
 
             let event = {
                 let mut session = session_mutex.lock().await;
                 let addr = session.addresses.clone();
-                send_group_invite(
-                    &mut session.signal,
-                    &group,
-                    signal_id,
-                    &addr,
-                ).await?
+                send_group_invite(&mut session.signal, &group, signal_id, &addr).await?
             };
 
-            nostr_client.send_event(event).await
+            nostr_client
+                .send_event(event)
+                .await
                 .map_err(|e| KeychatUniError::Transport { msg: e.to_string() })?;
 
-            tracing::info!("sent group invite to {}", &signal_id[..16.min(signal_id.len())]);
+            tracing::info!(
+                "sent group invite to {}",
+                &signal_id[..16.min(signal_id.len())]
+            );
         }
 
-        // Store group in manager
+        // Store group in manager + persist
         drop(inner);
         let mut inner = self.inner.write().await;
+        let gid = group.group_id.clone();
         inner.group_manager.add_group(group);
+        if let Ok(store) = inner.storage.clone().lock() {
+            let _ = inner.group_manager.save_group(&gid, &store);
+        }
 
         Ok(SignalGroupInfo {
             group_id,
@@ -124,13 +146,20 @@ impl KeychatClient {
     ) -> Result<GroupSentMessage, KeychatUniError> {
         let inner = self.inner.read().await;
 
-        let group = inner.group_manager.get_group(&group_id)
-            .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
+        let group = inner
+            .group_manager
+            .get_group(&group_id)
+            .ok_or(KeychatUniError::PeerNotFound {
+                peer_id: group_id.clone(),
+            })?
             .clone();
 
-        let transport = inner.transport.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "not connected".into() }
-        )?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         let nostr_client = transport.client().clone();
 
         let mut msg = KCMessage::text(&text);
@@ -140,12 +169,18 @@ impl KeychatClient {
 
         // Send to each member individually
         for member in group.other_members() {
-            let session_mutex = match inner.sessions.get(&member.signal_id)
-                    .or_else(|| inner.peer_nostr_to_signal.get(&member.nostr_pubkey)
-                        .and_then(|sid| inner.sessions.get(sid))) {
+            let session_mutex = match inner.sessions.get(&member.signal_id).or_else(|| {
+                inner
+                    .peer_nostr_to_signal
+                    .get(&member.nostr_pubkey)
+                    .and_then(|sid| inner.sessions.get(sid))
+            }) {
                 Some(s) => s.clone(),
                 None => {
-                    tracing::warn!("no session for group member {}", &member.signal_id[..16.min(member.signal_id.len())]);
+                    tracing::warn!(
+                        "no session for group member {}",
+                        &member.signal_id[..16.min(member.signal_id.len())]
+                    );
                     continue;
                 }
             };
@@ -153,17 +188,14 @@ impl KeychatClient {
             let events = {
                 let mut session = session_mutex.lock().await;
                 let addr = session.addresses.clone();
-                send_group_message(
-                    &mut session.signal,
-                    &group,
-                    &msg,
-                    &addr,
-                ).await?
+                send_group_message(&mut session.signal, &group, &msg, &addr).await?
             };
 
             for (_member_id, event) in events {
                 let eid = event.id.to_hex();
-                nostr_client.send_event(event).await
+                nostr_client
+                    .send_event(event)
+                    .await
                     .map_err(|e| KeychatUniError::Transport { msg: e.to_string() })?;
                 event_ids.push(eid);
             }
@@ -182,34 +214,37 @@ impl KeychatClient {
     }
 
     /// Leave a Signal group. Notifies all members.
-    pub async fn leave_signal_group(
-        &self,
-        group_id: String,
-    ) -> Result<(), KeychatUniError> {
+    pub async fn leave_signal_group(&self, group_id: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
 
-        let group = inner.group_manager.get_group(&group_id)
-            .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
+        let group = inner
+            .group_manager
+            .get_group(&group_id)
+            .ok_or(KeychatUniError::PeerNotFound {
+                peer_id: group_id.clone(),
+            })?
             .clone();
 
-        let transport = inner.transport.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "not connected".into() }
-        )?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         let nostr_client = transport.client().clone();
 
         // Send leave notification to all members
         for member in group.other_members() {
-            if let Some(session_mutex) = inner.sessions.get(&member.signal_id)
-                    .or_else(|| inner.peer_nostr_to_signal.get(&member.nostr_pubkey)
-                        .and_then(|sid| inner.sessions.get(sid))) {
+            if let Some(session_mutex) = inner.sessions.get(&member.signal_id).or_else(|| {
+                inner
+                    .peer_nostr_to_signal
+                    .get(&member.nostr_pubkey)
+                    .and_then(|sid| inner.sessions.get(sid))
+            }) {
                 let events = {
                     let mut session = session_mutex.lock().await;
                     let addr = session.addresses.clone();
-                    send_group_self_leave(
-                        &mut session.signal,
-                        &group,
-                        &addr,
-                    ).await?
+                    send_group_self_leave(&mut session.signal, &group, &addr).await?
                 };
 
                 for (_mid, event) in events {
@@ -220,43 +255,52 @@ impl KeychatClient {
             }
         }
 
-        // Remove group from manager
+        // Remove group from manager + storage
         drop(inner);
         let mut inner = self.inner.write().await;
-        inner.group_manager.remove_group(&group_id);
+        if let Ok(store) = inner.storage.clone().lock() {
+            let _ = inner
+                .group_manager
+                .remove_group_persistent(&group_id, &store);
+        } else {
+            inner.group_manager.remove_group(&group_id);
+        }
 
         tracing::info!("left signal group {}", &group_id[..16.min(group_id.len())]);
         Ok(())
     }
 
     /// Dissolve a Signal group (admin only). Notifies all members.
-    pub async fn dissolve_signal_group(
-        &self,
-        group_id: String,
-    ) -> Result<(), KeychatUniError> {
+    pub async fn dissolve_signal_group(&self, group_id: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
 
-        let group = inner.group_manager.get_group(&group_id)
-            .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
+        let group = inner
+            .group_manager
+            .get_group(&group_id)
+            .ok_or(KeychatUniError::PeerNotFound {
+                peer_id: group_id.clone(),
+            })?
             .clone();
 
-        let transport = inner.transport.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "not connected".into() }
-        )?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         let nostr_client = transport.client().clone();
 
         for member in group.other_members() {
-            if let Some(session_mutex) = inner.sessions.get(&member.signal_id)
-                    .or_else(|| inner.peer_nostr_to_signal.get(&member.nostr_pubkey)
-                        .and_then(|sid| inner.sessions.get(sid))) {
+            if let Some(session_mutex) = inner.sessions.get(&member.signal_id).or_else(|| {
+                inner
+                    .peer_nostr_to_signal
+                    .get(&member.nostr_pubkey)
+                    .and_then(|sid| inner.sessions.get(sid))
+            }) {
                 let events = {
                     let mut session = session_mutex.lock().await;
                     let addr = session.addresses.clone();
-                    send_group_dissolve(
-                        &mut session.signal,
-                        &group,
-                        &addr,
-                    ).await?
+                    send_group_dissolve(&mut session.signal, &group, &addr).await?
                 };
 
                 for (_mid, event) in events {
@@ -269,9 +313,18 @@ impl KeychatClient {
 
         drop(inner);
         let mut inner = self.inner.write().await;
-        inner.group_manager.remove_group(&group_id);
+        if let Ok(store) = inner.storage.clone().lock() {
+            let _ = inner
+                .group_manager
+                .remove_group_persistent(&group_id, &store);
+        } else {
+            inner.group_manager.remove_group(&group_id);
+        }
 
-        tracing::info!("dissolved signal group {}", &group_id[..16.min(group_id.len())]);
+        tracing::info!(
+            "dissolved signal group {}",
+            &group_id[..16.min(group_id.len())]
+        );
         Ok(())
     }
 
@@ -283,24 +336,38 @@ impl KeychatClient {
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
 
-        let group = inner.group_manager.get_group(&group_id)
-            .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
+        let group = inner
+            .group_manager
+            .get_group(&group_id)
+            .ok_or(KeychatUniError::PeerNotFound {
+                peer_id: group_id.clone(),
+            })?
             .clone();
 
-        let removed_signal_id = inner.peer_nostr_to_signal.get(&member_nostr_pubkey)
-            .ok_or(KeychatUniError::PeerNotFound { peer_id: member_nostr_pubkey.clone() })?
+        let removed_signal_id = inner
+            .peer_nostr_to_signal
+            .get(&member_nostr_pubkey)
+            .ok_or(KeychatUniError::PeerNotFound {
+                peer_id: member_nostr_pubkey.clone(),
+            })?
             .clone();
 
-        let transport = inner.transport.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "not connected".into() }
-        )?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         let nostr_client = transport.client().clone();
 
         // Send removal notification to all members
         for member in group.other_members() {
-            if let Some(session_mutex) = inner.sessions.get(&member.signal_id)
-                    .or_else(|| inner.peer_nostr_to_signal.get(&member.nostr_pubkey)
-                        .and_then(|sid| inner.sessions.get(sid))) {
+            if let Some(session_mutex) = inner.sessions.get(&member.signal_id).or_else(|| {
+                inner
+                    .peer_nostr_to_signal
+                    .get(&member.nostr_pubkey)
+                    .and_then(|sid| inner.sessions.get(sid))
+            }) {
                 let events = {
                     let mut session = session_mutex.lock().await;
                     let addr = session.addresses.clone();
@@ -309,7 +376,8 @@ impl KeychatClient {
                         &group,
                         &removed_signal_id,
                         &addr,
-                    ).await?
+                    )
+                    .await?
                 };
 
                 for (_mid, event) in events {
@@ -320,14 +388,21 @@ impl KeychatClient {
             }
         }
 
-        // Update group state
+        // Update group state + persist
         drop(inner);
         let mut inner = self.inner.write().await;
         if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
             g.remove_member(&removed_signal_id);
         }
+        if let Ok(store) = inner.storage.clone().lock() {
+            let _ = inner.group_manager.save_group(&group_id, &store);
+        }
 
-        tracing::info!("removed member {} from group {}", &member_nostr_pubkey[..16.min(member_nostr_pubkey.len())], &group_id[..16.min(group_id.len())]);
+        tracing::info!(
+            "removed member {} from group {}",
+            &member_nostr_pubkey[..16.min(member_nostr_pubkey.len())],
+            &group_id[..16.min(group_id.len())]
+        );
         Ok(())
     }
 
@@ -339,28 +414,33 @@ impl KeychatClient {
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
 
-        let group = inner.group_manager.get_group(&group_id)
-            .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
+        let group = inner
+            .group_manager
+            .get_group(&group_id)
+            .ok_or(KeychatUniError::PeerNotFound {
+                peer_id: group_id.clone(),
+            })?
             .clone();
 
-        let transport = inner.transport.as_ref().ok_or(
-            KeychatUniError::NotInitialized { msg: "not connected".into() }
-        )?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         let nostr_client = transport.client().clone();
 
         for member in group.other_members() {
-            if let Some(session_mutex) = inner.sessions.get(&member.signal_id)
-                    .or_else(|| inner.peer_nostr_to_signal.get(&member.nostr_pubkey)
-                        .and_then(|sid| inner.sessions.get(sid))) {
+            if let Some(session_mutex) = inner.sessions.get(&member.signal_id).or_else(|| {
+                inner
+                    .peer_nostr_to_signal
+                    .get(&member.nostr_pubkey)
+                    .and_then(|sid| inner.sessions.get(sid))
+            }) {
                 let events = {
                     let mut session = session_mutex.lock().await;
                     let addr = session.addresses.clone();
-                    send_group_name_changed(
-                        &mut session.signal,
-                        &group,
-                        &new_name,
-                        &addr,
-                    ).await?
+                    send_group_name_changed(&mut session.signal, &group, &new_name, &addr).await?
                 };
 
                 for (_mid, event) in events {
@@ -377,7 +457,11 @@ impl KeychatClient {
             g.name = new_name.clone();
         }
 
-        tracing::info!("renamed group {} to {}", &group_id[..16.min(group_id.len())], new_name);
+        tracing::info!(
+            "renamed group {} to {}",
+            &group_id[..16.min(group_id.len())],
+            new_name
+        );
         Ok(())
     }
 }

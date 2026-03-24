@@ -24,6 +24,14 @@ fn to_signal_err(e: crate::error::KeychatError) -> SignalProtocolError {
     SignalProtocolError::InvalidArgument(e.to_string())
 }
 
+fn lock_storage(
+    storage: &Arc<Mutex<SecureStorage>>,
+) -> Result<std::sync::MutexGuard<'_, SecureStorage>> {
+    storage.lock().map_err(|e| {
+        SignalProtocolError::InvalidArgument(format!("storage lock poisoned: {e}"))
+    })
+}
+
 // ─── PersistentSessionStore ──────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -39,17 +47,29 @@ impl PersistentSessionStore {
 
 #[async_trait(?Send)]
 impl libsignal_protocol::SessionStore for PersistentSessionStore {
-    async fn load_session(
-        &self,
-        address: &ProtocolAddress,
-    ) -> Result<Option<SessionRecord>> {
-        let db = self.storage.lock().unwrap();
+    async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>> {
+        let db = lock_storage(&self.storage)?;
         let bytes = db
             .load_session(address.name(), u32::from(address.device_id()))
             .map_err(to_signal_err)?;
         match bytes {
-            None => Ok(None),
-            Some(b) => Ok(Some(SessionRecord::deserialize(&b)?)),
+            None => {
+                tracing::debug!(
+                    "PersistentSessionStore::load_session({}.{}) → None",
+                    &address.name()[..16.min(address.name().len())],
+                    u32::from(address.device_id()),
+                );
+                Ok(None)
+            }
+            Some(ref b) => {
+                tracing::debug!(
+                    "PersistentSessionStore::load_session({}.{}) → {} bytes",
+                    &address.name()[..16.min(address.name().len())],
+                    u32::from(address.device_id()),
+                    b.len(),
+                );
+                Ok(Some(SessionRecord::deserialize(b)?))
+            }
         }
     }
 
@@ -59,7 +79,13 @@ impl libsignal_protocol::SessionStore for PersistentSessionStore {
         record: &SessionRecord,
     ) -> Result<()> {
         let bytes = record.serialize()?;
-        let db = self.storage.lock().unwrap();
+        tracing::debug!(
+            "PersistentSessionStore::store_session({}.{}) → {} bytes",
+            &address.name()[..16.min(address.name().len())],
+            u32::from(address.device_id()),
+            bytes.len(),
+        );
+        let db = lock_storage(&self.storage)?;
         db.save_session(address.name(), u32::from(address.device_id()), &bytes)
             .map_err(to_signal_err)?;
         Ok(())
@@ -81,11 +107,8 @@ impl PersistentPreKeyStore {
 
 #[async_trait(?Send)]
 impl libsignal_protocol::PreKeyStore for PersistentPreKeyStore {
-    async fn get_pre_key(
-        &self,
-        prekey_id: PreKeyId,
-    ) -> Result<PreKeyRecord> {
-        let db = self.storage.lock().unwrap();
+    async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord> {
+        let db = lock_storage(&self.storage)?;
         let bytes = db
             .load_pre_key(u32::from(prekey_id))
             .map_err(to_signal_err)?
@@ -93,23 +116,16 @@ impl libsignal_protocol::PreKeyStore for PersistentPreKeyStore {
         PreKeyRecord::deserialize(&bytes)
     }
 
-    async fn save_pre_key(
-        &mut self,
-        prekey_id: PreKeyId,
-        record: &PreKeyRecord,
-    ) -> Result<()> {
+    async fn save_pre_key(&mut self, prekey_id: PreKeyId, record: &PreKeyRecord) -> Result<()> {
         let bytes = record.serialize()?;
-        let db = self.storage.lock().unwrap();
+        let db = lock_storage(&self.storage)?;
         db.save_pre_key(u32::from(prekey_id), &bytes)
             .map_err(to_signal_err)?;
         Ok(())
     }
 
-    async fn remove_pre_key(
-        &mut self,
-        prekey_id: PreKeyId,
-    ) -> Result<()> {
-        let db = self.storage.lock().unwrap();
+    async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<()> {
+        let db = lock_storage(&self.storage)?;
         db.remove_pre_key(u32::from(prekey_id))
             .map_err(to_signal_err)?;
         Ok(())
@@ -135,7 +151,7 @@ impl libsignal_protocol::SignedPreKeyStore for PersistentSignedPreKeyStore {
         &self,
         signed_prekey_id: SignedPreKeyId,
     ) -> Result<SignedPreKeyRecord> {
-        let db = self.storage.lock().unwrap();
+        let db = lock_storage(&self.storage)?;
         let bytes = db
             .load_signed_pre_key(u32::from(signed_prekey_id))
             .map_err(to_signal_err)?
@@ -149,7 +165,7 @@ impl libsignal_protocol::SignedPreKeyStore for PersistentSignedPreKeyStore {
         record: &SignedPreKeyRecord,
     ) -> Result<()> {
         let bytes = record.serialize()?;
-        let db = self.storage.lock().unwrap();
+        let db = lock_storage(&self.storage)?;
         db.save_signed_pre_key(u32::from(signed_prekey_id), &bytes)
             .map_err(to_signal_err)?;
         Ok(())
@@ -171,11 +187,8 @@ impl PersistentKyberPreKeyStore {
 
 #[async_trait(?Send)]
 impl libsignal_protocol::KyberPreKeyStore for PersistentKyberPreKeyStore {
-    async fn get_kyber_pre_key(
-        &self,
-        kyber_prekey_id: KyberPreKeyId,
-    ) -> Result<KyberPreKeyRecord> {
-        let db = self.storage.lock().unwrap();
+    async fn get_kyber_pre_key(&self, kyber_prekey_id: KyberPreKeyId) -> Result<KyberPreKeyRecord> {
+        let db = lock_storage(&self.storage)?;
         let bytes = db
             .load_kyber_pre_key(u32::from(kyber_prekey_id))
             .map_err(to_signal_err)?
@@ -189,7 +202,7 @@ impl libsignal_protocol::KyberPreKeyStore for PersistentKyberPreKeyStore {
         record: &KyberPreKeyRecord,
     ) -> Result<()> {
         let bytes = record.serialize()?;
-        let db = self.storage.lock().unwrap();
+        let db = lock_storage(&self.storage)?;
         db.save_kyber_pre_key(u32::from(kyber_prekey_id), &bytes)
             .map_err(to_signal_err)?;
         Ok(())
@@ -202,7 +215,7 @@ impl libsignal_protocol::KyberPreKeyStore for PersistentKyberPreKeyStore {
         _base_key: &PublicKey,
     ) -> Result<()> {
         // One-time keys: remove after use.
-        let db = self.storage.lock().unwrap();
+        let db = lock_storage(&self.storage)?;
         db.remove_kyber_pre_key(u32::from(kyber_prekey_id))
             .map_err(to_signal_err)?;
         Ok(())
@@ -249,7 +262,7 @@ impl libsignal_protocol::IdentityKeyStore for PersistentIdentityKeyStore {
     ) -> Result<libsignal_protocol::IdentityChange> {
         use libsignal_protocol::IdentityChange;
 
-        let db = self.storage.lock().unwrap();
+        let db = lock_storage(&self.storage)?;
         let existing = db
             .load_peer_identity(address.name())
             .map_err(to_signal_err)?;
@@ -277,7 +290,7 @@ impl libsignal_protocol::IdentityKeyStore for PersistentIdentityKeyStore {
         identity: &IdentityKey,
         _direction: libsignal_protocol::Direction,
     ) -> Result<bool> {
-        let db = self.storage.lock().unwrap();
+        let db = lock_storage(&self.storage)?;
         let existing = db
             .load_peer_identity(address.name())
             .map_err(to_signal_err)?;
@@ -290,11 +303,8 @@ impl libsignal_protocol::IdentityKeyStore for PersistentIdentityKeyStore {
         }
     }
 
-    async fn get_identity(
-        &self,
-        address: &ProtocolAddress,
-    ) -> Result<Option<IdentityKey>> {
-        let db = self.storage.lock().unwrap();
+    async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {
+        let db = lock_storage(&self.storage)?;
         let bytes = db
             .load_peer_identity(address.name())
             .map_err(to_signal_err)?;
@@ -316,10 +326,7 @@ pub enum SessionStoreBackend {
 
 #[async_trait(?Send)]
 impl libsignal_protocol::SessionStore for SessionStoreBackend {
-    async fn load_session(
-        &self,
-        address: &ProtocolAddress,
-    ) -> Result<Option<SessionRecord>> {
+    async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>> {
         match self {
             Self::InMemory(s) => s.load_session(address).await,
             Self::Persistent(s) => s.load_session(address).await,
@@ -347,31 +354,21 @@ pub enum PreKeyStoreBackend {
 
 #[async_trait(?Send)]
 impl libsignal_protocol::PreKeyStore for PreKeyStoreBackend {
-    async fn get_pre_key(
-        &self,
-        prekey_id: PreKeyId,
-    ) -> Result<PreKeyRecord> {
+    async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord> {
         match self {
             Self::InMemory(s) => s.get_pre_key(prekey_id).await,
             Self::Persistent(s) => s.get_pre_key(prekey_id).await,
         }
     }
 
-    async fn save_pre_key(
-        &mut self,
-        prekey_id: PreKeyId,
-        record: &PreKeyRecord,
-    ) -> Result<()> {
+    async fn save_pre_key(&mut self, prekey_id: PreKeyId, record: &PreKeyRecord) -> Result<()> {
         match self {
             Self::InMemory(s) => s.save_pre_key(prekey_id, record).await,
             Self::Persistent(s) => s.save_pre_key(prekey_id, record).await,
         }
     }
 
-    async fn remove_pre_key(
-        &mut self,
-        prekey_id: PreKeyId,
-    ) -> Result<()> {
+    async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<()> {
         match self {
             Self::InMemory(s) => s.remove_pre_key(prekey_id).await,
             Self::Persistent(s) => s.remove_pre_key(prekey_id).await,
@@ -419,10 +416,7 @@ pub enum KyberPreKeyStoreBackend {
 
 #[async_trait(?Send)]
 impl libsignal_protocol::KyberPreKeyStore for KyberPreKeyStoreBackend {
-    async fn get_kyber_pre_key(
-        &self,
-        kyber_prekey_id: KyberPreKeyId,
-    ) -> Result<KyberPreKeyRecord> {
+    async fn get_kyber_pre_key(&self, kyber_prekey_id: KyberPreKeyId) -> Result<KyberPreKeyRecord> {
         match self {
             Self::InMemory(s) => s.get_kyber_pre_key(kyber_prekey_id).await,
             Self::Persistent(s) => s.get_kyber_pre_key(kyber_prekey_id).await,
@@ -505,10 +499,7 @@ impl libsignal_protocol::IdentityKeyStore for IdentityStoreBackend {
         }
     }
 
-    async fn get_identity(
-        &self,
-        address: &ProtocolAddress,
-    ) -> Result<Option<IdentityKey>> {
+    async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {
         match self {
             Self::InMemory(s) => s.get_identity(address).await,
             Self::Persistent(s) => s.get_identity(address).await,

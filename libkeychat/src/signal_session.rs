@@ -168,23 +168,33 @@ pub fn reconstruct_prekey_material(
 #[allow(clippy::type_complexity)]
 pub fn serialize_prekey_material(
     keys: &SignalPreKeyMaterial,
-) -> Result<(Vec<u8>, Vec<u8>, u32, u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>)> {
+) -> Result<(
+    Vec<u8>,
+    Vec<u8>,
+    u32,
+    u32,
+    Vec<u8>,
+    u32,
+    Vec<u8>,
+    u32,
+    Vec<u8>,
+)> {
     Ok((
         keys.identity_key_pair.identity_key().serialize().to_vec(),
         keys.identity_key_pair.private_key().serialize().to_vec(),
         keys.registration_id,
         u32::from(keys.signed_prekey_id),
-        keys.signed_prekey.serialize().map_err(|e| {
-            KeychatError::Signal(format!("failed to serialize signed prekey: {e}"))
-        })?,
+        keys.signed_prekey
+            .serialize()
+            .map_err(|e| KeychatError::Signal(format!("failed to serialize signed prekey: {e}")))?,
         u32::from(keys.prekey_id),
-        keys.prekey.serialize().map_err(|e| {
-            KeychatError::Signal(format!("failed to serialize prekey: {e}"))
-        })?,
+        keys.prekey
+            .serialize()
+            .map_err(|e| KeychatError::Signal(format!("failed to serialize prekey: {e}")))?,
         u32::from(keys.kyber_prekey_id),
-        keys.kyber_prekey.serialize().map_err(|e| {
-            KeychatError::Signal(format!("failed to serialize kyber prekey: {e}"))
-        })?,
+        keys.kyber_prekey
+            .serialize()
+            .map_err(|e| KeychatError::Signal(format!("failed to serialize kyber prekey: {e}")))?,
     ))
 }
 
@@ -325,11 +335,7 @@ impl SignalParticipant {
         Ok(())
     }
 
-    pub fn encrypt_bytes(
-        &mut self,
-        remote: &ProtocolAddress,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>> {
+    pub fn encrypt_bytes(&mut self, remote: &ProtocolAddress, plaintext: &[u8]) -> Result<Vec<u8>> {
         Ok(self.encrypt(remote, plaintext)?.bytes)
     }
 
@@ -474,11 +480,7 @@ impl SignalParticipant {
     /// Used after decrypting a FriendApprove PreKeySignalMessage:
     /// the decrypt used the local identity key as remote_address (wrong),
     /// but the session needs to be under the peer's identity key (correct).
-    pub fn relocate_session(
-        &mut self,
-        from: &ProtocolAddress,
-        to: &ProtocolAddress,
-    ) -> Result<()> {
+    pub fn relocate_session(&mut self, from: &ProtocolAddress, to: &ProtocolAddress) -> Result<()> {
         self.store
             .session_store
             .relocate_session(from, to)
@@ -516,7 +518,9 @@ impl SignalParticipant {
     }
 
     pub fn kyber_prekey_public_hex(&self) -> Result<String> {
-        Ok(hex::encode(self.keys.kyber_prekey.public_key()?.serialize()))
+        Ok(hex::encode(
+            self.keys.kyber_prekey.public_key()?.serialize(),
+        ))
     }
 
     pub fn kyber_prekey_signature_hex(&self) -> Result<String> {
@@ -660,16 +664,13 @@ mod tests {
 
         let bob_bundle = bob.prekey_bundle().unwrap();
         let bob_addr = ProtocolAddress::new(bob.identity_public_key_hex(), make_device_id(1));
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
 
         let plaintext = b"Hello, Bob!";
         let ciphertext = alice.encrypt_bytes(&bob_addr, plaintext).unwrap();
         assert!(SignalParticipant::is_prekey_message(&ciphertext));
 
-        let alice_addr =
-            ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
+        let alice_addr = ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
         let decrypted = bob.decrypt_bytes(&alice_addr, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -681,12 +682,9 @@ mod tests {
 
         let bob_bundle = bob.prekey_bundle().unwrap();
         let bob_addr = ProtocolAddress::new(bob.identity_public_key_hex(), make_device_id(1));
-        let alice_addr =
-            ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
+        let alice_addr = ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
 
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
 
         let ct1 = alice.encrypt_bytes(&bob_addr, b"Hello Bob!").unwrap();
         assert!(SignalParticipant::is_prekey_message(&ct1));
@@ -711,13 +709,10 @@ mod tests {
 
         let bob_bundle = bob.prekey_bundle().unwrap();
         let bob_addr = ProtocolAddress::new(bob.identity_public_key_hex(), make_device_id(1));
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
 
         let ciphertext = alice.encrypt_bytes(&bob_addr, b"Secret message").unwrap();
-        let alice_addr =
-            ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
+        let alice_addr = ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
         let result = charlie.decrypt_bytes(&alice_addr, &ciphertext);
         assert!(result.is_err());
     }
@@ -729,12 +724,9 @@ mod tests {
 
         let bob_bundle = bob.prekey_bundle().unwrap();
         let bob_addr = ProtocolAddress::new(bob.identity_public_key_hex(), make_device_id(1));
-        let alice_addr =
-            ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
+        let alice_addr = ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
 
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
 
         let ct1 = alice.encrypt_bytes(&bob_addr, b"first").unwrap();
         assert!(SignalParticipant::is_prekey_message(&ct1));
@@ -751,9 +743,7 @@ mod tests {
 
         let bob_bundle = bob.prekey_bundle().unwrap();
         let bob_addr = ProtocolAddress::new(bob.identity_public_key_hex(), make_device_id(1));
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
 
         let ct = alice.encrypt_bytes(&bob_addr, b"hello").unwrap();
         let sender_id = SignalParticipant::extract_prekey_sender_identity(&ct);
@@ -768,12 +758,9 @@ mod tests {
 
         let bob_bundle = bob.prekey_bundle().unwrap();
         let bob_addr = ProtocolAddress::new(bob.identity_public_key_hex(), make_device_id(1));
-        let alice_addr =
-            ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
+        let alice_addr = ProtocolAddress::new(alice.identity_public_key_hex(), make_device_id(1));
 
-        alice
-            .process_prekey_bundle(&bob_addr, &bob_bundle)
-            .unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
 
         let ct = alice.encrypt_bytes(&bob_addr, b"Hello Bob!").unwrap();
         assert!(SignalParticipant::is_prekey_message(&ct));

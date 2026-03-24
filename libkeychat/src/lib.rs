@@ -67,9 +67,9 @@
 //! - **Ecash Stamps**: Relay delivery format with ecash token attachment
 
 pub mod address;
-pub mod ffi;
 pub mod chat;
 pub mod error;
+pub mod ffi;
 pub mod friend_request;
 pub mod giftwrap;
 pub mod group;
@@ -82,23 +82,23 @@ pub mod mls;
 pub mod mls_extension;
 #[cfg(feature = "mls")]
 pub mod mls_provider;
-pub mod persistent_signal_store;
 pub mod nip44;
 pub mod payment;
-pub mod stamp;
+pub mod persistent_signal_store;
 pub mod session;
 pub mod signal_keys;
 pub mod signal_session;
 pub mod signal_store;
+pub mod stamp;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod transport;
 
 pub use address::{AddressManager, AddressUpdate, DerivedAddress, PeerAddressState};
 pub use chat::{
-    create_signal_prekey_auth, handle_received_message, parse_and_route,
-    receive_encrypted_message, receive_encrypted_message_flexible, send_encrypted_message,
-    verify_signal_prekey_auth, MessageAction, MessageMetadata,
+    create_signal_prekey_auth, handle_received_message, parse_and_route, receive_encrypted_message,
+    receive_encrypted_message_flexible, send_encrypted_message, verify_signal_prekey_auth,
+    MessageAction, MessageMetadata,
 };
 pub use error::{KeychatError, Result};
 pub use friend_request::{
@@ -107,34 +107,21 @@ pub use friend_request::{
     send_signal_message, FriendRequestAccepted, FriendRequestReceived, FriendRequestState,
 };
 pub use giftwrap::{create_gift_wrap, unwrap_gift_wrap, UnwrappedMessage};
-pub use identity::{EphemeralKeypair, Identity, IdentityWithMnemonic, normalize_pubkey};
-pub use message::{
-    FileCategory, ForwardFrom, KCCashuPayload, KCFilePayload, KCFilesPayload,
-    KCFriendApprovePayload, KCFriendRejectPayload, KCFriendRequestPayload, KCLightningPayload,
-    KCMessage, KCMessageKind, KCTextPayload, ReplyTo, SignalPrekeyAuth,
-};
-pub use media::{
-    build_file_message, build_multi_file_message, build_voice_message, decrypt_file,
-    encrypt_file, encrypt_file_with_key, EncryptedFile,
-};
-pub use payment::{
-    attach_ecash_stamp, build_cashu_message, build_lightning_message, validate_cashu_token,
-};
-pub use stamp::{fetch_relay_info, RelayFeeRule, RelayFees, RelayInfo};
-#[cfg(feature = "cashu")]
-pub use stamp::{CashuWallet, StampManager};
 pub use group::{
     create_signal_group, receive_group_invite, receive_group_message, send_group_dissolve,
     send_group_invite, send_group_member_removed, send_group_message, send_group_name_changed,
     send_group_self_leave, GroupManager, GroupMember, GroupMessageMetadata, RoomMember,
     RoomProfile, SignalGroup,
 };
-pub use session::ChatSession;
-pub use signal_keys::{
-    build_friend_request_payload, compute_global_sign, generate_kyber_prekey,
-    generate_one_time_prekey, generate_signal_identity, generate_signed_prekey,
-    verify_global_sign, FriendRequestSecrets, KyberPrekey, OneTimePrekey, SignalIdentity,
-    SignedPrekey,
+pub use identity::{normalize_pubkey, EphemeralKeypair, Identity, IdentityWithMnemonic};
+pub use media::{
+    build_file_message, build_multi_file_message, build_voice_message, decrypt_file, encrypt_file,
+    encrypt_file_with_key, EncryptedFile,
+};
+pub use message::{
+    FileCategory, ForwardFrom, KCCashuPayload, KCFilePayload, KCFilesPayload,
+    KCFriendApprovePayload, KCFriendRejectPayload, KCFriendRequestPayload, KCLightningPayload,
+    KCMessage, KCMessageKind, KCTextPayload, ReplyTo, SignalPrekeyAuth,
 };
 #[cfg(feature = "mls")]
 pub use mls::{
@@ -142,23 +129,35 @@ pub use mls::{
     receive_mls_message, send_mls_message, MlsGroupInvitePayload, MlsMessageMetadata,
     MlsParticipant, MlsProvider, KIND_MLS_KEY_PACKAGE, MLS_CIPHERSUITE,
 };
+pub use payment::{
+    attach_ecash_stamp, build_cashu_message, build_lightning_message, validate_cashu_token,
+};
+pub use session::ChatSession;
+pub use signal_keys::{
+    build_friend_request_payload, compute_global_sign, generate_kyber_prekey,
+    generate_one_time_prekey, generate_signal_identity, generate_signed_prekey, verify_global_sign,
+    FriendRequestSecrets, KyberPrekey, OneTimePrekey, SignalIdentity, SignedPrekey,
+};
 pub use signal_session::{
     derive_nostr_address_from_ratchet, generate_prekey_material, reconstruct_prekey_material,
     serialize_prekey_material, SignalCiphertext, SignalDecryptResult, SignalParticipant,
     SignalPreKeyMaterial,
 };
 pub use signal_store::{CapturingSessionStore, SignalProtocolStoreBundle};
+pub use stamp::{fetch_relay_info, RelayFeeRule, RelayFees, RelayInfo};
+#[cfg(feature = "cashu")]
+pub use stamp::{CashuWallet, StampManager};
 // Re-export libsignal types that clients need
 pub use libsignal_protocol::{
-    DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair, KyberPreKeyId,
-    KyberPreKeyRecord, PreKeyId, PreKeyRecord, PreKeySignalMessage, PrivateKey as SignalPrivateKey,
-    ProtocolAddress, SignedPreKeyId, SignedPreKeyRecord,
+    DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair, KyberPreKeyId, KyberPreKeyRecord,
+    PreKeyId, PreKeyRecord, PreKeySignalMessage, PrivateKey as SignalPrivateKey, ProtocolAddress,
+    SignedPreKeyId, SignedPreKeyRecord,
 };
 pub use storage::{
     DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,
 };
-pub use transport::{Transport, DEFAULT_RELAYS};
+pub use transport::{PublishResult, RelayHealth, Transport, DEFAULT_RELAYS};
 
 // Re-export key nostr types for convenience
 pub use nostr::{Event, EventId, Keys, Kind, PublicKey, SecretKey, Timestamp};
-pub use nostr_sdk::RelayPoolNotification;
+pub use nostr_sdk::{RelayPoolNotification, RelayStatus};

@@ -159,6 +159,16 @@ impl SecureStorage {
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
+            CREATE TABLE IF NOT EXISTS mls_group_ids (
+                group_id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS relays (
+                url TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
             COMMIT;",
         )
         .map_err(|e| KeychatError::Storage(format!("Failed to create schema: {e}")))?;
@@ -176,7 +186,7 @@ impl SecureStorage {
                 message_json TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );"
+            );",
         );
 
         Ok(Self { conn })
@@ -204,7 +214,10 @@ impl SecureStorage {
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![address, device_id], |row: &rusqlite::Row| row.get(0))
+            .query_row(
+                rusqlite::params![address, device_id],
+                |row: &rusqlite::Row| row.get(0),
+            )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load session: {e}")))?;
 
@@ -226,8 +239,8 @@ impl SecureStorage {
 
         let mut results = Vec::new();
         for row in rows {
-            let pair: (String, u32) = row
-                .map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?;
+            let pair: (String, u32) =
+                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?;
             results.push(pair);
         }
         Ok(results)
@@ -275,10 +288,7 @@ impl SecureStorage {
     /// Remove a pre-key (consumed after use).
     pub fn remove_pre_key(&self, id: u32) -> Result<()> {
         self.conn
-            .execute(
-                "DELETE FROM pre_keys WHERE id = ?1",
-                rusqlite::params![id],
-            )
+            .execute("DELETE FROM pre_keys WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| KeychatError::Storage(format!("Failed to remove pre-key: {e}")))?;
         Ok(())
     }
@@ -433,16 +443,12 @@ impl SecureStorage {
                  VALUES (?1, ?2, strftime('%s','now'))",
                 rusqlite::params![peer_signal_id, json],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to save peer addresses: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to save peer addresses: {e}")))?;
         Ok(())
     }
 
     /// Load all peer address states.
-    pub fn load_all_peer_addresses(
-        &self,
-    ) -> Result<Vec<(String, PeerAddressStateSerialized)>> {
+    pub fn load_all_peer_addresses(&self) -> Result<Vec<(String, PeerAddressStateSerialized)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT peer_signal_id, state_json FROM peer_addresses")
@@ -452,14 +458,12 @@ impl SecureStorage {
             .query_map([], |row: &rusqlite::Row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to load peer addresses: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to load peer addresses: {e}")))?;
 
         let mut results = Vec::new();
         for row in rows {
-            let (id, json) = row
-                .map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?;
+            let (id, json) =
+                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?;
             let state: PeerAddressStateSerialized = serde_json::from_str(&json)
                 .map_err(|e| KeychatError::Storage(format!("Failed to deserialize state: {e}")))?;
             results.push((id, state));
@@ -514,12 +518,7 @@ impl SecureStorage {
     // ─── Peer Mapping ─────────────────────────────────────
 
     /// Save peer mapping (nostr pubkey → signal identity).
-    pub fn save_peer_mapping(
-        &self,
-        nostr_pubkey: &str,
-        signal_id: &str,
-        name: &str,
-    ) -> Result<()> {
+    pub fn save_peer_mapping(&self, nostr_pubkey: &str, signal_id: &str, name: &str) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO peer_mappings (nostr_pubkey, signal_id, name, created_at) \
@@ -598,9 +597,7 @@ impl SecureStorage {
                 "DELETE FROM peer_addresses WHERE peer_signal_id = ?1",
                 rusqlite::params![peer_signal_id],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to delete peer addresses: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete peer addresses: {e}")))?;
         Ok(())
     }
 
@@ -624,9 +621,8 @@ impl SecureStorage {
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(
-                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
-            );
+            results
+                .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
         }
         Ok(results)
     }
@@ -747,9 +743,8 @@ impl SecureStorage {
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(
-                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
-            );
+            results
+                .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
         }
         Ok(results)
     }
@@ -869,9 +864,7 @@ impl SecureStorage {
                 ))
             })
             .optional()
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to load pending FR: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to load pending FR: {e}")))?;
 
         Ok(result)
     }
@@ -883,26 +876,40 @@ impl SecureStorage {
                 "DELETE FROM pending_friend_requests WHERE request_id = ?1",
                 rusqlite::params![request_id],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to delete pending FR: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete pending FR: {e}")))?;
         Ok(())
     }
 
     /// Promote a pending friend request to an active signal participant.
     /// Loads the pending FR key material, saves it as a participant, then deletes the pending FR.
-    pub fn promote_pending_fr(
-        &self,
-        request_id: &str,
-        peer_signal_id: &str,
-    ) -> Result<()> {
-        if let Some((device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, _first_inbox, _peer_nostr)) =
-            self.load_pending_fr(request_id)?
+    pub fn promote_pending_fr(&self, request_id: &str, peer_signal_id: &str) -> Result<()> {
+        if let Some((
+            device_id,
+            id_pub,
+            id_priv,
+            reg_id,
+            spk_id,
+            spk_rec,
+            pk_id,
+            pk_rec,
+            kpk_id,
+            kpk_rec,
+            _first_inbox,
+            _peer_nostr,
+        )) = self.load_pending_fr(request_id)?
         {
             self.save_signal_participant(
-                peer_signal_id, device_id,
-                &id_pub, &id_priv, reg_id,
-                spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
+                peer_signal_id,
+                device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+                pk_id,
+                &pk_rec,
+                kpk_id,
+                &kpk_rec,
             )?;
             self.delete_pending_fr(request_id)?;
         }
@@ -918,15 +925,12 @@ impl SecureStorage {
 
         let rows = stmt
             .query_map([], |row: &rusqlite::Row| row.get(0))
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to list pending FRs: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to list pending FRs: {e}")))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(
-                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
-            );
+            results
+                .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
         }
         Ok(results)
     }
@@ -953,7 +957,9 @@ impl SecureStorage {
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![group_id], |row: &rusqlite::Row| row.get(0))
+            .query_row(rusqlite::params![group_id], |row: &rusqlite::Row| {
+                row.get(0)
+            })
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load group: {e}")))?;
 
@@ -975,9 +981,8 @@ impl SecureStorage {
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(
-                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
-            );
+            results
+                .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
         }
         Ok(results)
     }
@@ -991,6 +996,85 @@ impl SecureStorage {
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete group: {e}")))?;
         Ok(())
+    }
+
+    // ─── MLS Group IDs ─────────────────────────────────────
+
+    /// Track an MLS group ID for re-subscription after restart.
+    pub fn save_mls_group_id(&self, group_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO mls_group_ids (group_id) VALUES (?1)",
+                rusqlite::params![group_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to save MLS group ID: {e}")))?;
+        Ok(())
+    }
+
+    /// List all tracked MLS group IDs.
+    pub fn list_mls_group_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_id FROM mls_group_ids")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .map_err(|e| KeychatError::Storage(format!("Failed to list MLS groups: {e}")))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results
+                .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
+        }
+        Ok(results)
+    }
+
+    /// Remove an MLS group ID.
+    pub fn delete_mls_group_id(&self, group_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM mls_group_ids WHERE group_id = ?1",
+                rusqlite::params![group_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete MLS group ID: {e}")))?;
+        Ok(())
+    }
+
+    // ─── Relays ───────────────────────────────────────────────
+
+    /// Save a relay URL.
+    pub fn save_relay(&self, url: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO relays (url) VALUES (?1)",
+                rusqlite::params![url],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to save relay: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete a relay URL.
+    pub fn delete_relay(&self, url: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM relays WHERE url = ?1", rusqlite::params![url])
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete relay: {e}")))?;
+        Ok(())
+    }
+
+    /// List all saved relay URLs.
+    pub fn list_relays(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT url FROM relays ORDER BY created_at")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .map_err(|e| KeychatError::Storage(format!("Failed to list relays: {e}")))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results
+                .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
+        }
+        Ok(results)
     }
 
     // ─── Inbound Friend Requests ─────────────────────────────
@@ -1010,18 +1094,13 @@ impl SecureStorage {
                  VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
                 rusqlite::params![request_id, sender_pubkey_hex, message_json, payload_json],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to save inbound FR: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to save inbound FR: {e}")))?;
         Ok(())
     }
 
     /// Load a received (inbound) friend request.
     /// Returns (sender_pubkey_hex, message_json, payload_json).
-    pub fn load_inbound_fr(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<(String, String, String)>> {
+    pub fn load_inbound_fr(&self, request_id: &str) -> Result<Option<(String, String, String)>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1039,9 +1118,7 @@ impl SecureStorage {
                 ))
             })
             .optional()
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to load inbound FR: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to load inbound FR: {e}")))?;
 
         Ok(result)
     }
@@ -1055,15 +1132,12 @@ impl SecureStorage {
 
         let rows = stmt
             .query_map([], |row: &rusqlite::Row| row.get(0))
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to list inbound FRs: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to list inbound FRs: {e}")))?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(
-                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
-            );
+            results
+                .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
         }
         Ok(results)
     }
@@ -1075,9 +1149,7 @@ impl SecureStorage {
                 "DELETE FROM inbound_friend_requests WHERE request_id = ?1",
                 rusqlite::params![request_id],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to delete inbound FR: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete inbound FR: {e}")))?;
         Ok(())
     }
 
@@ -1154,12 +1226,8 @@ mod tests {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
 
         // Save
-        store
-            .save_session("alice", 1, b"session-record-1")
-            .unwrap();
-        store
-            .save_session("alice", 2, b"session-record-2")
-            .unwrap();
+        store.save_session("alice", 1, b"session-record-1").unwrap();
+        store.save_session("alice", 2, b"session-record-2").unwrap();
         store.save_session("bob", 1, b"session-record-3").unwrap();
 
         // Load
@@ -1226,9 +1294,7 @@ mod tests {
         // Own key pair
         let pub_key = b"own-public-key-32bytes-xxxxxxxxx";
         let priv_key = b"own-private-key-32bytes-xxxxxxxx";
-        store
-            .save_identity_key("self", pub_key, priv_key)
-            .unwrap();
+        store.save_identity_key("self", pub_key, priv_key).unwrap();
         let loaded = store.load_identity_key("self").unwrap();
         assert_eq!(loaded, Some((pub_key.to_vec(), priv_key.to_vec())));
 
@@ -1264,7 +1330,9 @@ mod tests {
             peer_nostr_pubkey: Some("npub1abc".into()),
         };
 
-        store.save_peer_addresses("signal-id-alice", &state).unwrap();
+        store
+            .save_peer_addresses("signal-id-alice", &state)
+            .unwrap();
 
         let all = store.load_all_peer_addresses().unwrap();
         assert_eq!(all.len(), 1);
@@ -1294,10 +1362,13 @@ mod tests {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
 
         // Insert an event with an old timestamp
-        store.conn.execute(
-            "INSERT INTO processed_events (event_id, processed_at) VALUES ('old-evt', 1000)",
-            [],
-        ).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO processed_events (event_id, processed_at) VALUES ('old-evt', 1000)",
+                [],
+            )
+            .unwrap();
         store.mark_event_processed("new-evt").unwrap();
 
         // Prune events older than 1 day (the old one is from epoch + 1000s)
@@ -1335,7 +1406,10 @@ mod tests {
 
         // Non-existent
         assert!(store.load_peer_by_nostr("npub1unknown").unwrap().is_none());
-        assert!(store.load_peer_by_signal("signal-unknown").unwrap().is_none());
+        assert!(store
+            .load_peer_by_signal("signal-unknown")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1398,9 +1472,7 @@ mod tests {
 
         // 10000 events
         for i in 0..10000 {
-            store
-                .mark_event_processed(&format!("event-{i}"))
-                .unwrap();
+            store.mark_event_processed(&format!("event-{i}")).unwrap();
         }
 
         // Verify random lookups
@@ -1471,5 +1543,174 @@ mod tests {
 
         let loaded = store.load_session("alice", 1).unwrap();
         assert_eq!(loaded, Some(b"version-2".to_vec()));
+    }
+
+    #[test]
+    fn test_group_persistence_roundtrip() {
+        use crate::group::{GroupManager, GroupMember, SignalGroup};
+        use std::collections::{HashMap, HashSet};
+
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Build a group
+        let mut members = HashMap::new();
+        members.insert(
+            "signal-alice".to_string(),
+            GroupMember {
+                signal_id: "signal-alice".into(),
+                nostr_pubkey: "npub-alice".into(),
+                name: "Alice".into(),
+                is_admin: true,
+            },
+        );
+        members.insert(
+            "signal-bob".to_string(),
+            GroupMember {
+                signal_id: "signal-bob".into(),
+                nostr_pubkey: "npub-bob".into(),
+                name: "Bob".into(),
+                is_admin: false,
+            },
+        );
+        let mut admins = HashSet::new();
+        admins.insert("signal-alice".to_string());
+
+        let group = SignalGroup {
+            group_id: "group-123".into(),
+            name: "Test Group".into(),
+            members,
+            my_signal_id: "signal-alice".into(),
+            admins,
+        };
+
+        // Save via GroupManager
+        let mut mgr = GroupManager::new();
+        mgr.add_group(group);
+        mgr.save_group("group-123", &store).unwrap();
+
+        // Load into a new GroupManager
+        let mut mgr2 = GroupManager::new();
+        mgr2.load_all(&store).unwrap();
+
+        assert_eq!(mgr2.group_count(), 1);
+        let loaded = mgr2.get_group("group-123").unwrap();
+        assert_eq!(loaded.name, "Test Group");
+        assert_eq!(loaded.members.len(), 2);
+        assert!(loaded.is_admin("signal-alice"));
+        assert!(!loaded.is_admin("signal-bob"));
+        assert_eq!(loaded.my_signal_id, "signal-alice");
+
+        // Delete
+        mgr2.remove_group_persistent("group-123", &store).unwrap();
+        assert_eq!(mgr2.group_count(), 0);
+        let all = store.load_all_groups().unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn test_signal_participant_save_restore_roundtrip() {
+        use crate::signal_session::{generate_prekey_material, SignalParticipant};
+
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // 1. Generate keys and create a participant
+        let keys = generate_prekey_material().unwrap();
+        let original_identity = hex::encode(keys.identity_key_pair.identity_key().serialize());
+        let original_reg_id = keys.registration_id;
+
+        let participant =
+            SignalParticipant::from_prekey_material("test-peer".to_string(), 1, keys).unwrap();
+
+        // 2. Serialize and save to DB
+        let serialized = crate::signal_session::serialize_prekey_material(participant.keys());
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+            serialized.unwrap();
+
+        store
+            .save_signal_participant(
+                "test-peer",
+                1,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+                pk_id,
+                &pk_rec,
+                kpk_id,
+                &kpk_rec,
+            )
+            .unwrap();
+
+        // 3. Load from DB and reconstruct
+        let (d_id, l_pub, l_priv, l_reg, l_spk_id, l_spk, l_pk_id, l_pk, l_kpk_id, l_kpk) =
+            store.load_signal_participant("test-peer").unwrap().unwrap();
+
+        assert_eq!(d_id, 1);
+        assert_eq!(l_reg, original_reg_id);
+
+        let restored_keys = crate::signal_session::reconstruct_prekey_material(
+            &l_pub, &l_priv, l_reg, l_spk_id, &l_spk, l_pk_id, &l_pk, l_kpk_id, &l_kpk,
+        )
+        .unwrap();
+
+        let restored =
+            SignalParticipant::from_prekey_material("test-peer".to_string(), d_id, restored_keys)
+                .unwrap();
+
+        // 4. Verify identity is the same
+        assert_eq!(
+            restored.identity_public_key_hex(),
+            original_identity,
+            "restored participant must have the same identity key"
+        );
+        assert_eq!(
+            restored.registration_id(),
+            original_reg_id,
+            "restored participant must have the same registration ID"
+        );
+
+        // 5. Verify the restored participant can produce a valid prekey bundle
+        let bundle = restored.prekey_bundle();
+        assert!(
+            bundle.is_ok(),
+            "restored participant must produce a valid prekey bundle"
+        );
+    }
+
+    #[test]
+    fn test_relay_crud() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Empty initially
+        let relays = store.list_relays().unwrap();
+        assert!(relays.is_empty());
+
+        // Save
+        store.save_relay("wss://relay.example.com").unwrap();
+        store.save_relay("wss://relay2.example.com").unwrap();
+
+        let relays = store.list_relays().unwrap();
+        assert_eq!(relays.len(), 2);
+        assert!(relays.contains(&"wss://relay.example.com".to_string()));
+        assert!(relays.contains(&"wss://relay2.example.com".to_string()));
+
+        // Duplicate insert is ignored (INSERT OR IGNORE)
+        store.save_relay("wss://relay.example.com").unwrap();
+        assert_eq!(store.list_relays().unwrap().len(), 2);
+
+        // Delete
+        store.delete_relay("wss://relay.example.com").unwrap();
+        let relays = store.list_relays().unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0], "wss://relay2.example.com");
+
+        // Delete non-existent — no error
+        store.delete_relay("wss://nonexistent.com").unwrap();
+        assert_eq!(store.list_relays().unwrap().len(), 1);
+
+        // Delete last
+        store.delete_relay("wss://relay2.example.com").unwrap();
+        assert!(store.list_relays().unwrap().is_empty());
     }
 }
