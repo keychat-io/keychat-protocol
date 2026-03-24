@@ -1160,6 +1160,61 @@ impl SecureStorage {
             .map_err(|e| KeychatError::Storage(format!("WAL checkpoint failed: {e}")))?;
         Ok(())
     }
+
+    // ─── Bulk Deletion ───────────────────────────────────
+
+    /// Delete all data for the current identity (all tables except relays).
+    pub fn delete_all_data(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "DELETE FROM signal_sessions;
+                 DELETE FROM pre_keys;
+                 DELETE FROM signed_pre_keys;
+                 DELETE FROM kyber_pre_keys;
+                 DELETE FROM identity_keys;
+                 DELETE FROM peer_addresses;
+                 DELETE FROM processed_events;
+                 DELETE FROM peer_mappings;
+                 DELETE FROM signal_participants;
+                 DELETE FROM pending_friend_requests;
+                 DELETE FROM inbound_friend_requests;
+                 DELETE FROM signal_groups;
+                 DELETE FROM mls_group_ids;",
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete all data: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete all data for a single peer (1:1 room).
+    pub fn delete_peer_data(&self, signal_id: &str, nostr_pubkey: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM signal_sessions WHERE address = ?1",
+                rusqlite::params![signal_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete sessions: {e}")))?;
+        self.conn
+            .execute(
+                "DELETE FROM signal_participants WHERE peer_signal_id = ?1",
+                rusqlite::params![signal_id],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to delete signal participant: {e}"))
+            })?;
+        self.conn
+            .execute(
+                "DELETE FROM peer_mappings WHERE nostr_pubkey = ?1",
+                rusqlite::params![nostr_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete peer mapping: {e}")))?;
+        self.conn
+            .execute(
+                "DELETE FROM peer_addresses WHERE peer_signal_id = ?1",
+                rusqlite::params![signal_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to delete peer addresses: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Trait extension for rusqlite optional results.
@@ -1712,5 +1767,144 @@ mod tests {
         // Delete last
         store.delete_relay("wss://relay2.example.com").unwrap();
         assert!(store.list_relays().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_all_data() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Populate various tables
+        store.save_session("addr1", 1, b"record").unwrap();
+        store.save_pre_key(1, b"pk").unwrap();
+        store.save_signed_pre_key(1, b"spk").unwrap();
+        store.save_kyber_pre_key(1, b"kpk").unwrap();
+        store.save_identity_key("self", b"pub", b"priv").unwrap();
+        store.save_peer_identity("peer1", b"pub").unwrap();
+        store
+            .save_peer_mapping("npub1", "signal1", "Alice")
+            .unwrap();
+        store.mark_event_processed("evt1").unwrap();
+        store.save_relay("wss://relay.test.com").unwrap();
+
+        // Verify data exists
+        assert!(store.load_session("addr1", 1).unwrap().is_some());
+        assert_eq!(store.list_peers().unwrap().len(), 1);
+        assert!(store.is_event_processed("evt1").unwrap());
+        assert_eq!(store.list_relays().unwrap().len(), 1);
+
+        // Delete all
+        store.delete_all_data().unwrap();
+
+        // Everything gone except relays
+        assert!(store.load_session("addr1", 1).unwrap().is_none());
+        assert!(store.list_peers().unwrap().is_empty());
+        assert!(!store.is_event_processed("evt1").unwrap());
+        assert_eq!(
+            store.list_relays().unwrap().len(),
+            1,
+            "relays should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_delete_peer_data() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Create two peers
+        store
+            .save_peer_mapping("npub-alice", "signal-alice", "Alice")
+            .unwrap();
+        store
+            .save_peer_mapping("npub-bob", "signal-bob", "Bob")
+            .unwrap();
+        store
+            .save_session("signal-alice", 1, b"session-alice")
+            .unwrap();
+        store.save_session("signal-bob", 1, b"session-bob").unwrap();
+
+        assert_eq!(store.list_peers().unwrap().len(), 2);
+
+        // Delete Alice only
+        store
+            .delete_peer_data("signal-alice", "npub-alice")
+            .unwrap();
+
+        // Alice gone, Bob remains
+        assert_eq!(store.list_peers().unwrap().len(), 1);
+        assert!(store.load_session("signal-alice", 1).unwrap().is_none());
+        assert!(store.load_session("signal-bob", 1).unwrap().is_some());
+        assert_eq!(store.list_peers().unwrap()[0].name, "Bob");
+    }
+
+    #[test]
+    fn test_mls_group_ids_crud() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Empty
+        assert!(store.list_mls_group_ids().unwrap().is_empty());
+
+        // Save
+        store.save_mls_group_id("mls-group-1").unwrap();
+        store.save_mls_group_id("mls-group-2").unwrap();
+        assert_eq!(store.list_mls_group_ids().unwrap().len(), 2);
+
+        // Duplicate ignored
+        store.save_mls_group_id("mls-group-1").unwrap();
+        assert_eq!(store.list_mls_group_ids().unwrap().len(), 2);
+
+        // Delete one
+        store.delete_mls_group_id("mls-group-1").unwrap();
+        let ids = store.list_mls_group_ids().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "mls-group-2");
+
+        // Delete non-existent
+        store.delete_mls_group_id("no-such-group").unwrap();
+        assert_eq!(store.list_mls_group_ids().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_inbound_fr_crud() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Empty
+        assert!(store.list_inbound_frs().unwrap().is_empty());
+
+        // Save
+        store
+            .save_inbound_fr(
+                "fr-1",
+                "sender-pub-1",
+                r#"{"msg":"hi"}"#,
+                r#"{"payload":1}"#,
+            )
+            .unwrap();
+        store
+            .save_inbound_fr(
+                "fr-2",
+                "sender-pub-2",
+                r#"{"msg":"yo"}"#,
+                r#"{"payload":2}"#,
+            )
+            .unwrap();
+        assert_eq!(store.list_inbound_frs().unwrap().len(), 2);
+
+        // Load
+        let (sender, msg_json, payload_json) = store.load_inbound_fr("fr-1").unwrap().unwrap();
+        assert_eq!(sender, "sender-pub-1");
+        assert!(msg_json.contains("hi"));
+        assert!(payload_json.contains("1"));
+
+        // Non-existent
+        assert!(store.load_inbound_fr("fr-999").unwrap().is_none());
+
+        // Delete
+        store.delete_inbound_fr("fr-1").unwrap();
+        assert_eq!(store.list_inbound_frs().unwrap().len(), 1);
+        assert!(store.load_inbound_fr("fr-1").unwrap().is_none());
+
+        // Delete non-existent
+        store.delete_inbound_fr("fr-999").unwrap();
+        assert_eq!(store.list_inbound_frs().unwrap().len(), 1);
     }
 }

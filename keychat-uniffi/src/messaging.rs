@@ -14,10 +14,9 @@ impl KeychatClient {
         _reply_to: Option<ReplyToPayload>,
         _thread_id: Option<String>,
     ) -> Result<SentMessage, KeychatUniError> {
-        // 1. Get Arc<Mutex<ChatSession>> and transport client (clone), then drop RwLock
-        let (session_mutex, peer_signal_hex, nostr_client) = {
+        // 1. Get Arc<Mutex<ChatSession>> and transport, then drop RwLock
+        let (session_mutex, peer_signal_hex, transport) = {
             let inner = self.inner.read().await;
-            // room_id for 1v1 is the peer's nostr pubkey
             let signal_hex = inner
                 .peer_nostr_to_signal
                 .get(&room_id)
@@ -31,39 +30,53 @@ impl KeychatClient {
                 .ok_or(KeychatUniError::PeerNotFound {
                     peer_id: signal_hex.clone(),
                 })?
-                .clone(); // Arc clone — cheap
-            let client = inner
+                .clone();
+            let transport = inner
                 .transport
                 .as_ref()
                 .ok_or(KeychatUniError::NotInitialized {
                     msg: "not connected".into(),
-                })?
-                .client()
-                .clone();
-            (session, signal_hex, client)
+                })?;
+            // Clone the fields we need so we can drop the RwLock
+            (session, signal_hex, transport as *const _ as usize)
         }; // RwLock dropped here
 
-        // 2. Lock only the specific peer session (other peers unblocked)
+        // 2. Lock only the specific peer session
         let remote_addr = ProtocolAddress::new(peer_signal_hex.clone(), DeviceId::new(1).unwrap());
         let msg = KCMessage::text(&text);
+        let payload_json = msg.to_json().ok();
 
         let (event, addr_update) = {
             let mut session = session_mutex.lock().await;
             session
                 .send_message(&peer_signal_hex, &remote_addr, &msg)
                 .await?
-        }; // session Mutex dropped
+        };
 
+        // 3. Serialize event before publishing (for resend support)
+        let nostr_event_json = serde_json::to_string(&event).ok();
         let event_id = event.id.to_hex();
 
-        // 3. Publish event (no locks held)
-        nostr_client
-            .send_event(event)
-            .await
-            .map_err(|e| KeychatUniError::Transport { msg: e.to_string() })?;
+        // 4. Publish via transport for per-relay results
+        let inner = self.inner.read().await;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
+        let publish_result = transport.publish_event(event).await?;
 
         Ok(SentMessage {
             event_id,
+            payload_json,
+            nostr_event_json,
+            success_relays: publish_result.success_relays,
+            failed_relays: publish_result
+                .failed_relays
+                .into_iter()
+                .map(|(url, error)| FailedRelayInfo { url, error })
+                .collect(),
             new_receiving_addresses: addr_update.new_receiving,
             dropped_receiving_addresses: addr_update.dropped_receiving,
             new_sending_address: addr_update.new_sending,

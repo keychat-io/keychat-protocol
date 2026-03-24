@@ -757,6 +757,122 @@ impl KeychatClient {
         Ok(())
     }
 
+    /// Remove the current identity and all associated data.
+    ///
+    /// Stops the event loop, disconnects transport, clears all in-memory state,
+    /// and deletes all persisted data from SQLCipher (except relay config).
+    pub async fn remove_identity(&self) -> Result<(), KeychatUniError> {
+        tracing::info!("remove_identity: clearing all data");
+
+        // 1. Stop event loop
+        {
+            let inner = self.inner.read().await;
+            if let Some(ref stop_tx) = inner.event_loop_stop {
+                let _ = stop_tx.send(true);
+            }
+        }
+
+        // 2. Disconnect transport
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(t) = inner.transport.take() {
+                let _ = t.disconnect().await;
+            }
+        }
+
+        // 3. Clear all in-memory state + DB
+        let storage = self.inner.read().await.storage.clone();
+        {
+            let mut inner = self.inner.write().await;
+            inner.sessions.clear();
+            inner.peer_nostr_to_signal.clear();
+            inner.pending_outbound.clear();
+            inner.group_manager = libkeychat::GroupManager::new();
+            inner.identity = None;
+            inner.next_signal_device_id = 1;
+            inner.event_loop_stop = None;
+        }
+        if let Ok(store) = storage.lock() {
+            store
+                .delete_all_data()
+                .map_err(|e| KeychatUniError::Storage {
+                    msg: format!("delete_all_data: {e}"),
+                })?;
+        }
+
+        tracing::info!("remove_identity: done");
+        Ok(())
+    }
+
+    /// Remove a room (1:1 peer or group) and all associated data.
+    ///
+    /// For 1:1: clears session, signal participant, peer mapping, addresses.
+    /// For groups: removes from GroupManager + storage.
+    pub async fn remove_room(&self, room_id: String) -> Result<(), KeychatUniError> {
+        let storage = self.inner.read().await.storage.clone();
+
+        // Try as 1:1 peer first (room_id = nostr pubkey)
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&room_id) {
+                inner.sessions.remove(&signal_id);
+
+                // Remove any pending outbound FR for this peer
+                let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
+                for key in pending_keys {
+                    if let Some(state) = inner.pending_outbound.get(&key) {
+                        if state.peer_nostr_pubkey == room_id {
+                            inner.pending_outbound.remove(&key);
+                            break;
+                        }
+                    }
+                }
+                drop(inner);
+
+                // Delete from DB (no write lock held)
+                if let Ok(store) = storage.lock() {
+                    let _ = store.delete_peer_data(&signal_id, &room_id);
+                }
+
+                tracing::info!(
+                    "remove_room: removed 1:1 peer {}",
+                    &room_id[..16.min(room_id.len())]
+                );
+                return Ok(());
+            }
+        }
+
+        // Try as Signal group
+        {
+            let mut inner = self.inner.write().await;
+            if inner.group_manager.get_group(&room_id).is_some() {
+                if let Ok(store) = storage.lock() {
+                    let _ = inner
+                        .group_manager
+                        .remove_group_persistent(&room_id, &store);
+                } else {
+                    inner.group_manager.remove_group(&room_id);
+                }
+                tracing::info!(
+                    "remove_room: removed group {}",
+                    &room_id[..16.min(room_id.len())]
+                );
+                return Ok(());
+            }
+        }
+
+        // Try as MLS group
+        if let Ok(store) = storage.lock() {
+            let _ = store.delete_mls_group_id(&room_id);
+        }
+
+        tracing::warn!(
+            "remove_room: room {} not found",
+            &room_id[..16.min(room_id.len())]
+        );
+        Ok(())
+    }
+
     /// Register an event listener for receiving async events from the event loop.
     pub async fn set_event_listener(&self, listener: Box<dyn EventListener>) {
         let mut inner = self.inner.write().await;

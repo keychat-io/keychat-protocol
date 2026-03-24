@@ -31,6 +31,10 @@ pub struct ReceivedFriendRequest {
 #[derive(uniffi::Record)]
 pub struct SentMessage {
     pub event_id: String,
+    pub payload_json: Option<String>,
+    pub nostr_event_json: Option<String>,
+    pub success_relays: Vec<String>,
+    pub failed_relays: Vec<FailedRelayInfo>,
     pub new_receiving_addresses: Vec<String>,
     pub dropped_receiving_addresses: Vec<String>,
     pub new_sending_address: Option<String>,
@@ -187,6 +191,8 @@ pub enum ClientEvent {
         reply_to_event_id: Option<String>,
         group_id: Option<String>,
         thread_id: Option<String>,
+        nostr_event_json: Option<String>,
+        relay_url: Option<String>,
     },
     GroupInviteReceived {
         room_id: String,

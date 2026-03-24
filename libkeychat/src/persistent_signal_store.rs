@@ -27,9 +27,9 @@ fn to_signal_err(e: crate::error::KeychatError) -> SignalProtocolError {
 fn lock_storage(
     storage: &Arc<Mutex<SecureStorage>>,
 ) -> Result<std::sync::MutexGuard<'_, SecureStorage>> {
-    storage.lock().map_err(|e| {
-        SignalProtocolError::InvalidArgument(format!("storage lock poisoned: {e}"))
-    })
+    storage
+        .lock()
+        .map_err(|e| SignalProtocolError::InvalidArgument(format!("storage lock poisoned: {e}")))
 }
 
 // ─── PersistentSessionStore ──────────────────────────────────────────────────

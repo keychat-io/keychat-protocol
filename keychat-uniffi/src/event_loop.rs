@@ -44,7 +44,11 @@ impl KeychatClient {
                 }
                 result = notifications.recv() => {
                     match result {
-                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                        Ok(RelayPoolNotification::Event {
+                            relay_url,
+                            event,
+                            ..
+                        }) => {
                             // Deduplicate via Transport
                             let deduped = {
                                 let inner = self.inner.read().await;
@@ -56,7 +60,15 @@ impl KeychatClient {
 
                             if let Some(event) = deduped {
                                 if event.kind == Kind::GiftWrap {
-                                    self.handle_incoming_event(&event).await;
+                                    let relay = relay_url.to_string();
+                                    let event_json =
+                                        serde_json::to_string(&event).ok();
+                                    self.handle_incoming_event(
+                                        &event,
+                                        Some(relay),
+                                        event_json,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -87,7 +99,12 @@ impl KeychatClient {
     /// 1. Friend request (NIP-17 unwrap)
     /// 2. Friend approve response (pending outbound states)
     /// 3. Existing session message
-    async fn handle_incoming_event(&self, event: &Event) {
+    async fn handle_incoming_event(
+        &self,
+        event: &Event,
+        relay_url: Option<String>,
+        nostr_event_json: Option<String>,
+    ) {
         let event_hex = event.id.to_hex();
         tracing::info!(
             "⬇️ RECV GiftWrap event_id={}",
@@ -791,6 +808,8 @@ impl KeychatClient {
                                 reply_to_event_id,
                                 group_id,
                                 thread_id,
+                                nostr_event_json: nostr_event_json.clone(),
+                                relay_url: relay_url.clone(),
                             })
                             .await;
 
