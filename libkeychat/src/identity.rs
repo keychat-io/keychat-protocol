@@ -176,6 +176,19 @@ impl EphemeralKeypair {
     pub fn pubkey_hex(&self) -> String {
         self.keys.public_key().to_hex()
     }
+
+    /// Get the secret key as hex string (for persistence).
+    pub fn secret_hex(&self) -> String {
+        self.keys.secret_key().to_secret_hex()
+    }
+
+    /// Reconstruct from a secret key hex string.
+    pub fn from_secret_hex(secret_hex: &str) -> crate::Result<Self> {
+        let secret_key = SecretKey::from_hex(secret_hex)
+            .map_err(|e| crate::KeychatError::Identity(format!("invalid secret hex: {e}")))?;
+        let keys = Keys::new(secret_key);
+        Ok(Self { keys })
+    }
 }
 
 impl std::fmt::Debug for Identity {

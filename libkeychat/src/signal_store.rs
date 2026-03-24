@@ -168,6 +168,20 @@ impl CapturingSessionStore {
     pub fn take_alice_addrs(&self, peer: &str) -> Option<Vec<String>> {
         self.last_alice_addrs.lock().unwrap().remove(peer)
     }
+
+    /// Move a session record from one ProtocolAddress to another in the backing store.
+    /// Used to fix session address after decrypting a PreKeySignalMessage when the
+    /// sender's identity key was unknown at decrypt time.
+    pub fn relocate_session(
+        &mut self,
+        from: &ProtocolAddress,
+        to: &ProtocolAddress,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        if let Some(record) = futures::executor::block_on(self.inner.load_session(from))? {
+            futures::executor::block_on(self.inner.store_session(to, &record))?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait(?Send)]

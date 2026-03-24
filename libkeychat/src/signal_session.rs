@@ -16,9 +16,9 @@ use std::time::SystemTime;
 use futures::executor::block_on;
 use libsignal_protocol::{
     kem, message_decrypt_prekey, message_decrypt_signal, message_encrypt, process_prekey_bundle,
-    CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKeyPair, KeyPair, KyberPreKeyId,
-    KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SignalMessage, SignedPreKeyId,
+    CiphertextMessage, DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair, KeyPair,
+    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
+    PreKeySignalMessage, PreKeyStore, PrivateKey, ProtocolAddress, SignalMessage, SignedPreKeyId,
     SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
 };
 
@@ -134,10 +134,11 @@ pub fn reconstruct_prekey_material(
     kyber_prekey_id_val: u32,
     kyber_prekey_record_bytes: &[u8],
 ) -> Result<SignalPreKeyMaterial> {
-    let identity_key_pair = IdentityKeyPair::try_from(
-        [identity_public, identity_private].concat().as_slice(),
-    )
-    .map_err(|e| KeychatError::Signal(format!("failed to reconstruct identity key pair: {e}")))?;
+    let identity_key = IdentityKey::decode(identity_public)
+        .map_err(|e| KeychatError::Signal(format!("failed to decode identity public key: {e}")))?;
+    let private_key = PrivateKey::deserialize(identity_private)
+        .map_err(|e| KeychatError::Signal(format!("failed to decode identity private key: {e}")))?;
+    let identity_key_pair = IdentityKeyPair::new(identity_key, private_key);
 
     let signed_prekey = SignedPreKeyRecord::deserialize(signed_prekey_record_bytes)
         .map_err(|e| KeychatError::Signal(format!("failed to deserialize signed prekey: {e}")))?;
@@ -296,6 +297,11 @@ impl SignalParticipant {
 
     pub fn address(&self) -> &ProtocolAddress {
         &self.address
+    }
+
+    /// Access to pre-key material for serialization/persistence.
+    pub fn keys(&self) -> &SignalPreKeyMaterial {
+        &self.keys
     }
 
     pub fn prekey_bundle(&self) -> Result<PreKeyBundle> {
@@ -462,6 +468,21 @@ impl SignalParticipant {
 
     pub fn identity_public_key_hex(&self) -> String {
         hex::encode(self.keys.identity_key_pair.identity_key().serialize())
+    }
+
+    /// Move a session record from one ProtocolAddress to another.
+    /// Used after decrypting a FriendApprove PreKeySignalMessage:
+    /// the decrypt used the local identity key as remote_address (wrong),
+    /// but the session needs to be under the peer's identity key (correct).
+    pub fn relocate_session(
+        &mut self,
+        from: &ProtocolAddress,
+        to: &ProtocolAddress,
+    ) -> Result<()> {
+        self.store
+            .session_store
+            .relocate_session(from, to)
+            .map_err(|e| KeychatError::Signal(format!("relocate session: {e}")))
     }
 
     pub fn registration_id(&self) -> u32 {

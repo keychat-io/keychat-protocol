@@ -157,6 +157,22 @@ impl SecureStorage {
         )
         .map_err(|e| KeychatError::Storage(format!("Failed to create schema: {e}")))?;
 
+        // Migrations: add columns that may not exist in older databases
+        let _ = conn.execute_batch(
+            "ALTER TABLE pending_friend_requests ADD COLUMN peer_nostr_pubkey TEXT NOT NULL DEFAULT '';"
+        );
+
+        // Migration: inbound friend requests table
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS inbound_friend_requests (
+                request_id TEXT PRIMARY KEY,
+                sender_pubkey_hex TEXT NOT NULL,
+                message_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );"
+        );
+
         Ok(Self { conn })
     }
 
@@ -763,6 +779,7 @@ impl SecureStorage {
         kyber_prekey_id: u32,
         kyber_prekey_record: &[u8],
         first_inbox_secret: &str,
+        peer_nostr_pubkey: &str,
     ) -> Result<()> {
         self.conn
             .execute(
@@ -770,8 +787,8 @@ impl SecureStorage {
                  (request_id, device_id, identity_public, identity_private, \
                   registration_id, signed_prekey_id, signed_prekey_record, \
                   prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record, \
-                  first_inbox_secret, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%s','now'))",
+                  first_inbox_secret, peer_nostr_pubkey, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s','now'))",
                 rusqlite::params![
                     request_id,
                     device_id,
@@ -785,6 +802,7 @@ impl SecureStorage {
                     kyber_prekey_id,
                     kyber_prekey_record,
                     first_inbox_secret,
+                    peer_nostr_pubkey,
                 ],
             )
             .map_err(|e| {
@@ -796,7 +814,7 @@ impl SecureStorage {
     /// Load a pending friend request.
     /// Returns (device_id, identity_public, identity_private, registration_id,
     ///          signed_prekey_id, signed_prekey_record, prekey_id, prekey_record,
-    ///          kyber_prekey_id, kyber_prekey_record, first_inbox_secret).
+    ///          kyber_prekey_id, kyber_prekey_record, first_inbox_secret, peer_nostr_pubkey).
     #[allow(clippy::type_complexity)]
     pub fn load_pending_fr(
         &self,
@@ -814,6 +832,7 @@ impl SecureStorage {
             u32,
             Vec<u8>,
             String,
+            String,
         )>,
     > {
         let mut stmt = self
@@ -821,7 +840,7 @@ impl SecureStorage {
             .prepare(
                 "SELECT device_id, identity_public, identity_private, registration_id, \
                  signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, \
-                 kyber_prekey_id, kyber_prekey_record, first_inbox_secret \
+                 kyber_prekey_id, kyber_prekey_record, first_inbox_secret, peer_nostr_pubkey \
                  FROM pending_friend_requests WHERE request_id = ?1",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
@@ -840,6 +859,7 @@ impl SecureStorage {
                     row.get::<_, u32>(8)?,
                     row.get::<_, Vec<u8>>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })
             .optional()
@@ -863,6 +883,26 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// Promote a pending friend request to an active signal participant.
+    /// Loads the pending FR key material, saves it as a participant, then deletes the pending FR.
+    pub fn promote_pending_fr(
+        &self,
+        request_id: &str,
+        peer_signal_id: &str,
+    ) -> Result<()> {
+        if let Some((device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, _first_inbox, _peer_nostr)) =
+            self.load_pending_fr(request_id)?
+        {
+            self.save_signal_participant(
+                peer_signal_id, device_id,
+                &id_pub, &id_priv, reg_id,
+                spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
+            )?;
+            self.delete_pending_fr(request_id)?;
+        }
+        Ok(())
+    }
+
     /// List all pending friend request IDs.
     pub fn list_pending_frs(&self) -> Result<Vec<String>> {
         let mut stmt = self
@@ -883,6 +923,105 @@ impl SecureStorage {
             );
         }
         Ok(results)
+    }
+
+    // ─── Inbound Friend Requests ─────────────────────────────
+
+    /// Save a received (inbound) friend request.
+    /// Stores the full KCMessage and payload as JSON so the request
+    /// can be accepted/rejected after an app restart.
+    pub fn save_inbound_fr(
+        &self,
+        request_id: &str,
+        sender_pubkey_hex: &str,
+        message_json: &str,
+        payload_json: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO inbound_friend_requests \
+                 (request_id, sender_pubkey_hex, message_json, payload_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
+                rusqlite::params![request_id, sender_pubkey_hex, message_json, payload_json],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to save inbound FR: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Load a received (inbound) friend request.
+    /// Returns (sender_pubkey_hex, message_json, payload_json).
+    pub fn load_inbound_fr(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_pubkey_hex, message_json, payload_json \
+                 FROM inbound_friend_requests WHERE request_id = ?1",
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let result = stmt
+            .query_row(rusqlite::params![request_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to load inbound FR: {e}"))
+            })?;
+
+        Ok(result)
+    }
+
+    /// List all inbound friend request IDs.
+    pub fn list_inbound_frs(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT request_id FROM inbound_friend_requests")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to list inbound FRs: {e}"))
+            })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(
+                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?,
+            );
+        }
+        Ok(results)
+    }
+
+    /// Delete an inbound friend request (after accept or reject).
+    pub fn delete_inbound_fr(&self, request_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM inbound_friend_requests WHERE request_id = ?1",
+                rusqlite::params![request_id],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to delete inbound FR: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Force a WAL checkpoint so all data is written to the main database file.
+    /// Call before closing when another connection will reopen the same file.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| KeychatError::Storage(format!("WAL checkpoint failed: {e}")))?;
+        Ok(())
     }
 }
 
@@ -1205,6 +1344,57 @@ mod tests {
 
         let s = store.load_session("addr-500", 1).unwrap().unwrap();
         assert_eq!(s.len(), 256);
+    }
+
+    #[test]
+    fn test_promote_pending_fr() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Save a pending FR
+        store
+            .save_pending_fr(
+                "fr-test-123",
+                42, // device_id
+                b"id_pub",
+                b"id_priv",
+                1001, // reg_id
+                10,   // spk_id
+                b"spk_rec",
+                20, // pk_id
+                b"pk_rec",
+                30, // kpk_id
+                b"kpk_rec",
+                "first_inbox_secret",
+                "peer_nostr_pubkey",
+            )
+            .unwrap();
+
+        // Verify it's in pending
+        let frs = store.list_pending_frs().unwrap();
+        assert_eq!(frs.len(), 1);
+        assert!(store.list_signal_participants().unwrap().is_empty());
+
+        // Promote it
+        store
+            .promote_pending_fr("fr-test-123", "peer_signal_id_hex")
+            .unwrap();
+
+        // Verify it moved
+        assert!(store.list_pending_frs().unwrap().is_empty());
+        let participants = store.list_signal_participants().unwrap();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0], "peer_signal_id_hex");
+
+        // Verify data is correct
+        let (device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+            store
+                .load_signal_participant("peer_signal_id_hex")
+                .unwrap()
+                .unwrap();
+        assert_eq!(device_id, 42);
+        assert_eq!(id_pub, b"id_pub");
+        assert_eq!(id_priv, b"id_priv");
+        assert_eq!(reg_id, 1001);
     }
 
     #[test]

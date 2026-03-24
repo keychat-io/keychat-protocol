@@ -77,6 +77,27 @@ pub struct ProfilePayload {
     pub bio: Option<String>,
 }
 
+// ─── Signal Group Records ────────────────────────────────────────
+
+#[derive(uniffi::Record)]
+pub struct GroupMemberInput {
+    pub nostr_pubkey: String,
+    pub name: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct SignalGroupInfo {
+    pub group_id: String,
+    pub name: String,
+    pub member_count: u32,
+}
+
+#[derive(uniffi::Record)]
+pub struct GroupSentMessage {
+    pub group_id: String,
+    pub event_ids: Vec<String>,
+}
+
 // ─── Enums ───────────────────────────────────────────────────────
 
 #[derive(uniffi::Enum)]

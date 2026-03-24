@@ -36,7 +36,7 @@ echo "==> Creating XCFramework..."
 mkdir -p "$OUT_DIR/headers"
 cp "$OUT_DIR/swift/"*.h "$OUT_DIR/headers/" 2>/dev/null || true
 cat > "$OUT_DIR/headers/module.modulemap" << 'MODULEMAP'
-framework module keychat_uniffiFFI {
+module keychat_uniffiFFI {
     header "keychat_uniffiFFI.h"
     export *
 }
