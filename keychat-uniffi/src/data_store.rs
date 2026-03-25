@@ -204,6 +204,150 @@ impl KeychatClient {
                 msg: format!("update_app_contact: {e}"),
             })
     }
+
+    // ─── Write methods (used by tests + future Swift UI) ──────
+
+    pub async fn save_app_room_ffi(
+        &self,
+        to_main_pubkey: String,
+        identity_npub: String,
+        status: i32,
+        room_type: i32,
+        name: Option<String>,
+    ) -> Result<String, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .save_app_room(&to_main_pubkey, &identity_npub, status, room_type, name.as_deref(), None)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("save_app_room: {e}"),
+            })
+    }
+
+    pub async fn save_app_message_ffi(
+        &self,
+        msgid: String,
+        event_id: Option<String>,
+        room_id: String,
+        identity_npub: String,
+        sender_pubkey: String,
+        content: String,
+        is_me_send: bool,
+        status: i32,
+        created_at: u64,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .save_app_message(
+                &msgid, event_id.as_deref(), &room_id, &identity_npub,
+                &sender_pubkey, &content, is_me_send, status, created_at as i64,
+            )
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("save_app_message: {e}"),
+            })
+    }
+
+    pub async fn save_app_contact_ffi(
+        &self,
+        pubkey: String,
+        npubkey: String,
+        identity_npub: String,
+        name: Option<String>,
+    ) -> Result<String, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .save_app_contact(&pubkey, &npubkey, &identity_npub, name.as_deref())
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("save_app_contact: {e}"),
+            })
+    }
+
+    pub async fn update_app_room_ffi(
+        &self,
+        room_id: String,
+        status: Option<i32>,
+        name: Option<String>,
+        last_message_content: Option<String>,
+        last_message_at: Option<u64>,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .update_app_room(
+                &room_id, status, name.as_deref(),
+                last_message_content.as_deref(),
+                last_message_at.map(|t| t as i64),
+            )
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("update_app_room: {e}"),
+            })
+    }
+
+    pub async fn update_app_message_ffi(
+        &self,
+        msgid: String,
+        event_id: Option<String>,
+        status: Option<i32>,
+        relay_status_json: Option<String>,
+        payload_json: Option<String>,
+        nostr_event_json: Option<String>,
+        reply_to_event_id: Option<String>,
+        reply_to_content: Option<String>,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .update_app_message(
+                &msgid, event_id.as_deref(), status, relay_status_json.as_deref(),
+                payload_json.as_deref(), nostr_event_json.as_deref(),
+                reply_to_event_id.as_deref(), reply_to_content.as_deref(),
+            )
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("update_app_message: {e}"),
+            })
+    }
+
+    pub async fn increment_app_room_unread_ffi(
+        &self,
+        room_id: String,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .increment_app_room_unread(&room_id)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("increment_app_room_unread: {e}"),
+            })
+    }
+
+    pub async fn is_app_message_duplicate_ffi(
+        &self,
+        event_id: String,
+    ) -> Result<bool, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .is_app_message_duplicate(&event_id)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("is_app_message_duplicate: {e}"),
+            })
+    }
 }
 
 // ─── Conversion Helpers ──────────────────────────────────────────
