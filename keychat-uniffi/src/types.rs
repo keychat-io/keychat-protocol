@@ -172,6 +172,7 @@ pub enum ClientEvent {
         sender_pubkey: String,
         sender_name: String,
         message: Option<String>,
+        created_at: u64,
     },
     FriendRequestAccepted {
         peer_pubkey: String,

@@ -35,6 +35,8 @@ pub struct FriendRequestReceived {
     pub sender_pubkey_hex: String,
     pub message: KCMessage,
     pub payload: KCFriendRequestPayload,
+    /// The rumor created_at timestamp (real sender timestamp from NIP-17 inner layer)
+    pub created_at: u64,
 }
 
 /// Result of accepting a friend request.
@@ -166,6 +168,7 @@ pub fn receive_friend_request(
         sender_pubkey_hex: sender_hex,
         message,
         payload,
+        created_at: unwrapped.created_at.as_u64(),
     })
 }
 

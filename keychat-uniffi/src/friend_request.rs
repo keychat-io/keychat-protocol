@@ -160,6 +160,7 @@ impl KeychatClient {
                 sender_pubkey_hex,
                 message,
                 payload,
+                created_at: 0, // Restored from DB, original rumor timestamp not preserved
             };
 
             let did = inner.next_signal_device_id;

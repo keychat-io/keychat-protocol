@@ -129,6 +129,7 @@ impl KeychatClient {
                         let sender_pubkey = received.sender_pubkey_hex.clone();
                         let sender_name = received.payload.name.clone();
                         let message = received.payload.message.clone();
+                        let created_at = received.created_at;
 
                         tracing::info!(
                             "⬇️ Step1 OK: friendRequest from={} name={:?} reqId={}",
@@ -166,6 +167,7 @@ impl KeychatClient {
                             sender_pubkey,
                             sender_name,
                             message,
+                            created_at,
                         })
                         .await;
 
