@@ -14,8 +14,8 @@ impl KeychatClient {
         _reply_to: Option<ReplyToPayload>,
         _thread_id: Option<String>,
     ) -> Result<SentMessage, KeychatUniError> {
-        // 1. Get Arc<Mutex<ChatSession>> and transport, then drop RwLock
-        let (session_mutex, peer_signal_hex, transport) = {
+        // 1. Get Arc<Mutex<ChatSession>> and check transport exists
+        let (session_mutex, peer_signal_hex) = {
             let inner = self.inner.read().await;
             let signal_hex = inner
                 .peer_nostr_to_signal
@@ -31,17 +31,16 @@ impl KeychatClient {
                     peer_id: signal_hex.clone(),
                 })?
                 .clone();
-            let transport = inner
-                .transport
-                .as_ref()
-                .ok_or(KeychatUniError::NotInitialized {
+            // Verify transport is available
+            if inner.transport.is_none() {
+                return Err(KeychatUniError::NotInitialized {
                     msg: "not connected".into(),
-                })?;
-            // Clone the fields we need so we can drop the RwLock
-            (session, signal_hex, transport as *const _ as usize)
+                });
+            }
+            (session, signal_hex)
         }; // RwLock dropped here
 
-        // 2. Lock only the specific peer session
+        // 2. Lock only the specific peer session — encrypt the message
         let remote_addr = ProtocolAddress::new(peer_signal_hex.clone(), DeviceId::new(1).unwrap());
         let msg = KCMessage::text(&text);
         let payload_json = msg.to_json().ok();
@@ -57,26 +56,38 @@ impl KeychatClient {
         let nostr_event_json = serde_json::to_string(&event).ok();
         let event_id = event.id.to_hex();
 
-        // 4. Publish via transport for per-relay results
-        let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
+        // 4. Get connected relays list before publishing
+        let connected = {
+            let inner = self.inner.read().await;
+            let transport = inner.transport.as_ref().ok_or(KeychatUniError::NotInitialized {
                 msg: "not connected".into(),
             })?;
-        let publish_result = transport.publish_event(event).await?;
+            transport.connected_relays().await
+        };
+
+        if connected.is_empty() {
+            return Err(KeychatUniError::Transport {
+                msg: "no relay connected".into(),
+            });
+        }
+
+        // 5. Publish to relays — relay OK responses come via event loop
+        let inner = self.inner.read().await;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::NotInitialized {
+            msg: "not connected".into(),
+        })?;
+        let _published_id = transport.publish_event_async(event).await?;
+        tracing::info!(
+            "⬆️ SENT eventId={} to {} relays (async OK)",
+            &event_id[..16.min(event_id.len())],
+            connected.len()
+        );
 
         Ok(SentMessage {
             event_id,
             payload_json,
             nostr_event_json,
-            success_relays: publish_result.success_relays,
-            failed_relays: publish_result
-                .failed_relays
-                .into_iter()
-                .map(|(url, error)| FailedRelayInfo { url, error })
-                .collect(),
+            connected_relays: connected,
             new_receiving_addresses: addr_update.new_receiving,
             dropped_receiving_addresses: addr_update.dropped_receiving,
             new_sending_address: addr_update.new_sending,

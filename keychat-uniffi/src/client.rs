@@ -666,6 +666,18 @@ impl KeychatClient {
         Ok(transport.get_relays().await)
     }
 
+    /// Get only the currently connected relay URLs.
+    pub async fn connected_relays(&self) -> Result<Vec<String>, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
+        Ok(transport.connected_relays().await)
+    }
+
     /// Get relay URLs with their connection status.
     pub async fn get_relay_statuses(&self) -> Result<Vec<RelayStatusInfo>, KeychatUniError> {
         let inner = self.inner.read().await;

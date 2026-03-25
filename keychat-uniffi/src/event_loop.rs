@@ -6,7 +6,7 @@ use std::sync::Arc;
 use libkeychat::{
     receive_friend_request, receive_group_invite, receive_signal_message,
     serialize_prekey_material, AddressManager, ChatSession, DeviceId, Event, KCMessageKind, Kind,
-    ProtocolAddress, PublicKey, RelayPoolNotification, Timestamp,
+    ProtocolAddress, PublicKey, RelayMessage, RelayPoolNotification, Timestamp,
 };
 
 use crate::client::KeychatClient;
@@ -72,12 +72,32 @@ impl KeychatClient {
                                 }
                             }
                         }
+                        Ok(RelayPoolNotification::Message {
+                            relay_url,
+                            message: RelayMessage::Ok { event_id, status, message },
+                        }) => {
+                            // NIP-01 relay OK response: ["OK", event_id, true/false, message]
+                            let eid = event_id.to_hex();
+                            tracing::info!(
+                                "⬆️ RELAY_OK relay={} eventId={} ok={} msg={}",
+                                relay_url,
+                                &eid[..16.min(eid.len())],
+                                status,
+                                &message[..80.min(message.len())]
+                            );
+                            self.emit_event(ClientEvent::RelayOk {
+                                event_id: eid,
+                                relay_url: relay_url.to_string(),
+                                success: status,
+                                message,
+                            }).await;
+                        }
                         Ok(RelayPoolNotification::Shutdown) => {
                             tracing::info!("event loop: relay pool shutdown");
                             break;
                         }
                         Ok(_) => {
-                            // Other notification types (Message, etc.) — ignore
+                            // Other notification types — ignore
                         }
                         Err(e) => {
                             tracing::warn!("event loop: notification recv error: {e}");

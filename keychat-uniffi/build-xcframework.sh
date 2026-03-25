@@ -3,19 +3,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUT_DIR="$SCRIPT_DIR/generated"
+IOS_DIR="$(cd "$PROJECT_DIR/../keychat-iOS" && pwd)"
+TMP_DIR="$SCRIPT_DIR/.build-tmp"
 
 cd "$PROJECT_DIR"
 
-# Clean output
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR/swift"
+# Clean temp
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR/swift" "$TMP_DIR/headers"
 
 # Build for iOS device (aarch64)
 echo "==> Building for iOS (aarch64-apple-ios)..."
 cargo build --release --target aarch64-apple-ios -p keychat-uniffi
 
-# Build for iOS Simulator (aarch64 - Apple Silicon simulators)
+# Build for iOS Simulator (aarch64 - Apple Silicon)
 echo "==> Building for iOS Simulator (aarch64-apple-ios-sim)..."
 cargo build --release --target aarch64-apple-ios-sim -p keychat-uniffi
 
@@ -27,36 +28,44 @@ echo "==> Generating Swift bindings..."
 cargo run -p keychat-uniffi --bin uniffi-bindgen generate \
     --library target/release/libkeychat_uniffi.dylib \
     --language swift \
-    --out-dir "$OUT_DIR/swift"
+    --out-dir "$TMP_DIR/swift"
 
 # Create XCFramework
 echo "==> Creating XCFramework..."
 
-# The generated headers need a module.modulemap
-mkdir -p "$OUT_DIR/headers"
-cp "$OUT_DIR/swift/"*.h "$OUT_DIR/headers/" 2>/dev/null || true
-cat > "$OUT_DIR/headers/module.modulemap" << 'MODULEMAP'
+cp "$TMP_DIR/swift/"*.h "$TMP_DIR/headers/" 2>/dev/null || true
+cat > "$TMP_DIR/headers/module.modulemap" << 'MODULEMAP'
 module keychat_uniffiFFI {
     header "keychat_uniffiFFI.h"
     export *
 }
 MODULEMAP
 
-# Remove existing xcframework if present
-rm -rf "$OUT_DIR/KeychatFFI.xcframework"
-
+rm -rf "$TMP_DIR/KeychatFFI.xcframework"
 xcodebuild -create-xcframework \
     -library target/aarch64-apple-ios/release/libkeychat_uniffi.a \
-    -headers "$OUT_DIR/headers/" \
+    -headers "$TMP_DIR/headers/" \
     -library target/aarch64-apple-ios-sim/release/libkeychat_uniffi.a \
-    -headers "$OUT_DIR/headers/" \
-    -output "$OUT_DIR/KeychatFFI.xcframework"
+    -headers "$TMP_DIR/headers/" \
+    -output "$TMP_DIR/KeychatFFI.xcframework"
+
+# Deploy to iOS project
+echo "==> Deploying to $IOS_DIR ..."
+rm -rf "$IOS_DIR/KeychatFFI.xcframework"
+cp -R "$TMP_DIR/KeychatFFI.xcframework" "$IOS_DIR/KeychatFFI.xcframework"
+cp "$TMP_DIR/swift/KeychatFFI.swift" "$IOS_DIR/keychat/Services/KeychatFFI.swift"
+
+# Patch: UniFFI generates a function reference that Xcode 26 / Swift 6 rejects as
+# "a C function pointer can only be formed from a reference to a 'func' or a literal closure".
+# Wrap it in a literal closure to satisfy the compiler.
+echo "==> Patching Swift bindings for Xcode 26 compatibility..."
+sed -i '' 's/                uniffiFutureContinuationCallback,/                { handle, pollResult in uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult) },/' \
+    "$IOS_DIR/keychat/Services/KeychatFFI.swift"
+
+# Clean temp
+rm -rf "$TMP_DIR"
 
 echo ""
 echo "==> Done!"
-echo "    XCFramework: $OUT_DIR/KeychatFFI.xcframework"
-echo "    Swift sources: $OUT_DIR/swift/"
-echo ""
-echo "To use in your iOS project:"
-echo "  1. Add KeychatFFI.xcframework to your Xcode project"
-echo "  2. Copy the generated .swift file(s) into your project"
+echo "    XCFramework → $IOS_DIR/KeychatFFI.xcframework"
+echo "    Swift bindings → $IOS_DIR/keychat/Services/KeychatFFI.swift"

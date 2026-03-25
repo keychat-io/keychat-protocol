@@ -220,6 +220,44 @@ impl Transport {
         })
     }
 
+    /// Publish an event to all connected relays without waiting for OK responses.
+    /// Uses fire-and-forget: sends the EVENT message over websocket and returns immediately.
+    /// Relay OK responses are handled by the event loop via RelayPoolNotification::Message.
+    pub async fn publish_event_async(&self, event: Event) -> Result<EventId> {
+        let event_id = event.id;
+        let msg = ClientMessage::event(event);
+
+        let relays = self.client.relays().await;
+        let mut sent_count = 0u32;
+
+        for (url, relay) in relays.iter() {
+            if !relay.is_connected() {
+                continue;
+            }
+            match relay.batch_msg(vec![msg.clone()]) {
+                Ok(()) => {
+                    sent_count += 1;
+                    tracing::debug!("EVENT sent to {}", url);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to send EVENT to {}: {e}", url);
+                }
+            }
+        }
+
+        if sent_count == 0 {
+            return Err(KeychatError::Transport("no relay accepted the event".into()));
+        }
+
+        tracing::info!(
+            "⬆️ EVENT {} fire-and-forget to {} relay(s)",
+            &event_id.to_hex()[..16],
+            sent_count
+        );
+
+        Ok(event_id)
+    }
+
     /// Rebroadcast an already-signed event to all connected relays.
     pub async fn rebroadcast_event(&self, event: Event) -> Result<PublishResult> {
         self.publish_event(event).await
@@ -397,6 +435,17 @@ impl Transport {
             .await
             .iter()
             .map(|(url, relay)| (url.to_string(), relay.status().to_string()))
+            .collect()
+    }
+
+    /// Get only the currently connected relay URLs.
+    pub async fn connected_relays(&self) -> Vec<String> {
+        self.client
+            .relays()
+            .await
+            .iter()
+            .filter(|(_, relay)| relay.is_connected())
+            .map(|(url, _)| url.to_string())
             .collect()
     }
 

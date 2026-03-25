@@ -160,4 +160,5 @@ pub use transport::{PublishResult, RelayHealth, Transport, DEFAULT_RELAYS};
 
 // Re-export key nostr types for convenience
 pub use nostr::{Event, EventId, Keys, Kind, PublicKey, SecretKey, Timestamp};
+pub use nostr::message::relay::RelayMessage;
 pub use nostr_sdk::{RelayPoolNotification, RelayStatus};

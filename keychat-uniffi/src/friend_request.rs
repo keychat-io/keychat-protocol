@@ -80,22 +80,17 @@ impl KeychatClient {
             &request_id[..16.min(request_id.len())]
         );
 
-        // 3. Publish — get client clone, drop lock, then await
-        let nostr_client = {
+        // 3. Publish async — don't block waiting for relay OK responses
+        {
             let inner = self.inner.read().await;
-            inner
+            let transport = inner
                 .transport
                 .as_ref()
                 .ok_or(KeychatUniError::NotInitialized {
                     msg: "not connected".into(),
-                })?
-                .client()
-                .clone()
-        }; // lock dropped
-        nostr_client
-            .send_event(event)
-            .await
-            .map_err(|e| KeychatUniError::Transport { msg: e.to_string() })?;
+                })?;
+            transport.publish_event_async(event).await?;
+        }
 
         // 4. Store pending state in memory
         {
@@ -191,22 +186,17 @@ impl KeychatClient {
         let peer_nostr_hex = received.sender_pubkey_hex.clone();
         let peer_name = received.payload.name.clone();
 
-        // 3. Publish approval event
-        let nostr_client = {
+        // 3. Publish approval event async — don't block waiting for relay OK responses
+        {
             let inner = self.inner.read().await;
-            inner
+            let transport = inner
                 .transport
                 .as_ref()
                 .ok_or(KeychatUniError::NotInitialized {
                     msg: "not connected".into(),
-                })?
-                .client()
-                .clone()
-        };
-        nostr_client
-            .send_event(accepted.event)
-            .await
-            .map_err(|e| KeychatUniError::Transport { msg: e.to_string() })?;
+                })?;
+            transport.publish_event_async(accepted.event).await?;
+        }
 
         // 4. Create ChatSession and store
         let mut addresses = AddressManager::new();

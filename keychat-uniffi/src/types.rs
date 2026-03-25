@@ -33,8 +33,9 @@ pub struct SentMessage {
     pub event_id: String,
     pub payload_json: Option<String>,
     pub nostr_event_json: Option<String>,
-    pub success_relays: Vec<String>,
-    pub failed_relays: Vec<FailedRelayInfo>,
+    /// Relays that were connected at send time. Swift uses this for timeout tracking.
+    /// Per-relay OK results come async via ClientEvent::RelayOk.
+    pub connected_relays: Vec<String>,
     pub new_receiving_addresses: Vec<String>,
     pub dropped_receiving_addresses: Vec<String>,
     pub new_sending_address: Option<String>,
@@ -212,6 +213,14 @@ pub enum ClientEvent {
     },
     EventLoopError {
         description: String,
+    },
+    /// Per-relay OK response for a sent event (NIP-01).
+    /// Emitted by event loop when relay responds to our EVENT message.
+    RelayOk {
+        event_id: String,
+        relay_url: String,
+        success: bool,
+        message: String,
     },
 }
 
