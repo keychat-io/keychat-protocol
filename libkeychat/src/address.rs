@@ -126,6 +126,11 @@ impl AddressManager {
             }
 
             let derived = derive_address_with_secret(ratchet_key)?;
+            tracing::debug!(
+                "on_encrypt new receiving address={} for peer={}",
+                &derived.address[..16.min(derived.address.len())],
+                &peer_id[..16.min(peer_id.len())]
+            );
             update.new_receiving.push(derived.address.clone());
 
             state.receiving_addresses.push_back(derived);
@@ -186,6 +191,11 @@ impl AddressManager {
                 }
 
                 let derived = derive_address_with_secret(ratchet_key)?;
+                tracing::debug!(
+                    "on_decrypt new receiving address={} for peer={}",
+                    &derived.address[..16.min(derived.address.len())],
+                    &peer_id[..16.min(peer_id.len())]
+                );
                 update.new_receiving.push(derived.address.clone());
                 state.receiving_addresses.push_back(derived);
             }

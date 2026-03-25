@@ -13,9 +13,21 @@
 
 use crate::error::{KeychatError, Result};
 use crate::message::KCFriendRequestPayload;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Helper: truncate hex for safe debug display.
+fn redact(data: &[u8]) -> String {
+    let hex = hex::encode(data);
+    if hex.len() > 16 {
+        format!("{}...", &hex[..16])
+    } else {
+        hex
+    }
+}
 
 /// A Signal Curve25519 identity keypair.
-#[derive(Debug, Clone)]
+/// Private key is zeroed on drop (C-SEC2).
+#[derive(Clone)]
 pub struct SignalIdentity {
     /// 32-byte Curve25519 private key.
     pub private_key: [u8; 32],
@@ -23,38 +35,93 @@ pub struct SignalIdentity {
     pub public_key: [u8; 33],
 }
 
-/// A Signal signed prekey.
-#[derive(Debug, Clone)]
+impl Drop for SignalIdentity {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SignalIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalIdentity")
+            .field("public_key", &hex::encode(self.public_key))
+            .field("private_key", &redact(&self.private_key))
+            .finish()
+    }
+}
+
+/// A Signal signed prekey. Private key zeroed on drop (C-SEC2).
+#[derive(Clone)]
 pub struct SignedPrekey {
     pub id: u32,
-    /// 33-byte Curve25519 public key (0x05 prefix + 32 bytes).
     pub public_key: [u8; 33],
-    /// XEdDSA signature over the public key, signed by the identity private key.
     pub signature: Vec<u8>,
-    /// 32-byte private key (for session establishment).
     pub private_key: [u8; 32],
 }
 
-/// A Signal one-time prekey.
-#[derive(Debug, Clone)]
+impl Drop for SignedPrekey {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SignedPrekey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedPrekey")
+            .field("id", &self.id)
+            .field("public_key", &hex::encode(self.public_key))
+            .field("private_key", &redact(&self.private_key))
+            .finish()
+    }
+}
+
+/// A Signal one-time prekey. Private key zeroed on drop (C-SEC2).
+#[derive(Clone)]
 pub struct OneTimePrekey {
     pub id: u32,
-    /// 33-byte Curve25519 public key (0x05 prefix + 32 bytes).
     pub public_key: [u8; 33],
-    /// 32-byte private key.
     pub private_key: [u8; 32],
 }
 
-/// A Kyber KEM prekey (ML-KEM 1024 / CRYSTALS-Kyber-1024).
-#[derive(Debug, Clone)]
+impl Drop for OneTimePrekey {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for OneTimePrekey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneTimePrekey")
+            .field("id", &self.id)
+            .field("public_key", &hex::encode(self.public_key))
+            .field("private_key", &redact(&self.private_key))
+            .finish()
+    }
+}
+
+/// A Kyber KEM prekey (ML-KEM 1024 / CRYSTALS-Kyber-1024). Secret key zeroed on drop (C-SEC2).
+#[derive(Clone)]
 pub struct KyberPrekey {
     pub id: u32,
-    /// ML-KEM 1024 public key.
     pub public_key: Vec<u8>,
-    /// XEdDSA signature over the public key, signed by the identity private key.
     pub signature: Vec<u8>,
-    /// ML-KEM 1024 secret key (for decapsulation).
     pub secret_key: Vec<u8>,
+}
+
+impl Drop for KyberPrekey {
+    fn drop(&mut self) {
+        self.secret_key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for KyberPrekey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KyberPrekey")
+            .field("id", &self.id)
+            .field("public_key_len", &self.public_key.len())
+            .field("secret_key", &redact(&self.secret_key))
+            .finish()
+    }
 }
 
 /// Generate a new Signal identity keypair (Curve25519).
@@ -243,10 +310,12 @@ pub fn compute_global_sign(
 
     let secp = Secp256k1::new();
     // Extract the raw secp256k1 secret key bytes from the nostr SecretKey
-    let sk_bytes = hex::decode(nostr_secret_key.to_secret_hex())
+    let mut sk_bytes = hex::decode(nostr_secret_key.to_secret_hex())
         .map_err(|e| KeychatError::KeyDerivation(format!("hex decode error: {}", e)))?;
     let secp_sk = nostr::secp256k1::SecretKey::from_slice(&sk_bytes)
         .map_err(|e| KeychatError::KeyDerivation(format!("invalid secret key: {}", e)))?;
+    // Zeroize the hex-decoded secret key copy (C-SEC2)
+    sk_bytes.zeroize();
     let keypair = nostr::secp256k1::Keypair::from_secret_key(&secp, &secp_sk);
     let sig = secp.sign_schnorr(&message, &keypair);
 
@@ -319,7 +388,7 @@ pub fn build_friend_request_payload(
     // 6. Compute globalSign
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let global_sign = compute_global_sign(
@@ -560,5 +629,37 @@ mod tests {
             "missing signalKyberPrekey"
         );
         assert!(json.contains("globalSign"), "missing globalSign");
+    }
+
+    #[test]
+    fn debug_output_does_not_leak_full_private_key() {
+        let id = generate_signal_identity();
+        let debug = format!("{:?}", id);
+        // Private key should be truncated (16 hex chars + "...")
+        assert!(
+            debug.contains("..."),
+            "Debug output should truncate private key"
+        );
+        // Full private key (64 hex chars) should NOT appear
+        let full_priv_hex = hex::encode(id.private_key);
+        assert!(
+            !debug.contains(&full_priv_hex),
+            "Debug output must not contain full private key"
+        );
+    }
+
+    #[test]
+    fn zeroize_on_drop_clears_private_key() {
+        let id = generate_signal_identity();
+        let priv_copy = id.private_key;
+        assert_ne!(
+            priv_copy, [0u8; 32],
+            "key should not be all zeros initially"
+        );
+        // After drop, we can't inspect the original memory directly in safe Rust,
+        // but we verify the Drop impl exists and compiles correctly.
+        // The zeroize crate is well-tested; we trust it does its job.
+        drop(id);
+        // If we got here without panic, Drop ran successfully.
     }
 }

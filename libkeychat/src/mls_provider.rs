@@ -45,15 +45,22 @@ impl OpenMlsRustPersistentCrypto {
     }
 }
 
-impl Default for OpenMlsRustPersistentCrypto {
-    fn default() -> Self {
-        let connection = Connection::open_in_memory().unwrap();
+impl OpenMlsRustPersistentCrypto {
+    /// Create an in-memory MLS storage (fallible version).
+    pub fn new_in_memory() -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let connection = Connection::open_in_memory()?;
         let mut storage = SqliteStorageProvider::new(connection);
-        storage.run_migrations().unwrap();
-        Self {
+        storage.run_migrations()?;
+        Ok(Self {
             crypto: RustCrypto::default(),
             storage,
-        }
+        })
+    }
+}
+
+impl Default for OpenMlsRustPersistentCrypto {
+    fn default() -> Self {
+        Self::new_in_memory().expect("failed to create in-memory MLS storage")
     }
 }
 

@@ -369,7 +369,10 @@ pub unsafe extern "C" fn keychat_send_text(
         .unwrap_or_default();
 
     // Build Mode 1 event
-    let event = match ctx.rt.block_on(build_mode1_event(&ct.bytes, &to_address)) {
+    let event = match ctx
+        .rt
+        .block_on(build_mode1_event_ffi(&ct.bytes, &to_address))
+    {
         Ok(e) => e,
         Err(_) => return err,
     };
@@ -589,23 +592,14 @@ pub unsafe extern "C" fn keychat_free_buffer(buf: KeychatBuffer) {
 
 // ─── Internal helper ────────────────────────────────────────────────────────
 
-async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<nostr::Event, String> {
-    use crate::EphemeralKeypair;
-    use nostr::prelude::*;
-
-    let sender = EphemeralKeypair::generate();
-    let content = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ciphertext);
-    let to_pubkey =
-        PublicKey::from_hex(to_address).map_err(|e| format!("invalid to_address: {e}"))?;
-
-    EventBuilder::new(Kind::GiftWrap, &content)
-        .tag(Tag::public_key(to_pubkey))
-        .sign(sender.keys())
+async fn build_mode1_event_ffi(
+    ciphertext: &[u8],
+    to_address: &str,
+) -> Result<nostr::Event, String> {
+    crate::chat::build_mode1_event(ciphertext, to_address)
         .await
-        .map_err(|e| format!("sign: {e}"))
+        .map_err(|e| e.to_string())
 }
-
-use base64::Engine as _;
 
 // ─── Ecash Stamp FFI (not yet wired in Dart — available for future use) ─────
 

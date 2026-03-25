@@ -75,10 +75,11 @@ pub fn validate_cashu_token(token: &str) -> Result<()> {
 ///
 /// Per §13.1, the ecash token is appended as a third element to the standard
 /// Nostr `["EVENT", <event>]` message for relay consumption.
-pub fn attach_ecash_stamp(event: &Event, ecash_token: &str) -> String {
-    let event_json = serde_json::to_value(event).unwrap();
+pub fn attach_ecash_stamp(event: &Event, ecash_token: &str) -> Result<String> {
+    let event_json =
+        serde_json::to_value(event).map_err(|e| crate::KeychatError::Serialization(e))?;
     let arr = serde_json::json!(["EVENT", event_json, ecash_token]);
-    arr.to_string()
+    Ok(arr.to_string())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -154,7 +155,7 @@ mod tests {
             .unwrap();
 
         let token = "cashuAeyJhbGciOiJIUzI1NiJ9";
-        let result = attach_ecash_stamp(&event, token);
+        let result = attach_ecash_stamp(&event, token).unwrap();
 
         // Parse the result as a JSON array
         let arr: serde_json::Value = serde_json::from_str(&result).unwrap();

@@ -163,7 +163,7 @@ impl KeychatClient {
             })?;
         let storage = inner.storage.clone();
 
-        let store = storage.lock().map_err(|e| KeychatUniError::Transport {
+        let store = storage.lock().map_err(|e| KeychatUniError::Storage {
             msg: format!("storage lock: {e}"),
         })?;
 

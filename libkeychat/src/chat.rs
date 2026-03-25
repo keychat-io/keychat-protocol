@@ -81,11 +81,15 @@ pub fn create_signal_prekey_auth(
 ) -> Result<SignalPrekeyAuth> {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let sig = compute_global_sign(nostr_secret_key, nostr_pubkey_hex, signal_pubkey_hex, time)?;
 
+    tracing::info!(
+        "created signal prekey auth for nostr_id={}",
+        &nostr_pubkey_hex[..16.min(nostr_pubkey_hex.len())]
+    );
     Ok(SignalPrekeyAuth {
         nostr_id: nostr_pubkey_hex.to_string(),
         signal_id: signal_pubkey_hex.to_string(),
@@ -126,6 +130,10 @@ pub fn verify_signal_prekey_auth(auth: &SignalPrekeyAuth) -> Result<()> {
     // Verify Schnorr signature
     let valid = verify_global_sign(&auth.nostr_id, &auth.signal_id, auth.time, &auth.sig)?;
     if !valid {
+        tracing::warn!(
+            "signal prekey auth verification failed for nostr_id={}",
+            &auth.nostr_id[..16.min(auth.nostr_id.len())]
+        );
         return Err(KeychatError::Signal(
             "SignalPrekeyAuth signature verification failed".into(),
         ));
@@ -152,6 +160,11 @@ pub async fn send_encrypted_message(
     let json = message.to_json()?;
     let ct = signal.encrypt(remote_address, json.as_bytes())?;
     let ciphertext = ct.bytes;
+    tracing::info!(
+        "sending encrypted message kind={:?} to={}",
+        message.kind,
+        &to_address[..16.min(to_address.len())]
+    );
     build_mode1_event(&ciphertext, to_address).await
 }
 
@@ -187,7 +200,10 @@ pub fn receive_encrypted_message(
     let is_prekey = SignalParticipant::is_prekey_message(&ciphertext);
 
     // Decrypt
-    let decrypt_result = signal.decrypt(remote_address, &ciphertext)?;
+    let decrypt_result = signal.decrypt(remote_address, &ciphertext).map_err(|e| {
+        tracing::error!("receive_encrypted_message decrypt failed: {e}");
+        e
+    })?;
 
     // Parse plaintext
     let plaintext_str = String::from_utf8(decrypt_result.plaintext.clone())
@@ -196,6 +212,12 @@ pub fn receive_encrypted_message(
     let message = KCMessage::try_parse(&plaintext_str).ok_or_else(|| {
         KeychatError::Signal("decrypted content is not a valid KCMessage v2".into())
     })?;
+
+    tracing::info!(
+        "received encrypted message kind={:?} prekey={}",
+        message.kind,
+        is_prekey
+    );
 
     // Extract the p-tag receiving address
     let received_on = event
@@ -362,7 +384,9 @@ pub fn parse_and_route(plaintext: &str) -> MessageAction {
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
 /// Build a kind:1059 Mode 1 event with ephemeral sender and base64 content.
-async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
+/// Build a Mode 1 event (kind:1059, base64 ciphertext, p-tag to receiver).
+/// Shared by chat, group, session, friend_request modules.
+pub(crate) async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
     let sender = EphemeralKeypair::generate();
     let content = base64::engine::general_purpose::STANDARD.encode(ciphertext);
     let to_pubkey = PublicKey::from_hex(to_address)

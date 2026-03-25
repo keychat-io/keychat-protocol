@@ -360,7 +360,7 @@ pub async fn approve_friend(
         sender_pubkey_hex: pfr.sender_npub.clone(),
         payload,
         message: KCMessage::text(""), // placeholder, not used in accept
-        created_at: 0, // Restored from DB, original rumor timestamp not preserved
+        created_at: 0,                // Restored from DB, original rumor timestamp not preserved
     };
 
     do_accept_friend(state, &fr, event_tx).await?;

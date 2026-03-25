@@ -261,6 +261,11 @@ pub fn create_signal_group(
         );
     }
 
+    tracing::info!(
+        "created signal group: group_id={}, members={}",
+        &group_id[..16.min(group_id.len())],
+        members.len()
+    );
     SignalGroup {
         group_id,
         name: name.to_string(),
@@ -284,34 +289,17 @@ pub async fn send_group_message(
     message: &KCMessage,
     address_manager: &AddressManager,
 ) -> Result<Vec<(String, Event)>> {
-    // Verify groupId is set
     if message.group_id.as_deref() != Some(&group.group_id) {
         return Err(KeychatError::Signal(
             "KCMessage.groupId must match the group's ID".into(),
         ));
     }
-
-    let json = message.to_json()?;
-    let mut results = Vec::new();
-
-    for member in group.other_members() {
-        let remote_address =
-            ProtocolAddress::new(member.signal_id.clone(), DeviceId::new(1).unwrap());
-
-        // Resolve sending address via AddressManager
-        let to_address = address_manager.resolve_send_address(&member.signal_id)?;
-
-        // Encrypt with Signal
-        let ct = signal.encrypt(&remote_address, json.as_bytes())?;
-        let ciphertext = ct.bytes;
-
-        // Build kind:1059 event
-        let event = build_mode1_event(&ciphertext, &to_address).await?;
-
-        results.push((member.signal_id.clone(), event));
-    }
-
-    Ok(results)
+    tracing::info!(
+        "sending group message: group_id={}, members={}",
+        &group.group_id[..16.min(group.group_id.len())],
+        group.other_members().len()
+    );
+    send_to_all_members(signal, group, message, address_manager).await
 }
 
 /// Receive and decrypt a group message.
@@ -370,6 +358,11 @@ pub fn receive_group_message(
         event_id: event.id,
     };
 
+    tracing::info!(
+        "received group message: group_id={}, sender={}",
+        &group_id[..16.min(group_id.len())],
+        &sender_signal_id[..16.min(sender_signal_id.len())]
+    );
     Ok((message, metadata))
 }
 
@@ -416,6 +409,11 @@ pub async fn send_group_invite(
     invitee_signal_id: &str,
     address_manager: &AddressManager,
 ) -> Result<Event> {
+    tracing::info!(
+        "sending group invite: group_id={}, invitee={}",
+        &group.group_id[..16.min(group.group_id.len())],
+        &invitee_signal_id[..16.min(invitee_signal_id.len())]
+    );
     let message = build_group_invite_message(group);
     let remote_address =
         ProtocolAddress::new(invitee_signal_id.to_string(), DeviceId::new(1).unwrap());
@@ -458,6 +456,11 @@ pub fn receive_group_invite(message: &KCMessage, my_signal_id: &str) -> Result<S
         members.insert(rm.signal_id.clone(), member);
     }
 
+    tracing::info!(
+        "received group invite: group_id={}, members={}",
+        &profile.group_id[..16.min(profile.group_id.len())],
+        members.len()
+    );
     Ok(SignalGroup {
         group_id: profile.group_id,
         name: profile.name,
@@ -578,41 +581,8 @@ async fn send_to_all_members(
     Ok(results)
 }
 
-/// Build a kind:1059 Mode 1 event with ephemeral sender.
-async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
-    let sender = EphemeralKeypair::generate();
-    let content = base64::engine::general_purpose::STANDARD.encode(ciphertext);
-    let to_pubkey = PublicKey::from_hex(to_address)
-        .map_err(|e| KeychatError::Signal(format!("invalid to_address: {e}")))?;
-
-    let event = EventBuilder::new(Kind::GiftWrap, &content)
-        .tag(Tag::public_key(to_pubkey))
-        .sign(sender.keys())
-        .await
-        .map_err(|e| KeychatError::Signal(format!("failed to sign event: {e}")))?;
-
-    Ok(event)
-}
-
-/// Generate a UUID v4 string.
-fn uuid_v4() -> String {
-    use ::rand::Rng;
-    let mut rng = ::rand::rng();
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        u16::from_be_bytes([bytes[4], bytes[5]]),
-        u16::from_be_bytes([bytes[6], bytes[7]]),
-        u16::from_be_bytes([bytes[8], bytes[9]]),
-        u64::from_be_bytes([
-            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-        ])
-    )
-}
+use crate::chat::build_mode1_event;
+use crate::message::uuid_v4;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 

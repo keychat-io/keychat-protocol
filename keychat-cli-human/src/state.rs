@@ -217,7 +217,7 @@ impl AppState {
                 eprintln!("MLS storage open failed, falling back to in-memory: {e}");
                 libkeychat::mls::MlsProvider::new()
             });
-        let mls = MlsParticipant::with_provider(identity.pubkey_hex(), mls_provider);
+        let mls = MlsParticipant::with_provider(identity.pubkey_hex(), mls_provider)?;
 
         let owner = config.owner.clone();
 

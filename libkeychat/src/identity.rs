@@ -112,13 +112,19 @@ impl Identity {
     }
 
     /// Get the public key as npub (bech32).
-    pub fn npub(&self) -> String {
-        self.keys.public_key().to_bech32().unwrap()
+    pub fn npub(&self) -> Result<String> {
+        self.keys
+            .public_key()
+            .to_bech32()
+            .map_err(|e| KeychatError::Identity(format!("npub encode failed: {e}")))
     }
 
     /// Get the secret key as nsec (bech32).
-    pub fn nsec(&self) -> String {
-        self.keys.secret_key().to_bech32().unwrap()
+    pub fn nsec(&self) -> Result<String> {
+        self.keys
+            .secret_key()
+            .to_bech32()
+            .map_err(|e| KeychatError::Identity(format!("nsec encode failed: {e}")))
     }
 
     /// Get the secret key as hex string.
@@ -216,8 +222,8 @@ mod tests {
     fn generate_identity() {
         let gen = Identity::generate().unwrap();
         assert_eq!(gen.identity.pubkey_hex().len(), 64);
-        assert!(gen.identity.npub().starts_with("npub1"));
-        assert!(gen.identity.nsec().starts_with("nsec1"));
+        assert!(gen.identity.npub().unwrap().starts_with("npub1"));
+        assert!(gen.identity.nsec().unwrap().starts_with("nsec1"));
         // Mnemonic is returned separately, not inside Identity
         assert!(!gen.mnemonic.is_empty());
     }

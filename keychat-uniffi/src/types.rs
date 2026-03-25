@@ -166,6 +166,39 @@ pub enum MessageKind {
     GroupAnnouncement,
 }
 
+impl From<libkeychat::KCMessageKind> for MessageKind {
+    fn from(k: libkeychat::KCMessageKind) -> Self {
+        match k {
+            libkeychat::KCMessageKind::Text => MessageKind::Text,
+            libkeychat::KCMessageKind::Files => MessageKind::Files,
+            libkeychat::KCMessageKind::Cashu => MessageKind::Cashu,
+            libkeychat::KCMessageKind::LightningInvoice => MessageKind::LightningInvoice,
+            libkeychat::KCMessageKind::FriendRequest => MessageKind::FriendRequest,
+            libkeychat::KCMessageKind::FriendApprove => MessageKind::FriendApprove,
+            libkeychat::KCMessageKind::FriendReject => MessageKind::FriendReject,
+            libkeychat::KCMessageKind::SignalGroupInvite => MessageKind::SignalGroupInvite,
+            libkeychat::KCMessageKind::SignalGroupMemberRemoved => {
+                MessageKind::SignalGroupMemberRemoved
+            }
+            libkeychat::KCMessageKind::SignalGroupSelfLeave => MessageKind::SignalGroupSelfLeave,
+            libkeychat::KCMessageKind::SignalGroupDissolve => MessageKind::SignalGroupDissolve,
+            libkeychat::KCMessageKind::SignalGroupNameChanged => {
+                MessageKind::SignalGroupNameChanged
+            }
+            libkeychat::KCMessageKind::MlsGroupInvite => MessageKind::MlsGroupInvite,
+            libkeychat::KCMessageKind::AgentReply => MessageKind::AgentReply,
+            _ => MessageKind::Text, // Unknown kinds fallback to Text
+        }
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum GroupChangeKind {
+    MemberRemoved,
+    SelfLeave,
+    NameChanged,
+}
+
 #[derive(uniffi::Enum)]
 pub enum ClientEvent {
     FriendRequestReceived {
@@ -185,7 +218,7 @@ pub enum ClientEvent {
     MessageReceived {
         room_id: String,
         sender_pubkey: String,
-        kind: String,
+        kind: MessageKind,
         content: Option<String>,
         payload: Option<String>,
         event_id: String,
@@ -204,7 +237,7 @@ pub enum ClientEvent {
     },
     GroupMemberChanged {
         room_id: String,
-        kind: String,
+        kind: GroupChangeKind,
         member_pubkey: Option<String>,
         new_value: Option<String>,
     },

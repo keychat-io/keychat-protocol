@@ -11,11 +11,27 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Serializable version of a derived address for storage.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct DerivedAddressSerialized {
     pub address: String,
     pub secret_key: String,
     pub ratchet_key: String,
+}
+
+impl std::fmt::Debug for DerivedAddressSerialized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DerivedAddressSerialized")
+            .field("address", &self.address)
+            .field(
+                "secret_key",
+                &format!("{}...", &self.secret_key[..16.min(self.secret_key.len())]),
+            )
+            .field(
+                "ratchet_key",
+                &format!("{}...", &self.ratchet_key[..16.min(self.ratchet_key.len())]),
+            )
+            .finish()
+    }
 }
 
 /// Serializable version of PeerAddressState for storage.
@@ -59,14 +75,14 @@ impl SecureStorage {
 
     /// Common initialization: set encryption key, pragmas, create schema.
     fn init(conn: Connection, key: &str) -> Result<Self> {
-        // Escape single quotes in key for SQL safety
-        let escaped_key = key.replace('\'', "''");
-        conn.execute_batch(&format!(
-            "PRAGMA key = '{escaped_key}'; \
-             PRAGMA cipher_page_size = 4096; \
-             PRAGMA journal_mode = WAL;"
-        ))
-        .map_err(|e| KeychatError::Storage(format!("Failed to set encryption pragmas: {e}")))?;
+        // Use pragma API to avoid SQL injection risk (C-SEC5)
+        conn.pragma_update(None, "key", key)
+            .map_err(|e| KeychatError::Storage(format!("Failed to set encryption key: {e}")))?;
+        conn.execute_batch(
+            "PRAGMA cipher_page_size = 4096; \
+             PRAGMA journal_mode = WAL;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("Failed to set pragmas: {e}")))?;
 
         // Create all tables in a single transaction
         conn.execute_batch(

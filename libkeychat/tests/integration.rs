@@ -14,8 +14,8 @@ fn identity_generate_and_reimport() {
     let id2 = Identity::from_mnemonic_str(&mnemonic).unwrap();
     assert_eq!(id.pubkey_hex(), id2.pubkey_hex());
     assert_eq!(id.secret_hex(), id2.secret_hex());
-    assert_eq!(id.npub(), id2.npub());
-    assert_eq!(id.nsec(), id2.nsec());
+    assert_eq!(id.npub().unwrap(), id2.npub().unwrap());
+    assert_eq!(id.nsec().unwrap(), id2.nsec().unwrap());
 }
 
 #[test]

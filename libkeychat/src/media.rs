@@ -28,8 +28,15 @@ pub struct EncryptedFile {
 }
 
 // ─── PKCS7 padding ──────────────────────────────────────────────────────────
+//
+// NOTE (C-SEC4): AES-CTR is a stream cipher and does NOT require PKCS7 padding.
+// PKCS7 is only needed for block modes like CBC. The padding here exists solely
+// for backward compatibility with the Flutter/Dart Keychat client which applies
+// PKCS7 before CTR encryption. Removing it would break decryption of existing
+// files. New implementations should NOT add padding for CTR mode.
 
 /// Apply PKCS7 padding to `data` for the given block size (16 for AES).
+/// Retained for Flutter client compatibility — CTR mode does not require this.
 fn pkcs7_pad(data: &[u8], block_size: usize) -> Vec<u8> {
     let padding_len = block_size - (data.len() % block_size);
     let mut padded = Vec::with_capacity(data.len() + padding_len);

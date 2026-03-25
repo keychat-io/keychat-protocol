@@ -87,6 +87,10 @@ impl ChatSession {
         // Build kind:1059 event
         let event = build_mode1_event(&enc.bytes, &to_address).await?;
 
+        tracing::info!(
+            "ChatSession sent message to peer={}",
+            &peer_id[..16.min(peer_id.len())]
+        );
         Ok((event, update))
     }
 
@@ -114,7 +118,16 @@ impl ChatSession {
 
         let is_prekey = SignalParticipant::is_prekey_message(&ciphertext);
 
-        let decrypt_result = self.signal.decrypt(remote_address, &ciphertext)?;
+        let decrypt_result = self
+            .signal
+            .decrypt(remote_address, &ciphertext)
+            .map_err(|e| {
+                tracing::error!(
+                    "ChatSession decrypt failed for peer={}: {e}",
+                    &peer_id[..16.min(peer_id.len())]
+                );
+                e
+            })?;
 
         let plaintext_str = String::from_utf8(decrypt_result.plaintext)
             .map_err(|e| KeychatError::Signal(format!("invalid UTF-8: {e}")))?;
@@ -144,6 +157,12 @@ impl ChatSession {
             received_on_address: received_on,
         };
 
+        tracing::info!(
+            "ChatSession received message from peer={}, prekey={}",
+            &peer_id[..16.min(peer_id.len())],
+            is_prekey
+        );
+
         // Update addresses after decrypt
         let update = self.addresses.on_decrypt(
             peer_id,
@@ -165,21 +184,7 @@ impl ChatSession {
     }
 }
 
-/// Build a kind:1059 Mode 1 event with ephemeral sender and base64 content.
-async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
-    let sender = EphemeralKeypair::generate();
-    let content = base64::engine::general_purpose::STANDARD.encode(ciphertext);
-    let to_pubkey = PublicKey::from_hex(to_address)
-        .map_err(|e| KeychatError::Signal(format!("invalid to_address: {e}")))?;
-
-    let event = EventBuilder::new(Kind::GiftWrap, &content)
-        .tag(Tag::public_key(to_pubkey))
-        .sign(sender.keys())
-        .await
-        .map_err(|e| KeychatError::Signal(format!("failed to sign event: {e}")))?;
-
-    Ok(event)
-}
+use crate::chat::build_mode1_event;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 

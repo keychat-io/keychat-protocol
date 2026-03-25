@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use zeroize::Zeroize;
 
 use futures::executor::block_on;
 use libsignal_protocol::{
@@ -224,7 +225,12 @@ impl std::fmt::Debug for SignalParticipant {
 impl SignalParticipant {
     pub fn new(name: impl Into<String>, device_id_val: u32) -> Result<Self> {
         let keys = generate_prekey_material()?;
-        Self::from_prekey_material(name.into(), device_id_val, keys)
+        let name = name.into();
+        tracing::info!(
+            "signal session created (in-memory): name={}",
+            &name[..16.min(name.len())]
+        );
+        Self::from_prekey_material(name, device_id_val, keys)
     }
 
     pub fn from_prekey_material(
@@ -297,6 +303,10 @@ impl SignalParticipant {
             Ok::<(), KeychatError>(())
         })?;
 
+        tracing::info!(
+            "signal session created (persistent): name={}",
+            &name[..16.min(name.len())]
+        );
         Ok(Self {
             address: ProtocolAddress::new(name, make_device_id(device_id_val)),
             store,
@@ -332,6 +342,10 @@ impl SignalParticipant {
             &mut ::rand::rng(),
         ))?;
         self.track_peer(remote);
+        tracing::info!(
+            "processed prekey bundle for remote={}",
+            &remote.name()[..16.min(remote.name().len())]
+        );
         Ok(())
     }
 
@@ -354,7 +368,14 @@ impl SignalParticipant {
             &mut self.store.identity_store,
             SystemTime::now(),
             &mut ::rand::rng(),
-        ))?;
+        ))
+        .map_err(|e| {
+            tracing::error!(
+                "encrypt failed for {}: {e}",
+                &remote.name()[..16.min(remote.name().len())]
+            );
+            e
+        })?;
 
         let ciphertext_bytes = message.serialize().to_vec();
 
@@ -398,6 +419,10 @@ impl SignalParticipant {
         let message_key_hash = compute_message_hash(ciphertext);
 
         if let Ok(prekey) = PreKeySignalMessage::try_from(ciphertext) {
+            tracing::info!(
+                "decrypting prekey message from {}",
+                &remote.name()[..16.min(remote.name().len())]
+            );
             let plaintext = block_on(message_decrypt_prekey(
                 &prekey,
                 remote,
@@ -407,7 +432,14 @@ impl SignalParticipant {
                 &self.store.signed_pre_key_store,
                 &mut self.store.kyber_pre_key_store,
                 &mut ::rand::rng(),
-            ))?;
+            ))
+            .map_err(|e| {
+                tracing::error!(
+                    "decrypt (prekey) failed for {}: {e}",
+                    &remote.name()[..16.min(remote.name().len())]
+                );
+                e
+            })?;
 
             self.track_peer(remote);
             let alice_addrs = self.store.session_store.take_alice_addrs(remote.name());
@@ -436,7 +468,14 @@ impl SignalParticipant {
                 &mut self.store.session_store,
                 &mut self.store.identity_store,
                 &mut ::rand::rng(),
-            ))?;
+            ))
+            .map_err(|e| {
+                tracing::error!(
+                    "decrypt (signal) failed for {}: {e}",
+                    &remote.name()[..16.min(remote.name().len())]
+                );
+                e
+            })?;
 
             self.track_peer(remote);
             let alice_addrs = self.store.session_store.take_alice_addrs(remote.name());
@@ -567,7 +606,7 @@ impl SignalParticipant {
         };
 
         // Get signed pre-key private key (was the initial sender chain)
-        let signed_priv = hex::encode(
+        let mut signed_priv = hex::encode(
             self.keys
                 .signed_prekey
                 .private_key()
@@ -575,8 +614,12 @@ impl SignalParticipant {
                 .serialize(),
         );
 
-        let seed = format!("{}-{}", signed_priv, their_pub);
-        derive_nostr_address_from_ratchet(&seed).map(Some)
+        let mut seed = format!("{}-{}", signed_priv, their_pub);
+        let result = derive_nostr_address_from_ratchet(&seed).map(Some);
+        // Zeroize temporary key material (C-SEC2)
+        signed_priv.zeroize();
+        seed.zeroize();
+        result
     }
 
     fn derive_bob_address(&self, remote: &ProtocolAddress) -> Result<Option<String>> {

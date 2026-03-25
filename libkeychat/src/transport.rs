@@ -260,7 +260,9 @@ impl Transport {
         }
 
         if sent_count == 0 {
-            return Err(KeychatError::Transport("no relay accepted the event".into()));
+            return Err(KeychatError::Transport(
+                "no relay accepted the event".into(),
+            ));
         }
 
         tracing::info!(

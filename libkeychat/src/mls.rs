@@ -87,29 +87,32 @@ pub struct MlsParticipant {
 impl MlsParticipant {
     /// Create a new MLS participant with the given Nostr identity.
     /// Generates fresh MLS credential and signing keys.
-    pub fn new(nostr_id: impl Into<String>) -> Self {
+    pub fn new(nostr_id: impl Into<String>) -> Result<Self> {
         let nostr_id = nostr_id.into();
         let provider = MlsProvider::new();
 
-        // Use nostr_id as the credential identity (BasicCredential)
         let credential = BasicCredential::new(nostr_id.as_bytes().to_vec());
-        let signer = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
-            .expect("failed to generate MLS signature keypair");
+        let signer = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm()).map_err(|e| {
+            KeychatError::Mls(format!("failed to generate MLS signature keypair: {e}"))
+        })?;
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
         };
-        // Store the signing key in the provider's storage
         signer
             .store(provider.inner().storage())
-            .expect("failed to store signature keypair");
+            .map_err(|e| KeychatError::Mls(format!("failed to store signature keypair: {e}")))?;
 
-        Self {
+        tracing::info!(
+            "MLS participant created: nostr_id={}",
+            &nostr_id[..16.min(nostr_id.len())]
+        );
+        Ok(Self {
             nostr_id,
             provider,
             credential: credential_with_key,
             signer,
-        }
+        })
     }
 
     /// Create an MLS participant with a custom provider (e.g. file-backed).
@@ -118,51 +121,46 @@ impl MlsParticipant {
     /// signing key from the provider's storage. This is required for MLS group
     /// state to survive restarts. If restoration fails or no key is provided,
     /// generates a fresh signing key.
-    pub fn with_provider(nostr_id: impl Into<String>, provider: MlsProvider) -> Self {
+    pub fn with_provider(nostr_id: impl Into<String>, provider: MlsProvider) -> Result<Self> {
         Self::with_provider_and_signer(nostr_id, provider, None)
     }
 
     /// Create an MLS participant, optionally restoring a saved signing key.
-    ///
-    /// `signer_public_key`: the public key bytes from a previous session.
-    /// Pass `Some(bytes)` to restore, `None` to generate fresh keys.
     pub fn with_provider_and_signer(
         nostr_id: impl Into<String>,
         provider: MlsProvider,
         signer_public_key: Option<&[u8]>,
-    ) -> Self {
+    ) -> Result<Self> {
         let nostr_id = nostr_id.into();
         let credential = BasicCredential::new(nostr_id.as_bytes().to_vec());
 
-        // Try to restore existing signer from storage
-        let signer = signer_public_key
-            .and_then(|pub_key| {
-                SignatureKeyPair::read(
-                    provider.inner().storage(),
-                    pub_key,
-                    MLS_CIPHERSUITE.signature_algorithm(),
-                )
-            })
-            .unwrap_or_else(|| {
-                // No saved key or restore failed — generate fresh
-                let s = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
-                    .expect("failed to generate MLS signature keypair");
-                s.store(provider.inner().storage())
-                    .expect("failed to store signature keypair");
-                s
-            });
+        let signer = if let Some(restored) = signer_public_key.and_then(|pub_key| {
+            SignatureKeyPair::read(
+                provider.inner().storage(),
+                pub_key,
+                MLS_CIPHERSUITE.signature_algorithm(),
+            )
+        }) {
+            restored
+        } else {
+            let s = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
+                .map_err(|e| KeychatError::Mls(format!("failed to generate MLS keypair: {e}")))?;
+            s.store(provider.inner().storage())
+                .map_err(|e| KeychatError::Mls(format!("failed to store MLS keypair: {e}")))?;
+            s
+        };
 
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
         };
 
-        Self {
+        Ok(Self {
             nostr_id,
             provider,
             credential: credential_with_key,
             signer,
-        }
+        })
     }
 
     /// Get the MLS signer's public key bytes (for persistence).
@@ -240,6 +238,10 @@ impl MlsParticipant {
         )
         .map_err(|e| KeychatError::Mls(format!("failed to create MLS group: {e}")))?;
 
+        tracing::info!(
+            "MLS group created: group_id={}",
+            &group_id[..16.min(group_id.len())]
+        );
         Ok(())
     }
 
@@ -266,6 +268,11 @@ impl MlsParticipant {
             .tls_serialize_detached()
             .map_err(|e| KeychatError::Mls(format!("serialize welcome: {e}")))?;
 
+        tracing::info!(
+            "MLS add_members: group_id={}, count={}",
+            &group_id[..16.min(group_id.len())],
+            key_packages.len()
+        );
         Ok((commit_bytes, welcome_bytes))
     }
 
@@ -292,6 +299,10 @@ impl MlsParticipant {
         let group_id = String::from_utf8(group.group_id().as_slice().to_vec())
             .map_err(|e| KeychatError::Mls(format!("group_id not utf8: {e}")))?;
 
+        tracing::info!(
+            "MLS join_group: group_id={}",
+            &group_id[..16.min(group_id.len())]
+        );
         Ok(group_id)
     }
 
@@ -302,7 +313,13 @@ impl MlsParticipant {
 
         let msg_out = group
             .create_message(self.provider.inner(), &self.signer, plaintext)
-            .map_err(|e| KeychatError::Mls(format!("encrypt error: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(
+                    "MLS encrypt failed for group_id={}: {e}",
+                    &group_id[..16.min(group_id.len())]
+                );
+                KeychatError::Mls(format!("encrypt error: {e}"))
+            })?;
 
         let bytes = msg_out
             .tls_serialize_detached()
@@ -316,8 +333,13 @@ impl MlsParticipant {
     pub fn decrypt(&self, group_id: &str, ciphertext: &[u8]) -> Result<(Vec<u8>, String)> {
         let mut group = self.load_group(group_id)?;
 
-        let msg_in = MlsMessageIn::tls_deserialize_exact(ciphertext)
-            .map_err(|e| KeychatError::Mls(format!("deserialize msg: {e}")))?;
+        let msg_in = MlsMessageIn::tls_deserialize_exact(ciphertext).map_err(|e| {
+            tracing::error!(
+                "MLS decrypt deserialize failed for group_id={}: {e}",
+                &group_id[..16.min(group_id.len())]
+            );
+            KeychatError::Mls(format!("deserialize msg: {e}"))
+        })?;
 
         let protocol_msg = msg_in
             .try_into_protocol_message()
@@ -325,12 +347,20 @@ impl MlsParticipant {
 
         let processed = group
             .process_message(self.provider.inner(), protocol_msg)
-            .map_err(|e| KeychatError::Mls(format!("process message error: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(
+                    "MLS decrypt process_message failed for group_id={}: {e}",
+                    &group_id[..16.min(group_id.len())]
+                );
+                KeychatError::Mls(format!("process message error: {e}"))
+            })?;
 
         // Extract sender credential identity
         let sender_identity = processed.credential().serialized_content().to_vec();
-        let sender_id =
-            String::from_utf8(sender_identity).unwrap_or_else(|_| "unknown".to_string());
+        let sender_id = String::from_utf8(sender_identity).unwrap_or_else(|e| {
+            tracing::warn!("MLS sender credential is not valid UTF-8: {e}");
+            "unknown".to_string()
+        });
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => {
@@ -467,8 +497,10 @@ impl MlsParticipant {
         let members: Vec<String> = group
             .members()
             .map(|m| {
-                String::from_utf8(m.credential.serialized_content().to_vec())
-                    .unwrap_or_else(|_| "unknown".to_string())
+                String::from_utf8(m.credential.serialized_content().to_vec()).unwrap_or_else(|e| {
+                    tracing::warn!("MLS member credential is not valid UTF-8: {e}");
+                    "unknown".to_string()
+                })
             })
             .collect();
         Ok(members)
@@ -479,7 +511,10 @@ impl MlsParticipant {
         let group = self.load_group(group_id)?;
         for member in group.members() {
             let id = String::from_utf8(member.credential.serialized_content().to_vec())
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!("MLS member credential is not valid UTF-8: {e}");
+                    String::new()
+                });
             if id == member_id {
                 return Ok(member.index);
             }
@@ -806,9 +841,9 @@ mod tests {
 
     #[test]
     fn test_mls_group_create_and_message() {
-        let alice = MlsParticipant::new("alice_nostr_pubkey");
-        let bob = MlsParticipant::new("bob_nostr_pubkey");
-        let charlie = MlsParticipant::new("charlie_nostr_pubkey");
+        let alice = MlsParticipant::new("alice_nostr_pubkey").unwrap();
+        let bob = MlsParticipant::new("bob_nostr_pubkey").unwrap();
+        let charlie = MlsParticipant::new("charlie_nostr_pubkey").unwrap();
 
         let group_id = "test-group-1";
 
@@ -853,8 +888,8 @@ mod tests {
 
     #[test]
     fn test_epoch_rotation_changes_temp_inbox() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
 
         let group_id = "epoch-test";
         alice.create_group(group_id, "Epoch Test").unwrap();
@@ -892,9 +927,9 @@ mod tests {
 
     #[test]
     fn test_add_member_can_receive() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
-        let charlie = MlsParticipant::new("charlie");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
+        let charlie = MlsParticipant::new("charlie").unwrap();
 
         let group_id = "add-member-test";
         alice.create_group(group_id, "Add Member Test").unwrap();
@@ -928,9 +963,9 @@ mod tests {
 
     #[test]
     fn test_remove_member_cannot_decrypt() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
-        let charlie = MlsParticipant::new("charlie");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
+        let charlie = MlsParticipant::new("charlie").unwrap();
 
         let group_id = "remove-test";
         alice.create_group(group_id, "Remove Test").unwrap();
@@ -969,8 +1004,8 @@ mod tests {
 
     #[test]
     fn test_self_leave() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
 
         let group_id = "leave-test";
         alice.create_group(group_id, "Leave Test").unwrap();
@@ -1001,8 +1036,8 @@ mod tests {
 
     #[test]
     fn test_group_dissolve() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
 
         let group_id = "dissolve-test";
         alice.create_group(group_id, "Dissolve Test").unwrap();
@@ -1028,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_key_package_roundtrip() {
-        let alice = MlsParticipant::new("alice");
+        let alice = MlsParticipant::new("alice").unwrap();
         let kp = alice.generate_key_package().unwrap();
 
         // Create Nostr keys for publishing
@@ -1077,8 +1112,8 @@ mod tests {
 
     #[test]
     fn test_multiple_epochs() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
 
         let group_id = "multi-epoch";
         alice.create_group(group_id, "Multi Epoch").unwrap();
@@ -1115,8 +1150,8 @@ mod tests {
 
     #[test]
     fn test_send_receive_mls_message() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
 
         let group_id = "transport-test";
         alice.create_group(group_id, "Transport Test").unwrap();
@@ -1156,8 +1191,8 @@ mod tests {
 
     #[test]
     fn test_group_rename() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
 
         let group_id = "rename-test";
         alice.create_group(group_id, "Original Name").unwrap();
@@ -1209,8 +1244,8 @@ mod tests {
 
     #[test]
     fn test_group_members() {
-        let alice = MlsParticipant::new("alice");
-        let bob = MlsParticipant::new("bob");
+        let alice = MlsParticipant::new("alice").unwrap();
+        let bob = MlsParticipant::new("bob").unwrap();
 
         let group_id = "members-test";
         alice.create_group(group_id, "Members Test").unwrap();

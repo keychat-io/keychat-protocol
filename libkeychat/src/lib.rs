@@ -38,13 +38,6 @@
 //! - **Group Management**: Invite, remove, leave, dissolve, rename operations
 //! - **RoomProfile**: Serializable invite payload with member list
 //!
-//! ## Phase 6A: Signal Group (sendAll)
-//! - **SignalGroup**: Group struct with members, admins, and group ID
-//! - **GroupManager**: Manages multiple groups
-//! - **Group Messaging**: Fan-out per-member encryption (no shared group key)
-//! - **Group Management**: Invite, remove, leave, dissolve, rename operations
-//! - **RoomProfile**: Invite payload with member list for group creation
-//!
 //! ## Phase 6B: MLS Large Group (RFC 9420)
 //! - **MlsProvider**: OpenMLS provider wrapper with in-memory SQLite storage
 //! - **MlsParticipant**: Identity, credential, and group operations wrapper
@@ -59,12 +52,6 @@
 //! - **Cashu**: Ecash token message builders and validation (§13)
 //! - **Lightning**: Lightning invoice message builders
 //! - **Ecash Stamps**: Attach ecash stamps to relay events (§13.1)
-//!
-//! ## Phase 7: Media & Payment
-//! - **Media**: AES-256-CTR + PKCS7 file encryption/decryption (§12)
-//! - **Message Builders**: KCMessage builders for file, voice, and multi-file messages
-//! - **Payment**: Cashu ecash and Lightning invoice message builders (§13)
-//! - **Ecash Stamps**: Relay delivery format with ecash token attachment
 
 pub mod address;
 pub mod chat;
@@ -159,6 +146,6 @@ pub use storage::{
 pub use transport::{PublishResult, RelayHealth, Transport, DEFAULT_RELAYS};
 
 // Re-export key nostr types for convenience
-pub use nostr::{Event, EventId, Keys, Kind, PublicKey, SecretKey, Timestamp};
 pub use nostr::message::relay::RelayMessage;
+pub use nostr::{Event, EventId, Keys, Kind, PublicKey, SecretKey, Timestamp};
 pub use nostr_sdk::{RelayPoolNotification, RelayStatus};

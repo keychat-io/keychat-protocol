@@ -49,21 +49,20 @@ pub struct FriendRequestAccepted {
     pub sender_address: Option<String>,
 }
 
-/// Send a friend request to a peer (§6.2).
-pub async fn send_friend_request(
+// ─── Shared helpers (C-DUP3) ────────────────────────────────────────────────
+
+/// Build a friend request event from an already-created SignalParticipant.
+async fn build_friend_request_event(
     my_identity: &Identity,
-    peer_nostr_pubkey: &str,
+    peer_nostr_pubkey_hex: &str,
     display_name: &str,
     device_id: &str,
-) -> Result<(Event, FriendRequestState)> {
-    let peer_nostr_pubkey_hex = crate::identity::normalize_pubkey(peer_nostr_pubkey)?;
-    let signal_participant = SignalParticipant::new(my_identity.pubkey_hex(), 1)?;
-    let first_inbox_keys = EphemeralKeypair::generate();
-    let first_inbox_hex = first_inbox_keys.pubkey_hex();
-
+    signal_participant: &SignalParticipant,
+    first_inbox_hex: &str,
+) -> Result<(Event, String)> {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let signal_identity_key_hex = signal_participant.identity_public_key_hex();
@@ -79,7 +78,7 @@ pub async fn send_friend_request(
         name: display_name.to_string(),
         nostr_identity_key: my_identity.pubkey_hex(),
         signal_identity_key: signal_identity_key_hex,
-        first_inbox: first_inbox_hex,
+        first_inbox: first_inbox_hex.to_string(),
         device_id: device_id.to_string(),
         signal_signed_prekey_id: signal_participant.signed_prekey_id(),
         signal_signed_prekey: signal_participant.signed_prekey_public_hex()?,
@@ -101,19 +100,175 @@ pub async fn send_friend_request(
     let kc_message = KCMessage::friend_request(request_id.clone(), payload);
     let kc_json = kc_message.to_json()?;
 
-    let peer_pubkey = PublicKey::from_hex(&peer_nostr_pubkey_hex)
+    let peer_pubkey = PublicKey::from_hex(peer_nostr_pubkey_hex)
         .map_err(|e| KeychatError::Signal(format!("invalid peer pubkey: {e}")))?;
 
     let gift_wrap_event = create_gift_wrap(my_identity.keys(), &peer_pubkey, &kc_json).await?;
+    tracing::info!("friend request event built: request_id={request_id}");
+    Ok((gift_wrap_event, request_id))
+}
 
-    let state = FriendRequestState {
-        signal_participant,
-        first_inbox_keys,
-        request_id,
-        peer_nostr_pubkey: peer_nostr_pubkey_hex,
-    };
+/// Parse a KCFriendRequestPayload into a PreKeyBundle + remote ProtocolAddress.
+fn build_prekey_bundle_from_payload(
+    payload: &KCFriendRequestPayload,
+) -> Result<(PreKeyBundle, ProtocolAddress)> {
+    let remote_identity_key_bytes = hex::decode(&payload.signal_identity_key)
+        .map_err(|e| KeychatError::Signal(format!("hex decode signal identity: {e}")))?;
+    let remote_identity_key =
+        libsignal_protocol::IdentityKey::decode(&remote_identity_key_bytes)
+            .map_err(|e| KeychatError::Signal(format!("invalid signal identity key: {e}")))?;
 
-    Ok((gift_wrap_event, state))
+    let remote_signed_prekey_bytes = hex::decode(&payload.signal_signed_prekey)
+        .map_err(|e| KeychatError::Signal(format!("hex decode signed prekey: {e}")))?;
+    let remote_signed_prekey =
+        libsignal_protocol::PublicKey::deserialize(&remote_signed_prekey_bytes)
+            .map_err(|e| KeychatError::Signal(format!("invalid signed prekey: {e}")))?;
+
+    let remote_signed_prekey_sig = hex::decode(&payload.signal_signed_prekey_signature)
+        .map_err(|e| KeychatError::Signal(format!("hex decode sig: {e}")))?;
+
+    let remote_one_time_prekey_bytes = hex::decode(&payload.signal_one_time_prekey)
+        .map_err(|e| KeychatError::Signal(format!("hex decode one-time prekey: {e}")))?;
+    let remote_one_time_prekey =
+        libsignal_protocol::PublicKey::deserialize(&remote_one_time_prekey_bytes)
+            .map_err(|e| KeychatError::Signal(format!("invalid one-time prekey: {e}")))?;
+
+    if payload.signal_kyber_prekey.is_empty() {
+        return Err(KeychatError::Signal(
+            "Kyber prekey is required for PQXDH session establishment".into(),
+        ));
+    }
+
+    let kyber_prekey_bytes = hex::decode(&payload.signal_kyber_prekey)
+        .map_err(|e| KeychatError::Signal(format!("hex decode kyber prekey: {e}")))?;
+    let kyber_public_key = kem::PublicKey::deserialize(&kyber_prekey_bytes)
+        .map_err(|e| KeychatError::Signal(format!("invalid kyber prekey: {e}")))?;
+    let kyber_sig = hex::decode(&payload.signal_kyber_prekey_signature)
+        .map_err(|e| KeychatError::Signal(format!("hex decode kyber sig: {e}")))?;
+
+    let remote_device_id: u32 = payload.device_id.parse().unwrap_or_else(|_| {
+        tracing::warn!(
+            "device_id parse failed for '{}', defaulting to 1",
+            payload.device_id
+        );
+        1
+    });
+    let device_id = DeviceId::new(remote_device_id as u8).unwrap_or_else(|_| {
+        tracing::warn!(
+            "device_id {} out of range, defaulting to 1",
+            remote_device_id
+        );
+        DeviceId::new(1).unwrap()
+    });
+
+    let prekey_bundle = PreKeyBundle::new(
+        1,
+        device_id,
+        Some((
+            libsignal_protocol::PreKeyId::from(payload.signal_one_time_prekey_id),
+            remote_one_time_prekey,
+        )),
+        libsignal_protocol::SignedPreKeyId::from(payload.signal_signed_prekey_id),
+        remote_signed_prekey,
+        remote_signed_prekey_sig,
+        KyberPreKeyId::from(payload.signal_kyber_prekey_id),
+        kyber_public_key,
+        kyber_sig,
+        remote_identity_key,
+    )
+    .map_err(|e| KeychatError::Signal(format!("failed to build prekey bundle: {e}")))?;
+
+    let remote_address = ProtocolAddress::new(payload.signal_identity_key.clone(), device_id);
+
+    Ok((prekey_bundle, remote_address))
+}
+
+/// Build the accept event: process bundle, encrypt approval, wrap as kind:1059.
+async fn build_accept_event(
+    my_identity: &Identity,
+    my_signal: &mut SignalParticipant,
+    friend_request: &FriendRequestReceived,
+    display_name: &str,
+) -> Result<FriendRequestAccepted> {
+    let payload = &friend_request.payload;
+    let (prekey_bundle, remote_address) = build_prekey_bundle_from_payload(payload)?;
+
+    my_signal.process_prekey_bundle(&remote_address, &prekey_bundle)?;
+    tracing::info!("session established for friend request acceptance");
+
+    let request_id = friend_request.message.id.clone().unwrap_or_default();
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let my_signal_id_hex = my_signal.identity_public_key_hex();
+    let sig = compute_global_sign(
+        my_identity.secret_key(),
+        &my_identity.pubkey_hex(),
+        &my_signal_id_hex,
+        time,
+    )?;
+
+    let mut approve_msg = KCMessage::friend_approve(request_id, None);
+    approve_msg.signal_prekey_auth = Some(SignalPrekeyAuth {
+        nostr_id: my_identity.pubkey_hex(),
+        signal_id: my_signal_id_hex,
+        time,
+        name: display_name.to_string(),
+        sig,
+        avatar: None,
+        lightning: None,
+    });
+
+    let approve_json = approve_msg.to_json()?;
+    let ct = my_signal.encrypt(&remote_address, approve_json.as_bytes())?;
+    let event = build_mode1_event(&ct.bytes, &payload.first_inbox).await?;
+
+    Ok(FriendRequestAccepted {
+        signal_participant: my_signal.clone(),
+        event,
+        message: approve_msg,
+        sender_address: ct.sender_address,
+    })
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+/// Send a friend request to a peer (§6.2).
+pub async fn send_friend_request(
+    my_identity: &Identity,
+    peer_nostr_pubkey: &str,
+    display_name: &str,
+    device_id: &str,
+) -> Result<(Event, FriendRequestState)> {
+    let peer_nostr_pubkey_hex = crate::identity::normalize_pubkey(peer_nostr_pubkey)?;
+    let signal_participant = SignalParticipant::new(my_identity.pubkey_hex(), 1)?;
+    let first_inbox_keys = EphemeralKeypair::generate();
+
+    let (gift_wrap_event, request_id) = build_friend_request_event(
+        my_identity,
+        &peer_nostr_pubkey_hex,
+        display_name,
+        device_id,
+        &signal_participant,
+        &first_inbox_keys.pubkey_hex(),
+    )
+    .await?;
+
+    tracing::info!(
+        "sent friend request to peer={}",
+        &peer_nostr_pubkey_hex[..16.min(peer_nostr_pubkey_hex.len())]
+    );
+    Ok((
+        gift_wrap_event,
+        FriendRequestState {
+            signal_participant,
+            first_inbox_keys,
+            request_id,
+            peer_nostr_pubkey: peer_nostr_pubkey_hex,
+        },
+    ))
 }
 
 /// Receive and parse a friend request from a Gift Wrap event (§7.1, §7.2).
@@ -150,6 +305,10 @@ pub fn receive_friend_request(
     )?;
 
     if !valid {
+        tracing::warn!(
+            "globalSign verification failed for friend request from {}",
+            &payload.nostr_identity_key[..16.min(payload.nostr_identity_key.len())]
+        );
         return Err(KeychatError::Signal(
             "globalSign verification failed".into(),
         ));
@@ -163,6 +322,10 @@ pub fn receive_friend_request(
         )));
     }
 
+    tracing::info!(
+        "received friend request from {}",
+        &sender_hex[..16.min(sender_hex.len())]
+    );
     Ok(FriendRequestReceived {
         sender_pubkey: unwrapped.sender_pubkey,
         sender_pubkey_hex: sender_hex,
@@ -178,110 +341,12 @@ pub async fn accept_friend_request(
     friend_request: &FriendRequestReceived,
     display_name: &str,
 ) -> Result<FriendRequestAccepted> {
-    let payload = &friend_request.payload;
-
-    let mut my_signal = SignalParticipant::new(my_identity.pubkey_hex(), 1)?;
-
-    // Build PreKeyBundle from friend request payload
-    let remote_identity_key_bytes = hex::decode(&payload.signal_identity_key)
-        .map_err(|e| KeychatError::Signal(format!("hex decode signal identity: {e}")))?;
-    let remote_identity_key =
-        libsignal_protocol::IdentityKey::decode(&remote_identity_key_bytes)
-            .map_err(|e| KeychatError::Signal(format!("invalid signal identity key: {e}")))?;
-
-    let remote_signed_prekey_bytes = hex::decode(&payload.signal_signed_prekey)
-        .map_err(|e| KeychatError::Signal(format!("hex decode signed prekey: {e}")))?;
-    let remote_signed_prekey =
-        libsignal_protocol::PublicKey::deserialize(&remote_signed_prekey_bytes)
-            .map_err(|e| KeychatError::Signal(format!("invalid signed prekey: {e}")))?;
-
-    let remote_signed_prekey_sig = hex::decode(&payload.signal_signed_prekey_signature)
-        .map_err(|e| KeychatError::Signal(format!("hex decode sig: {e}")))?;
-
-    let remote_one_time_prekey_bytes = hex::decode(&payload.signal_one_time_prekey)
-        .map_err(|e| KeychatError::Signal(format!("hex decode one-time prekey: {e}")))?;
-    let remote_one_time_prekey =
-        libsignal_protocol::PublicKey::deserialize(&remote_one_time_prekey_bytes)
-            .map_err(|e| KeychatError::Signal(format!("invalid one-time prekey: {e}")))?;
-
-    // Kyber prekey is mandatory for PQXDH in libsignal v0.88.3
-    if payload.signal_kyber_prekey.is_empty() {
-        return Err(KeychatError::Signal(
-            "Kyber prekey is required for PQXDH session establishment".into(),
-        ));
-    }
-
-    let kyber_prekey_bytes = hex::decode(&payload.signal_kyber_prekey)
-        .map_err(|e| KeychatError::Signal(format!("hex decode kyber prekey: {e}")))?;
-    let kyber_public_key = kem::PublicKey::deserialize(&kyber_prekey_bytes)
-        .map_err(|e| KeychatError::Signal(format!("invalid kyber prekey: {e}")))?;
-    let kyber_sig = hex::decode(&payload.signal_kyber_prekey_signature)
-        .map_err(|e| KeychatError::Signal(format!("hex decode kyber sig: {e}")))?;
-
-    let prekey_bundle = PreKeyBundle::new(
-        1,
-        DeviceId::new(1).unwrap(),
-        Some((
-            libsignal_protocol::PreKeyId::from(payload.signal_one_time_prekey_id),
-            remote_one_time_prekey,
-        )),
-        libsignal_protocol::SignedPreKeyId::from(payload.signal_signed_prekey_id),
-        remote_signed_prekey,
-        remote_signed_prekey_sig,
-        KyberPreKeyId::from(payload.signal_kyber_prekey_id),
-        kyber_public_key,
-        kyber_sig,
-        remote_identity_key,
-    )
-    .map_err(|e| KeychatError::Signal(format!("failed to build prekey bundle: {e}")))?;
-
-    // Process prekey bundle (PQXDH handshake)
-    let remote_address = ProtocolAddress::new(
-        payload.signal_identity_key.clone(),
-        DeviceId::new(1).unwrap(),
+    tracing::info!(
+        "accepting friend request from {}",
+        &friend_request.sender_pubkey_hex[..16.min(friend_request.sender_pubkey_hex.len())]
     );
-    my_signal.process_prekey_bundle(&remote_address, &prekey_bundle)?;
-
-    // Build friendApprove with signalPrekeyAuth
-    let request_id = friend_request.message.id.clone().unwrap_or_default();
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    let my_signal_id_hex = my_signal.identity_public_key_hex();
-    let sig = compute_global_sign(
-        my_identity.secret_key(),
-        &my_identity.pubkey_hex(),
-        &my_signal_id_hex,
-        time,
-    )?;
-
-    let mut approve_msg = KCMessage::friend_approve(request_id, None);
-    approve_msg.signal_prekey_auth = Some(SignalPrekeyAuth {
-        nostr_id: my_identity.pubkey_hex(),
-        signal_id: my_signal_id_hex,
-        time,
-        name: display_name.to_string(),
-        sig,
-        avatar: None,
-        lightning: None,
-    });
-
-    let approve_json = approve_msg.to_json()?;
-
-    // Encrypt with Signal (PrekeyMessage) — use encrypt to capture ratchet info
-    let ct = my_signal.encrypt(&remote_address, approve_json.as_bytes())?;
-
-    // Build kind:1059 Mode 1 event → peer's firstInbox
-    let event = build_mode1_event(&ct.bytes, &payload.first_inbox).await?;
-
-    Ok(FriendRequestAccepted {
-        signal_participant: my_signal,
-        event,
-        message: approve_msg,
-        sender_address: ct.sender_address,
-    })
+    let mut my_signal = SignalParticipant::new(my_identity.pubkey_hex(), 1)?;
+    build_accept_event(my_identity, &mut my_signal, friend_request, display_name).await
 }
 
 /// Send a friend request with persistent Signal participant (§6.2).
@@ -302,61 +367,30 @@ pub async fn send_friend_request_persistent(
     let signal_participant =
         SignalParticipant::persistent(my_identity.pubkey_hex(), signal_device_id, keys, storage)?;
     let first_inbox_keys = EphemeralKeypair::generate();
-    let first_inbox_hex = first_inbox_keys.pubkey_hex();
 
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    let (gift_wrap_event, request_id) = build_friend_request_event(
+        my_identity,
+        &peer_nostr_pubkey_hex,
+        display_name,
+        device_id,
+        &signal_participant,
+        &first_inbox_keys.pubkey_hex(),
+    )
+    .await?;
 
-    let signal_identity_key_hex = signal_participant.identity_public_key_hex();
-    let global_sign = compute_global_sign(
-        my_identity.secret_key(),
-        &my_identity.pubkey_hex(),
-        &signal_identity_key_hex,
-        time,
-    )?;
-
-    let payload = KCFriendRequestPayload {
-        message: None,
-        name: display_name.to_string(),
-        nostr_identity_key: my_identity.pubkey_hex(),
-        signal_identity_key: signal_identity_key_hex,
-        first_inbox: first_inbox_hex,
-        device_id: device_id.to_string(),
-        signal_signed_prekey_id: signal_participant.signed_prekey_id(),
-        signal_signed_prekey: signal_participant.signed_prekey_public_hex()?,
-        signal_signed_prekey_signature: signal_participant.signed_prekey_signature_hex()?,
-        signal_one_time_prekey_id: signal_participant.prekey_id(),
-        signal_one_time_prekey: signal_participant.prekey_public_hex()?,
-        signal_kyber_prekey_id: signal_participant.kyber_prekey_id(),
-        signal_kyber_prekey: signal_participant.kyber_prekey_public_hex()?,
-        signal_kyber_prekey_signature: signal_participant.kyber_prekey_signature_hex()?,
-        global_sign,
-        time: Some(time),
-        version: 2,
-        relay: None,
-        avatar: None,
-        lightning: None,
-    };
-
-    let request_id = format!("fr-{}", uuid_v4());
-    let kc_message = KCMessage::friend_request(request_id.clone(), payload);
-    let kc_json = kc_message.to_json()?;
-
-    let peer_pubkey = PublicKey::from_hex(&peer_nostr_pubkey_hex)
-        .map_err(|e| KeychatError::Signal(format!("invalid peer pubkey: {e}")))?;
-
-    let gift_wrap_event = create_gift_wrap(my_identity.keys(), &peer_pubkey, &kc_json).await?;
-
-    let state = FriendRequestState {
-        signal_participant,
-        first_inbox_keys,
-        request_id,
-        peer_nostr_pubkey: peer_nostr_pubkey_hex,
-    };
-
-    Ok((gift_wrap_event, state))
+    tracing::info!(
+        "sent friend request (persistent) to peer={}",
+        &peer_nostr_pubkey_hex[..16.min(peer_nostr_pubkey_hex.len())]
+    );
+    Ok((
+        gift_wrap_event,
+        FriendRequestState {
+            signal_participant,
+            first_inbox_keys,
+            request_id,
+            peer_nostr_pubkey: peer_nostr_pubkey_hex,
+        },
+    ))
 }
 
 /// Accept a friend request with persistent Signal participant (§7.3, §7.4).
@@ -372,110 +406,13 @@ pub async fn accept_friend_request_persistent(
     storage: Arc<Mutex<SecureStorage>>,
     signal_device_id: u32,
 ) -> Result<FriendRequestAccepted> {
-    let payload = &friend_request.payload;
-
+    tracing::info!(
+        "accepting friend request (persistent) from {}",
+        &friend_request.sender_pubkey_hex[..16.min(friend_request.sender_pubkey_hex.len())]
+    );
     let mut my_signal =
         SignalParticipant::persistent(my_identity.pubkey_hex(), signal_device_id, keys, storage)?;
-
-    // Build PreKeyBundle from friend request payload
-    let remote_identity_key_bytes = hex::decode(&payload.signal_identity_key)
-        .map_err(|e| KeychatError::Signal(format!("hex decode signal identity: {e}")))?;
-    let remote_identity_key =
-        libsignal_protocol::IdentityKey::decode(&remote_identity_key_bytes)
-            .map_err(|e| KeychatError::Signal(format!("invalid signal identity key: {e}")))?;
-
-    let remote_signed_prekey_bytes = hex::decode(&payload.signal_signed_prekey)
-        .map_err(|e| KeychatError::Signal(format!("hex decode signed prekey: {e}")))?;
-    let remote_signed_prekey =
-        libsignal_protocol::PublicKey::deserialize(&remote_signed_prekey_bytes)
-            .map_err(|e| KeychatError::Signal(format!("invalid signed prekey: {e}")))?;
-
-    let remote_signed_prekey_sig = hex::decode(&payload.signal_signed_prekey_signature)
-        .map_err(|e| KeychatError::Signal(format!("hex decode sig: {e}")))?;
-
-    let remote_one_time_prekey_bytes = hex::decode(&payload.signal_one_time_prekey)
-        .map_err(|e| KeychatError::Signal(format!("hex decode one-time prekey: {e}")))?;
-    let remote_one_time_prekey =
-        libsignal_protocol::PublicKey::deserialize(&remote_one_time_prekey_bytes)
-            .map_err(|e| KeychatError::Signal(format!("invalid one-time prekey: {e}")))?;
-
-    if payload.signal_kyber_prekey.is_empty() {
-        return Err(KeychatError::Signal(
-            "Kyber prekey is required for PQXDH session establishment".into(),
-        ));
-    }
-
-    let kyber_prekey_bytes = hex::decode(&payload.signal_kyber_prekey)
-        .map_err(|e| KeychatError::Signal(format!("hex decode kyber prekey: {e}")))?;
-    let kyber_public_key = kem::PublicKey::deserialize(&kyber_prekey_bytes)
-        .map_err(|e| KeychatError::Signal(format!("invalid kyber prekey: {e}")))?;
-    let kyber_sig = hex::decode(&payload.signal_kyber_prekey_signature)
-        .map_err(|e| KeychatError::Signal(format!("hex decode kyber sig: {e}")))?;
-
-    // Parse remote device_id from payload, default to 1
-    let remote_device_id: u32 = payload.device_id.parse().unwrap_or(1);
-
-    let prekey_bundle = PreKeyBundle::new(
-        1,
-        DeviceId::new(remote_device_id as u8).unwrap_or(DeviceId::new(1).unwrap()),
-        Some((
-            libsignal_protocol::PreKeyId::from(payload.signal_one_time_prekey_id),
-            remote_one_time_prekey,
-        )),
-        libsignal_protocol::SignedPreKeyId::from(payload.signal_signed_prekey_id),
-        remote_signed_prekey,
-        remote_signed_prekey_sig,
-        KyberPreKeyId::from(payload.signal_kyber_prekey_id),
-        kyber_public_key,
-        kyber_sig,
-        remote_identity_key,
-    )
-    .map_err(|e| KeychatError::Signal(format!("failed to build prekey bundle: {e}")))?;
-
-    let remote_address = ProtocolAddress::new(
-        payload.signal_identity_key.clone(),
-        DeviceId::new(remote_device_id as u8).unwrap_or(DeviceId::new(1).unwrap()),
-    );
-    my_signal.process_prekey_bundle(&remote_address, &prekey_bundle)?;
-
-    let request_id = friend_request.message.id.clone().unwrap_or_default();
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    let my_signal_id_hex = my_signal.identity_public_key_hex();
-    let sig = compute_global_sign(
-        my_identity.secret_key(),
-        &my_identity.pubkey_hex(),
-        &my_signal_id_hex,
-        time,
-    )?;
-
-    let mut approve_msg = KCMessage::friend_approve(request_id, None);
-    approve_msg.signal_prekey_auth = Some(SignalPrekeyAuth {
-        nostr_id: my_identity.pubkey_hex(),
-        signal_id: my_signal_id_hex,
-        time,
-        name: display_name.to_string(),
-        sig,
-        avatar: None,
-        lightning: None,
-    });
-
-    let approve_json = approve_msg.to_json()?;
-
-    // Encrypt with Signal — session changes automatically persisted to SQLCipher
-    let ct = my_signal.encrypt(&remote_address, approve_json.as_bytes())?;
-
-    let event = build_mode1_event(&ct.bytes, &payload.first_inbox).await?;
-
-    Ok(FriendRequestAccepted {
-        signal_participant: my_signal,
-        event,
-        message: approve_msg,
-        sender_address: ct.sender_address,
-    })
+    build_accept_event(my_identity, &mut my_signal, friend_request, display_name).await
 }
 
 /// Send a Signal-encrypted KCMessage as kind:1059 Mode 1 (§8.1).
@@ -512,40 +449,8 @@ pub fn receive_signal_message(
     Ok((message, decrypt_result))
 }
 
-/// Build a kind:1059 Mode 1 event with ephemeral sender and base64 content.
-async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
-    let sender = EphemeralKeypair::generate();
-    let content = base64::engine::general_purpose::STANDARD.encode(ciphertext);
-    let to_pubkey = PublicKey::from_hex(to_address)
-        .map_err(|e| KeychatError::Signal(format!("invalid to_address: {e}")))?;
-
-    let event = EventBuilder::new(Kind::GiftWrap, &content)
-        .tag(Tag::public_key(to_pubkey))
-        .sign(sender.keys())
-        .await
-        .map_err(|e| KeychatError::Signal(format!("failed to sign event: {e}")))?;
-
-    Ok(event)
-}
-
-fn uuid_v4() -> String {
-    use ::rand::Rng;
-    let mut rng = ::rand::rng();
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        u16::from_be_bytes([bytes[4], bytes[5]]),
-        u16::from_be_bytes([bytes[6], bytes[7]]),
-        u16::from_be_bytes([bytes[8], bytes[9]]),
-        u64::from_be_bytes([
-            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-        ])
-    )
-}
+use crate::chat::build_mode1_event;
+use crate::message::uuid_v4;
 
 #[cfg(test)]
 mod tests {

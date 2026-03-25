@@ -56,7 +56,7 @@ impl KeychatClient {
 
         // 2b. Persist pending FR to SQLCipher
         {
-            let store = storage.lock().map_err(|e| KeychatUniError::Transport {
+            let store = storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
             store.save_pending_fr(
@@ -217,7 +217,7 @@ impl KeychatClient {
 
         // 4b. Persist to SQLCipher: signal participant, peer addresses, peer mapping
         {
-            let store = storage.lock().map_err(|e| KeychatUniError::Transport {
+            let store = storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
             store.save_signal_participant(

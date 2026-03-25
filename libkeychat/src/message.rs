@@ -515,6 +515,8 @@ impl KCMessage {
     }
 
     /// An empty message shell (all optional fields None).
+    /// Note: `kind` defaults to `Text` as a placeholder — callers should set the
+    /// actual kind before use.
     pub fn empty() -> Self {
         Self {
             v: 2,

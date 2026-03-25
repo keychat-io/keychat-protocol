@@ -165,7 +165,10 @@ impl CapturingSessionStore {
 
     /// Take and clear the last alice_addrs for a peer.
     pub fn take_alice_addrs(&self, peer: &str) -> Option<Vec<String>> {
-        self.last_alice_addrs.lock().unwrap().remove(peer)
+        self.last_alice_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer)
     }
 
     /// Move a session record from one ProtocolAddress to another in the backing store.
@@ -198,7 +201,12 @@ impl SessionStore for CapturingSessionStore {
         record: &SessionRecord,
     ) -> std::result::Result<(), SignalProtocolError> {
         let new_snap = parse_ratchet_snapshot(record);
-        let old_snap = self.snapshots.lock().unwrap().get(address.name()).cloned();
+        let old_snap = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(address.name())
+            .cloned();
 
         if let Some(ref snap) = new_snap {
             // Always update my_receiver_addresses with current ratchet key pair

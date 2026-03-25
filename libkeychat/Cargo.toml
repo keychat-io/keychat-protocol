@@ -80,6 +80,7 @@ cdk-common = { version = "0.15.1", default-features = false, optional = true }
 
 # Utilities
 rand = "0.9"
+zeroize = "1"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
 hex = "0.4"
 base64 = "0.22"

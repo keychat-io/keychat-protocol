@@ -461,7 +461,7 @@ impl StampManager {
         }
 
         match self.create_stamp(relay_url, event.kind).await? {
-            Some(token) => Ok(attach_ecash_stamp(event, &token)),
+            Some(token) => attach_ecash_stamp(event, &token),
             None => {
                 // Standard Nostr EVENT message (no stamp needed)
                 let event_json = serde_json::to_value(event)
@@ -620,7 +620,7 @@ mod tests {
             .unwrap();
 
         let token = "cashuAeyJhbGciOiJIUzI1NiJ9";
-        let result = attach_ecash_stamp(&event, token);
+        let result = attach_ecash_stamp(&event, token).unwrap();
 
         let arr: serde_json::Value = serde_json::from_str(&result).unwrap();
         let arr = arr.as_array().unwrap();

@@ -1,5 +1,9 @@
 use libkeychat::{DeviceId, KCMessage, ProtocolAddress};
 
+fn default_device_id() -> DeviceId {
+    DeviceId::new(1).expect("device_id 1 is always valid")
+}
+
 use crate::client::KeychatClient;
 use crate::error::KeychatUniError;
 use crate::types::*;
@@ -40,8 +44,8 @@ impl KeychatClient {
             (session, signal_hex)
         }; // RwLock dropped here
 
-        // 2. Lock only the specific peer session — encrypt the message
-        let remote_addr = ProtocolAddress::new(peer_signal_hex.clone(), DeviceId::new(1).unwrap());
+        // 2. Lock only the specific peer session
+        let remote_addr = ProtocolAddress::new(peer_signal_hex.clone(), default_device_id());
         let msg = KCMessage::text(&text);
         let payload_json = msg.to_json().ok();
 
@@ -59,9 +63,12 @@ impl KeychatClient {
         // 4. Get connected relays list before publishing
         let connected = {
             let inner = self.inner.read().await;
-            let transport = inner.transport.as_ref().ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
-            })?;
+            let transport = inner
+                .transport
+                .as_ref()
+                .ok_or(KeychatUniError::NotInitialized {
+                    msg: "not connected".into(),
+                })?;
             transport.connected_relays().await
         };
 
@@ -73,9 +80,12 @@ impl KeychatClient {
 
         // 5. Publish to relays — relay OK responses come via event loop
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::NotInitialized {
-            msg: "not connected".into(),
-        })?;
+        let transport = inner
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::NotInitialized {
+                msg: "not connected".into(),
+            })?;
         let _published_id = transport.publish_event_async(event).await?;
         tracing::info!(
             "⬆️ SENT eventId={} to {} relays (async OK)",
