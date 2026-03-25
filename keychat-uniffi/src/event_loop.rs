@@ -9,6 +9,8 @@ use libkeychat::{
     ProtocolAddress, PublicKey, RelayMessage, RelayPoolNotification, Timestamp,
 };
 
+use tracing::warn;
+
 use crate::client::KeychatClient;
 use crate::types::*;
 
@@ -274,10 +276,10 @@ impl KeychatClient {
                     let room_id = store.save_app_room(
                         &sender_pubkey, &identity_npub, 0, 0, Some(&sender_name), None,
                     ).ok()?;
-                    let _ = store.save_app_contact(&sender_pubkey, &sender_npub, &identity_npub, Some(&sender_name));
-                    let _ = store.save_app_message(&msgid, None, &room_id, &identity_npub, &sender_pubkey, fr_content, false, 1, created_at as i64);
-                    let _ = store.update_app_room(&room_id, None, None, Some(fr_content), Some(created_at as i64));
-                    let _ = store.increment_app_room_unread(&room_id);
+                    if let Err(e) = store.save_app_contact(&sender_pubkey, &sender_npub, &identity_npub, Some(&sender_name)) { warn!("save_app_contact: {e}"); }
+                    if let Err(e) = store.save_app_message(&msgid, None, &room_id, &identity_npub, &sender_pubkey, fr_content, false, 1, created_at as i64) { warn!("save_app_message: {e}"); }
+                    if let Err(e) = store.update_app_room(&room_id, None, None, Some(fr_content), Some(created_at as i64)) { warn!("update_app_room: {e}"); }
+                    if let Err(e) = store.increment_app_room_unread(&room_id) { warn!("increment_app_room_unread: {e}"); }
                     Some(room_id)
                 });
                 result
@@ -543,7 +545,7 @@ impl KeychatClient {
                                     }
                                 }
                                 // Delete the pending FR (now an active session)
-                                let _ = store.delete_pending_fr(request_id);
+                                if let Err(e) = store.delete_pending_fr(request_id) { warn!("delete_pending_fr: {e}"); }
                                 tracing::info!("[Step2]: persisted session to SQLCipher");
                             }
                         } // store MutexGuard dropped here
@@ -610,14 +612,14 @@ impl KeychatClient {
                                         &peer_nostr_id, &identity_npub, 1, 0,
                                         Some(&peer_name), Some(signal_id_hex),
                                     ).ok()?;
-                                    let _ = store.save_app_contact(&peer_nostr_id, &peer_npub, &identity_npub, Some(&peer_name));
+                                    if let Err(e) = store.save_app_contact(&peer_nostr_id, &peer_npub, &identity_npub, Some(&peer_name)) { warn!("save_app_contact: {e}"); }
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs() as i64;
-                                    let _ = store.save_app_message(&msgid, None, &room_id, &identity_npub, &peer_nostr_id, "[Friend Request Accepted]", false, 1, now);
-                                    let _ = store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now));
-                                    let _ = store.increment_app_room_unread(&room_id);
+                                    if let Err(e) = store.save_app_message(&msgid, None, &room_id, &identity_npub, &peer_nostr_id, "[Friend Request Accepted]", false, 1, now) { warn!("save_app_message: {e}"); }
+                                    if let Err(e) = store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now)) { warn!("update_app_room: {e}"); }
+                                    if let Err(e) = store.increment_app_room_unread(&room_id) { warn!("increment_app_room_unread: {e}"); }
                                     Some(room_id)
                                 })
                             }; // storage + MutexGuard dropped
@@ -658,7 +660,7 @@ impl KeychatClient {
                     if !identity_npub.is_empty() {
                         let room_id = format!("{}:{}", peer_pubkey, identity_npub);
                         if let Ok(store) = inner.storage.lock() {
-                            let _ = store.update_app_room(&room_id, Some(-1), None, Some("[Friend Request Rejected]"), None);
+                            if let Err(e) = store.update_app_room(&room_id, Some(-1), None, Some("[Friend Request Rejected]"), None) { warn!("update_app_room reject: {e}"); }
                         }
                         drop(inner);
                         self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
@@ -964,13 +966,11 @@ impl KeychatClient {
                         {
                             let mut inner = self.inner.write().await;
                             if let Ok(store) = inner.storage.clone().lock() {
-                                let _ = inner
-                                    .group_manager
-                                    .remove_group_persistent(&group_id, &store);
+                                if let Err(e) = inner.group_manager.remove_group_persistent(&group_id, &store) { warn!("remove_group_persistent: {e}"); }
                                 // Delete app room
                                 let full_room_id =
                                     format!("{}:{}", group_id, identity_npub);
-                                let _ = store.delete_app_room(&full_room_id);
+                                if let Err(e) = store.delete_app_room(&full_room_id) { warn!("delete_app_room: {e}"); }
                             } else {
                                 inner.group_manager.remove_group(&group_id);
                             }
@@ -1016,17 +1016,17 @@ impl KeychatClient {
                                 g.name = name.clone();
                             }
                             if let Ok(store) = inner.storage.clone().lock() {
-                                let _ = inner.group_manager.save_group(&group_id, &store);
+                                if let Err(e) = inner.group_manager.save_group(&group_id, &store) { warn!("save_group: {e}"); }
                                 // Update app room name
                                 let full_room_id =
                                     format!("{}:{}", group_id, identity_npub);
-                                let _ = store.update_app_room(
+                                if let Err(e) = store.update_app_room(
                                     &full_room_id,
                                     None,
                                     Some(name),
                                     None,
                                     None,
-                                );
+                                ) { warn!("update_app_room name: {e}"); }
                             }
                         }
 
@@ -1092,26 +1092,26 @@ impl KeychatClient {
                                 let msgid = event_id.clone();
 
                                 // Ensure room exists
-                                let _ = store.save_app_room(
+                                if let Err(e) = store.save_app_room(
                                     &room_id, &identity_npub, 1,
                                     if group_id.is_some() { 1 } else { 0 }, None, None,
-                                );
+                                ) { warn!("save_app_room: {e}"); }
 
                                 // Save message + metadata
-                                let _ = store.save_app_message(
+                                if let Err(e) = store.save_app_message(
                                     &msgid, Some(&event_id), &full_room_id, &identity_npub,
                                     &sender_pubkey, content_str, false, 1, created_at,
-                                );
-                                let _ = store.update_app_message(
+                                ) { warn!("save_app_message: {e}"); }
+                                if let Err(e) = store.update_app_message(
                                     &msgid, None, None, None,
                                     payload.as_deref(), nostr_event_json.as_deref(),
                                     reply_to_event_id.as_deref(), None,
-                                );
+                                ) { warn!("update_app_message: {e}"); }
 
                                 // Resolve reply-to content
                                 if let Some(ref reply_eid) = reply_to_event_id {
                                     if let Ok(Some(reply_msg)) = store.get_app_message_by_event_id(reply_eid) {
-                                        let _ = store.update_app_message(&msgid, None, None, None, None, None, None, Some(&reply_msg.content));
+                                        if let Err(e) = store.update_app_message(&msgid, None, None, None, None, None, None, Some(&reply_msg.content)) { warn!("update reply_to_content: {e}"); }
                                     }
                                 }
 
@@ -1121,8 +1121,8 @@ impl KeychatClient {
                                 } else {
                                     content_str
                                 };
-                                let _ = store.update_app_room(&full_room_id, None, None, Some(display_content), Some(created_at));
-                                let _ = store.increment_app_room_unread(&full_room_id);
+                                if let Err(e) = store.update_app_room(&full_room_id, None, None, Some(display_content), Some(created_at)) { warn!("update_app_room: {e}"); }
+                                if let Err(e) = store.increment_app_room_unread(&full_room_id) { warn!("increment_app_room_unread: {e}"); }
 
                                 Some(msgid)
                             })

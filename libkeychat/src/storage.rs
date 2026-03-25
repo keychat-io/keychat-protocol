@@ -1314,8 +1314,13 @@ impl SecureStorage {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO app_identities (npub, nostr_pubkey_hex, name, idx, is_default, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT created_at FROM app_identities WHERE npub = ?1), strftime('%s','now')))",
+                "INSERT INTO app_identities (npub, nostr_pubkey_hex, name, idx, is_default, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+                 ON CONFLICT(npub) DO UPDATE SET
+                   nostr_pubkey_hex = excluded.nostr_pubkey_hex,
+                   name = excluded.name,
+                   idx = excluded.idx,
+                   is_default = excluded.is_default",
                 rusqlite::params![npub, nostr_pubkey_hex, name, idx, is_default as i32],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_identity: {e}")))?;
@@ -1409,8 +1414,12 @@ impl SecureStorage {
         let id = format!("{}:{}", to_main_pubkey, identity_npub);
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO app_rooms (id, to_main_pubkey, identity_npub, status, type, name, peer_signal_identity_key, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE((SELECT created_at FROM app_rooms WHERE id = ?1), strftime('%s','now')))",
+                "INSERT INTO app_rooms (id, to_main_pubkey, identity_npub, status, type, name, peer_signal_identity_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                   status = CASE WHEN excluded.status > status THEN excluded.status ELSE status END,
+                   name = COALESCE(excluded.name, name),
+                   peer_signal_identity_key = COALESCE(excluded.peer_signal_identity_key, peer_signal_identity_key)",
                 rusqlite::params![id, to_main_pubkey, identity_npub, status, room_type, name, peer_signal_identity_key],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_room: {e}")))?;
@@ -1522,22 +1531,42 @@ impl SecureStorage {
         last_message_content: Option<&str>,
         last_message_at: Option<i64>,
     ) -> Result<()> {
+        let mut sets = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut idx = 1;
+
         if let Some(s) = status {
-            self.conn.execute("UPDATE app_rooms SET status = ?1 WHERE id = ?2", rusqlite::params![s, room_id])
-                .map_err(|e| KeychatError::Storage(format!("update_app_room status: {e}")))?;
+            sets.push(format!("status = ?{idx}"));
+            params.push(Box::new(s));
+            idx += 1;
         }
         if let Some(n) = name {
-            self.conn.execute("UPDATE app_rooms SET name = ?1 WHERE id = ?2", rusqlite::params![n, room_id])
-                .map_err(|e| KeychatError::Storage(format!("update_app_room name: {e}")))?;
+            sets.push(format!("name = ?{idx}"));
+            params.push(Box::new(n.to_string()));
+            idx += 1;
         }
         if let Some(c) = last_message_content {
-            self.conn.execute("UPDATE app_rooms SET last_message_content = ?1 WHERE id = ?2", rusqlite::params![c, room_id])
-                .map_err(|e| KeychatError::Storage(format!("update_app_room last_message: {e}")))?;
+            sets.push(format!("last_message_content = ?{idx}"));
+            params.push(Box::new(c.to_string()));
+            idx += 1;
         }
         if let Some(t) = last_message_at {
-            self.conn.execute("UPDATE app_rooms SET last_message_at = ?1 WHERE id = ?2", rusqlite::params![t, room_id])
-                .map_err(|e| KeychatError::Storage(format!("update_app_room last_message_at: {e}")))?;
+            sets.push(format!("last_message_at = ?{idx}"));
+            params.push(Box::new(t));
+            idx += 1;
         }
+
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!("UPDATE app_rooms SET {} WHERE id = ?{idx}", sets.join(", "));
+        params.push(Box::new(room_id.to_string()));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        self.conn
+            .execute(&sql, param_refs.as_slice())
+            .map_err(|e| KeychatError::Storage(format!("update_app_room: {e}")))?;
         Ok(())
     }
 
@@ -1688,7 +1717,7 @@ impl SecureStorage {
             .map_err(|e| KeychatError::Storage(format!("get_app_message_by_event_id: {e}")))
     }
 
-    /// Update message status and relay info.
+    /// Update message status and relay info (single atomic UPDATE).
     pub fn update_app_message(
         &self,
         msgid: &str,
@@ -1700,34 +1729,60 @@ impl SecureStorage {
         reply_to_event_id: Option<&str>,
         reply_to_content: Option<&str>,
     ) -> Result<()> {
-        if let Some(eid) = event_id {
-            self.conn.execute("UPDATE app_messages SET event_id = ?1 WHERE msgid = ?2", rusqlite::params![eid, msgid])
-                .map_err(|e| KeychatError::Storage(format!("update_app_message event_id: {e}")))?;
+        let mut sets = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut idx = 1;
+
+        if let Some(v) = event_id {
+            sets.push(format!("event_id = ?{idx}"));
+            params.push(Box::new(v.to_string()));
+            idx += 1;
         }
-        if let Some(s) = status {
-            self.conn.execute("UPDATE app_messages SET status = ?1 WHERE msgid = ?2", rusqlite::params![s, msgid])
-                .map_err(|e| KeychatError::Storage(format!("update_app_message status: {e}")))?;
+        if let Some(v) = status {
+            sets.push(format!("status = ?{idx}"));
+            params.push(Box::new(v));
+            idx += 1;
         }
-        if let Some(r) = relay_status_json {
-            self.conn.execute("UPDATE app_messages SET relay_status_json = ?1 WHERE msgid = ?2", rusqlite::params![r, msgid])
-                .map_err(|e| KeychatError::Storage(format!("update_app_message relay: {e}")))?;
+        if let Some(v) = relay_status_json {
+            sets.push(format!("relay_status_json = ?{idx}"));
+            params.push(Box::new(v.to_string()));
+            idx += 1;
         }
-        if let Some(p) = payload_json {
-            self.conn.execute("UPDATE app_messages SET payload_json = ?1 WHERE msgid = ?2", rusqlite::params![p, msgid])
-                .map_err(|e| KeychatError::Storage(format!("update_app_message payload: {e}")))?;
+        if let Some(v) = payload_json {
+            sets.push(format!("payload_json = ?{idx}"));
+            params.push(Box::new(v.to_string()));
+            idx += 1;
         }
-        if let Some(n) = nostr_event_json {
-            self.conn.execute("UPDATE app_messages SET nostr_event_json = ?1 WHERE msgid = ?2", rusqlite::params![n, msgid])
-                .map_err(|e| KeychatError::Storage(format!("update_app_message nostr: {e}")))?;
+        if let Some(v) = nostr_event_json {
+            sets.push(format!("nostr_event_json = ?{idx}"));
+            params.push(Box::new(v.to_string()));
+            idx += 1;
         }
-        if let Some(r) = reply_to_event_id {
-            self.conn.execute("UPDATE app_messages SET reply_to_event_id = ?1 WHERE msgid = ?2", rusqlite::params![r, msgid])
-                .map_err(|e| KeychatError::Storage(format!("update_app_message reply_to: {e}")))?;
+        if let Some(v) = reply_to_event_id {
+            sets.push(format!("reply_to_event_id = ?{idx}"));
+            params.push(Box::new(v.to_string()));
+            idx += 1;
         }
-        if let Some(c) = reply_to_content {
-            self.conn.execute("UPDATE app_messages SET reply_to_content = ?1 WHERE msgid = ?2", rusqlite::params![c, msgid])
-                .map_err(|e| KeychatError::Storage(format!("update_app_message reply_content: {e}")))?;
+        if let Some(v) = reply_to_content {
+            sets.push(format!("reply_to_content = ?{idx}"));
+            params.push(Box::new(v.to_string()));
+            idx += 1;
         }
+
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "UPDATE app_messages SET {} WHERE msgid = ?{idx}",
+            sets.join(", ")
+        );
+        params.push(Box::new(msgid.to_string()));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        self.conn
+            .execute(&sql, param_refs.as_slice())
+            .map_err(|e| KeychatError::Storage(format!("update_app_message: {e}")))?;
         Ok(())
     }
 
@@ -1803,8 +1858,12 @@ impl SecureStorage {
             .as_secs() as i64;
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO app_contacts (id, pubkey, npubkey, identity_npub, name, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT created_at FROM app_contacts WHERE id = ?1), ?6), ?6)",
+                "INSERT INTO app_contacts (id, pubkey, npubkey, identity_npub, name, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   npubkey = excluded.npubkey,
+                   name = COALESCE(excluded.name, name),
+                   updated_at = excluded.updated_at",
                 rusqlite::params![id, pubkey, npubkey, identity_npub, name, now],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_contact: {e}")))?;
