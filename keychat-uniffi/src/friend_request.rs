@@ -20,7 +20,7 @@ impl KeychatClient {
         device_id: String,
     ) -> Result<PendingFriendRequest, KeychatUniError> {
         // 1. Extract needed data, drop lock before async
-        let (identity, storage, signal_device_id) = {
+        let (identity, storage, signal_device_id, identity_npub) = {
             let mut inner = self.inner.write().await;
             let id = inner
                 .identity
@@ -28,15 +28,14 @@ impl KeychatClient {
                 .ok_or(KeychatUniError::NotInitialized {
                     msg: "no identity".into(),
                 })?;
+            let npub = id.npub().unwrap_or_default();
             let did = inner.next_signal_device_id;
             inner.next_signal_device_id += 1;
-            (id, inner.storage.clone(), did)
+            (id, inner.storage.clone(), did, npub)
         }; // lock dropped
 
         // 2. Generate keys and send (async, no lock held)
         let keys = generate_prekey_material()?;
-
-        // Serialize keys for persistence before they're consumed
         let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
             serialize_prekey_material(&keys)?;
 
@@ -101,6 +100,47 @@ impl KeychatClient {
         // 5. Refresh subscriptions to include first_inbox for this pending FR
         let _ = self.refresh_subscriptions().await;
 
+        // 6. Write to app_* tables: room (status=0 requesting) + contact + message
+        let peer_npub = crate::npub_from_hex(peer_nostr_pubkey.clone()).unwrap_or_default();
+        let room_id = format!("{}:{}", peer_nostr_pubkey, identity_npub);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let fr_storage = self.inner.read().await.storage.clone();
+        if let Some(store) = fr_storage.lock().ok() {
+            if let Err(e) = store.save_app_room(
+                &peer_nostr_pubkey, &identity_npub, 0, 0, None, None,
+            ) {
+                tracing::warn!("send_friend_request save_app_room: {e}");
+            }
+            if let Err(e) = store.save_app_contact(
+                &peer_nostr_pubkey, &peer_npub, &identity_npub, None,
+            ) {
+                tracing::warn!("send_friend_request save_app_contact: {e}");
+            }
+            if let Err(e) = store.save_app_message(
+                &request_id, None, &room_id, &identity_npub,
+                &identity.pubkey_hex(), "[Friend Request Sent]", true, 1, now,
+            ) {
+                tracing::warn!("send_friend_request save_app_message: {e}");
+            }
+            if let Err(e) = store.update_app_room(
+                &room_id, None, None, Some("[Friend Request Sent]"), Some(now),
+            ) {
+                tracing::warn!("send_friend_request update_app_room: {e}");
+            }
+        }
+        drop(fr_storage);
+
+        self.emit_data_change(DataChange::RoomListChanged).await;
+        self.emit_data_change(DataChange::ContactListChanged).await;
+        self.emit_data_change(DataChange::MessageAdded {
+            room_id: room_id.clone(),
+            msgid: request_id.clone(),
+        })
+        .await;
+
         Ok(PendingFriendRequest {
             request_id,
             peer_nostr_pubkey,
@@ -122,7 +162,6 @@ impl KeychatClient {
                     msg: "no identity".into(),
                 })?;
 
-            // Load from SQLCipher instead of in-memory HashMap
             let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
@@ -158,7 +197,7 @@ impl KeychatClient {
                 sender_pubkey_hex,
                 message,
                 payload,
-                created_at: 0, // Restored from DB, original rumor timestamp not preserved
+                created_at: 0,
             };
 
             let did = inner.next_signal_device_id;
@@ -168,8 +207,6 @@ impl KeychatClient {
 
         // 2. Accept (async, no lock)
         let keys = generate_prekey_material()?;
-
-        // Serialize keys for persistence
         let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
             serialize_prekey_material(&keys)?;
 
@@ -183,13 +220,11 @@ impl KeychatClient {
         )
         .await?;
 
-        // Use the PEER's Signal identity key (from their FR payload), not our own.
-        // The session in our SignalParticipant is stored under this key as remote_address.
         let peer_signal_hex = received.payload.signal_identity_key.clone();
         let peer_nostr_hex = received.sender_pubkey_hex.clone();
         let peer_name = received.payload.name.clone();
 
-        // 3. Publish approval event async — don't block waiting for relay OK responses
+        // 3. Publish approval event async
         {
             let inner = self.inner.read().await;
             let transport = inner
@@ -208,12 +243,10 @@ impl KeychatClient {
             Some(received.payload.first_inbox.clone()),
             Some(peer_nostr_hex.clone()),
         );
-        // Register ratchet-derived receiving address from the acceptance encrypt.
-        // This ensures we subscribe to the address that the peer will send messages to.
         if accepted.sender_address.is_some() {
             let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
         }
-        let session = ChatSession::new(accepted.signal_participant, addresses, identity);
+        let session = ChatSession::new(accepted.signal_participant, addresses, identity.clone());
 
         // 4b. Persist to SQLCipher: signal participant, peer addresses, peer mapping
         {
@@ -234,15 +267,12 @@ impl KeychatClient {
                 &kpk_rec,
             )?;
 
-            // Serialize and save address state
-            let sess = &session;
-            if let Some(addr_state) = sess.addresses.to_serialized(&peer_signal_hex) {
+            if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
                 store.save_peer_addresses(&peer_signal_hex, &addr_state)?;
             }
 
             store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
 
-            // Remove the inbound FR now that it's been accepted
             let _ = store.delete_inbound_fr(&request_id);
         }
         tracing::info!(
@@ -262,8 +292,47 @@ impl KeychatClient {
                 .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
         }
 
-        // Refresh relay subscriptions to include the new session's receiving addresses
         let _ = self.refresh_subscriptions().await;
+
+        // 5. Write to app_* tables: update room status to enabled, create acceptance message
+        let identity_npub = identity.npub().unwrap_or_default();
+        let room_id = format!("{}:{}", peer_nostr_hex, identity_npub);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let msgid = format!("accept-{}", request_id);
+        let accept_storage = self.inner.read().await.storage.clone();
+        if let Some(store) = accept_storage.lock().ok() {
+            if let Err(e) = store.update_app_room(
+                &room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now),
+            ) {
+                tracing::warn!("accept_friend_request update_app_room: {e}");
+            }
+            if let Err(e) = store.update_app_contact(
+                &peer_nostr_hex, &identity_npub, None, Some(&peer_name), None,
+            ) {
+                tracing::warn!("accept_friend_request update_app_contact: {e}");
+            }
+            if let Err(e) = store.save_app_message(
+                &msgid, None, &room_id, &identity_npub,
+                &identity.pubkey_hex(), "[Friend Request Accepted]", true, 1, now,
+            ) {
+                tracing::warn!("accept_friend_request save_app_message: {e}");
+            }
+        }
+        drop(accept_storage);
+
+        self.emit_data_change(DataChange::RoomUpdated {
+            room_id: room_id.clone(),
+        })
+        .await;
+        self.emit_data_change(DataChange::ContactListChanged).await;
+        self.emit_data_change(DataChange::MessageAdded {
+            room_id,
+            msgid,
+        })
+        .await;
 
         Ok(ContactInfo {
             nostr_pubkey_hex: peer_nostr_hex,
@@ -277,16 +346,49 @@ impl KeychatClient {
         request_id: String,
         _message: Option<String>,
     ) -> Result<(), KeychatUniError> {
-        // Remove from DB. Optionally could send a reject message in the future.
-        let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
-        })?;
-        store
-            .delete_inbound_fr(&request_id)
-            .map_err(|e| KeychatUniError::Storage {
-                msg: format!("delete_inbound_fr: {e}"),
+        // Load sender info before deleting
+        let (sender_pubkey_hex, identity_npub) = {
+            let inner = self.inner.read().await;
+            let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+                msg: format!("storage lock: {e}"),
             })?;
+            let fr = store
+                .load_inbound_fr(&request_id)
+                .map_err(|e| KeychatUniError::Storage {
+                    msg: format!("load_inbound_fr: {e}"),
+                })?;
+            let npub = inner
+                .identity
+                .as_ref()
+                .and_then(|id| id.npub().ok())
+                .unwrap_or_default();
+            let sender = fr.map(|(pubkey, _, _)| pubkey).unwrap_or_default();
+
+            // Delete from DB
+            store
+                .delete_inbound_fr(&request_id)
+                .map_err(|e| KeychatUniError::Storage {
+                    msg: format!("delete_inbound_fr: {e}"),
+                })?;
+
+            (sender, npub)
+        };
+
+        // Update room status to rejected (-1)
+        if !sender_pubkey_hex.is_empty() && !identity_npub.is_empty() {
+            let room_id = format!("{}:{}", sender_pubkey_hex, identity_npub);
+            let rej_storage = self.inner.read().await.storage.clone();
+            if let Some(store) = rej_storage.lock().ok() {
+                if let Err(e) = store.update_app_room(
+                    &room_id, Some(-1), None, Some("[Friend Request Rejected]"), None,
+                ) {
+                    tracing::warn!("reject_friend_request update_app_room: {e}");
+                }
+            }
+            drop(rej_storage);
+            self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+        }
+
         Ok(())
     }
 }

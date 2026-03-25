@@ -114,6 +114,15 @@ impl KeychatClient {
                                 status,
                                 &message[..80.min(message.len())]
                             );
+                            // Check relay send tracker for finalization
+                            let finalized = {
+                                let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                                tracker.handle_relay_ok(&eid, &relay_url.to_string(), status, &message)
+                            };
+                            if let Some(entry) = finalized {
+                                self.finalize_tracked_send(entry).await;
+                            }
+
                             self.emit_event(ClientEvent::RelayOk {
                                 event_id: eid,
                                 relay_url: relay_url.to_string(),
@@ -1162,6 +1171,57 @@ impl KeychatClient {
             }
         }
         false
+    }
+
+    /// Finalize a tracked send: update message status in DB and emit DataChange.
+    pub(crate) async fn finalize_tracked_send(&self, entry: crate::relay_tracker::FinalizedEntry) {
+        let status = if entry.success { 1 } else { 2 }; // 1=success, 2=failed
+        let storage = self.inner.read().await.storage.clone();
+        if let Ok(store) = storage.lock() {
+            if let Err(e) = store.update_app_message(
+                &entry.msgid,
+                None,
+                Some(status),
+                Some(&entry.relay_status_json),
+                None,
+                None,
+                None,
+                None,
+            ) {
+                warn!("finalize_tracked_send update_app_message: {e}");
+            }
+        }
+        tracing::info!(
+            "⬆️ FINALIZED eventId={} status={} relays={}",
+            &entry.event_id[..16.min(entry.event_id.len())],
+            if entry.success { "success" } else { "failed" },
+            entry.relay_status_json.len()
+        );
+        self.emit_data_change(DataChange::MessageUpdated {
+            room_id: entry.room_id,
+            msgid: entry.msgid,
+        })
+        .await;
+    }
+
+    /// Spawn a timeout task that finalizes any unresolved relay tracking after 3 seconds.
+    pub(crate) fn spawn_tracker_timeout(self: &Arc<Self>, event_id: String) {
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let finalized = {
+                let mut tracker = client
+                    .relay_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                tracker.check_timeouts(3)
+            };
+            for entry in finalized {
+                if entry.event_id == event_id {
+                    client.finalize_tracked_send(entry).await;
+                }
+            }
+        });
     }
 
     /// Emit a ClientEvent to the registered EventListener.

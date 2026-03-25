@@ -9,6 +9,7 @@ use libkeychat::{
 use std::sync::Once;
 
 use crate::error::KeychatUniError;
+use crate::relay_tracker::RelaySendTracker;
 use crate::types::*;
 
 static TRACING_INIT: Once = Once::new();
@@ -32,6 +33,7 @@ pub struct KeychatClient {
     pub(crate) inner: tokio::sync::RwLock<ClientInner>,
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
     pub(crate) db_path: String,
+    pub(crate) relay_tracker: std::sync::Mutex<RelaySendTracker>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -75,6 +77,7 @@ impl KeychatClient {
             }),
             runtime: Arc::new(runtime),
             db_path,
+            relay_tracker: std::sync::Mutex::new(RelaySendTracker::new()),
         })
     }
 

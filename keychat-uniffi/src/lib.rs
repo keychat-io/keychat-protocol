@@ -6,6 +6,7 @@ mod event_loop;
 mod friend_request;
 mod group;
 mod messaging;
+mod relay_tracker;
 mod types;
 
 pub use client::KeychatClient;
