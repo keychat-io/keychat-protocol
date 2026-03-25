@@ -23,6 +23,7 @@ pub(crate) struct ClientInner {
     pub group_manager: GroupManager,
     pub next_signal_device_id: u32,
     pub event_listener: Option<Box<dyn EventListener>>,
+    pub data_listener: Option<Box<dyn DataListener>>,
     pub event_loop_stop: Option<tokio::sync::watch::Sender<bool>>,
 }
 
@@ -69,6 +70,7 @@ impl KeychatClient {
                 group_manager: GroupManager::new(),
                 next_signal_device_id: 1,
                 event_listener: None,
+                data_listener: None,
                 event_loop_stop: None,
             }),
             runtime: Arc::new(runtime),
@@ -889,6 +891,11 @@ impl KeychatClient {
     pub async fn set_event_listener(&self, listener: Box<dyn EventListener>) {
         let mut inner = self.inner.write().await;
         inner.event_listener = Some(listener);
+    }
+
+    pub async fn set_data_listener(&self, listener: Box<dyn DataListener>) {
+        let mut inner = self.inner.write().await;
+        inner.data_listener = Some(listener);
     }
 
     /// Start the event loop: subscribe to relay notifications and dispatch

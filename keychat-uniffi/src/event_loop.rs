@@ -252,6 +252,44 @@ impl KeychatClient {
             }
         }
 
+        // ── Persist to app_* tables ──────────────────────────────
+        let identity_npub = {
+            let inner = self.inner.read().await;
+            inner
+                .identity
+                .as_ref()
+                .and_then(|id| id.npub().ok())
+                .unwrap_or_default()
+        };
+
+        if !identity_npub.is_empty() {
+            let fr_content = message.as_deref().unwrap_or("[Friend Request]");
+            let sender_npub = crate::npub_from_hex(sender_pubkey.clone()).unwrap_or_default();
+            let msgid = format!("fr-recv-{}", &request_id);
+
+            // DB writes under sync lock (no await while lock held)
+            let saved_room_id = {
+                let storage = self.inner.read().await.storage.clone();
+                let result = storage.lock().ok().and_then(|store| {
+                    let room_id = store.save_app_room(
+                        &sender_pubkey, &identity_npub, 0, 0, Some(&sender_name), None,
+                    ).ok()?;
+                    let _ = store.save_app_contact(&sender_pubkey, &sender_npub, &identity_npub, Some(&sender_name));
+                    let _ = store.save_app_message(&msgid, None, &room_id, &identity_npub, &sender_pubkey, fr_content, false, 1, created_at as i64);
+                    let _ = store.update_app_room(&room_id, None, None, Some(fr_content), Some(created_at as i64));
+                    let _ = store.increment_app_room_unread(&room_id);
+                    Some(room_id)
+                });
+                result
+            }; // storage + MutexGuard dropped
+
+            if let Some(room_id) = saved_room_id {
+                self.emit_data_change(DataChange::RoomListChanged).await;
+                self.emit_data_change(DataChange::ContactListChanged).await;
+                self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+            }
+        }
+
         self.emit_event(ClientEvent::FriendRequestReceived {
             request_id,
             sender_pubkey,
@@ -549,6 +587,49 @@ impl KeychatClient {
                         drop(inner);
                     }
 
+                    // ── Persist to app_* tables ──────────────────
+                    {
+                        let identity_npub = {
+                            let inner = self.inner.read().await;
+                            inner
+                                .identity
+                                .as_ref()
+                                .and_then(|id| id.npub().ok())
+                                .unwrap_or_default()
+                        };
+                        if !identity_npub.is_empty() {
+                            let peer_npub =
+                                crate::npub_from_hex(peer_nostr_id.clone()).unwrap_or_default();
+                            let msgid = format!("fr-accept-{}", request_id);
+
+                            // DB writes under sync lock (no await while lock held)
+                            let saved_room_id = {
+                                let storage = self.inner.read().await.storage.clone();
+                                storage.lock().ok().and_then(|store| {
+                                    let room_id = store.save_app_room(
+                                        &peer_nostr_id, &identity_npub, 1, 0,
+                                        Some(&peer_name), Some(signal_id_hex),
+                                    ).ok()?;
+                                    let _ = store.save_app_contact(&peer_nostr_id, &peer_npub, &identity_npub, Some(&peer_name));
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs() as i64;
+                                    let _ = store.save_app_message(&msgid, None, &room_id, &identity_npub, &peer_nostr_id, "[Friend Request Accepted]", false, 1, now);
+                                    let _ = store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now));
+                                    let _ = store.increment_app_room_unread(&room_id);
+                                    Some(room_id)
+                                })
+                            }; // storage + MutexGuard dropped
+
+                            if let Some(room_id) = saved_room_id {
+                                self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
+                                self.emit_data_change(DataChange::ContactListChanged).await;
+                                self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+                            }
+                        }
+                    }
+
                     self.emit_event(ClientEvent::FriendRequestAccepted {
                         peer_pubkey: peer_nostr_id,
                         peer_name,
@@ -567,7 +648,23 @@ impl KeychatClient {
                     // Remove from pending
                     let mut inner = self.inner.write().await;
                     inner.pending_outbound.remove(request_id);
-                    drop(inner);
+
+                    // Update room status to rejected
+                    let identity_npub = inner
+                        .identity
+                        .as_ref()
+                        .and_then(|id| id.npub().ok())
+                        .unwrap_or_default();
+                    if !identity_npub.is_empty() {
+                        let room_id = format!("{}:{}", peer_pubkey, identity_npub);
+                        if let Ok(store) = inner.storage.lock() {
+                            let _ = store.update_app_room(&room_id, Some(-1), None, Some("[Friend Request Rejected]"), None);
+                        }
+                        drop(inner);
+                        self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+                    } else {
+                        drop(inner);
+                    }
 
                     self.emit_event(ClientEvent::FriendRequestRejected { peer_pubkey })
                         .await;
@@ -708,6 +805,29 @@ impl KeychatClient {
                                     }
                                 }
 
+                                // Persist group room to app_* tables
+                                {
+                                    let identity_npub = {
+                                        let inner = self.inner.read().await;
+                                        inner
+                                            .identity
+                                            .as_ref()
+                                            .and_then(|id| id.npub().ok())
+                                            .unwrap_or_default()
+                                    };
+                                    if !identity_npub.is_empty() {
+                                        let saved = {
+                                            let storage = self.inner.read().await.storage.clone();
+                                            storage.lock().ok().and_then(|store| {
+                                                store.save_app_room(&group_id, &identity_npub, 1, 1, Some(&group_name), None).ok()
+                                            })
+                                        };
+                                        if saved.is_some() {
+                                            self.emit_data_change(DataChange::RoomListChanged).await;
+                                        }
+                                    }
+                                }
+
                                 self.emit_event(ClientEvent::GroupInviteReceived {
                                     room_id: group_id,
                                     group_type: "signal".into(),
@@ -737,6 +857,15 @@ impl KeychatClient {
                             removed_member
                         );
 
+                        let identity_npub = {
+                            let inner = self.inner.read().await;
+                            inner
+                                .identity
+                                .as_ref()
+                                .and_then(|id| id.npub().ok())
+                                .unwrap_or_default()
+                        };
+
                         // Update GroupManager + persist
                         if let Some(ref member_id) = removed_member {
                             let mut inner = self.inner.write().await;
@@ -747,6 +876,12 @@ impl KeychatClient {
                                 let _ = inner.group_manager.save_group(&group_id, &store);
                             }
                         }
+
+                        let full_room_id = format!("{}:{}", group_id, identity_npub);
+                        self.emit_data_change(DataChange::RoomUpdated {
+                            room_id: full_room_id,
+                        })
+                        .await;
 
                         self.emit_event(ClientEvent::GroupMemberChanged {
                             room_id: group_id,
@@ -772,6 +907,15 @@ impl KeychatClient {
                             left_member
                         );
 
+                        let identity_npub = {
+                            let inner = self.inner.read().await;
+                            inner
+                                .identity
+                                .as_ref()
+                                .and_then(|id| id.npub().ok())
+                                .unwrap_or_default()
+                        };
+
                         // Remove member from group + persist
                         if let Some(ref member_id) = left_member {
                             let mut inner = self.inner.write().await;
@@ -782,6 +926,12 @@ impl KeychatClient {
                                 let _ = inner.group_manager.save_group(&group_id, &store);
                             }
                         }
+
+                        let full_room_id = format!("{}:{}", group_id, identity_npub);
+                        self.emit_data_change(DataChange::RoomUpdated {
+                            room_id: full_room_id,
+                        })
+                        .await;
 
                         self.emit_event(ClientEvent::GroupMemberChanged {
                             room_id: group_id,
@@ -801,6 +951,15 @@ impl KeychatClient {
                             &group_id[..16.min(group_id.len())]
                         );
 
+                        let identity_npub = {
+                            let inner = self.inner.read().await;
+                            inner
+                                .identity
+                                .as_ref()
+                                .and_then(|id| id.npub().ok())
+                                .unwrap_or_default()
+                        };
+
                         // Remove group from manager + storage
                         {
                             let mut inner = self.inner.write().await;
@@ -808,10 +967,19 @@ impl KeychatClient {
                                 let _ = inner
                                     .group_manager
                                     .remove_group_persistent(&group_id, &store);
+                                // Delete app room
+                                let full_room_id =
+                                    format!("{}:{}", group_id, identity_npub);
+                                let _ = store.delete_app_room(&full_room_id);
                             } else {
                                 inner.group_manager.remove_group(&group_id);
                             }
                         }
+
+                        self.emit_data_change(DataChange::RoomDeleted {
+                            room_id: format!("{}:{}", group_id, identity_npub),
+                        })
+                        .await;
 
                         self.emit_event(ClientEvent::GroupDissolved { room_id: group_id })
                             .await;
@@ -832,6 +1000,15 @@ impl KeychatClient {
                             new_name
                         );
 
+                        let identity_npub = {
+                            let inner = self.inner.read().await;
+                            inner
+                                .identity
+                                .as_ref()
+                                .and_then(|id| id.npub().ok())
+                                .unwrap_or_default()
+                        };
+
                         // Update group name + persist
                         if let Some(ref name) = new_name {
                             let mut inner = self.inner.write().await;
@@ -840,8 +1017,24 @@ impl KeychatClient {
                             }
                             if let Ok(store) = inner.storage.clone().lock() {
                                 let _ = inner.group_manager.save_group(&group_id, &store);
+                                // Update app room name
+                                let full_room_id =
+                                    format!("{}:{}", group_id, identity_npub);
+                                let _ = store.update_app_room(
+                                    &full_room_id,
+                                    None,
+                                    Some(name),
+                                    None,
+                                    None,
+                                );
                             }
                         }
+
+                        let full_room_id = format!("{}:{}", group_id, identity_npub);
+                        self.emit_data_change(DataChange::RoomUpdated {
+                            room_id: full_room_id,
+                        })
+                        .await;
 
                         self.emit_event(ClientEvent::GroupMemberChanged {
                             room_id: group_id,
@@ -855,14 +1048,6 @@ impl KeychatClient {
 
                     // All other message kinds (Text, Files, etc.)
                     _ => {
-                        let room_id = if msg.group_id.is_some() {
-                            // Group message: room_id = group_id
-                            msg.group_id.clone().unwrap()
-                        } else {
-                            // 1:1 message: room_id = peer nostr pubkey
-                            sender_nostr_pubkey.clone()
-                        };
-
                         let kind: MessageKind = msg.kind.clone().into();
                         let content = msg.text.as_ref().map(|t| t.content.clone());
                         let payload = msg.to_json().ok();
@@ -876,8 +1061,87 @@ impl KeychatClient {
                         let fallback = msg.fallback.clone();
                         let sender_pubkey = sender_nostr_pubkey;
 
+                        // ── Persist to app_* tables ──────────────────
+                        let identity_npub = {
+                            let inner = self.inner.read().await;
+                            inner
+                                .identity
+                                .as_ref()
+                                .and_then(|id| id.npub().ok())
+                                .unwrap_or_default()
+                        };
+
+                        // Room ID = "peer_pubkey:identity_npub" for 1:1
+                        // Room ID = "group_id:identity_npub" for groups
+                        let room_id = if group_id.is_some() {
+                            group_id.clone().unwrap()
+                        } else {
+                            sender_pubkey.clone()
+                        };
+                        let full_room_id = format!("{}:{}", room_id, identity_npub);
+
+                        // DB writes under sync lock (no await while lock held)
+                        let saved_msgid = if !identity_npub.is_empty() {
+                            let storage = self.inner.read().await.storage.clone();
+                            storage.lock().ok().and_then(|store| {
+                                if store.is_app_message_duplicate(&event_id).unwrap_or(false) {
+                                    return None;
+                                }
+                                let content_str = content.as_deref().unwrap_or("");
+                                let created_at = event.created_at.as_u64() as i64;
+                                let msgid = event_id.clone();
+
+                                // Ensure room exists
+                                let _ = store.save_app_room(
+                                    &room_id, &identity_npub, 1,
+                                    if group_id.is_some() { 1 } else { 0 }, None, None,
+                                );
+
+                                // Save message + metadata
+                                let _ = store.save_app_message(
+                                    &msgid, Some(&event_id), &full_room_id, &identity_npub,
+                                    &sender_pubkey, content_str, false, 1, created_at,
+                                );
+                                let _ = store.update_app_message(
+                                    &msgid, None, None, None,
+                                    payload.as_deref(), nostr_event_json.as_deref(),
+                                    reply_to_event_id.as_deref(), None,
+                                );
+
+                                // Resolve reply-to content
+                                if let Some(ref reply_eid) = reply_to_event_id {
+                                    if let Ok(Some(reply_msg)) = store.get_app_message_by_event_id(reply_eid) {
+                                        let _ = store.update_app_message(&msgid, None, None, None, None, None, None, Some(&reply_msg.content));
+                                    }
+                                }
+
+                                // Update room last message + unread
+                                let display_content = if content_str.is_empty() {
+                                    fallback.as_deref().unwrap_or("[Message]")
+                                } else {
+                                    content_str
+                                };
+                                let _ = store.update_app_room(&full_room_id, None, None, Some(display_content), Some(created_at));
+                                let _ = store.increment_app_room_unread(&full_room_id);
+
+                                Some(msgid)
+                            })
+                        } else {
+                            None
+                        }; // storage + MutexGuard dropped
+
+                        // Emit data changes after lock released
+                        if let Some(msgid) = saved_msgid {
+                            self.emit_data_change(DataChange::MessageAdded {
+                                room_id: full_room_id.clone(), msgid,
+                            }).await;
+                            self.emit_data_change(DataChange::RoomUpdated {
+                                room_id: full_room_id.clone(),
+                            }).await;
+                        }
+
                         self.emit_event(ClientEvent::MessageReceived {
-                            room_id,
+                            room_id: full_room_id,
                             sender_pubkey,
                             kind,
                             content,
@@ -905,6 +1169,14 @@ impl KeychatClient {
         let inner = self.inner.read().await;
         if let Some(listener) = &inner.event_listener {
             listener.on_event(event);
+        }
+    }
+
+    /// Emit a DataChange to the registered DataListener.
+    pub(crate) async fn emit_data_change(&self, change: DataChange) {
+        let inner = self.inner.read().await;
+        if let Some(listener) = &inner.data_listener {
+            listener.on_data_change(change);
         }
     }
 
