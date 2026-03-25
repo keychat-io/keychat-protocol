@@ -98,6 +98,9 @@ impl KeychatClient {
             inner.pending_outbound.insert(request_id.clone(), state);
         }
 
+        // 5. Refresh subscriptions to include first_inbox for this pending FR
+        let _ = self.refresh_subscriptions().await;
+
         Ok(PendingFriendRequest {
             request_id,
             peer_nostr_pubkey,
