@@ -276,9 +276,83 @@ pub struct RelayStatusInfo {
     pub status: String,
 }
 
-// ─── Callback Interface ──────────────────────────────────────────
+// ─── App Data Query Types ────────────────────────────────────────
+
+#[derive(uniffi::Record)]
+pub struct IdentityInfo {
+    pub npub: String,
+    pub nostr_pubkey_hex: String,
+    pub name: String,
+    pub avatar: Option<String>,
+    pub index: i32,
+    pub is_default: bool,
+    pub created_at: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct RoomInfo {
+    pub id: String,
+    pub to_main_pubkey: String,
+    pub identity_npub: String,
+    pub status: i32,
+    pub room_type: i32,
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+    pub last_message_content: Option<String>,
+    pub last_message_at: Option<u64>,
+    pub unread_count: i32,
+    pub created_at: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct MessageInfo {
+    pub msgid: String,
+    pub event_id: Option<String>,
+    pub room_id: String,
+    pub sender_pubkey: String,
+    pub content: String,
+    pub is_me_send: bool,
+    pub is_read: bool,
+    pub status: i32,
+    pub reply_to_event_id: Option<String>,
+    pub reply_to_content: Option<String>,
+    pub payload_json: Option<String>,
+    pub nostr_event_json: Option<String>,
+    pub relay_status_json: Option<String>,
+    pub local_file_path: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct ContactInfoFull {
+    pub pubkey: String,
+    pub npubkey: String,
+    pub identity_npub: String,
+    pub petname: Option<String>,
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+}
+
+#[derive(uniffi::Enum)]
+pub enum DataChange {
+    RoomUpdated { room_id: String },
+    RoomDeleted { room_id: String },
+    RoomListChanged,
+    MessageAdded { room_id: String, msgid: String },
+    MessageUpdated { room_id: String, msgid: String },
+    ContactUpdated { pubkey: String },
+    ContactListChanged,
+    IdentityListChanged,
+}
+
+// ─── Callback Interfaces ────────────────────────────────────────
 
 #[uniffi::export(callback_interface)]
 pub trait EventListener: Send + Sync {
     fn on_event(&self, event: ClientEvent);
+}
+
+#[uniffi::export(callback_interface)]
+pub trait DataListener: Send + Sync {
+    fn on_data_change(&self, change: DataChange);
 }

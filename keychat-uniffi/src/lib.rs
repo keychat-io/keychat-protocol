@@ -1,5 +1,6 @@
 mod address;
 mod client;
+mod data_store;
 mod error;
 mod event_loop;
 mod friend_request;
