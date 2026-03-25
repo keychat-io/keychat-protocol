@@ -132,11 +132,25 @@ impl Transport {
             filter = filter.since(since_ts);
         }
 
+        let connected = self.connected_relays().await;
+        tracing::info!(
+            "📡 SUB: filter → {} connected relay(s): [{}]",
+            connected.len(),
+            connected.join(", ")
+        );
+
         let output = self
             .client
             .subscribe(vec![filter], None)
             .await
             .map_err(|e| KeychatError::Transport(format!("subscribe failed: {e}")))?;
+
+        tracing::info!(
+            "📡 SUB: ok subId={} success={} failed={}",
+            output.val,
+            output.success.len(),
+            output.failed.len()
+        );
 
         Ok(output.val)
     }

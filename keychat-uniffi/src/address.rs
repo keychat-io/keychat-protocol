@@ -7,8 +7,18 @@ impl KeychatClient {
     pub(crate) async fn refresh_subscriptions(&self) -> Result<(), KeychatUniError> {
         let pubkeys = self.collect_subscribe_pubkeys().await;
         if pubkeys.is_empty() {
-            return Ok(()); // No pubkeys to subscribe to
+            tracing::debug!("📡 SUB: no pubkeys to subscribe");
+            return Ok(());
         }
+
+        tracing::info!(
+            "📡 SUB: subscribing to {} pubkeys: [{}]",
+            pubkeys.len(),
+            pubkeys.iter().map(|pk| {
+                let h = pk.to_hex();
+                h[..16.min(h.len())].to_string()
+            }).collect::<Vec<_>>().join(", ")
+        );
 
         let inner = self.inner.read().await;
         let transport = inner

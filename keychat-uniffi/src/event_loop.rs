@@ -49,6 +49,9 @@ impl KeychatClient {
                             event,
                             ..
                         }) => {
+                            let eid = event.id.to_hex();
+                            let eid_short = &eid[..16.min(eid.len())];
+
                             // Deduplicate via Transport
                             let deduped = {
                                 let inner = self.inner.read().await;
@@ -60,6 +63,12 @@ impl KeychatClient {
 
                             if let Some(event) = deduped {
                                 if event.kind == Kind::GiftWrap {
+                                    tracing::info!(
+                                        "⬇️ RECV kind={} id={} from={}",
+                                        event.kind.as_u16(),
+                                        eid_short,
+                                        relay_url
+                                    );
                                     let relay = relay_url.to_string();
                                     let event_json =
                                         serde_json::to_string(&event).ok();
@@ -69,7 +78,20 @@ impl KeychatClient {
                                         event_json,
                                     )
                                     .await;
+                                } else {
+                                    tracing::debug!(
+                                        "⬇️ RECV kind={} id={} from={} (ignored, not GiftWrap)",
+                                        event.kind.as_u16(),
+                                        eid_short,
+                                        relay_url
+                                    );
                                 }
+                            } else {
+                                tracing::debug!(
+                                    "⬇️ DUP id={} from={}",
+                                    eid_short,
+                                    relay_url
+                                );
                             }
                         }
                         Ok(RelayPoolNotification::Message {
