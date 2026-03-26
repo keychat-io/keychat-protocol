@@ -276,6 +276,98 @@ pub struct RelayStatusInfo {
     pub status: String,
 }
 
+// ─── Status Enums ───────────────────────────────────────────────
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoomStatus {
+    Requesting,  // 0
+    Enabled,     // 1
+    Approving,   // 2
+    Rejected,    // -1
+}
+
+impl RoomStatus {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => RoomStatus::Requesting,
+            1 => RoomStatus::Enabled,
+            2 => RoomStatus::Approving,
+            -1 => RoomStatus::Rejected,
+            _ => RoomStatus::Requesting,
+        }
+    }
+
+    pub fn to_i32(self) -> i32 {
+        match self {
+            RoomStatus::Requesting => 0,
+            RoomStatus::Enabled => 1,
+            RoomStatus::Approving => 2,
+            RoomStatus::Rejected => -1,
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoomType {
+    Dm,           // 0
+    SignalGroup,  // 1
+    MlsGroup,    // 2
+}
+
+impl RoomType {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => RoomType::Dm,
+            1 => RoomType::SignalGroup,
+            2 => RoomType::MlsGroup,
+            _ => RoomType::Dm,
+        }
+    }
+
+    pub fn to_i32(self) -> i32 {
+        match self {
+            RoomType::Dm => 0,
+            RoomType::SignalGroup => 1,
+            RoomType::MlsGroup => 2,
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MessageStatus {
+    Sending,   // 0
+    Success,   // 1
+    Failed,    // 2
+}
+
+impl MessageStatus {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => MessageStatus::Sending,
+            1 => MessageStatus::Success,
+            2 => MessageStatus::Failed,
+            _ => MessageStatus::Sending,
+        }
+    }
+
+    pub fn to_i32(self) -> i32 {
+        match self {
+            MessageStatus::Sending => 0,
+            MessageStatus::Success => 1,
+            MessageStatus::Failed => 2,
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Failed,
+}
+
 // ─── App Data Query Types ────────────────────────────────────────
 
 #[derive(uniffi::Record)]
@@ -294,8 +386,8 @@ pub struct RoomInfo {
     pub id: String,
     pub to_main_pubkey: String,
     pub identity_npub: String,
-    pub status: i32,
-    pub room_type: i32,
+    pub status: RoomStatus,
+    pub room_type: RoomType,
     pub name: Option<String>,
     pub avatar: Option<String>,
     pub last_message_content: Option<String>,
@@ -313,7 +405,7 @@ pub struct MessageInfo {
     pub content: String,
     pub is_me_send: bool,
     pub is_read: bool,
-    pub status: i32,
+    pub status: MessageStatus,
     pub reply_to_event_id: Option<String>,
     pub reply_to_content: Option<String>,
     pub payload_json: Option<String>,
@@ -343,6 +435,7 @@ pub enum DataChange {
     ContactUpdated { pubkey: String },
     ContactListChanged,
     IdentityListChanged,
+    ConnectionStatusChanged { status: ConnectionStatus, message: Option<String> },
 }
 
 // ─── Callback Interfaces ────────────────────────────────────────

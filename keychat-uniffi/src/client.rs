@@ -26,6 +26,8 @@ pub(crate) struct ClientInner {
     pub event_listener: Option<Box<dyn EventListener>>,
     pub data_listener: Option<Box<dyn DataListener>>,
     pub event_loop_stop: Option<tokio::sync::watch::Sender<bool>>,
+    pub reconnect_stop: Option<tokio::sync::watch::Sender<bool>>,
+    pub last_relay_urls: Vec<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -74,6 +76,8 @@ impl KeychatClient {
                 event_listener: None,
                 data_listener: None,
                 event_loop_stop: None,
+                reconnect_stop: None,
+                last_relay_urls: Vec::new(),
             }),
             runtime: Arc::new(runtime),
             db_path,
@@ -615,9 +619,10 @@ impl KeychatClient {
             }
         }
 
-        // 4. Re-acquire lock to store transport
+        // 4. Re-acquire lock to store transport and relay list
         let mut inner = self.inner.write().await;
         inner.transport = Some(transport);
+        inner.last_relay_urls = urls;
         Ok(())
     }
 
@@ -827,6 +832,7 @@ impl KeychatClient {
     /// For groups: removes from GroupManager + storage.
     pub async fn remove_room(&self, room_id: String) -> Result<(), KeychatUniError> {
         let storage = self.inner.read().await.storage.clone();
+        let mut found = false;
 
         // Try as 1:1 peer first (room_id = nostr pubkey)
         {
@@ -855,12 +861,12 @@ impl KeychatClient {
                     "remove_room: removed 1:1 peer {}",
                     &room_id[..16.min(room_id.len())]
                 );
-                return Ok(());
+                found = true;
             }
         }
 
         // Try as Signal group
-        {
+        if !found {
             let mut inner = self.inner.write().await;
             if inner.group_manager.get_group(&room_id).is_some() {
                 if let Ok(store) = storage.lock() {
@@ -874,19 +880,44 @@ impl KeychatClient {
                     "remove_room: removed group {}",
                     &room_id[..16.min(room_id.len())]
                 );
-                return Ok(());
+                found = true;
             }
         }
 
         // Try as MLS group
-        if let Ok(store) = storage.lock() {
-            let _ = store.delete_mls_group_id(&room_id);
+        if !found {
+            if let Ok(store) = storage.lock() {
+                let _ = store.delete_mls_group_id(&room_id);
+            }
+            tracing::warn!(
+                "remove_room: room {} not found",
+                &room_id[..16.min(room_id.len())]
+            );
         }
 
-        tracing::warn!(
-            "remove_room: room {} not found",
-            &room_id[..16.min(room_id.len())]
-        );
+        // Clean up app_* tables
+        let identity_npub = {
+            let inner = self.inner.read().await;
+            inner
+                .identity
+                .as_ref()
+                .and_then(|id| id.npub().ok())
+                .unwrap_or_default()
+        };
+        if !identity_npub.is_empty() {
+            let app_room_id = format!("{}:{}", room_id, identity_npub);
+            if let Ok(store) = storage.lock() {
+                if let Err(e) = store.delete_app_room(&app_room_id) {
+                    tracing::warn!("remove_room: delete_app_room: {e}");
+                }
+                if let Err(e) = store.delete_app_contact(&room_id, &identity_npub) {
+                    tracing::warn!("remove_room: delete_app_contact: {e}");
+                }
+            }
+            self.emit_data_change(DataChange::RoomListChanged).await;
+            self.emit_data_change(DataChange::ContactListChanged).await;
+        }
+
         Ok(())
     }
 
@@ -952,6 +983,215 @@ impl KeychatClient {
         let mut inner = self.inner.write().await;
         if let Some(stop_tx) = inner.event_loop_stop.take() {
             let _ = stop_tx.send(true);
+        }
+    }
+
+    // ─── Auto-Reconnect ─────────────────────────────────────
+
+    /// Enable automatic reconnection with exponential backoff.
+    /// When connection is lost, the Rust layer will:
+    /// 1. Retry connection with exponential backoff (2s, 4s, 8s, ... up to max_delay_secs)
+    /// 2. Emit DataChange::ConnectionStatusChanged on every state change
+    /// 3. Auto-retry failed messages after successful reconnection
+    ///
+    /// Call this once after initial `connect()` + `start_event_loop()`.
+    /// Call `disable_auto_reconnect()` to stop.
+    pub async fn enable_auto_reconnect(
+        self: Arc<Self>,
+        max_delay_secs: u32,
+    ) -> Result<(), KeychatUniError> {
+        // Stop any existing reconnect task
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(stop_tx) = inner.reconnect_stop.take() {
+                let _ = stop_tx.send(true);
+            }
+        }
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut inner = self.inner.write().await;
+            inner.reconnect_stop = Some(stop_tx);
+        }
+
+        let max_delay = std::cmp::max(max_delay_secs, 2) as u64;
+        let self_clone = self.clone();
+
+        tokio::spawn(async move {
+            self_clone.reconnect_loop(stop_rx, max_delay).await;
+        });
+
+        tracing::info!("auto-reconnect enabled (max_delay={}s)", max_delay);
+        Ok(())
+    }
+
+    /// Disable automatic reconnection.
+    pub async fn disable_auto_reconnect(&self) {
+        let mut inner = self.inner.write().await;
+        if let Some(stop_tx) = inner.reconnect_stop.take() {
+            let _ = stop_tx.send(true);
+        }
+        tracing::info!("auto-reconnect disabled");
+    }
+
+    /// Check connectivity and reconnect if needed. Call on app foreground.
+    /// Returns the current connection status.
+    pub async fn check_connection(&self) -> ConnectionStatus {
+        let connected = self.connected_relays().await.unwrap_or_default();
+        if !connected.is_empty() {
+            self.notify_connection_status(ConnectionStatus::Connected, None).await;
+            ConnectionStatus::Connected
+        } else {
+            // Trigger immediate reconnect attempt
+            self.notify_connection_status(ConnectionStatus::Reconnecting, None).await;
+            match self.try_reconnect().await {
+                Ok(_) => {
+                    self.notify_connection_status(ConnectionStatus::Connected, None).await;
+                    // Auto-retry failed messages after reconnection
+                    let _ = self.retry_failed_messages().await;
+                    ConnectionStatus::Connected
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    self.notify_connection_status(ConnectionStatus::Failed, Some(msg)).await;
+                    ConnectionStatus::Failed
+                }
+            }
+        }
+    }
+
+}
+
+// ─── Private methods (not exported via UniFFI) ───────────────────
+
+impl KeychatClient {
+    /// Internal: reconnect loop with exponential backoff.
+    pub(crate) async fn reconnect_loop(
+        self: Arc<Self>,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+        max_delay_secs: u64,
+    ) {
+        // Monitor loop: check connectivity periodically
+        let check_interval = std::time::Duration::from_secs(10);
+
+        loop {
+            // Wait for check interval or stop signal
+            tokio::select! {
+                _ = tokio::time::sleep(check_interval) => {}
+                _ = stop_rx.changed() => {
+                    tracing::info!("reconnect loop: stop signal received");
+                    return;
+                }
+            }
+
+            if *stop_rx.borrow() {
+                return;
+            }
+
+            // Check if we're still connected
+            let connected = self.connected_relays().await.unwrap_or_default();
+            if !connected.is_empty() {
+                continue; // Still connected, keep monitoring
+            }
+
+            // Lost connection — start reconnect attempts
+            tracing::info!("reconnect loop: connection lost, starting backoff");
+            let mut attempt: u32 = 0;
+
+            loop {
+                if *stop_rx.borrow() {
+                    return;
+                }
+
+                attempt += 1;
+                let delay_secs = std::cmp::min(
+                    2u64.saturating_pow(attempt),
+                    max_delay_secs,
+                );
+
+                self.notify_connection_status(
+                    ConnectionStatus::Reconnecting,
+                    Some(format!("attempt {attempt}, retry in {delay_secs}s")),
+                ).await;
+
+                tracing::info!("reconnect attempt {attempt} in {delay_secs}s…");
+
+                // Wait for delay or stop signal
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                    _ = stop_rx.changed() => {
+                        tracing::info!("reconnect loop: stop signal during backoff");
+                        return;
+                    }
+                }
+
+                if *stop_rx.borrow() {
+                    return;
+                }
+
+                match self.try_reconnect().await {
+                    Ok(_) => {
+                        tracing::info!("reconnected on attempt {attempt}");
+                        self.notify_connection_status(ConnectionStatus::Connected, None).await;
+
+                        // Auto-retry failed messages
+                        match self.retry_failed_messages().await {
+                            Ok(count) => {
+                                if count > 0 {
+                                    tracing::info!("retried {count} failed messages after reconnect");
+                                }
+                            }
+                            Err(e) => tracing::warn!("retry_failed_messages after reconnect: {e}"),
+                        }
+
+                        break; // Back to monitoring loop
+                    }
+                    Err(e) => {
+                        tracing::warn!("reconnect attempt {attempt} failed: {e}");
+                        self.notify_connection_status(
+                            ConnectionStatus::Failed,
+                            Some(format!("attempt {attempt}: {e}")),
+                        ).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Internal: attempt to reconnect using stored relay URLs.
+    pub(crate) async fn try_reconnect(&self) -> Result<(), KeychatUniError> {
+        let relay_urls = {
+            let inner = self.inner.read().await;
+            inner.last_relay_urls.clone()
+        };
+
+        if relay_urls.is_empty() {
+            return Err(KeychatUniError::NotInitialized {
+                msg: "no relay URLs stored".into(),
+            });
+        }
+
+        // Reconnect existing transport if available
+        {
+            let inner = self.inner.read().await;
+            if let Some(ref transport) = inner.transport {
+                transport.reconnect().await?;
+                return Ok(());
+            }
+        }
+
+        // No transport — do a full connect
+        self.connect(relay_urls).await
+    }
+
+    /// Internal: notify DataListener of connection status change.
+    pub(crate) async fn notify_connection_status(&self, status: ConnectionStatus, message: Option<String>) {
+        let inner = self.inner.read().await;
+        if let Some(ref listener) = inner.data_listener {
+            listener.on_data_change(DataChange::ConnectionStatusChanged {
+                status,
+                message,
+            });
         }
     }
 }

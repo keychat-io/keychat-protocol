@@ -148,6 +148,23 @@ impl KeychatClient {
         Ok(rows.into_iter().map(message_row_to_info).collect())
     }
 
+    /// Get a single message by its msgid (primary key).
+    pub async fn get_message_by_msgid(
+        &self,
+        msgid: String,
+    ) -> Result<Option<MessageInfo>, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        let row = store
+            .get_app_message_by_msgid(&msgid)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("get_app_message_by_msgid: {e}"),
+            })?;
+        Ok(row.map(message_row_to_info))
+    }
+
     pub async fn get_message_count(&self, room_id: String) -> Result<i32, KeychatUniError> {
         let inner = self.inner.read().await;
         let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
@@ -211,8 +228,8 @@ impl KeychatClient {
         &self,
         to_main_pubkey: String,
         identity_npub: String,
-        status: i32,
-        room_type: i32,
+        status: RoomStatus,
+        room_type: RoomType,
         name: Option<String>,
     ) -> Result<String, KeychatUniError> {
         let inner = self.inner.read().await;
@@ -220,7 +237,7 @@ impl KeychatClient {
             msg: format!("storage lock: {e}"),
         })?;
         store
-            .save_app_room(&to_main_pubkey, &identity_npub, status, room_type, name.as_deref(), None)
+            .save_app_room(&to_main_pubkey, &identity_npub, status.to_i32(), room_type.to_i32(), name.as_deref(), None)
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("save_app_room: {e}"),
             })
@@ -235,7 +252,7 @@ impl KeychatClient {
         sender_pubkey: String,
         content: String,
         is_me_send: bool,
-        status: i32,
+        status: MessageStatus,
         created_at: u64,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
@@ -245,7 +262,7 @@ impl KeychatClient {
         store
             .save_app_message(
                 &msgid, event_id.as_deref(), &room_id, &identity_npub,
-                &sender_pubkey, &content, is_me_send, status, created_at as i64,
+                &sender_pubkey, &content, is_me_send, status.to_i32(), created_at as i64,
             )
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("save_app_message: {e}"),
@@ -273,7 +290,7 @@ impl KeychatClient {
     pub async fn update_app_room_ffi(
         &self,
         room_id: String,
-        status: Option<i32>,
+        status: Option<RoomStatus>,
         name: Option<String>,
         last_message_content: Option<String>,
         last_message_at: Option<u64>,
@@ -284,7 +301,7 @@ impl KeychatClient {
         })?;
         store
             .update_app_room(
-                &room_id, status, name.as_deref(),
+                &room_id, status.map(|s| s.to_i32()), name.as_deref(),
                 last_message_content.as_deref(),
                 last_message_at.map(|t| t as i64),
             )
@@ -297,7 +314,7 @@ impl KeychatClient {
         &self,
         msgid: String,
         event_id: Option<String>,
-        status: Option<i32>,
+        status: Option<MessageStatus>,
         relay_status_json: Option<String>,
         payload_json: Option<String>,
         nostr_event_json: Option<String>,
@@ -310,7 +327,7 @@ impl KeychatClient {
         })?;
         store
             .update_app_message(
-                &msgid, event_id.as_deref(), status, relay_status_json.as_deref(),
+                &msgid, event_id.as_deref(), status.map(|s| s.to_i32()), relay_status_json.as_deref(),
                 payload_json.as_deref(), nostr_event_json.as_deref(),
                 reply_to_event_id.as_deref(), reply_to_content.as_deref(),
             )
@@ -348,6 +365,36 @@ impl KeychatClient {
                 msg: format!("is_app_message_duplicate: {e}"),
             })
     }
+    /// Look up the request_id for an incoming friend request by sender pubkey.
+    /// Used by Swift to get the request_id needed for accept/reject.
+    pub async fn get_inbound_request_id(
+        &self,
+        sender_pubkey: String,
+    ) -> Result<Option<String>, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store
+            .get_inbound_fr_request_id_by_sender(&sender_pubkey)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("get_inbound_fr_request_id_by_sender: {e}"),
+            })
+    }
+
+    /// Delete an app room and its associated messages and contact.
+    pub async fn delete_app_room_ffi(
+        &self,
+        room_id: String,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        store.delete_app_room(&room_id).map_err(|e| KeychatUniError::Storage {
+            msg: format!("delete_app_room: {e}"),
+        })
+    }
 }
 
 // ─── Conversion Helpers ──────────────────────────────────────────
@@ -357,8 +404,8 @@ fn room_row_to_info(r: libkeychat::storage::RoomRow) -> RoomInfo {
         id: r.id,
         to_main_pubkey: r.to_main_pubkey,
         identity_npub: r.identity_npub,
-        status: r.status,
-        room_type: r.room_type,
+        status: RoomStatus::from_i32(r.status),
+        room_type: RoomType::from_i32(r.room_type),
         name: r.name,
         avatar: r.avatar,
         last_message_content: r.last_message_content,
@@ -377,7 +424,7 @@ fn message_row_to_info(r: libkeychat::storage::MessageRow) -> MessageInfo {
         content: r.content,
         is_me_send: r.is_me_send,
         is_read: r.is_read,
-        status: r.status,
+        status: MessageStatus::from_i32(r.status),
         reply_to_event_id: r.reply_to_event_id,
         reply_to_content: r.reply_to_content,
         payload_json: r.payload_json,

@@ -277,16 +277,17 @@ impl KeychatClient {
             let fr_content = message.as_deref().unwrap_or("[Friend Request]");
             let sender_npub = crate::npub_from_hex(sender_pubkey.clone()).unwrap_or_default();
             let msgid = format!("fr-recv-{}", &request_id);
+            let event_id_hex = event.id.to_hex();
 
             // DB writes under sync lock (no await while lock held)
             let saved_room_id = {
                 let storage = self.inner.read().await.storage.clone();
                 let result = storage.lock().ok().and_then(|store| {
                     let room_id = store.save_app_room(
-                        &sender_pubkey, &identity_npub, 0, 0, Some(&sender_name), None,
+                        &sender_pubkey, &identity_npub, 2, 0, Some(&sender_name), None,
                     ).ok()?;
                     if let Err(e) = store.save_app_contact(&sender_pubkey, &sender_npub, &identity_npub, Some(&sender_name)) { warn!("save_app_contact: {e}"); }
-                    if let Err(e) = store.save_app_message(&msgid, None, &room_id, &identity_npub, &sender_pubkey, fr_content, false, 1, created_at as i64) { warn!("save_app_message: {e}"); }
+                    if let Err(e) = store.save_app_message(&msgid, Some(&event_id_hex), &room_id, &identity_npub, &sender_pubkey, fr_content, false, 1, created_at as i64) { warn!("save_app_message: {e}"); }
                     if let Err(e) = store.update_app_room(&room_id, None, None, Some(fr_content), Some(created_at as i64)) { warn!("update_app_room: {e}"); }
                     if let Err(e) = store.increment_app_room_unread(&room_id) { warn!("increment_app_room_unread: {e}"); }
                     Some(room_id)
@@ -612,6 +613,7 @@ impl KeychatClient {
                             let peer_npub =
                                 crate::npub_from_hex(peer_nostr_id.clone()).unwrap_or_default();
                             let msgid = format!("fr-accept-{}", request_id);
+                            let event_id_hex = event.id.to_hex();
 
                             // DB writes under sync lock (no await while lock held)
                             let saved_room_id = {
@@ -626,7 +628,7 @@ impl KeychatClient {
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs() as i64;
-                                    if let Err(e) = store.save_app_message(&msgid, None, &room_id, &identity_npub, &peer_nostr_id, "[Friend Request Accepted]", false, 1, now) { warn!("save_app_message: {e}"); }
+                                    if let Err(e) = store.save_app_message(&msgid, Some(&event_id_hex), &room_id, &identity_npub, &peer_nostr_id, "[Friend Request Accepted]", false, 1, now) { warn!("save_app_message: {e}"); }
                                     if let Err(e) = store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now)) { warn!("update_app_room: {e}"); }
                                     if let Err(e) = store.increment_app_room_unread(&room_id) { warn!("increment_app_room_unread: {e}"); }
                                     Some(room_id)

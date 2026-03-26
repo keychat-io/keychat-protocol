@@ -141,7 +141,7 @@ impl SecureStorage {
         Self::init(conn, key)
     }
 
-    /// Common initialization: set encryption key, pragmas, create schema.
+    /// Common initialization: set encryption key, pragmas, run migrations.
     fn init(conn: Connection, key: &str) -> Result<Self> {
         // Use pragma API to avoid SQL injection risk (C-SEC5)
         conn.pragma_update(None, "key", key)
@@ -152,7 +152,39 @@ impl SecureStorage {
         )
         .map_err(|e| KeychatError::Storage(format!("Failed to set pragmas: {e}")))?;
 
-        // Create all tables in a single transaction
+        // Run versioned migrations
+        Self::run_migrations(&conn)?;
+
+        Ok(Self { conn })
+    }
+
+    /// Schema version. Increment when adding a new migration.
+    const SCHEMA_VERSION: u32 = 2;
+
+    /// Run all pending migrations sequentially.
+    fn run_migrations(conn: &Connection) -> Result<()> {
+        let current: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|e| KeychatError::Storage(format!("Failed to read user_version: {e}")))?;
+
+        tracing::info!(
+            "database schema version: {current}, target: {}",
+            Self::SCHEMA_VERSION
+        );
+
+        if current < 1 {
+            Self::migrate_v0_to_v1(conn)?;
+        }
+        if current < 2 {
+            Self::migrate_v1_to_v2(conn)?;
+        }
+
+        Ok(())
+    }
+
+    /// V0 → V1: Create all base tables (initial schema).
+    fn migrate_v0_to_v1(conn: &Connection) -> Result<()> {
+        tracing::info!("running migration v0 → v1: create base schema");
         conn.execute_batch(
             "BEGIN;
 
@@ -234,8 +266,18 @@ impl SecureStorage {
                 kyber_prekey_id INTEGER NOT NULL,
                 kyber_prekey_record BLOB NOT NULL,
                 first_inbox_secret TEXT NOT NULL,
+                peer_nostr_pubkey TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
+
+            CREATE TABLE IF NOT EXISTS inbound_friend_requests (
+                request_id TEXT PRIMARY KEY,
+                sender_pubkey_hex TEXT NOT NULL,
+                message_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_inbound_fr_sender ON inbound_friend_requests(sender_pubkey_hex);
 
             CREATE TABLE IF NOT EXISTS signal_groups (
                 group_id TEXT PRIMARY KEY,
@@ -252,8 +294,6 @@ impl SecureStorage {
                 url TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
-
-            -- App data tables (Phase 1: FFI migration)
 
             CREATE TABLE IF NOT EXISTS app_identities (
                 npub TEXT PRIMARY KEY,
@@ -280,10 +320,11 @@ impl SecureStorage {
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 UNIQUE(to_main_pubkey, identity_npub)
             );
+            CREATE INDEX IF NOT EXISTS idx_app_rooms_identity ON app_rooms(identity_npub, last_message_at);
 
             CREATE TABLE IF NOT EXISTS app_messages (
                 msgid TEXT PRIMARY KEY,
-                event_id TEXT,
+                event_id TEXT UNIQUE,
                 room_id TEXT NOT NULL,
                 identity_npub TEXT NOT NULL,
                 sender_pubkey TEXT NOT NULL,
@@ -300,7 +341,8 @@ impl SecureStorage {
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_app_messages_room ON app_messages(room_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_app_messages_event ON app_messages(event_id);
+            CREATE INDEX IF NOT EXISTS idx_app_messages_unread ON app_messages(room_id, is_read) WHERE is_read = 0;
+            CREATE INDEX IF NOT EXISTS idx_app_messages_failed ON app_messages(is_me_send, status) WHERE is_me_send = 1 AND status = 2;
 
             CREATE TABLE IF NOT EXISTS app_contacts (
                 id TEXT PRIMARY KEY,
@@ -316,17 +358,31 @@ impl SecureStorage {
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 UNIQUE(pubkey, identity_npub)
             );
+            CREATE INDEX IF NOT EXISTS idx_app_contacts_identity ON app_contacts(identity_npub);
+
+            CREATE INDEX IF NOT EXISTS idx_processed_events_at ON processed_events(processed_at);
+
+            PRAGMA user_version = 1;
 
             COMMIT;",
         )
-        .map_err(|e| KeychatError::Storage(format!("Failed to create schema: {e}")))?;
+        .map_err(|e| KeychatError::Storage(format!("migration v0→v1 failed: {e}")))?;
 
-        // Migrations: add columns that may not exist in older databases
+        tracing::info!("migration v0 → v1 complete");
+        Ok(())
+    }
+
+    /// V1 → V2: Add peer_nostr_pubkey to pending_friend_requests, create inbound_friend_requests.
+    /// This migration handles databases created before the versioning system was added.
+    fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+        tracing::info!("running migration v1 → v2: friend request columns");
+
+        // For databases that were v0 but now v1 (which already includes peer_nostr_pubkey
+        // and inbound_friend_requests in the base schema), these will be no-ops.
+        // For databases upgraded from the old ad-hoc system, these apply the changes.
         let _ = conn.execute_batch(
             "ALTER TABLE pending_friend_requests ADD COLUMN peer_nostr_pubkey TEXT NOT NULL DEFAULT '';"
         );
-
-        // Migration: inbound friend requests table
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS inbound_friend_requests (
                 request_id TEXT PRIMARY KEY,
@@ -334,10 +390,14 @@ impl SecureStorage {
                 message_json TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );",
+            );"
         );
 
-        Ok(Self { conn })
+        conn.pragma_update(None, "user_version", 2)
+            .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
+
+        tracing::info!("migration v1 → v2 complete");
+        Ok(())
     }
 
     // ─── Signal Session Store ─────────────────────────────
@@ -1301,6 +1361,23 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// Look up an inbound friend request's request_id by sender pubkey.
+    pub fn get_inbound_fr_request_id_by_sender(&self, sender_pubkey_hex: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id FROM inbound_friend_requests WHERE sender_pubkey_hex = ?1 LIMIT 1"
+        ).map_err(|e| KeychatError::Storage(format!("prepare get_inbound_fr_by_sender: {e}")))?;
+
+        let result = stmt.query_row(rusqlite::params![sender_pubkey_hex], |row| {
+            row.get::<_, String>(0)
+        });
+
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(KeychatError::Storage(format!("get_inbound_fr_by_sender: {e}"))),
+        }
+    }
+
     // ─── App Identity CRUD ─────────────────────────────────
 
     /// Save or update an identity.
@@ -1715,6 +1792,40 @@ impl SecureStorage {
             )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("get_app_message_by_event_id: {e}")))
+    }
+
+    /// Get a single message by its msgid (primary key).
+    pub fn get_app_message_by_msgid(&self, msgid: &str) -> Result<Option<MessageRow>> {
+        self.conn
+            .query_row(
+                "SELECT msgid, event_id, room_id, identity_npub, sender_pubkey, content,
+                        is_me_send, is_read, status, reply_to_event_id, reply_to_content,
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                 FROM app_messages WHERE msgid = ?1 LIMIT 1",
+                rusqlite::params![msgid],
+                |row| {
+                    Ok(MessageRow {
+                        msgid: row.get(0)?,
+                        event_id: row.get(1)?,
+                        room_id: row.get(2)?,
+                        identity_npub: row.get(3)?,
+                        sender_pubkey: row.get(4)?,
+                        content: row.get(5)?,
+                        is_me_send: row.get::<_, i32>(6)? != 0,
+                        is_read: row.get::<_, i32>(7)? != 0,
+                        status: row.get(8)?,
+                        reply_to_event_id: row.get(9)?,
+                        reply_to_content: row.get(10)?,
+                        payload_json: row.get(11)?,
+                        nostr_event_json: row.get(12)?,
+                        relay_status_json: row.get(13)?,
+                        local_file_path: row.get(14)?,
+                        created_at: row.get(15)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| KeychatError::Storage(format!("get_app_message_by_msgid: {e}")))
     }
 
     /// Update message status and relay info (single atomic UPDATE).

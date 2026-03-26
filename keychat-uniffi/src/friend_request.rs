@@ -52,6 +52,7 @@ impl KeychatClient {
 
         let request_id = state.request_id.clone();
         let first_inbox_secret = state.first_inbox_keys.secret_hex();
+        let event_id_hex = event.id.to_hex();
 
         // 2b. Persist pending FR to SQLCipher
         {
@@ -120,7 +121,7 @@ impl KeychatClient {
                 tracing::warn!("send_friend_request save_app_contact: {e}");
             }
             if let Err(e) = store.save_app_message(
-                &request_id, None, &room_id, &identity_npub,
+                &request_id, Some(&event_id_hex), &room_id, &identity_npub,
                 &identity.pubkey_hex(), "[Friend Request Sent]", true, 1, now,
             ) {
                 tracing::warn!("send_friend_request save_app_message: {e}");
@@ -225,6 +226,7 @@ impl KeychatClient {
         let peer_name = received.payload.name.clone();
 
         // 3. Publish approval event async
+        let accept_event_id_hex = accepted.event.id.to_hex();
         {
             let inner = self.inner.read().await;
             let transport = inner
@@ -315,7 +317,7 @@ impl KeychatClient {
                 tracing::warn!("accept_friend_request update_app_contact: {e}");
             }
             if let Err(e) = store.save_app_message(
-                &msgid, None, &room_id, &identity_npub,
+                &msgid, Some(&accept_event_id_hex), &room_id, &identity_npub,
                 &identity.pubkey_hex(), "[Friend Request Accepted]", true, 1, now,
             ) {
                 tracing::warn!("accept_friend_request save_app_message: {e}");
