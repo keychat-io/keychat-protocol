@@ -31,6 +31,7 @@ keyring = { version = "3.6", features = ["apple-native", "linux-native"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 unicode-width = "0.2"
+qrcode = "0.14"
 
 [dev-dependencies]
 tempfile = "3"

@@ -10,6 +10,7 @@
 //! └───────────────────┴─────────────────────────────────────┘
 //!  [Connected 2/3] [Identity: a1b2c3...] [Tab: switch panel]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +63,7 @@ enum Panel {
 
 struct App {
     client: Arc<KeychatClient>,
+    data_dir: PathBuf,
     rooms: Vec<RoomEntry>,
     room_state: ListState,
     messages: Vec<MessageEntry>,
@@ -70,6 +72,7 @@ struct App {
     active_panel: Panel,
     notification: Option<(String, std::time::Instant)>,
     identity_hex: Option<String>,
+    owner_pubkey: Option<String>,
     connected_relays: usize,
     total_relays: usize,
     should_quit: bool,
@@ -80,11 +83,13 @@ struct App {
 }
 
 impl App {
-    fn new(client: Arc<KeychatClient>) -> Self {
+    fn new(client: Arc<KeychatClient>, data_dir: PathBuf) -> Self {
         let mut room_state = ListState::default();
         room_state.select(Some(0));
+        let owner_pubkey = load_owner(&data_dir);
         Self {
             client,
+            data_dir,
             rooms: Vec::new(),
             room_state,
             messages: Vec::new(),
@@ -93,6 +98,7 @@ impl App {
             active_panel: Panel::Input,
             notification: None,
             identity_hex: None,
+            owner_pubkey,
             connected_relays: 0,
             total_relays: 0,
             should_quit: false,
@@ -136,6 +142,7 @@ pub async fn run(
     client: Arc<KeychatClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
+    data_dir: String,
 ) -> anyhow::Result<()> {
     // Setup terminal
     terminal::enable_raw_mode()?;
@@ -144,7 +151,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(Arc::clone(&client));
+    let mut app = App::new(Arc::clone(&client), PathBuf::from(&data_dir));
 
     // Load identity if exists
     if let Ok(pubkey) = client.get_pubkey_hex().await {
@@ -830,13 +837,30 @@ async fn process_command(app: &mut App, input: &str) {
             match app.client.create_identity().await {
                 Ok(result) => {
                     app.identity_hex = Some(result.pubkey_hex.clone());
+                    let npub = keychat_uniffi::npub_from_hex(result.pubkey_hex.clone())
+                        .unwrap_or_default();
+
+                    app.push_output("Identity created!".into(), Color::Green);
+                    app.push_output(String::new(), Color::White);
+                    app.push_output(format!("Pubkey: {}", result.pubkey_hex), Color::Cyan);
+                    app.push_output(format!("npub:   {npub}"), Color::Cyan);
+                    app.push_output(String::new(), Color::White);
+
+                    // Show QR code of npub for easy scanning
+                    let qr_lines = render_qr_lines(&npub);
+                    for line in &qr_lines {
+                        app.push_output(line.clone(), Color::White);
+                    }
+                    app.push_output(String::new(), Color::White);
                     app.push_output(
-                        format!("Identity created: {}", short_key(&result.pubkey_hex)),
-                        Color::Green,
-                    );
-                    app.push_output(
-                        format!("⚠️  Mnemonic (SAVE THIS): {}", result.mnemonic),
+                        "Mnemonic (SAVE THIS!):".into(),
                         Color::Yellow,
+                    );
+                    app.push_output(result.mnemonic, Color::Yellow);
+                    app.push_output(String::new(), Color::White);
+                    app.push_output(
+                        "First friend request will be auto-approved as owner.".into(),
+                        Color::DarkGray,
                     );
                     app.notify("Identity created! Use /connect to join relays.".into());
                 }
@@ -866,6 +890,21 @@ async fn process_command(app: &mut App, input: &str) {
                 let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
                 app.push_output(format!("Pubkey: {pk}"), Color::Cyan);
                 app.push_output(format!("npub:   {npub}"), Color::Cyan);
+                app.push_output(String::new(), Color::White);
+                let qr_lines = render_qr_lines(&npub);
+                for line in &qr_lines {
+                    app.push_output(line.clone(), Color::White);
+                }
+                if let Some(owner) = app.owner_pubkey.clone() {
+                    app.push_output(String::new(), Color::White);
+                    app.push_output(format!("Owner: {}", short_key(&owner)), Color::Green);
+                } else {
+                    app.push_output(String::new(), Color::White);
+                    app.push_output(
+                        "No owner set — first friend request will be auto-approved.".into(),
+                        Color::DarkGray,
+                    );
+                }
             } else {
                 app.notify("No identity".into());
             }
@@ -1263,16 +1302,47 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
         }
         ClientEvent::FriendRequestReceived {
             request_id,
+            sender_pubkey,
             sender_name,
             ..
         } => {
-            app.push_output(
-                format!(
-                    "Friend request from {sender_name}. /accept {request_id}"
-                ),
-                Color::Yellow,
-            );
-            app.notify(format!("Friend request from {sender_name}"));
+            // Auto-approve first friend request as owner
+            if app.owner_pubkey.is_none() {
+                app.push_output(
+                    format!("Auto-approving {sender_name} as owner..."),
+                    Color::Green,
+                );
+                match app
+                    .client
+                    .accept_friend_request(request_id.clone(), "CLI User".to_string())
+                    .await
+                {
+                    Ok(contact) => {
+                        save_owner(&app.data_dir, sender_pubkey);
+                        app.owner_pubkey = Some(sender_pubkey.clone());
+                        app.push_output(
+                            format!(
+                                "Owner set: {} ({})",
+                                contact.display_name,
+                                short_key(sender_pubkey)
+                            ),
+                            Color::Green,
+                        );
+                        app.notify(format!("{} approved as owner", contact.display_name));
+                    }
+                    Err(e) => {
+                        app.push_output(format!("Auto-approve failed: {e}"), Color::Red);
+                    }
+                }
+            } else {
+                app.push_output(
+                    format!(
+                        "Friend request from {sender_name}. /accept {request_id}"
+                    ),
+                    Color::Yellow,
+                );
+                app.notify(format!("Friend request from {sender_name}"));
+            }
             refresh_rooms(app).await;
         }
         ClientEvent::FriendRequestAccepted { peer_name, .. } => {
@@ -1446,4 +1516,61 @@ fn format_timestamp(ts: u64) -> String {
         .single()
         .map(|dt| dt.format("%H:%M").to_string())
         .unwrap_or_else(|| ts.to_string())
+}
+
+// ─── Owner management ───────────────────────────────────────
+
+const OWNER_FILE: &str = "owner.txt";
+
+fn load_owner(data_dir: &PathBuf) -> Option<String> {
+    let path = data_dir.join(OWNER_FILE);
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_owner(data_dir: &PathBuf, pubkey: &str) {
+    let path = data_dir.join(OWNER_FILE);
+    if let Err(e) = std::fs::write(&path, pubkey) {
+        tracing::warn!("Failed to save owner file: {e}");
+    }
+}
+
+// ─── QR code rendering ─────────────────────────────────────
+
+fn render_qr_lines(data: &str) -> Vec<String> {
+    use qrcode::QrCode;
+
+    let code = match QrCode::new(data.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return vec!["(QR generation failed)".to_string()],
+    };
+
+    let matrix = code.to_colors();
+    let width = code.width();
+
+    // Use Unicode half-block characters: each character encodes 2 vertical pixels
+    // ▀ = top filled, ▄ = bottom filled, █ = both filled, ' ' = neither
+    let mut lines = Vec::new();
+    let rows: Vec<&[qrcode::Color]> = matrix.chunks(width).collect();
+
+    for pair in rows.chunks(2) {
+        let top = pair[0];
+        let bottom = if pair.len() > 1 { Some(pair[1]) } else { None };
+        let mut line = String::with_capacity(width + 4);
+        line.push_str("  ");
+        for x in 0..width {
+            let t = top[x] == qrcode::Color::Dark;
+            let b = bottom.map_or(false, |row| row[x] == qrcode::Color::Dark);
+            line.push(match (t, b) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        lines.push(line);
+    }
+    lines
 }

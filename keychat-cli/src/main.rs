@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         Commands::Tui => {
-            tui::run(client, event_tx, data_tx).await?;
+            tui::run(client, event_tx, data_tx, cli.data_dir).await?;
         }
         Commands::Interactive => {
             repl::run(client, event_tx, data_tx).await?;
