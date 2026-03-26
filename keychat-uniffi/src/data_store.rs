@@ -268,13 +268,14 @@ impl KeychatClient {
         status: RoomStatus,
         room_type: RoomType,
         name: Option<String>,
+        parent_room_id: Option<String>,
     ) -> Result<String, KeychatUniError> {
         let inner = self.inner.read().await;
         let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
             msg: format!("storage lock: {e}"),
         })?;
         store
-            .save_app_room(&to_main_pubkey, &identity_pubkey, status.to_i32(), room_type.to_i32(), name.as_deref(), None)
+            .save_app_room(&to_main_pubkey, &identity_pubkey, status.to_i32(), room_type.to_i32(), name.as_deref(), None, parent_room_id.as_deref())
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("save_app_room: {e}"),
             })
@@ -445,6 +446,7 @@ fn room_row_to_info(r: libkeychat::storage::RoomRow) -> RoomInfo {
         room_type: RoomType::from_i32(r.room_type),
         name: r.name,
         avatar: r.avatar,
+        parent_room_id: r.parent_room_id,
         last_message_content: r.last_message_content,
         last_message_at: r.last_message_at.map(|t| t as u64),
         unread_count: r.unread_count,

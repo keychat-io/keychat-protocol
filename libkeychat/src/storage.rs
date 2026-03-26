@@ -77,6 +77,7 @@ pub struct RoomRow {
     pub name: Option<String>,
     pub avatar: Option<String>,
     pub peer_signal_identity_key: Option<String>,
+    pub parent_room_id: Option<String>,
     pub last_message_content: Option<String>,
     pub last_message_at: Option<i64>,
     pub unread_count: i32,
@@ -193,7 +194,6 @@ impl SecureStorage {
         if current < 2 {
             Self::migrate_v1_to_v2(conn)?;
         }
-
         Ok(())
     }
 
@@ -329,6 +329,7 @@ impl SecureStorage {
                 name TEXT,
                 avatar TEXT,
                 peer_signal_identity_key TEXT,
+                parent_room_id TEXT REFERENCES app_rooms(id),
                 last_message_content TEXT,
                 last_message_at INTEGER,
                 unread_count INTEGER NOT NULL DEFAULT 0,
@@ -337,6 +338,7 @@ impl SecureStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_app_rooms_identity ON app_rooms(identity_pubkey, last_message_at);
             CREATE INDEX IF NOT EXISTS idx_app_rooms_pubkey ON app_rooms(to_main_pubkey);
+            CREATE INDEX IF NOT EXISTS idx_app_rooms_parent ON app_rooms(parent_room_id);
 
             CREATE TABLE IF NOT EXISTS app_messages (
                 msgid TEXT PRIMARY KEY,
@@ -1503,17 +1505,19 @@ impl SecureStorage {
         room_type: i32,
         name: Option<&str>,
         peer_signal_identity_key: Option<&str>,
+        parent_room_id: Option<&str>,
     ) -> Result<String> {
         let id = format!("{}:{}", to_main_pubkey, identity_pubkey);
         self.conn
             .execute(
-                "INSERT INTO app_rooms (id, to_main_pubkey, identity_pubkey, status, type, name, peer_signal_identity_key)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO app_rooms (id, to_main_pubkey, identity_pubkey, status, type, name, peer_signal_identity_key, parent_room_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                    status = CASE WHEN excluded.status > status THEN excluded.status ELSE status END,
                    name = COALESCE(excluded.name, name),
-                   peer_signal_identity_key = COALESCE(excluded.peer_signal_identity_key, peer_signal_identity_key)",
-                rusqlite::params![id, to_main_pubkey, identity_pubkey, status, room_type, name, peer_signal_identity_key],
+                   peer_signal_identity_key = COALESCE(excluded.peer_signal_identity_key, peer_signal_identity_key),
+                   parent_room_id = COALESCE(excluded.parent_room_id, parent_room_id)",
+                rusqlite::params![id, to_main_pubkey, identity_pubkey, status, room_type, name, peer_signal_identity_key, parent_room_id],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_room: {e}")))?;
         Ok(id)
@@ -1524,29 +1528,14 @@ impl SecureStorage {
         let mut stmt = self.conn
             .prepare(
                 "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
-                        peer_signal_identity_key, last_message_content, last_message_at,
-                        unread_count, created_at
+                        peer_signal_identity_key, parent_room_id, last_message_content,
+                        last_message_at, unread_count, created_at
                  FROM app_rooms WHERE identity_pubkey = ?1
                  ORDER BY COALESCE(last_message_at, created_at) DESC, id ASC",
             )
             .map_err(|e| KeychatError::Storage(format!("get_app_rooms prepare: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![identity_pubkey], |row| {
-                Ok(RoomRow {
-                    id: row.get(0)?,
-                    to_main_pubkey: row.get(1)?,
-                    identity_pubkey: row.get(2)?,
-                    status: row.get(3)?,
-                    room_type: row.get(4)?,
-                    name: row.get(5)?,
-                    avatar: row.get(6)?,
-                    peer_signal_identity_key: row.get(7)?,
-                    last_message_content: row.get(8)?,
-                    last_message_at: row.get(9)?,
-                    unread_count: row.get(10)?,
-                    created_at: row.get(11)?,
-                })
-            })
+            .query_map(rusqlite::params![identity_pubkey], Self::map_room_row)
             .map_err(|e| KeychatError::Storage(format!("get_app_rooms query: {e}")))?;
         let mut result = Vec::new();
         for r in rows {
@@ -1555,31 +1544,35 @@ impl SecureStorage {
         Ok(result)
     }
 
+    /// Shared row mapper for room queries.
+    fn map_room_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoomRow> {
+        Ok(RoomRow {
+            id: row.get(0)?,
+            to_main_pubkey: row.get(1)?,
+            identity_pubkey: row.get(2)?,
+            status: row.get(3)?,
+            room_type: row.get(4)?,
+            name: row.get(5)?,
+            avatar: row.get(6)?,
+            peer_signal_identity_key: row.get(7)?,
+            parent_room_id: row.get(8)?,
+            last_message_content: row.get(9)?,
+            last_message_at: row.get(10)?,
+            unread_count: row.get(11)?,
+            created_at: row.get(12)?,
+        })
+    }
+
     /// Get a single room by ID.
     pub fn get_app_room(&self, room_id: &str) -> Result<Option<RoomRow>> {
         self.conn
             .query_row(
                 "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
-                        peer_signal_identity_key, last_message_content, last_message_at,
-                        unread_count, created_at
+                        peer_signal_identity_key, parent_room_id, last_message_content,
+                        last_message_at, unread_count, created_at
                  FROM app_rooms WHERE id = ?1",
                 rusqlite::params![room_id],
-                |row| {
-                    Ok(RoomRow {
-                        id: row.get(0)?,
-                        to_main_pubkey: row.get(1)?,
-                        identity_pubkey: row.get(2)?,
-                        status: row.get(3)?,
-                        room_type: row.get(4)?,
-                        name: row.get(5)?,
-                        avatar: row.get(6)?,
-                        peer_signal_identity_key: row.get(7)?,
-                        last_message_content: row.get(8)?,
-                        last_message_at: row.get(9)?,
-                        unread_count: row.get(10)?,
-                        created_at: row.get(11)?,
-                    })
-                },
+                Self::map_room_row,
             )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("get_app_room: {e}")))
@@ -1590,26 +1583,11 @@ impl SecureStorage {
         self.conn
             .query_row(
                 "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
-                        peer_signal_identity_key, last_message_content, last_message_at,
-                        unread_count, created_at
+                        peer_signal_identity_key, parent_room_id, last_message_content,
+                        last_message_at, unread_count, created_at
                  FROM app_rooms WHERE to_main_pubkey = ?1 LIMIT 1",
                 rusqlite::params![to_main_pubkey],
-                |row| {
-                    Ok(RoomRow {
-                        id: row.get(0)?,
-                        to_main_pubkey: row.get(1)?,
-                        identity_pubkey: row.get(2)?,
-                        status: row.get(3)?,
-                        room_type: row.get(4)?,
-                        name: row.get(5)?,
-                        avatar: row.get(6)?,
-                        peer_signal_identity_key: row.get(7)?,
-                        last_message_content: row.get(8)?,
-                        last_message_at: row.get(9)?,
-                        unread_count: row.get(10)?,
-                        created_at: row.get(11)?,
-                    })
-                },
+                Self::map_room_row,
             )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("find_app_room_by_pubkey: {e}")))
@@ -1681,8 +1659,18 @@ impl SecureStorage {
 
     /// Delete a room and its messages.
     pub fn delete_app_room(&self, room_id: &str) -> Result<()> {
+        // Delete messages for child topic rooms first
+        self.conn.execute(
+            "DELETE FROM app_messages WHERE room_id IN (SELECT id FROM app_rooms WHERE parent_room_id = ?1)",
+            rusqlite::params![room_id],
+        ).map_err(|e| KeychatError::Storage(format!("delete_app_room child messages: {e}")))?;
+        // Delete child topic rooms
+        self.conn.execute("DELETE FROM app_rooms WHERE parent_room_id = ?1", rusqlite::params![room_id])
+            .map_err(|e| KeychatError::Storage(format!("delete_app_room children: {e}")))?;
+        // Delete messages for this room
         self.conn.execute("DELETE FROM app_messages WHERE room_id = ?1", rusqlite::params![room_id])
             .map_err(|e| KeychatError::Storage(format!("delete_app_room messages: {e}")))?;
+        // Delete the room itself
         self.conn.execute("DELETE FROM app_rooms WHERE id = ?1", rusqlite::params![room_id])
             .map_err(|e| KeychatError::Storage(format!("delete_app_room: {e}")))?;
         Ok(())
@@ -2992,7 +2980,7 @@ mod tests {
         assert!(ids[1].is_default);  // Bob now default
 
         // Delete cascading (by pubkey_hex)
-        store.save_app_room("peer1", "hex1", 2, 0, Some("Room1"), None).unwrap();
+        store.save_app_room("peer1", "hex1", 2, 0, Some("Room1"), None, None).unwrap();
         store.save_app_contact("peer1", "npub1peer", "hex1", Some("Peer")).unwrap();
         store.delete_app_identity("hex1").unwrap();
         let ids = store.get_app_identities().unwrap();
@@ -3006,8 +2994,8 @@ mod tests {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
 
         // Save rooms (identity_pubkey is now hex)
-        let id1 = store.save_app_room("peer1", "hex1", 2, 0, Some("Alice"), None).unwrap();
-        let id2 = store.save_app_room("group1", "hex1", 2, 1, Some("Group"), None).unwrap();
+        let id1 = store.save_app_room("peer1", "hex1", 2, 0, Some("Alice"), None, None).unwrap();
+        let id2 = store.save_app_room("group1", "hex1", 2, 1, Some("Group"), None, None).unwrap();
         assert_eq!(id1, "peer1:hex1");
         assert_eq!(id2, "group1:hex1");
 
@@ -3051,7 +3039,7 @@ mod tests {
     #[test]
     fn test_app_message_crud() {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
-        let room_id = store.save_app_room("peer1", "hex1", 2, 0, Some("Alice"), None).unwrap();
+        let room_id = store.save_app_room("peer1", "hex1", 2, 0, Some("Alice"), None, None).unwrap();
 
         // Save messages
         store.save_app_message("msg1", Some("ev1"), &room_id, "hex1", "peer1", "hello", false, 1, 1000).unwrap();

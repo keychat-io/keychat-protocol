@@ -390,6 +390,7 @@ pub struct RoomInfo {
     pub room_type: RoomType,
     pub name: Option<String>,
     pub avatar: Option<String>,
+    pub parent_room_id: Option<String>,
     pub last_message_content: Option<String>,
     pub last_message_at: Option<u64>,
     pub unread_count: i32,

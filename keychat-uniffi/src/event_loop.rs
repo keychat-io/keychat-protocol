@@ -290,7 +290,7 @@ impl KeychatClient {
                     }
                     store.transaction(|_| {
                         let room_id = store.save_app_room(
-                            &sender_pubkey, &identity_pubkey, 2, 0, Some(&sender_name), None,
+                            &sender_pubkey, &identity_pubkey, 2, 0, Some(&sender_name), None, None,
                         )?;
                         store.save_app_contact(&sender_pubkey, &sender_npub, &identity_pubkey, Some(&sender_name))?;
                         store.save_app_message(&msgid, Some(&event_id_hex), &room_id, &identity_pubkey, &sender_pubkey, fr_content, false, 1, created_at as i64)?;
@@ -638,7 +638,7 @@ impl KeychatClient {
                                     store.transaction(|_| {
                                         let room_id = store.save_app_room(
                                             &peer_nostr_id, &identity_pubkey, 1, 0,
-                                            Some(&peer_name), Some(signal_id_hex),
+                                            Some(&peer_name), Some(signal_id_hex), None,
                                         )?;
                                         store.save_app_contact(&peer_nostr_id, &peer_npub, &identity_pubkey, Some(&peer_name))?;
                                         store.save_app_message(&msgid, Some(&event_id_hex), &room_id, &identity_pubkey, &peer_nostr_id, "[Friend Request Accepted]", false, 1, now)?;
@@ -846,7 +846,7 @@ impl KeychatClient {
                                         let saved = {
                                             let storage = self.inner.read().await.storage.clone();
                                             storage.lock().ok().and_then(|store| {
-                                                store.save_app_room(&group_id, &identity_pubkey, 1, 1, Some(&group_name), None).ok()
+                                                store.save_app_room(&group_id, &identity_pubkey, 1, 1, Some(&group_name), None, None).ok()
                                             })
                                         };
                                         if saved.is_some() {
@@ -1129,7 +1129,7 @@ impl KeychatClient {
                                 store.transaction(|_| {
                                     store.save_app_room(
                                         &room_id, &identity_pubkey, 1,
-                                        if group_id.is_some() { 1 } else { 0 }, None, None,
+                                        if group_id.is_some() { 1 } else { 0 }, None, None, None,
                                     )?;
                                     store.save_app_message(
                                         &msgid, Some(&event_id), &full_room_id, &identity_pubkey,

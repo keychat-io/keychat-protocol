@@ -111,7 +111,7 @@ impl KeychatClient {
         let fr_storage = self.inner.read().await.storage.clone();
         if let Some(store) = fr_storage.lock().ok() {
             if let Err(e) = store.transaction(|_| {
-                store.save_app_room(&peer_nostr_pubkey, &identity_pubkey, 0, 0, None, None)?;
+                store.save_app_room(&peer_nostr_pubkey, &identity_pubkey, 0, 0, None, None, None)?;
                 store.save_app_contact(&peer_nostr_pubkey, &peer_npub, &identity_pubkey, None)?;
                 store.save_app_message(
                     &request_id, Some(&event_id_hex), &room_id, &identity_pubkey,
