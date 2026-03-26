@@ -1,10 +1,6 @@
-use libkeychat::{DeviceId, KCMessage, ProtocolAddress};
+use libkeychat::{KCMessage, ProtocolAddress};
 
-fn default_device_id() -> DeviceId {
-    DeviceId::new(1).expect("device_id 1 is always valid")
-}
-
-use crate::client::KeychatClient;
+use crate::client::{default_device_id, KeychatClient};
 use crate::error::KeychatUniError;
 use crate::types::*;
 
@@ -95,7 +91,7 @@ impl KeychatClient {
         };
 
         let send_storage = self.inner.read().await.app_storage.clone();
-        if let Some(store) = send_storage.lock().ok() {
+        if let Ok(store) = send_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (send): {e}")) {
             if let Err(e) = store.save_app_message(
                 &event_id, Some(&event_id), &full_room_id, &identity_pubkey,
                 &my_pubkey, &text, true, 0, now,
@@ -211,10 +207,12 @@ impl KeychatClient {
 
             // Mark as sending (status=0)
             let retry_s1 = self.inner.read().await.app_storage.clone();
-            if let Some(store) = retry_s1.lock().ok() {
-                let _ = store.update_app_message(
+            if let Ok(store) = retry_s1.lock().map_err(|e| tracing::error!("app_storage lock poisoned (retry mark sending): {e}")) {
+                if let Err(e) = store.update_app_message(
                     &msg.msgid, None, Some(0), None, None, None, None, None,
-                );
+                ) {
+                    tracing::warn!("retry update_app_message (sending): {e}");
+                }
             }
             drop(retry_s1);
 
@@ -237,11 +235,13 @@ impl KeychatClient {
                     let relay_json = serde_json::to_string(&relays).unwrap_or_default();
 
                     let retry_s2 = self.inner.read().await.app_storage.clone();
-                    if let Some(store) = retry_s2.lock().ok() {
-                        let _ = store.update_app_message(
+                    if let Ok(store) = retry_s2.lock().map_err(|e| tracing::error!("app_storage lock poisoned (retry result): {e}")) {
+                        if let Err(e) = store.update_app_message(
                             &msg.msgid, None, Some(status), Some(&relay_json),
                             None, None, None, None,
-                        );
+                        ) {
+                            tracing::warn!("retry update_app_message (result): {e}");
+                        }
                     }
                     drop(retry_s2);
 
@@ -267,10 +267,12 @@ impl KeychatClient {
                     );
                     // Mark as failed again
                     let retry_s3 = self.inner.read().await.app_storage.clone();
-                    if let Some(store) = retry_s3.lock().ok() {
-                        let _ = store.update_app_message(
+                    if let Ok(store) = retry_s3.lock().map_err(|e| tracing::error!("app_storage lock poisoned (retry failed): {e}")) {
+                        if let Err(e) = store.update_app_message(
                             &msg.msgid, None, Some(2), None, None, None, None, None,
-                        );
+                        ) {
+                            tracing::warn!("retry update_app_message (mark failed): {e}");
+                        }
                     }
                     drop(retry_s3);
                 }

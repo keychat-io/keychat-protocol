@@ -11,13 +11,8 @@ use libkeychat::{
 
 use tracing::warn;
 
-use crate::client::KeychatClient;
+use crate::client::{default_device_id, KeychatClient};
 use crate::types::*;
-
-/// Default Signal device ID used throughout the FFI layer (M-4).
-fn default_device_id() -> DeviceId {
-    DeviceId::new(1).expect("device_id 1 is always valid")
-}
 
 impl KeychatClient {
     /// Run the event loop, dispatching relay notifications to EventListener.
@@ -282,7 +277,7 @@ impl KeychatClient {
             // DB writes under sync lock (no await while lock held)
             let saved_room_id = {
                 let app_storage = self.inner.read().await.app_storage.clone();
-                let result = app_storage.lock().ok().and_then(|store| {
+                let result = app_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (friend request): {e}")).ok().and_then(|store| {
                     // Dedup: skip if this event was already persisted
                     if store.is_app_message_duplicate(&event_id_hex).unwrap_or(false) {
                         tracing::info!("friend request event already persisted, skipping: {}", &event_id_hex[..16.min(event_id_hex.len())]);
@@ -625,7 +620,7 @@ impl KeychatClient {
                             // DB writes under sync lock (no await while lock held)
                             let saved_room_id = {
                                 let app_storage = self.inner.read().await.app_storage.clone();
-                                app_storage.lock().ok().and_then(|store| {
+                                app_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (friend accept): {e}")).ok().and_then(|store| {
                                     // Dedup: skip if this event was already persisted
                                     if store.is_app_message_duplicate(&event_id_hex).unwrap_or(false) {
                                         tracing::info!("friend accept event already persisted, skipping: {}", &event_id_hex[..16.min(event_id_hex.len())]);
@@ -845,7 +840,7 @@ impl KeychatClient {
                                     if !identity_pubkey.is_empty() {
                                         let saved = {
                                             let app_storage = self.inner.read().await.app_storage.clone();
-                                            app_storage.lock().ok().and_then(|store| {
+                                            app_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (group invite): {e}")).ok().and_then(|store| {
                                                 store.save_app_room(&group_id, &identity_pubkey, 1, 1, Some(&group_name), None, None).ok()
                                             })
                                         };
@@ -1056,7 +1051,7 @@ impl KeychatClient {
                             let full_room_id =
                                 format!("{}:{}", group_id, identity_pubkey);
                             {
-                                let app_store = app_storage_clone.lock().unwrap();
+                                let Ok(app_store) = app_storage_clone.lock().map_err(|e| tracing::error!("app_storage lock poisoned (group rename): {e}")) else { continue };
                                 if let Err(e) = app_store.update_app_room(
                                     &full_room_id,
                                     None,
@@ -1120,7 +1115,7 @@ impl KeychatClient {
                         // DB writes under sync lock (no await while lock held)
                         let saved_msgid = if !identity_pubkey.is_empty() {
                             let app_storage = self.inner.read().await.app_storage.clone();
-                            app_storage.lock().ok().and_then(|store| {
+                            app_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (save message): {e}")).ok().and_then(|store| {
                                 if store.is_app_message_duplicate(&event_id).unwrap_or(false) {
                                     return None;
                                 }

@@ -292,23 +292,25 @@ impl AppStorage {
         avatar: Option<&str>,
         is_default: Option<bool>,
     ) -> Result<()> {
-        if let Some(n) = name {
-            self.conn.execute("UPDATE app_identities SET name = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![n, pubkey_hex])
-                .map_err(|e| KeychatError::Storage(format!("update_app_identity name: {e}")))?;
-        }
-        if let Some(a) = avatar {
-            self.conn.execute("UPDATE app_identities SET avatar = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![a, pubkey_hex])
-                .map_err(|e| KeychatError::Storage(format!("update_app_identity avatar: {e}")))?;
-        }
-        if let Some(d) = is_default {
-            if d {
-                self.conn.execute("UPDATE app_identities SET is_default = 0", [])
-                    .map_err(|e| KeychatError::Storage(format!("update_app_identity clear defaults: {e}")))?;
+        self.transaction(|_| {
+            if let Some(n) = name {
+                self.conn.execute("UPDATE app_identities SET name = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![n, pubkey_hex])
+                    .map_err(|e| KeychatError::Storage(format!("update_app_identity name: {e}")))?;
             }
-            self.conn.execute("UPDATE app_identities SET is_default = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![d as i32, pubkey_hex])
-                .map_err(|e| KeychatError::Storage(format!("update_app_identity is_default: {e}")))?;
-        }
-        Ok(())
+            if let Some(a) = avatar {
+                self.conn.execute("UPDATE app_identities SET avatar = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![a, pubkey_hex])
+                    .map_err(|e| KeychatError::Storage(format!("update_app_identity avatar: {e}")))?;
+            }
+            if let Some(d) = is_default {
+                if d {
+                    self.conn.execute("UPDATE app_identities SET is_default = 0", [])
+                        .map_err(|e| KeychatError::Storage(format!("update_app_identity clear defaults: {e}")))?;
+                }
+                self.conn.execute("UPDATE app_identities SET is_default = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![d as i32, pubkey_hex])
+                    .map_err(|e| KeychatError::Storage(format!("update_app_identity is_default: {e}")))?;
+            }
+            Ok(())
+        })
     }
 
     pub fn delete_app_identity(&self, pubkey_hex: &str) -> Result<()> {
@@ -823,6 +825,22 @@ impl AppStorage {
         Ok(id)
     }
 
+    fn map_contact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactRow> {
+        Ok(ContactRow {
+            id: row.get(0)?,
+            pubkey: row.get(1)?,
+            npubkey: row.get(2)?,
+            identity_pubkey: row.get(3)?,
+            signal_identity_key: row.get(4)?,
+            petname: row.get(5)?,
+            name: row.get(6)?,
+            about: row.get(7)?,
+            avatar: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    }
+
     pub fn get_app_contacts(&self, identity_pubkey: &str) -> Result<Vec<ContactRow>> {
         let mut stmt = self.conn
             .prepare(
@@ -831,21 +849,7 @@ impl AppStorage {
             )
             .map_err(|e| KeychatError::Storage(format!("get_app_contacts prepare: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![identity_pubkey], |row| {
-                Ok(ContactRow {
-                    id: row.get(0)?,
-                    pubkey: row.get(1)?,
-                    npubkey: row.get(2)?,
-                    identity_pubkey: row.get(3)?,
-                    signal_identity_key: row.get(4)?,
-                    petname: row.get(5)?,
-                    name: row.get(6)?,
-                    about: row.get(7)?,
-                    avatar: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                })
-            })
+            .query_map(rusqlite::params![identity_pubkey], Self::map_contact_row)
             .map_err(|e| KeychatError::Storage(format!("get_app_contacts query: {e}")))?;
         let mut result = Vec::new();
         for r in rows {
@@ -861,21 +865,7 @@ impl AppStorage {
                 "SELECT id, pubkey, npubkey, identity_pubkey, signal_identity_key, petname, name, about, avatar, created_at, updated_at
                  FROM app_contacts WHERE id = ?1",
                 rusqlite::params![id],
-                |row| {
-                    Ok(ContactRow {
-                        id: row.get(0)?,
-                        pubkey: row.get(1)?,
-                        npubkey: row.get(2)?,
-                        identity_pubkey: row.get(3)?,
-                        signal_identity_key: row.get(4)?,
-                        petname: row.get(5)?,
-                        name: row.get(6)?,
-                        about: row.get(7)?,
-                        avatar: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                    })
-                },
+                Self::map_contact_row,
             )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("get_app_contact: {e}")))
@@ -890,19 +880,21 @@ impl AppStorage {
         avatar: Option<&str>,
     ) -> Result<()> {
         let id = format!("{}:{}", pubkey, identity_pubkey);
-        if let Some(p) = petname {
-            self.conn.execute("UPDATE app_contacts SET petname = ?1, updated_at = strftime('%s','now') WHERE id = ?2", rusqlite::params![p, id])
-                .map_err(|e| KeychatError::Storage(format!("update_app_contact petname: {e}")))?;
-        }
-        if let Some(n) = name {
-            self.conn.execute("UPDATE app_contacts SET name = ?1, updated_at = strftime('%s','now') WHERE id = ?2", rusqlite::params![n, id])
-                .map_err(|e| KeychatError::Storage(format!("update_app_contact name: {e}")))?;
-        }
-        if let Some(a) = avatar {
-            self.conn.execute("UPDATE app_contacts SET avatar = ?1, updated_at = strftime('%s','now') WHERE id = ?2", rusqlite::params![a, id])
-                .map_err(|e| KeychatError::Storage(format!("update_app_contact avatar: {e}")))?;
-        }
-        Ok(())
+        self.transaction(|_| {
+            if let Some(p) = petname {
+                self.conn.execute("UPDATE app_contacts SET petname = ?1, updated_at = strftime('%s','now') WHERE id = ?2", rusqlite::params![p, id])
+                    .map_err(|e| KeychatError::Storage(format!("update_app_contact petname: {e}")))?;
+            }
+            if let Some(n) = name {
+                self.conn.execute("UPDATE app_contacts SET name = ?1, updated_at = strftime('%s','now') WHERE id = ?2", rusqlite::params![n, id])
+                    .map_err(|e| KeychatError::Storage(format!("update_app_contact name: {e}")))?;
+            }
+            if let Some(a) = avatar {
+                self.conn.execute("UPDATE app_contacts SET avatar = ?1, updated_at = strftime('%s','now') WHERE id = ?2", rusqlite::params![a, id])
+                    .map_err(|e| KeychatError::Storage(format!("update_app_contact avatar: {e}")))?;
+            }
+            Ok(())
+        })
     }
 
     pub fn delete_app_contact(&self, pubkey: &str, identity_pubkey: &str) -> Result<()> {

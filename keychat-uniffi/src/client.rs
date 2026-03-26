@@ -2,9 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use libkeychat::{
-    reconstruct_prekey_material, AddressManager, ChatSession, EphemeralKeypair, FriendRequestState,
-    GroupManager, Identity, SecureStorage, SignalParticipant, Transport,
+    reconstruct_prekey_material, AddressManager, ChatSession, DeviceId, EphemeralKeypair,
+    FriendRequestState, GroupManager, Identity, SecureStorage, SignalParticipant, Transport,
 };
+
+/// Default Signal device ID used throughout the FFI layer.
+pub(crate) fn default_device_id() -> DeviceId {
+    DeviceId::new(1).expect("device_id 1 is always valid")
+}
 
 use std::sync::Once;
 
