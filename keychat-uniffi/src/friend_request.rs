@@ -86,8 +86,8 @@ impl KeychatClient {
             let transport = inner
                 .transport
                 .as_ref()
-                .ok_or(KeychatUniError::NotInitialized {
-                    msg: "not connected".into(),
+                .ok_or(KeychatUniError::Transport {
+                    msg: "Not connected to any relay. Please check your network.".into(),
                 })?;
             transport.publish_event_async(event).await?;
         }
@@ -223,8 +223,8 @@ impl KeychatClient {
             let transport = inner
                 .transport
                 .as_ref()
-                .ok_or(KeychatUniError::NotInitialized {
-                    msg: "not connected".into(),
+                .ok_or(KeychatUniError::Transport {
+                    msg: "Not connected to any relay. Please check your network.".into(),
                 })?;
             transport.publish_event_async(accepted.event).await?;
         }

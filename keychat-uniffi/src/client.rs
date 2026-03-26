@@ -632,8 +632,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         transport.add_relay_and_connect(&url).await?;
 
@@ -651,8 +651,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         transport.remove_relay(&url).await?;
 
@@ -670,8 +670,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         Ok(transport.get_relays().await)
     }
@@ -682,8 +682,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         Ok(transport.connected_relays().await)
     }
@@ -694,8 +694,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         Ok(transport
             .get_relay_statuses()
@@ -711,8 +711,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         transport.reconnect().await?;
         tracing::info!("reconnected to all relays");
@@ -725,8 +725,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         transport.reconnect_relay(&url).await?;
         tracing::info!("reconnected relay: {url}");
@@ -746,8 +746,8 @@ impl KeychatClient {
         let transport = inner
             .transport
             .as_ref()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "not connected".into(),
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
             })?;
         let result = transport.rebroadcast_event(event).await?;
         Ok(PublishResultInfo {
@@ -953,8 +953,8 @@ impl KeychatClient {
             let transport = inner
                 .transport
                 .as_ref()
-                .ok_or(KeychatUniError::NotInitialized {
-                    msg: "not connected".into(),
+                .ok_or(KeychatUniError::Transport {
+                    msg: "Not connected to any relay. Please check your network.".into(),
                 })?;
             transport.subscribe(pubkeys, None).await.map_err(|e| {
                 tracing::error!("event loop: subscribe failed: {e}");

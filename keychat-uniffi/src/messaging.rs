@@ -18,10 +18,27 @@ impl KeychatClient {
         reply_to: Option<ReplyToPayload>,
         _thread_id: Option<String>,
     ) -> Result<SentMessage, KeychatUniError> {
-        // 1. Get Arc<Mutex<ChatSession>> and check transport exists
+        // 1. Check relay connection FIRST — before any expensive work
+        let connected = {
+            let inner = self.inner.read().await;
+            let transport = inner
+                .transport
+                .as_ref()
+                .ok_or(KeychatUniError::Transport {
+                    msg: "Not connected to any relay. Please check your network.".into(),
+                })?;
+            transport.connected_relays().await
+        };
+
+        if connected.is_empty() {
+            return Err(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            });
+        }
+
+        // 2. Get session and peer info
         let (session_mutex, peer_signal_hex, identity_pubkey) = {
             let inner = self.inner.read().await;
-            // room_id format is "peer_hex:identity_hex" — extract peer pubkey
             let peer_pubkey = room_id.split(':').next().unwrap_or(&room_id);
             let signal_hex = inner
                 .peer_nostr_to_signal
@@ -37,11 +54,6 @@ impl KeychatClient {
                     peer_id: signal_hex.clone(),
                 })?
                 .clone();
-            if inner.transport.is_none() {
-                return Err(KeychatUniError::NotInitialized {
-                    msg: "not connected".into(),
-                });
-            }
             let pubkey_hex = inner
                 .identity
                 .as_ref()
@@ -50,7 +62,7 @@ impl KeychatClient {
             (session, signal_hex, pubkey_hex)
         }; // RwLock dropped here
 
-        // 2. Lock only the specific peer session
+        // 3. Lock only the specific peer session and encrypt
         let remote_addr = ProtocolAddress::new(peer_signal_hex.clone(), default_device_id());
         let msg = KCMessage::text(&text);
         let payload_json = msg.to_json().ok();
@@ -62,27 +74,9 @@ impl KeychatClient {
                 .await?
         };
 
-        // 3. Serialize event before publishing (for resend support)
+        // 4. Serialize event before publishing (for resend support)
         let nostr_event_json = serde_json::to_string(&event).ok();
         let event_id = event.id.to_hex();
-
-        // 4. Get connected relays list before publishing
-        let connected = {
-            let inner = self.inner.read().await;
-            let transport = inner
-                .transport
-                .as_ref()
-                .ok_or(KeychatUniError::NotInitialized {
-                    msg: "not connected".into(),
-                })?;
-            transport.connected_relays().await
-        };
-
-        if connected.is_empty() {
-            return Err(KeychatUniError::Transport {
-                msg: "no relay connected".into(),
-            });
-        }
 
         // 5. Write message to DB (status=0 sending) before publishing
         // room_id is already "peer_hex:identity_hex" from Swift — use as-is
@@ -140,8 +134,8 @@ impl KeychatClient {
             let transport = inner
                 .transport
                 .as_ref()
-                .ok_or(KeychatUniError::NotInitialized {
-                    msg: "not connected".into(),
+                .ok_or(KeychatUniError::Transport {
+                    msg: "Not connected to any relay. Please check your network.".into(),
                 })?;
             transport.publish_event_async(event).await?;
         }
