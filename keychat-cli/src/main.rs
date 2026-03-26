@@ -1,25 +1,42 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use keychat_cli::{commands, daemon, repl};
+use keychat_cli::{commands, daemon, repl, tui};
 use keychat_uniffi::KeychatClient;
 
 #[derive(Parser)]
-#[command(name = "keychat", about = "Keychat unified CLI")]
+#[command(
+    name = "keychat",
+    about = "Keychat — E2E encrypted messaging over Nostr",
+    long_about = "Keychat CLI provides three interface modes:\n\n\
+        • tui (default)   — Full terminal UI with room list, messages, and input\n\
+        • interactive      — Simple REPL with slash commands\n\
+        • daemon           — HTTP REST API + SSE event stream\n\n\
+        Examples:\n\
+        \x20 keychat                          Start TUI mode\n\
+        \x20 keychat tui                      Start TUI mode (explicit)\n\
+        \x20 keychat interactive              Start REPL mode\n\
+        \x20 keychat daemon --port 9000       Start HTTP daemon on port 9000\n\
+        \x20 keychat daemon --interactive     Daemon + REPL together\n\
+        \x20 keychat --data-dir /tmp/bob tui  Use custom data directory",
+    version
+)]
 struct Cli {
     /// Database directory (default: ~/.keychat)
     #[arg(long, default_value_t = default_data_dir())]
     data_dir: String,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start interactive REPL mode
+    /// Start full terminal UI with room list and message panels (default)
+    Tui,
+    /// Start simple REPL with slash commands
     Interactive,
-    /// Start HTTP daemon mode
+    /// Start HTTP daemon mode (REST API + SSE)
     Daemon {
         /// Port to listen on
         #[arg(long, default_value = "8080")]
@@ -64,7 +81,13 @@ async fn main() -> anyhow::Result<()> {
     client.set_event_listener(Box::new(event_listener)).await;
     client.set_data_listener(Box::new(data_listener)).await;
 
-    match cli.command {
+    // Default to TUI mode if no subcommand given
+    let command = cli.command.unwrap_or(Commands::Tui);
+
+    match command {
+        Commands::Tui => {
+            tui::run(client, event_tx, data_tx).await?;
+        }
         Commands::Interactive => {
             repl::run(client, event_tx, data_tx).await?;
         }
