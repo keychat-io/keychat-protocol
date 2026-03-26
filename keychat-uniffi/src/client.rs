@@ -1086,7 +1086,7 @@ impl KeychatClient {
 
     /// Check connectivity and reconnect if needed. Call on app foreground.
     /// Returns the current connection status.
-    pub async fn check_connection(&self) -> ConnectionStatus {
+    pub async fn check_connection(self: Arc<Self>) -> ConnectionStatus {
         let connected = self.connected_relays().await.unwrap_or_default();
         if !connected.is_empty() {
             self.notify_connection_status(ConnectionStatus::Connected, None).await;
@@ -1097,8 +1097,19 @@ impl KeychatClient {
             match self.try_reconnect().await {
                 Ok(_) => {
                     self.notify_connection_status(ConnectionStatus::Connected, None).await;
-                    // Auto-retry failed messages after reconnection
-                    let _ = self.retry_failed_messages().await;
+                    // Auto-retry failed messages after reconnect (delayed to let relays stabilize)
+                    let client = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        match client.retry_failed_messages().await {
+                            Ok(count) => {
+                                if count > 0 {
+                                    tracing::info!("auto-retry after reconnect: {count} messages retried");
+                                }
+                            }
+                            Err(e) => tracing::warn!("auto-retry after reconnect failed: {e}"),
+                        }
+                    });
                     ConnectionStatus::Connected
                 }
                 Err(e) => {
@@ -1184,15 +1195,19 @@ impl KeychatClient {
                         tracing::info!("reconnected on attempt {attempt}");
                         self.notify_connection_status(ConnectionStatus::Connected, None).await;
 
-                        // Auto-retry failed messages
-                        match self.retry_failed_messages().await {
-                            Ok(count) => {
-                                if count > 0 {
-                                    tracing::info!("retried {count} failed messages after reconnect");
+                        // Auto-retry failed messages (delayed to let relay connections stabilize)
+                        let client = Arc::clone(&self);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            match client.retry_failed_messages().await {
+                                Ok(count) => {
+                                    if count > 0 {
+                                        tracing::info!("auto-retry after reconnect: {count} messages retried");
+                                    }
                                 }
+                                Err(e) => tracing::warn!("auto-retry after reconnect failed: {e}"),
                             }
-                            Err(e) => tracing::warn!("retry_failed_messages after reconnect: {e}"),
-                        }
+                        });
 
                         break; // Back to monitoring loop
                     }
