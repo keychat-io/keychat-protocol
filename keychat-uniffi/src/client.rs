@@ -8,6 +8,7 @@ use libkeychat::{
 
 use std::sync::Once;
 
+use crate::app_storage::AppStorage;
 use crate::error::KeychatUniError;
 use crate::relay_tracker::RelaySendTracker;
 use crate::types::*;
@@ -18,6 +19,7 @@ pub(crate) struct ClientInner {
     pub identity: Option<Identity>,
     pub transport: Option<Transport>,
     pub storage: Arc<std::sync::Mutex<SecureStorage>>,
+    pub app_storage: Arc<std::sync::Mutex<AppStorage>>,
     pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
     pub peer_nostr_to_signal: HashMap<String, String>,
     pub pending_outbound: HashMap<String, FriendRequestState>,
@@ -58,6 +60,17 @@ impl KeychatClient {
         });
 
         let storage = SecureStorage::open(&db_path, &db_key)?;
+
+        // Derive app database path: protocol.db → protocol_app.db
+        let app_db_path = if db_path.ends_with(".db") {
+            db_path.replace(".db", "_app.db")
+        } else {
+            format!("{}_app", db_path)
+        };
+        let app_storage = AppStorage::open(&app_db_path, &db_key).map_err(|e| {
+            KeychatUniError::Storage { msg: format!("open app database: {e}") }
+        })?;
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -68,6 +81,7 @@ impl KeychatClient {
                 identity: None,
                 transport: None,
                 storage: Arc::new(std::sync::Mutex::new(storage)),
+                app_storage: Arc::new(std::sync::Mutex::new(app_storage)),
                 sessions: HashMap::new(),
                 peer_nostr_to_signal: HashMap::new(),
                 pending_outbound: HashMap::new(),
@@ -821,6 +835,15 @@ impl KeychatClient {
                     msg: format!("delete_all_data: {e}"),
                 })?;
         }
+        // Also clear application-layer data
+        let app_storage = self.inner.read().await.app_storage.clone();
+        if let Ok(store) = app_storage.lock() {
+            store
+                .delete_all_data()
+                .map_err(|e| KeychatUniError::Storage {
+                    msg: format!("delete_all_app_data: {e}"),
+                })?;
+        }
 
         tracing::info!("remove_identity: done");
         Ok(())
@@ -895,7 +918,7 @@ impl KeychatClient {
             );
         }
 
-        // Clean up app_* tables
+        // Clean up app_* tables (in app database)
         let identity_pubkey = {
             let inner = self.inner.read().await;
             inner
@@ -906,7 +929,8 @@ impl KeychatClient {
         };
         if !identity_pubkey.is_empty() {
             let app_room_id = format!("{}:{}", room_id, identity_pubkey);
-            if let Ok(store) = storage.lock() {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            if let Ok(store) = app_storage.lock() {
                 if let Err(e) = store.delete_app_room(&app_room_id) {
                     tracing::warn!("remove_room: delete_app_room: {e}");
                 }

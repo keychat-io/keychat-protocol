@@ -108,7 +108,7 @@ impl KeychatClient {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let fr_storage = self.inner.read().await.storage.clone();
+        let fr_storage = self.inner.read().await.app_storage.clone();
         if let Some(store) = fr_storage.lock().ok() {
             if let Err(e) = store.transaction(|_| {
                 store.save_app_room(&peer_nostr_pubkey, &identity_pubkey, 0, 0, None, None, None)?;
@@ -295,7 +295,7 @@ impl KeychatClient {
             .unwrap_or_default()
             .as_secs() as i64;
         let msgid = format!("accept-{}", request_id);
-        let accept_storage = self.inner.read().await.storage.clone();
+        let accept_storage = self.inner.read().await.app_storage.clone();
         if let Some(store) = accept_storage.lock().ok() {
             if let Err(e) = store.transaction(|_| {
                 store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now))?;
@@ -365,7 +365,7 @@ impl KeychatClient {
         // Update room status to rejected (-1)
         if !sender_pubkey_hex.is_empty() && !identity_pubkey.is_empty() {
             let room_id = format!("{}:{}", sender_pubkey_hex, identity_pubkey);
-            let rej_storage = self.inner.read().await.storage.clone();
+            let rej_storage = self.inner.read().await.app_storage.clone();
             if let Some(store) = rej_storage.lock().ok() {
                 if let Err(e) = store.update_app_room(
                     &room_id, Some(-1), None, Some("[Friend Request Rejected]"), None,

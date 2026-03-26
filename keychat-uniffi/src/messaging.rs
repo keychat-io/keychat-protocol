@@ -94,7 +94,7 @@ impl KeychatClient {
                 .unwrap_or_default()
         };
 
-        let send_storage = self.inner.read().await.storage.clone();
+        let send_storage = self.inner.read().await.app_storage.clone();
         if let Some(store) = send_storage.lock().ok() {
             if let Err(e) = store.save_app_message(
                 &event_id, Some(&event_id), &full_room_id, &identity_pubkey,
@@ -176,9 +176,9 @@ impl KeychatClient {
     pub async fn retry_failed_messages(&self) -> Result<u32, KeychatUniError> {
         // 1. Query failed messages from DB
         let failed_messages = {
-            let storage = self.inner.read().await.storage.clone();
+            let storage = self.inner.read().await.app_storage.clone();
             let store = storage.lock().map_err(|e| KeychatUniError::Storage {
-                msg: format!("storage lock: {e}"),
+                msg: format!("app_storage lock: {e}"),
             })?;
             store
                 .get_app_failed_messages()
@@ -210,7 +210,7 @@ impl KeychatClient {
             };
 
             // Mark as sending (status=0)
-            let retry_s1 = self.inner.read().await.storage.clone();
+            let retry_s1 = self.inner.read().await.app_storage.clone();
             if let Some(store) = retry_s1.lock().ok() {
                 let _ = store.update_app_message(
                     &msg.msgid, None, Some(0), None, None, None, None, None,
@@ -236,7 +236,7 @@ impl KeychatClient {
                     }
                     let relay_json = serde_json::to_string(&relays).unwrap_or_default();
 
-                    let retry_s2 = self.inner.read().await.storage.clone();
+                    let retry_s2 = self.inner.read().await.app_storage.clone();
                     if let Some(store) = retry_s2.lock().ok() {
                         let _ = store.update_app_message(
                             &msg.msgid, None, Some(status), Some(&relay_json),
@@ -266,7 +266,7 @@ impl KeychatClient {
                         &msg.msgid[..16.min(msg.msgid.len())]
                     );
                     // Mark as failed again
-                    let retry_s3 = self.inner.read().await.storage.clone();
+                    let retry_s3 = self.inner.read().await.app_storage.clone();
                     if let Some(store) = retry_s3.lock().ok() {
                         let _ = store.update_app_message(
                             &msg.msgid, None, Some(2), None, None, None, None, None,

@@ -1,4 +1,5 @@
 mod address;
+pub(crate) mod app_storage;
 mod client;
 mod data_store;
 mod error;

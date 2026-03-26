@@ -281,8 +281,8 @@ impl KeychatClient {
 
             // DB writes under sync lock (no await while lock held)
             let saved_room_id = {
-                let storage = self.inner.read().await.storage.clone();
-                let result = storage.lock().ok().and_then(|store| {
+                let app_storage = self.inner.read().await.app_storage.clone();
+                let result = app_storage.lock().ok().and_then(|store| {
                     // Dedup: skip if this event was already persisted
                     if store.is_app_message_duplicate(&event_id_hex).unwrap_or(false) {
                         tracing::info!("friend request event already persisted, skipping: {}", &event_id_hex[..16.min(event_id_hex.len())]);
@@ -300,7 +300,7 @@ impl KeychatClient {
                     }).ok()
                 });
                 result
-            }; // storage + MutexGuard dropped
+            }; // app_storage + MutexGuard dropped
 
             if let Some(room_id) = saved_room_id {
                 self.emit_data_change(DataChange::RoomListChanged).await;
@@ -624,8 +624,8 @@ impl KeychatClient {
 
                             // DB writes under sync lock (no await while lock held)
                             let saved_room_id = {
-                                let storage = self.inner.read().await.storage.clone();
-                                storage.lock().ok().and_then(|store| {
+                                let app_storage = self.inner.read().await.app_storage.clone();
+                                app_storage.lock().ok().and_then(|store| {
                                     // Dedup: skip if this event was already persisted
                                     if store.is_app_message_duplicate(&event_id_hex).unwrap_or(false) {
                                         tracing::info!("friend accept event already persisted, skipping: {}", &event_id_hex[..16.min(event_id_hex.len())]);
@@ -647,7 +647,7 @@ impl KeychatClient {
                                         Ok(room_id)
                                     }).ok()
                                 })
-                            }; // storage + MutexGuard dropped
+                            }; // app_storage + MutexGuard dropped
 
                             if let Some(room_id) = saved_room_id {
                                 self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
@@ -684,7 +684,7 @@ impl KeychatClient {
                         .unwrap_or_default();
                     if !identity_pubkey.is_empty() {
                         let room_id = format!("{}:{}", peer_pubkey, identity_pubkey);
-                        if let Ok(store) = inner.storage.lock() {
+                        if let Ok(store) = inner.app_storage.lock() {
                             if let Err(e) = store.update_app_room(&room_id, Some(-1), None, Some("[Friend Request Rejected]"), None) { warn!("update_app_room reject: {e}"); }
                         }
                         drop(inner);
@@ -844,8 +844,8 @@ impl KeychatClient {
                                     };
                                     if !identity_pubkey.is_empty() {
                                         let saved = {
-                                            let storage = self.inner.read().await.storage.clone();
-                                            storage.lock().ok().and_then(|store| {
+                                            let app_storage = self.inner.read().await.app_storage.clone();
+                                            app_storage.lock().ok().and_then(|store| {
                                                 store.save_app_room(&group_id, &identity_pubkey, 1, 1, Some(&group_name), None, None).ok()
                                             })
                                         };
@@ -987,17 +987,22 @@ impl KeychatClient {
                                 .unwrap_or_default()
                         };
 
-                        // Remove group from manager + storage
-                        {
+                        // Remove group from manager + protocol storage
+                        let app_storage_clone = {
                             let mut inner = self.inner.write().await;
                             if let Ok(store) = inner.storage.clone().lock() {
                                 if let Err(e) = inner.group_manager.remove_group_persistent(&group_id, &store) { warn!("remove_group_persistent: {e}"); }
-                                // Delete app room
-                                let full_room_id =
-                                    format!("{}:{}", group_id, identity_pubkey);
-                                if let Err(e) = store.delete_app_room(&full_room_id) { warn!("delete_app_room: {e}"); }
                             } else {
                                 inner.group_manager.remove_group(&group_id);
+                            }
+                            inner.app_storage.clone()
+                        };
+                        // Delete app room (separate DB)
+                        {
+                            let full_room_id =
+                                format!("{}:{}", group_id, identity_pubkey);
+                            if let Ok(app_store) = app_storage_clone.lock() {
+                                if let Err(e) = app_store.delete_app_room(&full_room_id) { warn!("delete_app_room: {e}"); }
                             }
                         }
 
@@ -1036,16 +1041,23 @@ impl KeychatClient {
 
                         // Update group name + persist
                         if let Some(ref name) = new_name {
-                            let mut inner = self.inner.write().await;
-                            if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
-                                g.name = name.clone();
+                            let app_storage_clone;
+                            {
+                                let mut inner = self.inner.write().await;
+                                if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
+                                    g.name = name.clone();
+                                }
+                                if let Ok(store) = inner.storage.clone().lock() {
+                                    if let Err(e) = inner.group_manager.save_group(&group_id, &store) { warn!("save_group: {e}"); }
+                                }
+                                app_storage_clone = inner.app_storage.clone();
                             }
-                            if let Ok(store) = inner.storage.clone().lock() {
-                                if let Err(e) = inner.group_manager.save_group(&group_id, &store) { warn!("save_group: {e}"); }
-                                // Update app room name
-                                let full_room_id =
-                                    format!("{}:{}", group_id, identity_pubkey);
-                                if let Err(e) = store.update_app_room(
+                            // Update app room name (separate DB)
+                            let full_room_id =
+                                format!("{}:{}", group_id, identity_pubkey);
+                            {
+                                let app_store = app_storage_clone.lock().unwrap();
+                                if let Err(e) = app_store.update_app_room(
                                     &full_room_id,
                                     None,
                                     Some(name),
@@ -1107,8 +1119,8 @@ impl KeychatClient {
 
                         // DB writes under sync lock (no await while lock held)
                         let saved_msgid = if !identity_pubkey.is_empty() {
-                            let storage = self.inner.read().await.storage.clone();
-                            storage.lock().ok().and_then(|store| {
+                            let app_storage = self.inner.read().await.app_storage.clone();
+                            app_storage.lock().ok().and_then(|store| {
                                 if store.is_app_message_duplicate(&event_id).unwrap_or(false) {
                                     return None;
                                 }
@@ -1155,7 +1167,7 @@ impl KeychatClient {
                             })
                         } else {
                             None
-                        }; // storage + MutexGuard dropped
+                        }; // app_storage + MutexGuard dropped
 
                         // Emit data changes after lock released
                         if let Some(msgid) = saved_msgid {
@@ -1194,8 +1206,8 @@ impl KeychatClient {
     /// Finalize a tracked send: update message status in DB and emit DataChange.
     pub(crate) async fn finalize_tracked_send(&self, entry: crate::relay_tracker::FinalizedEntry) {
         let status = if entry.success { 1 } else { 2 }; // 1=success, 2=failed
-        let storage = self.inner.read().await.storage.clone();
-        if let Ok(store) = storage.lock() {
+        let app_storage = self.inner.read().await.app_storage.clone();
+        if let Ok(store) = app_storage.lock() {
             if let Err(e) = store.update_app_message(
                 &entry.msgid,
                 None,

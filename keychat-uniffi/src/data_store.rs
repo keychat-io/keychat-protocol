@@ -1,6 +1,7 @@
 //! FFI query layer for app data (identities, rooms, messages, contacts).
-//! Bridges libkeychat::SecureStorage CRUD to UniFFI-exported methods.
+//! Bridges AppStorage CRUD to UniFFI-exported methods.
 
+use crate::app_storage;
 use crate::client::KeychatClient;
 use crate::error::KeychatUniError;
 use crate::types::*;
@@ -11,8 +12,8 @@ impl KeychatClient {
 
     pub async fn get_identities(&self) -> Result<Vec<IdentityInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let rows = store.get_app_identities().map_err(|e| KeychatUniError::Storage {
             msg: format!("get_app_identities: {e}"),
@@ -40,8 +41,8 @@ impl KeychatClient {
         is_default: bool,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .save_app_identity(&pubkey_hex, &npub, &name, index, is_default)
@@ -58,8 +59,8 @@ impl KeychatClient {
         is_default: Option<bool>,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .update_app_identity(
@@ -75,8 +76,8 @@ impl KeychatClient {
 
     pub async fn delete_app_identity_ffi(&self, pubkey_hex: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store.delete_app_identity(&pubkey_hex).map_err(|e| KeychatUniError::Storage {
             msg: format!("delete_app_identity: {e}"),
@@ -87,8 +88,8 @@ impl KeychatClient {
 
     pub async fn get_rooms(&self, identity_pubkey: String) -> Result<Vec<RoomInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let rows = store
             .get_app_rooms(&identity_pubkey)
@@ -100,8 +101,8 @@ impl KeychatClient {
 
     pub async fn get_room(&self, room_id: String) -> Result<Option<RoomInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let row = store
             .get_app_room(&room_id)
@@ -113,8 +114,8 @@ impl KeychatClient {
 
     pub async fn mark_room_read(&self, room_id: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .mark_app_messages_read(&room_id)
@@ -137,8 +138,8 @@ impl KeychatClient {
         offset: i32,
     ) -> Result<Vec<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let rows = store
             .get_app_messages(&room_id, limit, offset)
@@ -148,14 +149,13 @@ impl KeychatClient {
         Ok(rows.into_iter().map(message_row_to_info).collect())
     }
 
-    /// Get a single message by its msgid (primary key).
     pub async fn get_message_by_msgid(
         &self,
         msgid: String,
     ) -> Result<Option<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let row = store
             .get_app_message_by_msgid(&msgid)
@@ -165,15 +165,14 @@ impl KeychatClient {
         Ok(row.map(message_row_to_info))
     }
 
-    /// Load initial messages: all unread + context before them, or latest page if no unread.
     pub async fn get_messages_initial(
         &self,
         room_id: String,
         context_count: i32,
     ) -> Result<Vec<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let rows = store
             .get_app_messages_unread_with_context(&room_id, context_count)
@@ -183,7 +182,6 @@ impl KeychatClient {
         Ok(rows.into_iter().map(message_row_to_info).collect())
     }
 
-    /// Load older messages before a given timestamp for pagination.
     pub async fn get_messages_before(
         &self,
         room_id: String,
@@ -191,8 +189,8 @@ impl KeychatClient {
         limit: i32,
     ) -> Result<Vec<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let rows = store
             .get_app_messages_before(&room_id, before_ts, limit)
@@ -204,8 +202,8 @@ impl KeychatClient {
 
     pub async fn get_message_count(&self, room_id: String) -> Result<i32, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .get_app_message_count(&room_id)
@@ -221,8 +219,8 @@ impl KeychatClient {
         identity_pubkey: String,
     ) -> Result<Vec<ContactInfoFull>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         let rows = store
             .get_app_contacts(&identity_pubkey)
@@ -249,8 +247,8 @@ impl KeychatClient {
         petname: String,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .update_app_contact(&pubkey, &identity_pubkey, Some(&petname), None, None)
@@ -259,7 +257,7 @@ impl KeychatClient {
             })
     }
 
-    // ─── Write methods (used by tests + future Swift UI) ──────
+    // ─── Write methods (used by tests + Swift UI) ──────
 
     pub async fn save_app_room_ffi(
         &self,
@@ -271,8 +269,8 @@ impl KeychatClient {
         parent_room_id: Option<String>,
     ) -> Result<String, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .save_app_room(&to_main_pubkey, &identity_pubkey, status.to_i32(), room_type.to_i32(), name.as_deref(), None, parent_room_id.as_deref())
@@ -294,8 +292,8 @@ impl KeychatClient {
         created_at: u64,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .save_app_message(
@@ -315,8 +313,8 @@ impl KeychatClient {
         name: Option<String>,
     ) -> Result<String, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .save_app_contact(&pubkey, &npubkey, &identity_pubkey, name.as_deref())
@@ -334,8 +332,8 @@ impl KeychatClient {
         last_message_at: Option<u64>,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .update_app_room(
@@ -360,8 +358,8 @@ impl KeychatClient {
         reply_to_content: Option<String>,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .update_app_message(
@@ -379,8 +377,8 @@ impl KeychatClient {
         room_id: String,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .increment_app_room_unread(&room_id)
@@ -394,8 +392,8 @@ impl KeychatClient {
         event_id: String,
     ) -> Result<bool, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store
             .is_app_message_duplicate(&event_id)
@@ -403,8 +401,9 @@ impl KeychatClient {
                 msg: format!("is_app_message_duplicate: {e}"),
             })
     }
+
     /// Look up the request_id for an incoming friend request by sender pubkey.
-    /// Used by Swift to get the request_id needed for accept/reject.
+    /// This queries the PROTOCOL database (inbound_friend_requests table).
     pub async fn get_inbound_request_id(
         &self,
         sender_pubkey: String,
@@ -420,14 +419,13 @@ impl KeychatClient {
             })
     }
 
-    /// Delete an app room and its associated messages and contact.
     pub async fn delete_app_room_ffi(
         &self,
         room_id: String,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
+        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("app_storage lock: {e}"),
         })?;
         store.delete_app_room(&room_id).map_err(|e| KeychatUniError::Storage {
             msg: format!("delete_app_room: {e}"),
@@ -437,7 +435,7 @@ impl KeychatClient {
 
 // ─── Conversion Helpers ──────────────────────────────────────────
 
-fn room_row_to_info(r: libkeychat::storage::RoomRow) -> RoomInfo {
+fn room_row_to_info(r: app_storage::RoomRow) -> RoomInfo {
     RoomInfo {
         id: r.id,
         to_main_pubkey: r.to_main_pubkey,
@@ -454,7 +452,7 @@ fn room_row_to_info(r: libkeychat::storage::RoomRow) -> RoomInfo {
     }
 }
 
-fn message_row_to_info(r: libkeychat::storage::MessageRow) -> MessageInfo {
+fn message_row_to_info(r: app_storage::MessageRow) -> MessageInfo {
     MessageInfo {
         msgid: r.msgid,
         event_id: r.event_id,
