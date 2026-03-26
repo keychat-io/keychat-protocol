@@ -385,7 +385,7 @@ pub struct IdentityInfo {
 pub struct RoomInfo {
     pub id: String,
     pub to_main_pubkey: String,
-    pub identity_npub: String,
+    pub identity_pubkey: String,
     pub status: RoomStatus,
     pub room_type: RoomType,
     pub name: Option<String>,
@@ -419,7 +419,7 @@ pub struct MessageInfo {
 pub struct ContactInfoFull {
     pub pubkey: String,
     pub npubkey: String,
-    pub identity_npub: String,
+    pub identity_pubkey: String,
     pub petname: Option<String>,
     pub name: Option<String>,
     pub avatar: Option<String>,

@@ -896,21 +896,21 @@ impl KeychatClient {
         }
 
         // Clean up app_* tables
-        let identity_npub = {
+        let identity_pubkey = {
             let inner = self.inner.read().await;
             inner
                 .identity
                 .as_ref()
-                .and_then(|id| id.npub().ok())
+                .map(|id| id.pubkey_hex())
                 .unwrap_or_default()
         };
-        if !identity_npub.is_empty() {
-            let app_room_id = format!("{}:{}", room_id, identity_npub);
+        if !identity_pubkey.is_empty() {
+            let app_room_id = format!("{}:{}", room_id, identity_pubkey);
             if let Ok(store) = storage.lock() {
                 if let Err(e) = store.delete_app_room(&app_room_id) {
                     tracing::warn!("remove_room: delete_app_room: {e}");
                 }
-                if let Err(e) = store.delete_app_contact(&room_id, &identity_npub) {
+                if let Err(e) = store.delete_app_contact(&room_id, &identity_pubkey) {
                     tracing::warn!("remove_room: delete_app_contact: {e}");
                 }
             }

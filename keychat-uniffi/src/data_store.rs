@@ -33,8 +33,8 @@ impl KeychatClient {
 
     pub async fn save_app_identity_ffi(
         &self,
+        pubkey_hex: String,
         npub: String,
-        nostr_pubkey_hex: String,
         name: String,
         index: i32,
         is_default: bool,
@@ -44,7 +44,7 @@ impl KeychatClient {
             msg: format!("storage lock: {e}"),
         })?;
         store
-            .save_app_identity(&npub, &nostr_pubkey_hex, &name, index, is_default)
+            .save_app_identity(&pubkey_hex, &npub, &name, index, is_default)
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("save_app_identity: {e}"),
             })
@@ -52,7 +52,7 @@ impl KeychatClient {
 
     pub async fn update_app_identity_ffi(
         &self,
-        npub: String,
+        pubkey_hex: String,
         name: Option<String>,
         avatar: Option<String>,
         is_default: Option<bool>,
@@ -63,7 +63,7 @@ impl KeychatClient {
         })?;
         store
             .update_app_identity(
-                &npub,
+                &pubkey_hex,
                 name.as_deref(),
                 avatar.as_deref(),
                 is_default,
@@ -73,25 +73,25 @@ impl KeychatClient {
             })
     }
 
-    pub async fn delete_app_identity_ffi(&self, npub: String) -> Result<(), KeychatUniError> {
+    pub async fn delete_app_identity_ffi(&self, pubkey_hex: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
         let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
             msg: format!("storage lock: {e}"),
         })?;
-        store.delete_app_identity(&npub).map_err(|e| KeychatUniError::Storage {
+        store.delete_app_identity(&pubkey_hex).map_err(|e| KeychatUniError::Storage {
             msg: format!("delete_app_identity: {e}"),
         })
     }
 
     // ─── Room Queries ────────────────────────────────────────
 
-    pub async fn get_rooms(&self, identity_npub: String) -> Result<Vec<RoomInfo>, KeychatUniError> {
+    pub async fn get_rooms(&self, identity_pubkey: String) -> Result<Vec<RoomInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
         let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
             msg: format!("storage lock: {e}"),
         })?;
         let rows = store
-            .get_app_rooms(&identity_npub)
+            .get_app_rooms(&identity_pubkey)
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("get_app_rooms: {e}"),
             })?;
@@ -165,6 +165,43 @@ impl KeychatClient {
         Ok(row.map(message_row_to_info))
     }
 
+    /// Load initial messages: all unread + context before them, or latest page if no unread.
+    pub async fn get_messages_initial(
+        &self,
+        room_id: String,
+        context_count: i32,
+    ) -> Result<Vec<MessageInfo>, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        let rows = store
+            .get_app_messages_unread_with_context(&room_id, context_count)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("get_messages_initial: {e}"),
+            })?;
+        Ok(rows.into_iter().map(message_row_to_info).collect())
+    }
+
+    /// Load older messages before a given timestamp for pagination.
+    pub async fn get_messages_before(
+        &self,
+        room_id: String,
+        before_ts: i64,
+        limit: i32,
+    ) -> Result<Vec<MessageInfo>, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            msg: format!("storage lock: {e}"),
+        })?;
+        let rows = store
+            .get_app_messages_before(&room_id, before_ts, limit)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("get_messages_before: {e}"),
+            })?;
+        Ok(rows.into_iter().map(message_row_to_info).collect())
+    }
+
     pub async fn get_message_count(&self, room_id: String) -> Result<i32, KeychatUniError> {
         let inner = self.inner.read().await;
         let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
@@ -181,14 +218,14 @@ impl KeychatClient {
 
     pub async fn get_contacts(
         &self,
-        identity_npub: String,
+        identity_pubkey: String,
     ) -> Result<Vec<ContactInfoFull>, KeychatUniError> {
         let inner = self.inner.read().await;
         let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
             msg: format!("storage lock: {e}"),
         })?;
         let rows = store
-            .get_app_contacts(&identity_npub)
+            .get_app_contacts(&identity_pubkey)
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("get_app_contacts: {e}"),
             })?;
@@ -197,7 +234,7 @@ impl KeychatClient {
             .map(|r| ContactInfoFull {
                 pubkey: r.pubkey,
                 npubkey: r.npubkey,
-                identity_npub: r.identity_npub,
+                identity_pubkey: r.identity_pubkey,
                 petname: r.petname,
                 name: r.name,
                 avatar: r.avatar,
@@ -208,7 +245,7 @@ impl KeychatClient {
     pub async fn update_contact_petname(
         &self,
         pubkey: String,
-        identity_npub: String,
+        identity_pubkey: String,
         petname: String,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
@@ -216,7 +253,7 @@ impl KeychatClient {
             msg: format!("storage lock: {e}"),
         })?;
         store
-            .update_app_contact(&pubkey, &identity_npub, Some(&petname), None, None)
+            .update_app_contact(&pubkey, &identity_pubkey, Some(&petname), None, None)
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("update_app_contact: {e}"),
             })
@@ -227,7 +264,7 @@ impl KeychatClient {
     pub async fn save_app_room_ffi(
         &self,
         to_main_pubkey: String,
-        identity_npub: String,
+        identity_pubkey: String,
         status: RoomStatus,
         room_type: RoomType,
         name: Option<String>,
@@ -237,7 +274,7 @@ impl KeychatClient {
             msg: format!("storage lock: {e}"),
         })?;
         store
-            .save_app_room(&to_main_pubkey, &identity_npub, status.to_i32(), room_type.to_i32(), name.as_deref(), None)
+            .save_app_room(&to_main_pubkey, &identity_pubkey, status.to_i32(), room_type.to_i32(), name.as_deref(), None)
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("save_app_room: {e}"),
             })
@@ -248,7 +285,7 @@ impl KeychatClient {
         msgid: String,
         event_id: Option<String>,
         room_id: String,
-        identity_npub: String,
+        identity_pubkey: String,
         sender_pubkey: String,
         content: String,
         is_me_send: bool,
@@ -261,7 +298,7 @@ impl KeychatClient {
         })?;
         store
             .save_app_message(
-                &msgid, event_id.as_deref(), &room_id, &identity_npub,
+                &msgid, event_id.as_deref(), &room_id, &identity_pubkey,
                 &sender_pubkey, &content, is_me_send, status.to_i32(), created_at as i64,
             )
             .map_err(|e| KeychatUniError::Storage {
@@ -273,7 +310,7 @@ impl KeychatClient {
         &self,
         pubkey: String,
         npubkey: String,
-        identity_npub: String,
+        identity_pubkey: String,
         name: Option<String>,
     ) -> Result<String, KeychatUniError> {
         let inner = self.inner.read().await;
@@ -281,7 +318,7 @@ impl KeychatClient {
             msg: format!("storage lock: {e}"),
         })?;
         store
-            .save_app_contact(&pubkey, &npubkey, &identity_npub, name.as_deref())
+            .save_app_contact(&pubkey, &npubkey, &identity_pubkey, name.as_deref())
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("save_app_contact: {e}"),
             })
@@ -403,7 +440,7 @@ fn room_row_to_info(r: libkeychat::storage::RoomRow) -> RoomInfo {
     RoomInfo {
         id: r.id,
         to_main_pubkey: r.to_main_pubkey,
-        identity_npub: r.identity_npub,
+        identity_pubkey: r.identity_pubkey,
         status: RoomStatus::from_i32(r.status),
         room_type: RoomType::from_i32(r.room_type),
         name: r.name,

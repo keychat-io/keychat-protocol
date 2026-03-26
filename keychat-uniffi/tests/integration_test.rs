@@ -58,6 +58,9 @@ impl DataListener for TestDataListener {
             DataChange::ContactUpdated { pubkey } => format!("ContactUpdated:{pubkey}"),
             DataChange::ContactListChanged => "ContactListChanged".into(),
             DataChange::IdentityListChanged => "IdentityListChanged".into(),
+            DataChange::ConnectionStatusChanged { status, message } => {
+                format!("ConnectionStatusChanged:{:?}:{}", status, message.unwrap_or_default())
+            }
         };
         self.changes.lock().unwrap().push(label);
     }
@@ -295,7 +298,7 @@ async_test!(app_room_and_message_crud_via_ffi, {
     let room_id = client
         .save_app_room_ffi(
             "peer_pubkey_hex".into(), identity_npub.into(),
-            1, 0, Some("Bob".into()),
+            RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()),
         )
         .await
         .unwrap();
@@ -304,7 +307,7 @@ async_test!(app_room_and_message_crud_via_ffi, {
     let rooms = client.get_rooms(identity_npub.into()).await.unwrap();
     assert_eq!(rooms.len(), 1);
     assert_eq!(rooms[0].name.as_deref(), Some("Bob"));
-    assert_eq!(rooms[0].status, 1);
+    assert_eq!(rooms[0].status, RoomStatus::Enabled);
     assert_eq!(rooms[0].unread_count, 0);
 
     // Get room by ID
@@ -316,14 +319,14 @@ async_test!(app_room_and_message_crud_via_ffi, {
     client
         .save_app_message_ffi(
             "msg1".into(), Some("evt1".into()), room_id.clone(), identity_npub.into(),
-            "peer_pubkey_hex".into(), "Hello!".into(), false, 1, 1000,
+            "peer_pubkey_hex".into(), "Hello!".into(), false, MessageStatus::Success, 1000,
         )
         .await
         .unwrap();
     client
         .save_app_message_ffi(
             "msg2".into(), Some("evt2".into()), room_id.clone(), identity_npub.into(),
-            identity_npub.into(), "Hi back!".into(), true, 1, 1001,
+            identity_npub.into(), "Hi back!".into(), true, MessageStatus::Success, 1001,
         )
         .await
         .unwrap();
@@ -417,7 +420,7 @@ async_test!(message_dedup_via_ffi, {
 
     // Create room
     let room_id = client
-        .save_app_room_ffi("peer".into(), identity_npub.into(), 1, 0, None)
+        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None)
         .await
         .unwrap();
 
@@ -425,7 +428,7 @@ async_test!(message_dedup_via_ffi, {
     client
         .save_app_message_ffi(
             "msg1".into(), Some("event_abc".into()), room_id.clone(), identity_npub.into(),
-            "peer".into(), "Hello".into(), false, 1, 1000,
+            "peer".into(), "Hello".into(), false, MessageStatus::Success, 1000,
         )
         .await
         .unwrap();
@@ -438,7 +441,7 @@ async_test!(message_dedup_via_ffi, {
     client
         .save_app_message_ffi(
             "msg1".into(), Some("event_abc".into()), room_id.clone(), identity_npub.into(),
-            "peer".into(), "Hello duplicate".into(), false, 1, 1000,
+            "peer".into(), "Hello duplicate".into(), false, MessageStatus::Success, 1000,
         )
         .await
         .unwrap();
@@ -463,7 +466,7 @@ async_test!(message_reply_to_resolution_via_ffi, {
     let identity_npub = "npub1me";
 
     let room_id = client
-        .save_app_room_ffi("peer".into(), identity_npub.into(), 1, 0, None)
+        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None)
         .await
         .unwrap();
 
@@ -471,7 +474,7 @@ async_test!(message_reply_to_resolution_via_ffi, {
     client
         .save_app_message_ffi(
             "msg1".into(), Some("event_original".into()), room_id.clone(), identity_npub.into(),
-            "peer".into(), "Original message".into(), false, 1, 1000,
+            "peer".into(), "Original message".into(), false, MessageStatus::Success, 1000,
         )
         .await
         .unwrap();
@@ -480,7 +483,7 @@ async_test!(message_reply_to_resolution_via_ffi, {
     client
         .save_app_message_ffi(
             "msg2".into(), Some("event_reply".into()), room_id.clone(), identity_npub.into(),
-            identity_npub.into(), "Reply text".into(), true, 1, 1001,
+            identity_npub.into(), "Reply text".into(), true, MessageStatus::Success, 1001,
         )
         .await
         .unwrap();
@@ -517,7 +520,7 @@ async_test!(room_last_message_and_ordering, {
 
     // Room A - older last message
     let room_a_id = client
-        .save_app_room_ffi("peer_a".into(), identity_npub.into(), 1, 0, Some("Alice".into()))
+        .save_app_room_ffi("peer_a".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Alice".into()))
         .await
         .unwrap();
     client
@@ -527,7 +530,7 @@ async_test!(room_last_message_and_ordering, {
 
     // Room B - newer last message
     let room_b_id = client
-        .save_app_room_ffi("peer_b".into(), identity_npub.into(), 1, 0, Some("Bob".into()))
+        .save_app_room_ffi("peer_b".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()))
         .await
         .unwrap();
     client

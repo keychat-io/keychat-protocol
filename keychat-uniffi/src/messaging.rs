@@ -19,13 +19,15 @@ impl KeychatClient {
         _thread_id: Option<String>,
     ) -> Result<SentMessage, KeychatUniError> {
         // 1. Get Arc<Mutex<ChatSession>> and check transport exists
-        let (session_mutex, peer_signal_hex, identity_npub) = {
+        let (session_mutex, peer_signal_hex, identity_pubkey) = {
             let inner = self.inner.read().await;
+            // room_id format is "peer_hex:identity_hex" — extract peer pubkey
+            let peer_pubkey = room_id.split(':').next().unwrap_or(&room_id);
             let signal_hex = inner
                 .peer_nostr_to_signal
-                .get(&room_id)
+                .get(peer_pubkey)
                 .ok_or(KeychatUniError::PeerNotFound {
-                    peer_id: room_id.clone(),
+                    peer_id: peer_pubkey.to_string(),
                 })?
                 .clone();
             let session = inner
@@ -40,12 +42,12 @@ impl KeychatClient {
                     msg: "not connected".into(),
                 });
             }
-            let npub = inner
+            let pubkey_hex = inner
                 .identity
                 .as_ref()
-                .and_then(|id| id.npub().ok())
+                .map(|id| id.pubkey_hex())
                 .unwrap_or_default();
-            (session, signal_hex, npub)
+            (session, signal_hex, pubkey_hex)
         }; // RwLock dropped here
 
         // 2. Lock only the specific peer session
@@ -83,7 +85,8 @@ impl KeychatClient {
         }
 
         // 5. Write message to DB (status=0 sending) before publishing
-        let full_room_id = format!("{}:{}", room_id, identity_npub);
+        // room_id is already "peer_hex:identity_hex" from Swift — use as-is
+        let full_room_id = room_id.clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -100,7 +103,7 @@ impl KeychatClient {
         let send_storage = self.inner.read().await.storage.clone();
         if let Some(store) = send_storage.lock().ok() {
             if let Err(e) = store.save_app_message(
-                &event_id, Some(&event_id), &full_room_id, &identity_npub,
+                &event_id, Some(&event_id), &full_room_id, &identity_pubkey,
                 &my_pubkey, &text, true, 0, now,
             ) {
                 tracing::warn!("save_app_message (send): {e}");

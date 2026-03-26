@@ -68,7 +68,7 @@ pub struct KeychatFriendRequestResult {
 /// Result from receiving a friend request.
 #[repr(C)]
 pub struct KeychatFriendReceived {
-    pub sender_npub: *mut c_char,
+    pub sender_pubkey: *mut c_char,
     pub sender_name: *mut c_char,
     pub sender_signal_id: *mut c_char,
     pub error: i32,
@@ -77,7 +77,7 @@ pub struct KeychatFriendReceived {
 /// Incoming decrypted message.
 #[repr(C)]
 pub struct KeychatMessage {
-    pub sender_npub: *mut c_char,
+    pub sender_pubkey: *mut c_char,
     pub content: *mut c_char,
     pub kind: *mut c_char,
     /// New addresses to subscribe to (JSON array string). May be null.
@@ -111,8 +111,8 @@ unsafe fn from_cstr(p: *const c_char) -> &'static str {
     CStr::from_ptr(p).to_str().unwrap_or("")
 }
 
-fn find_peer<'a>(ctx: &'a mut KeychatContext, npub: &str) -> Option<&'a mut PeerState> {
-    ctx.peers.iter_mut().find(|p| p.nostr_pubkey == npub)
+fn find_peer<'a>(ctx: &'a mut KeychatContext, pubkey: &str) -> Option<&'a mut PeerState> {
+    ctx.peers.iter_mut().find(|p| p.nostr_pubkey == pubkey)
 }
 
 // ─── Lifecycle ──────────────────────────────────────────────────────────────
@@ -189,7 +189,7 @@ pub unsafe extern "C" fn keychat_destroy(ctx: *mut KeychatContext) {
 
 /// Get the nostr public key (hex). Caller must free with `keychat_free_string()`.
 #[no_mangle]
-pub unsafe extern "C" fn keychat_get_npub(ctx: *const KeychatContext) -> *mut c_char {
+pub unsafe extern "C" fn keychat_get_pubkey(ctx: *const KeychatContext) -> *mut c_char {
     if ctx.is_null() {
         return null_str();
     }
@@ -202,14 +202,14 @@ pub unsafe extern "C" fn keychat_get_npub(ctx: *const KeychatContext) -> *mut c_
 // ─── Friend Request ─────────────────────────────────────────────────────────
 
 /// Send a friend request to a peer.
-/// `peer_npub`: hex nostr pubkey of the peer.
+/// `peer_pubkey`: hex nostr pubkey of the peer.
 /// `display_name`: your display name.
 ///
 /// Returns event JSON to publish to relay + firstInbox address to subscribe to.
 #[no_mangle]
 pub unsafe extern "C" fn keychat_send_friend_request(
     ctx: *mut KeychatContext,
-    peer_npub: *const c_char,
+    peer_pubkey: *const c_char,
     display_name: *const c_char,
 ) -> KeychatFriendRequestResult {
     let err_result = KeychatFriendRequestResult {
@@ -221,7 +221,7 @@ pub unsafe extern "C" fn keychat_send_friend_request(
         return err_result;
     }
     let ctx = &mut *ctx;
-    let peer = from_cstr(peer_npub);
+    let peer = from_cstr(peer_pubkey);
     let name = from_cstr(display_name);
 
     let result = ctx
@@ -259,7 +259,7 @@ pub unsafe extern "C" fn keychat_receive_friend_request(
     event_json: *const c_char,
 ) -> KeychatFriendReceived {
     let err = KeychatFriendReceived {
-        sender_npub: null_str(),
+        sender_pubkey: null_str(),
         sender_name: null_str(),
         sender_signal_id: null_str(),
         error: -1,
@@ -309,7 +309,7 @@ pub unsafe extern "C" fn keychat_receive_friend_request(
     });
 
     KeychatFriendReceived {
-        sender_npub: to_cstring(&sender_hex),
+        sender_pubkey: to_cstring(&sender_hex),
         sender_name: to_cstring(&peer_name),
         sender_signal_id: to_cstring(&accept_event_json), // piggyback: acceptance event JSON
         error: 0,
@@ -319,14 +319,14 @@ pub unsafe extern "C" fn keychat_receive_friend_request(
 // ─── Messaging ──────────────────────────────────────────────────────────────
 
 /// Encrypt and build a send event for a text message.
-/// `peer_npub`: hex nostr pubkey of the recipient (must be an established peer).
+/// `peer_pubkey`: hex nostr pubkey of the recipient (must be an established peer).
 /// `text`: message content.
 ///
 /// Returns the event JSON to publish + any new addresses to subscribe to.
 #[no_mangle]
 pub unsafe extern "C" fn keychat_send_text(
     ctx: *mut KeychatContext,
-    peer_npub: *const c_char,
+    peer_pubkey: *const c_char,
     text: *const c_char,
 ) -> KeychatSendResult {
     let err = KeychatSendResult {
@@ -338,10 +338,10 @@ pub unsafe extern "C" fn keychat_send_text(
         return err;
     }
     let ctx = &mut *ctx;
-    let npub = from_cstr(peer_npub);
+    let pubkey = from_cstr(peer_pubkey);
     let content = from_cstr(text);
 
-    let peer = match find_peer(ctx, npub) {
+    let peer = match find_peer(ctx, pubkey) {
         Some(p) => p,
         None => return err,
     };
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn keychat_receive_event(
     event_json: *const c_char,
 ) -> KeychatMessage {
     let err = KeychatMessage {
-        sender_npub: null_str(),
+        sender_pubkey: null_str(),
         content: null_str(),
         kind: null_str(),
         new_addresses_json: null_str(),
@@ -454,7 +454,7 @@ pub unsafe extern "C" fn keychat_receive_event(
             };
 
             return KeychatMessage {
-                sender_npub: to_cstring(&peer.nostr_pubkey),
+                sender_pubkey: to_cstring(&peer.nostr_pubkey),
                 content: to_cstring(&content),
                 kind: to_cstring(&kind),
                 new_addresses_json: new_addrs,
@@ -468,7 +468,7 @@ pub unsafe extern "C" fn keychat_receive_event(
         // Peer was added; return a friend_accepted event
         if let Some(peer) = ctx.peers.last() {
             return KeychatMessage {
-                sender_npub: to_cstring(&peer.nostr_pubkey),
+                sender_pubkey: to_cstring(&peer.nostr_pubkey),
                 content: to_cstring(&peer.name),
                 kind: to_cstring("friend_accepted"),
                 new_addresses_json: null_str(),
@@ -539,7 +539,7 @@ pub unsafe extern "C" fn keychat_list_peers(ctx: *const KeychatContext) -> *mut 
         .iter()
         .map(|p| {
             serde_json::json!({
-                "npub": p.nostr_pubkey,
+                "pubkey": p.nostr_pubkey,
                 "name": p.name,
                 "signal_id": p.signal_id,
             })
@@ -553,14 +553,14 @@ pub unsafe extern "C" fn keychat_list_peers(ctx: *const KeychatContext) -> *mut 
 #[no_mangle]
 pub unsafe extern "C" fn keychat_resolve_send_address(
     ctx: *mut KeychatContext,
-    peer_npub: *const c_char,
+    peer_pubkey: *const c_char,
 ) -> *mut c_char {
     if ctx.is_null() {
         return null_str();
     }
     let ctx = &mut *ctx;
-    let npub = from_cstr(peer_npub);
-    match find_peer(ctx, npub) {
+    let pubkey = from_cstr(peer_pubkey);
+    match find_peer(ctx, pubkey) {
         Some(peer) => {
             let addr = peer
                 .address_manager

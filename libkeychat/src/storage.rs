@@ -71,7 +71,7 @@ pub struct IdentityRow {
 pub struct RoomRow {
     pub id: String,
     pub to_main_pubkey: String,
-    pub identity_npub: String,
+    pub identity_pubkey: String,
     pub status: i32,
     pub room_type: i32,
     pub name: Option<String>,
@@ -89,7 +89,7 @@ pub struct MessageRow {
     pub msgid: String,
     pub event_id: Option<String>,
     pub room_id: String,
-    pub identity_npub: String,
+    pub identity_pubkey: String,
     pub sender_pubkey: String,
     pub content: String,
     pub is_me_send: bool,
@@ -110,7 +110,7 @@ pub struct ContactRow {
     pub id: String,
     pub pubkey: String,
     pub npubkey: String,
-    pub identity_npub: String,
+    pub identity_pubkey: String,
     pub signal_identity_key: Option<String>,
     pub petname: Option<String>,
     pub name: Option<String>,
@@ -156,6 +156,21 @@ impl SecureStorage {
         Self::run_migrations(&conn)?;
 
         Ok(Self { conn })
+    }
+
+    /// Execute multiple operations in a single transaction.
+    /// If the closure returns Ok, the transaction is committed.
+    /// If it returns Err or panics, the transaction is rolled back.
+    pub fn transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let tx = self.conn.unchecked_transaction()
+            .map_err(|e| KeychatError::Storage(format!("begin transaction: {e}")))?;
+        let result = f(&self.conn)?;
+        tx.commit()
+            .map_err(|e| KeychatError::Storage(format!("commit transaction: {e}")))?;
+        Ok(result)
     }
 
     /// Schema version. Increment when adding a new migration.
@@ -296,8 +311,8 @@ impl SecureStorage {
             );
 
             CREATE TABLE IF NOT EXISTS app_identities (
-                npub TEXT PRIMARY KEY,
-                nostr_pubkey_hex TEXT NOT NULL,
+                nostr_pubkey_hex TEXT PRIMARY KEY,
+                npub TEXT NOT NULL,
                 name TEXT NOT NULL,
                 avatar TEXT,
                 idx INTEGER NOT NULL DEFAULT 0,
@@ -308,7 +323,7 @@ impl SecureStorage {
             CREATE TABLE IF NOT EXISTS app_rooms (
                 id TEXT PRIMARY KEY,
                 to_main_pubkey TEXT NOT NULL,
-                identity_npub TEXT NOT NULL,
+                identity_pubkey TEXT NOT NULL,
                 status INTEGER NOT NULL DEFAULT 0,
                 type INTEGER NOT NULL DEFAULT 0,
                 name TEXT,
@@ -318,15 +333,16 @@ impl SecureStorage {
                 last_message_at INTEGER,
                 unread_count INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                UNIQUE(to_main_pubkey, identity_npub)
+                UNIQUE(to_main_pubkey, identity_pubkey)
             );
-            CREATE INDEX IF NOT EXISTS idx_app_rooms_identity ON app_rooms(identity_npub, last_message_at);
+            CREATE INDEX IF NOT EXISTS idx_app_rooms_identity ON app_rooms(identity_pubkey, last_message_at);
+            CREATE INDEX IF NOT EXISTS idx_app_rooms_pubkey ON app_rooms(to_main_pubkey);
 
             CREATE TABLE IF NOT EXISTS app_messages (
                 msgid TEXT PRIMARY KEY,
                 event_id TEXT UNIQUE,
                 room_id TEXT NOT NULL,
-                identity_npub TEXT NOT NULL,
+                identity_pubkey TEXT NOT NULL,
                 sender_pubkey TEXT NOT NULL,
                 content TEXT NOT NULL DEFAULT '',
                 is_me_send INTEGER NOT NULL DEFAULT 0,
@@ -348,7 +364,7 @@ impl SecureStorage {
                 id TEXT PRIMARY KEY,
                 pubkey TEXT NOT NULL,
                 npubkey TEXT NOT NULL,
-                identity_npub TEXT NOT NULL,
+                identity_pubkey TEXT NOT NULL,
                 signal_identity_key TEXT,
                 petname TEXT,
                 name TEXT,
@@ -356,9 +372,9 @@ impl SecureStorage {
                 avatar TEXT,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                UNIQUE(pubkey, identity_npub)
+                UNIQUE(pubkey, identity_pubkey)
             );
-            CREATE INDEX IF NOT EXISTS idx_app_contacts_identity ON app_contacts(identity_npub);
+            CREATE INDEX IF NOT EXISTS idx_app_contacts_identity ON app_contacts(identity_pubkey);
 
             CREATE INDEX IF NOT EXISTS idx_processed_events_at ON processed_events(processed_at);
 
@@ -1383,22 +1399,22 @@ impl SecureStorage {
     /// Save or update an identity.
     pub fn save_app_identity(
         &self,
+        pubkey_hex: &str,
         npub: &str,
-        nostr_pubkey_hex: &str,
         name: &str,
         idx: i32,
         is_default: bool,
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO app_identities (npub, nostr_pubkey_hex, name, idx, is_default, created_at)
+                "INSERT INTO app_identities (nostr_pubkey_hex, npub, name, idx, is_default, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
-                 ON CONFLICT(npub) DO UPDATE SET
-                   nostr_pubkey_hex = excluded.nostr_pubkey_hex,
+                 ON CONFLICT(nostr_pubkey_hex) DO UPDATE SET
+                   npub = excluded.npub,
                    name = excluded.name,
                    idx = excluded.idx,
                    is_default = excluded.is_default",
-                rusqlite::params![npub, nostr_pubkey_hex, name, idx, is_default as i32],
+                rusqlite::params![pubkey_hex, npub, name, idx, is_default as i32],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_identity: {e}")))?;
         Ok(())
@@ -1407,13 +1423,13 @@ impl SecureStorage {
     /// Get all identities ordered by index.
     pub fn get_app_identities(&self) -> Result<Vec<IdentityRow>> {
         let mut stmt = self.conn
-            .prepare("SELECT npub, nostr_pubkey_hex, name, avatar, idx, is_default, created_at FROM app_identities ORDER BY idx")
+            .prepare("SELECT nostr_pubkey_hex, npub, name, avatar, idx, is_default, created_at FROM app_identities ORDER BY idx")
             .map_err(|e| KeychatError::Storage(format!("get_app_identities prepare: {e}")))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(IdentityRow {
-                    npub: row.get(0)?,
-                    nostr_pubkey_hex: row.get(1)?,
+                    nostr_pubkey_hex: row.get(0)?,
+                    npub: row.get(1)?,
                     name: row.get(2)?,
                     avatar: row.get(3)?,
                     idx: row.get(4)?,
@@ -1432,17 +1448,17 @@ impl SecureStorage {
     /// Update identity fields (only non-None values are updated).
     pub fn update_app_identity(
         &self,
-        npub: &str,
+        pubkey_hex: &str,
         name: Option<&str>,
         avatar: Option<&str>,
         is_default: Option<bool>,
     ) -> Result<()> {
         if let Some(n) = name {
-            self.conn.execute("UPDATE app_identities SET name = ?1 WHERE npub = ?2", rusqlite::params![n, npub])
+            self.conn.execute("UPDATE app_identities SET name = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![n, pubkey_hex])
                 .map_err(|e| KeychatError::Storage(format!("update_app_identity name: {e}")))?;
         }
         if let Some(a) = avatar {
-            self.conn.execute("UPDATE app_identities SET avatar = ?1 WHERE npub = ?2", rusqlite::params![a, npub])
+            self.conn.execute("UPDATE app_identities SET avatar = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![a, pubkey_hex])
                 .map_err(|e| KeychatError::Storage(format!("update_app_identity avatar: {e}")))?;
         }
         if let Some(d) = is_default {
@@ -1451,27 +1467,27 @@ impl SecureStorage {
                 self.conn.execute("UPDATE app_identities SET is_default = 0", [])
                     .map_err(|e| KeychatError::Storage(format!("update_app_identity clear defaults: {e}")))?;
             }
-            self.conn.execute("UPDATE app_identities SET is_default = ?1 WHERE npub = ?2", rusqlite::params![d as i32, npub])
+            self.conn.execute("UPDATE app_identities SET is_default = ?1 WHERE nostr_pubkey_hex = ?2", rusqlite::params![d as i32, pubkey_hex])
                 .map_err(|e| KeychatError::Storage(format!("update_app_identity is_default: {e}")))?;
         }
         Ok(())
     }
 
     /// Delete an identity and its associated rooms, messages, and contacts.
-    pub fn delete_app_identity(&self, npub: &str) -> Result<()> {
+    pub fn delete_app_identity(&self, pubkey_hex: &str) -> Result<()> {
         // Delete messages for all rooms of this identity
         self.conn.execute(
-            "DELETE FROM app_messages WHERE room_id IN (SELECT id FROM app_rooms WHERE identity_npub = ?1)",
-            rusqlite::params![npub],
+            "DELETE FROM app_messages WHERE room_id IN (SELECT id FROM app_rooms WHERE identity_pubkey = ?1)",
+            rusqlite::params![pubkey_hex],
         ).map_err(|e| KeychatError::Storage(format!("delete_app_identity messages: {e}")))?;
         // Delete rooms
-        self.conn.execute("DELETE FROM app_rooms WHERE identity_npub = ?1", rusqlite::params![npub])
+        self.conn.execute("DELETE FROM app_rooms WHERE identity_pubkey = ?1", rusqlite::params![pubkey_hex])
             .map_err(|e| KeychatError::Storage(format!("delete_app_identity rooms: {e}")))?;
         // Delete contacts
-        self.conn.execute("DELETE FROM app_contacts WHERE identity_npub = ?1", rusqlite::params![npub])
+        self.conn.execute("DELETE FROM app_contacts WHERE identity_pubkey = ?1", rusqlite::params![pubkey_hex])
             .map_err(|e| KeychatError::Storage(format!("delete_app_identity contacts: {e}")))?;
         // Delete identity
-        self.conn.execute("DELETE FROM app_identities WHERE npub = ?1", rusqlite::params![npub])
+        self.conn.execute("DELETE FROM app_identities WHERE nostr_pubkey_hex = ?1", rusqlite::params![pubkey_hex])
             .map_err(|e| KeychatError::Storage(format!("delete_app_identity: {e}")))?;
         Ok(())
     }
@@ -1482,44 +1498,44 @@ impl SecureStorage {
     pub fn save_app_room(
         &self,
         to_main_pubkey: &str,
-        identity_npub: &str,
+        identity_pubkey: &str,
         status: i32,
         room_type: i32,
         name: Option<&str>,
         peer_signal_identity_key: Option<&str>,
     ) -> Result<String> {
-        let id = format!("{}:{}", to_main_pubkey, identity_npub);
+        let id = format!("{}:{}", to_main_pubkey, identity_pubkey);
         self.conn
             .execute(
-                "INSERT INTO app_rooms (id, to_main_pubkey, identity_npub, status, type, name, peer_signal_identity_key)
+                "INSERT INTO app_rooms (id, to_main_pubkey, identity_pubkey, status, type, name, peer_signal_identity_key)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                    status = CASE WHEN excluded.status > status THEN excluded.status ELSE status END,
                    name = COALESCE(excluded.name, name),
                    peer_signal_identity_key = COALESCE(excluded.peer_signal_identity_key, peer_signal_identity_key)",
-                rusqlite::params![id, to_main_pubkey, identity_npub, status, room_type, name, peer_signal_identity_key],
+                rusqlite::params![id, to_main_pubkey, identity_pubkey, status, room_type, name, peer_signal_identity_key],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_room: {e}")))?;
         Ok(id)
     }
 
     /// Get all rooms for an identity, ordered by last_message_at desc.
-    pub fn get_app_rooms(&self, identity_npub: &str) -> Result<Vec<RoomRow>> {
+    pub fn get_app_rooms(&self, identity_pubkey: &str) -> Result<Vec<RoomRow>> {
         let mut stmt = self.conn
             .prepare(
-                "SELECT id, to_main_pubkey, identity_npub, status, type, name, avatar,
+                "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
                         peer_signal_identity_key, last_message_content, last_message_at,
                         unread_count, created_at
-                 FROM app_rooms WHERE identity_npub = ?1
-                 ORDER BY COALESCE(last_message_at, created_at) DESC",
+                 FROM app_rooms WHERE identity_pubkey = ?1
+                 ORDER BY COALESCE(last_message_at, created_at) DESC, id ASC",
             )
             .map_err(|e| KeychatError::Storage(format!("get_app_rooms prepare: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![identity_npub], |row| {
+            .query_map(rusqlite::params![identity_pubkey], |row| {
                 Ok(RoomRow {
                     id: row.get(0)?,
                     to_main_pubkey: row.get(1)?,
-                    identity_npub: row.get(2)?,
+                    identity_pubkey: row.get(2)?,
                     status: row.get(3)?,
                     room_type: row.get(4)?,
                     name: row.get(5)?,
@@ -1543,7 +1559,7 @@ impl SecureStorage {
     pub fn get_app_room(&self, room_id: &str) -> Result<Option<RoomRow>> {
         self.conn
             .query_row(
-                "SELECT id, to_main_pubkey, identity_npub, status, type, name, avatar,
+                "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
                         peer_signal_identity_key, last_message_content, last_message_at,
                         unread_count, created_at
                  FROM app_rooms WHERE id = ?1",
@@ -1552,7 +1568,7 @@ impl SecureStorage {
                     Ok(RoomRow {
                         id: row.get(0)?,
                         to_main_pubkey: row.get(1)?,
-                        identity_npub: row.get(2)?,
+                        identity_pubkey: row.get(2)?,
                         status: row.get(3)?,
                         room_type: row.get(4)?,
                         name: row.get(5)?,
@@ -1573,7 +1589,7 @@ impl SecureStorage {
     pub fn find_app_room_by_pubkey(&self, to_main_pubkey: &str) -> Result<Option<RoomRow>> {
         self.conn
             .query_row(
-                "SELECT id, to_main_pubkey, identity_npub, status, type, name, avatar,
+                "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
                         peer_signal_identity_key, last_message_content, last_message_at,
                         unread_count, created_at
                  FROM app_rooms WHERE to_main_pubkey = ?1 LIMIT 1",
@@ -1582,7 +1598,7 @@ impl SecureStorage {
                     Ok(RoomRow {
                         id: row.get(0)?,
                         to_main_pubkey: row.get(1)?,
-                        identity_npub: row.get(2)?,
+                        identity_pubkey: row.get(2)?,
                         status: row.get(3)?,
                         room_type: row.get(4)?,
                         name: row.get(5)?,
@@ -1680,7 +1696,7 @@ impl SecureStorage {
         msgid: &str,
         event_id: Option<&str>,
         room_id: &str,
-        identity_npub: &str,
+        identity_pubkey: &str,
         sender_pubkey: &str,
         content: &str,
         is_me_send: bool,
@@ -1689,9 +1705,9 @@ impl SecureStorage {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO app_messages (msgid, event_id, room_id, identity_npub, sender_pubkey, content, is_me_send, status, created_at)
+                "INSERT OR IGNORE INTO app_messages (msgid, event_id, room_id, identity_pubkey, sender_pubkey, content, is_me_send, status, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![msgid, event_id, room_id, identity_npub, sender_pubkey, content, is_me_send as i32, status, created_at],
+                rusqlite::params![msgid, event_id, room_id, identity_pubkey, sender_pubkey, content, is_me_send as i32, status, created_at],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_message: {e}")))?;
         Ok(())
@@ -1701,40 +1717,150 @@ impl SecureStorage {
     pub fn get_app_messages(&self, room_id: &str, limit: i32, offset: i32) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn
             .prepare(
-                "SELECT msgid, event_id, room_id, identity_npub, sender_pubkey, content,
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
                         payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
                  FROM app_messages WHERE room_id = ?1
-                 ORDER BY created_at ASC LIMIT ?2 OFFSET ?3",
+                 ORDER BY created_at ASC, rowid ASC LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| KeychatError::Storage(format!("get_app_messages prepare: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![room_id, limit, offset], |row| {
-                Ok(MessageRow {
-                    msgid: row.get(0)?,
-                    event_id: row.get(1)?,
-                    room_id: row.get(2)?,
-                    identity_npub: row.get(3)?,
-                    sender_pubkey: row.get(4)?,
-                    content: row.get(5)?,
-                    is_me_send: row.get::<_, i32>(6)? != 0,
-                    is_read: row.get::<_, i32>(7)? != 0,
-                    status: row.get(8)?,
-                    reply_to_event_id: row.get(9)?,
-                    reply_to_content: row.get(10)?,
-                    payload_json: row.get(11)?,
-                    nostr_event_json: row.get(12)?,
-                    relay_status_json: row.get(13)?,
-                    local_file_path: row.get(14)?,
-                    created_at: row.get(15)?,
-                })
-            })
+            .query_map(rusqlite::params![room_id, limit, offset], Self::map_message_row)
             .map_err(|e| KeychatError::Storage(format!("get_app_messages query: {e}")))?;
         let mut result = Vec::new();
         for r in rows {
             result.push(r.map_err(|e| KeychatError::Storage(format!("get_app_messages row: {e}")))?);
         }
         Ok(result)
+    }
+
+    /// Get the latest N messages for a room, returned in chronological order (ASC).
+    pub fn get_app_messages_latest(&self, room_id: &str, limit: i32) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
+                        is_me_send, is_read, status, reply_to_event_id, reply_to_content,
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                 FROM app_messages WHERE room_id = ?1
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+            )
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_latest prepare: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![room_id, limit], Self::map_message_row)
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_latest query: {e}")))?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r.map_err(|e| KeychatError::Storage(format!("get_app_messages_latest row: {e}")))?);
+        }
+        result.reverse(); // DESC → ASC for display
+        Ok(result)
+    }
+
+    /// Get all unread messages plus `context` preceding read messages for a room.
+    /// Returns messages in chronological (ASC) order.
+    pub fn get_app_messages_unread_with_context(&self, room_id: &str, context: i32) -> Result<Vec<MessageRow>> {
+        // Find the created_at of the oldest unread message
+        let oldest_unread_ts: Option<i64> = self.conn
+            .query_row(
+                "SELECT MIN(created_at) FROM app_messages WHERE room_id = ?1 AND is_read = 0 AND is_me_send = 0",
+                rusqlite::params![room_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| KeychatError::Storage(format!("oldest_unread_ts: {e}")))?;
+
+        let oldest_ts = match oldest_unread_ts {
+            Some(ts) => ts,
+            None => {
+                // No unread messages — fall back to latest page
+                return self.get_app_messages_latest(room_id, context);
+            }
+        };
+
+        // 1. Context messages before oldest unread (DESC, then reverse)
+        let mut context_stmt = self.conn
+            .prepare(
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
+                        is_me_send, is_read, status, reply_to_event_id, reply_to_content,
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                 FROM app_messages
+                 WHERE room_id = ?1 AND created_at < ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+            )
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_unread context prepare: {e}")))?;
+        let ctx_rows = context_stmt
+            .query_map(rusqlite::params![room_id, oldest_ts, context], Self::map_message_row)
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_unread context query: {e}")))?;
+        let mut result = Vec::new();
+        for r in ctx_rows {
+            result.push(r.map_err(|e| KeychatError::Storage(format!("context row: {e}")))?);
+        }
+        result.reverse(); // DESC → ASC
+
+        // 2. All unread and newer messages (already ASC)
+        let mut unread_stmt = self.conn
+            .prepare(
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
+                        is_me_send, is_read, status, reply_to_event_id, reply_to_content,
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                 FROM app_messages
+                 WHERE room_id = ?1 AND created_at >= ?2
+                 ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_unread unread prepare: {e}")))?;
+        let unread_rows = unread_stmt
+            .query_map(rusqlite::params![room_id, oldest_ts], Self::map_message_row)
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_unread unread query: {e}")))?;
+        for r in unread_rows {
+            result.push(r.map_err(|e| KeychatError::Storage(format!("unread row: {e}")))?);
+        }
+        Ok(result)
+    }
+
+    /// Get older messages before or at a given timestamp for pagination.
+    /// Uses `<=` to avoid missing messages with the same second-level timestamp.
+    /// Caller should deduplicate by msgid.
+    pub fn get_app_messages_before(&self, room_id: &str, before_ts: i64, limit: i32) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
+                        is_me_send, is_read, status, reply_to_event_id, reply_to_content,
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                 FROM app_messages
+                 WHERE room_id = ?1 AND created_at <= ?2
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+            )
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_before prepare: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![room_id, before_ts, limit], Self::map_message_row)
+            .map_err(|e| KeychatError::Storage(format!("get_app_messages_before query: {e}")))?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r.map_err(|e| KeychatError::Storage(format!("get_app_messages_before row: {e}")))?);
+        }
+        result.reverse(); // DESC → ASC for display
+        Ok(result)
+    }
+
+    /// Helper to map a rusqlite Row to MessageRow.
+    fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+        Ok(MessageRow {
+            msgid: row.get(0)?,
+            event_id: row.get(1)?,
+            room_id: row.get(2)?,
+            identity_pubkey: row.get(3)?,
+            sender_pubkey: row.get(4)?,
+            content: row.get(5)?,
+            is_me_send: row.get::<_, i32>(6)? != 0,
+            is_read: row.get::<_, i32>(7)? != 0,
+            status: row.get(8)?,
+            reply_to_event_id: row.get(9)?,
+            reply_to_content: row.get(10)?,
+            payload_json: row.get(11)?,
+            nostr_event_json: row.get(12)?,
+            relay_status_json: row.get(13)?,
+            local_file_path: row.get(14)?,
+            created_at: row.get(15)?,
+        })
     }
 
     /// Get message count for a room.
@@ -1750,21 +1876,21 @@ impl SecureStorage {
 
     /// Check if a message with this event_id already exists.
     pub fn is_app_message_duplicate(&self, event_id: &str) -> Result<bool> {
-        let count: i32 = self.conn
+        let exists: bool = self.conn
             .query_row(
-                "SELECT COUNT(*) FROM app_messages WHERE event_id = ?1",
+                "SELECT EXISTS(SELECT 1 FROM app_messages WHERE event_id = ?1)",
                 rusqlite::params![event_id],
                 |row| row.get(0),
             )
             .map_err(|e| KeychatError::Storage(format!("is_app_message_duplicate: {e}")))?;
-        Ok(count > 0)
+        Ok(exists)
     }
 
     /// Get a message by event_id (for reply-to resolution).
     pub fn get_app_message_by_event_id(&self, event_id: &str) -> Result<Option<MessageRow>> {
         self.conn
             .query_row(
-                "SELECT msgid, event_id, room_id, identity_npub, sender_pubkey, content,
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
                         payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
                  FROM app_messages WHERE event_id = ?1 LIMIT 1",
@@ -1774,7 +1900,7 @@ impl SecureStorage {
                         msgid: row.get(0)?,
                         event_id: row.get(1)?,
                         room_id: row.get(2)?,
-                        identity_npub: row.get(3)?,
+                        identity_pubkey: row.get(3)?,
                         sender_pubkey: row.get(4)?,
                         content: row.get(5)?,
                         is_me_send: row.get::<_, i32>(6)? != 0,
@@ -1798,7 +1924,7 @@ impl SecureStorage {
     pub fn get_app_message_by_msgid(&self, msgid: &str) -> Result<Option<MessageRow>> {
         self.conn
             .query_row(
-                "SELECT msgid, event_id, room_id, identity_npub, sender_pubkey, content,
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
                         payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
                  FROM app_messages WHERE msgid = ?1 LIMIT 1",
@@ -1808,7 +1934,7 @@ impl SecureStorage {
                         msgid: row.get(0)?,
                         event_id: row.get(1)?,
                         room_id: row.get(2)?,
-                        identity_npub: row.get(3)?,
+                        identity_pubkey: row.get(3)?,
                         sender_pubkey: row.get(4)?,
                         content: row.get(5)?,
                         is_me_send: row.get::<_, i32>(6)? != 0,
@@ -1909,7 +2035,7 @@ impl SecureStorage {
     pub fn get_app_failed_messages(&self) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn
             .prepare(
-                "SELECT msgid, event_id, room_id, identity_npub, sender_pubkey, content,
+                "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
                         payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
                  FROM app_messages WHERE is_me_send = 1 AND status = 2
@@ -1922,7 +2048,7 @@ impl SecureStorage {
                     msgid: row.get(0)?,
                     event_id: row.get(1)?,
                     room_id: row.get(2)?,
-                    identity_npub: row.get(3)?,
+                    identity_pubkey: row.get(3)?,
                     sender_pubkey: row.get(4)?,
                     content: row.get(5)?,
                     is_me_send: row.get::<_, i32>(6)? != 0,
@@ -1959,43 +2085,43 @@ impl SecureStorage {
         &self,
         pubkey: &str,
         npubkey: &str,
-        identity_npub: &str,
+        identity_pubkey: &str,
         name: Option<&str>,
     ) -> Result<String> {
-        let id = format!("{}:{}", pubkey, identity_npub);
+        let id = format!("{}:{}", pubkey, identity_pubkey);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         self.conn
             .execute(
-                "INSERT INTO app_contacts (id, pubkey, npubkey, identity_npub, name, created_at, updated_at)
+                "INSERT INTO app_contacts (id, pubkey, npubkey, identity_pubkey, name, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
                  ON CONFLICT(id) DO UPDATE SET
                    npubkey = excluded.npubkey,
                    name = COALESCE(excluded.name, name),
                    updated_at = excluded.updated_at",
-                rusqlite::params![id, pubkey, npubkey, identity_npub, name, now],
+                rusqlite::params![id, pubkey, npubkey, identity_pubkey, name, now],
             )
             .map_err(|e| KeychatError::Storage(format!("save_app_contact: {e}")))?;
         Ok(id)
     }
 
     /// Get all contacts for an identity.
-    pub fn get_app_contacts(&self, identity_npub: &str) -> Result<Vec<ContactRow>> {
+    pub fn get_app_contacts(&self, identity_pubkey: &str) -> Result<Vec<ContactRow>> {
         let mut stmt = self.conn
             .prepare(
-                "SELECT id, pubkey, npubkey, identity_npub, signal_identity_key, petname, name, about, avatar, created_at, updated_at
-                 FROM app_contacts WHERE identity_npub = ?1 ORDER BY updated_at DESC",
+                "SELECT id, pubkey, npubkey, identity_pubkey, signal_identity_key, petname, name, about, avatar, created_at, updated_at
+                 FROM app_contacts WHERE identity_pubkey = ?1 ORDER BY updated_at DESC",
             )
             .map_err(|e| KeychatError::Storage(format!("get_app_contacts prepare: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![identity_npub], |row| {
+            .query_map(rusqlite::params![identity_pubkey], |row| {
                 Ok(ContactRow {
                     id: row.get(0)?,
                     pubkey: row.get(1)?,
                     npubkey: row.get(2)?,
-                    identity_npub: row.get(3)?,
+                    identity_pubkey: row.get(3)?,
                     signal_identity_key: row.get(4)?,
                     petname: row.get(5)?,
                     name: row.get(6)?,
@@ -2014,11 +2140,11 @@ impl SecureStorage {
     }
 
     /// Get a contact by pubkey and identity.
-    pub fn get_app_contact(&self, pubkey: &str, identity_npub: &str) -> Result<Option<ContactRow>> {
-        let id = format!("{}:{}", pubkey, identity_npub);
+    pub fn get_app_contact(&self, pubkey: &str, identity_pubkey: &str) -> Result<Option<ContactRow>> {
+        let id = format!("{}:{}", pubkey, identity_pubkey);
         self.conn
             .query_row(
-                "SELECT id, pubkey, npubkey, identity_npub, signal_identity_key, petname, name, about, avatar, created_at, updated_at
+                "SELECT id, pubkey, npubkey, identity_pubkey, signal_identity_key, petname, name, about, avatar, created_at, updated_at
                  FROM app_contacts WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
@@ -2026,7 +2152,7 @@ impl SecureStorage {
                         id: row.get(0)?,
                         pubkey: row.get(1)?,
                         npubkey: row.get(2)?,
-                        identity_npub: row.get(3)?,
+                        identity_pubkey: row.get(3)?,
                         signal_identity_key: row.get(4)?,
                         petname: row.get(5)?,
                         name: row.get(6)?,
@@ -2045,12 +2171,12 @@ impl SecureStorage {
     pub fn update_app_contact(
         &self,
         pubkey: &str,
-        identity_npub: &str,
+        identity_pubkey: &str,
         petname: Option<&str>,
         name: Option<&str>,
         avatar: Option<&str>,
     ) -> Result<()> {
-        let id = format!("{}:{}", pubkey, identity_npub);
+        let id = format!("{}:{}", pubkey, identity_pubkey);
         if let Some(p) = petname {
             self.conn.execute("UPDATE app_contacts SET petname = ?1, updated_at = strftime('%s','now') WHERE id = ?2", rusqlite::params![p, id])
                 .map_err(|e| KeychatError::Storage(format!("update_app_contact petname: {e}")))?;
@@ -2067,8 +2193,8 @@ impl SecureStorage {
     }
 
     /// Delete a contact.
-    pub fn delete_app_contact(&self, pubkey: &str, identity_npub: &str) -> Result<()> {
-        let id = format!("{}:{}", pubkey, identity_npub);
+    pub fn delete_app_contact(&self, pubkey: &str, identity_pubkey: &str) -> Result<()> {
+        let id = format!("{}:{}", pubkey, identity_pubkey);
         self.conn.execute("DELETE FROM app_contacts WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| KeychatError::Storage(format!("delete_app_contact: {e}")))?;
         Ok(())
@@ -2086,8 +2212,8 @@ impl SecureStorage {
 
     /// Delete all data for the current identity (all tables except relays).
     pub fn delete_all_data(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
+        self.transaction(|conn| {
+            conn.execute_batch(
                 "DELETE FROM signal_sessions;
                  DELETE FROM pre_keys;
                  DELETE FROM signed_pre_keys;
@@ -2107,7 +2233,8 @@ impl SecureStorage {
                  DELETE FROM app_contacts;",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete all data: {e}")))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Delete all data for a single peer (1:1 room).
@@ -2842,9 +2969,9 @@ mod tests {
         // Empty
         assert!(store.get_app_identities().unwrap().is_empty());
 
-        // Save
-        store.save_app_identity("npub1abc", "hex1", "Alice", 0, true).unwrap();
-        store.save_app_identity("npub1def", "hex2", "Bob", 1, false).unwrap();
+        // Save (pubkey_hex, npub, name, idx, is_default)
+        store.save_app_identity("hex1", "npub1abc", "Alice", 0, true).unwrap();
+        store.save_app_identity("hex2", "npub1def", "Bob", 1, false).unwrap();
 
         let ids = store.get_app_identities().unwrap();
         assert_eq!(ids.len(), 2);
@@ -2853,39 +2980,39 @@ mod tests {
         assert_eq!(ids[1].name, "Bob");
         assert!(!ids[1].is_default);
 
-        // Update
-        store.update_app_identity("npub1abc", Some("Alice2"), None, None).unwrap();
+        // Update (by pubkey_hex)
+        store.update_app_identity("hex1", Some("Alice2"), None, None).unwrap();
         let ids = store.get_app_identities().unwrap();
         assert_eq!(ids[0].name, "Alice2");
 
         // Set default
-        store.update_app_identity("npub1def", None, None, Some(true)).unwrap();
+        store.update_app_identity("hex2", None, None, Some(true)).unwrap();
         let ids = store.get_app_identities().unwrap();
         assert!(!ids[0].is_default); // Alice cleared
         assert!(ids[1].is_default);  // Bob now default
 
-        // Delete cascading
-        store.save_app_room("peer1", "npub1abc", 2, 0, Some("Room1"), None).unwrap();
-        store.save_app_contact("peer1", "npub1peer", "npub1abc", Some("Peer")).unwrap();
-        store.delete_app_identity("npub1abc").unwrap();
+        // Delete cascading (by pubkey_hex)
+        store.save_app_room("peer1", "hex1", 2, 0, Some("Room1"), None).unwrap();
+        store.save_app_contact("peer1", "npub1peer", "hex1", Some("Peer")).unwrap();
+        store.delete_app_identity("hex1").unwrap();
         let ids = store.get_app_identities().unwrap();
         assert_eq!(ids.len(), 1);
-        assert!(store.get_app_rooms("npub1abc").unwrap().is_empty());
-        assert!(store.get_app_contacts("npub1abc").unwrap().is_empty());
+        assert!(store.get_app_rooms("hex1").unwrap().is_empty());
+        assert!(store.get_app_contacts("hex1").unwrap().is_empty());
     }
 
     #[test]
     fn test_app_room_crud() {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
 
-        // Save rooms
-        let id1 = store.save_app_room("peer1", "npub1", 2, 0, Some("Alice"), None).unwrap();
-        let id2 = store.save_app_room("group1", "npub1", 2, 1, Some("Group"), None).unwrap();
-        assert_eq!(id1, "peer1:npub1");
-        assert_eq!(id2, "group1:npub1");
+        // Save rooms (identity_pubkey is now hex)
+        let id1 = store.save_app_room("peer1", "hex1", 2, 0, Some("Alice"), None).unwrap();
+        let id2 = store.save_app_room("group1", "hex1", 2, 1, Some("Group"), None).unwrap();
+        assert_eq!(id1, "peer1:hex1");
+        assert_eq!(id2, "group1:hex1");
 
         // Get rooms
-        let rooms = store.get_app_rooms("npub1").unwrap();
+        let rooms = store.get_app_rooms("hex1").unwrap();
         assert_eq!(rooms.len(), 2);
 
         // Get single room
@@ -2915,7 +3042,7 @@ mod tests {
         assert_eq!(room.unread_count, 0);
 
         // Delete (cascade messages)
-        store.save_app_message("msg1", None, &id1, "npub1", "peer1", "hi", false, 1, 1000).unwrap();
+        store.save_app_message("msg1", None, &id1, "hex1", "peer1", "hi", false, 1, 1000).unwrap();
         store.delete_app_room(&id1).unwrap();
         assert!(store.get_app_room(&id1).unwrap().is_none());
         assert!(store.get_app_messages(&id1, 100, 0).unwrap().is_empty());
@@ -2924,12 +3051,12 @@ mod tests {
     #[test]
     fn test_app_message_crud() {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
-        let room_id = store.save_app_room("peer1", "npub1", 2, 0, Some("Alice"), None).unwrap();
+        let room_id = store.save_app_room("peer1", "hex1", 2, 0, Some("Alice"), None).unwrap();
 
         // Save messages
-        store.save_app_message("msg1", Some("ev1"), &room_id, "npub1", "peer1", "hello", false, 1, 1000).unwrap();
-        store.save_app_message("msg2", Some("ev2"), &room_id, "npub1", "me", "world", true, 0, 1001).unwrap();
-        store.save_app_message("msg3", None, &room_id, "npub1", "peer1", "bye", false, 1, 1002).unwrap();
+        store.save_app_message("msg1", Some("ev1"), &room_id, "hex1", "peer1", "hello", false, 1, 1000).unwrap();
+        store.save_app_message("msg2", Some("ev2"), &room_id, "hex1", "me", "world", true, 0, 1001).unwrap();
+        store.save_app_message("msg3", None, &room_id, "hex1", "peer1", "bye", false, 1, 1002).unwrap();
 
         // Get messages
         let msgs = store.get_app_messages(&room_id, 100, 0).unwrap();
@@ -2952,7 +3079,7 @@ mod tests {
         assert!(!store.is_app_message_duplicate("ev999").unwrap());
 
         // Duplicate insert (INSERT OR IGNORE)
-        store.save_app_message("msg1", Some("ev1"), &room_id, "npub1", "peer1", "changed", false, 1, 1000).unwrap();
+        store.save_app_message("msg1", Some("ev1"), &room_id, "hex1", "peer1", "changed", false, 1, 1000).unwrap();
         let msgs = store.get_app_messages(&room_id, 100, 0).unwrap();
         assert_eq!(msgs[0].content, "hello"); // unchanged
 
@@ -2973,7 +3100,7 @@ mod tests {
         assert!(msgs.iter().all(|m| m.is_read));
 
         // Failed messages query
-        store.save_app_message("msg4", Some("ev4"), &room_id, "npub1", "me", "failed msg", true, 2, 1003).unwrap();
+        store.save_app_message("msg4", Some("ev4"), &room_id, "hex1", "me", "failed msg", true, 2, 1003).unwrap();
         let failed = store.get_app_failed_messages().unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].msgid, "msg4");
@@ -2987,32 +3114,32 @@ mod tests {
     fn test_app_contact_crud() {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
 
-        // Save
-        let id = store.save_app_contact("pub1", "npub1pub1", "npub1identity", Some("Alice")).unwrap();
-        assert_eq!(id, "pub1:npub1identity");
+        // Save (identity_pubkey is now hex)
+        let id = store.save_app_contact("pub1", "npub1pub1", "hexidentity1", Some("Alice")).unwrap();
+        assert_eq!(id, "pub1:hexidentity1");
 
-        store.save_app_contact("pub2", "npub1pub2", "npub1identity", None).unwrap();
+        store.save_app_contact("pub2", "npub1pub2", "hexidentity1", None).unwrap();
 
         // Get all
-        let contacts = store.get_app_contacts("npub1identity").unwrap();
+        let contacts = store.get_app_contacts("hexidentity1").unwrap();
         assert_eq!(contacts.len(), 2);
 
         // Get single
-        let c = store.get_app_contact("pub1", "npub1identity").unwrap().unwrap();
+        let c = store.get_app_contact("pub1", "hexidentity1").unwrap().unwrap();
         assert_eq!(c.name, Some("Alice".to_string()));
         assert!(c.petname.is_none());
 
         // Not found
-        assert!(store.get_app_contact("pub999", "npub1identity").unwrap().is_none());
+        assert!(store.get_app_contact("pub999", "hexidentity1").unwrap().is_none());
 
         // Update
-        store.update_app_contact("pub1", "npub1identity", Some("Ali"), None, None).unwrap();
-        let c = store.get_app_contact("pub1", "npub1identity").unwrap().unwrap();
+        store.update_app_contact("pub1", "hexidentity1", Some("Ali"), None, None).unwrap();
+        let c = store.get_app_contact("pub1", "hexidentity1").unwrap().unwrap();
         assert_eq!(c.petname, Some("Ali".to_string()));
 
         // Delete
-        store.delete_app_contact("pub1", "npub1identity").unwrap();
-        assert!(store.get_app_contact("pub1", "npub1identity").unwrap().is_none());
-        assert_eq!(store.get_app_contacts("npub1identity").unwrap().len(), 1);
+        store.delete_app_contact("pub1", "hexidentity1").unwrap();
+        assert!(store.get_app_contact("pub1", "hexidentity1").unwrap().is_none());
+        assert_eq!(store.get_app_contacts("hexidentity1").unwrap().len(), 1);
     }
 }
