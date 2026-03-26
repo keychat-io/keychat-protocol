@@ -109,7 +109,8 @@ impl KeychatClient {
             .unwrap_or_default()
             .as_secs() as i64;
         let fr_storage = self.inner.read().await.app_storage.clone();
-        if let Ok(store) = fr_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (send friend request): {e}")) {
+        {
+            let store = crate::client::lock_app_storage(&fr_storage);
             if let Err(e) = store.transaction(|_| {
                 store.save_app_room(&peer_nostr_pubkey, &identity_pubkey, 0, 0, None, None, None)?;
                 store.save_app_contact(&peer_nostr_pubkey, &peer_npub, &identity_pubkey, None)?;
@@ -296,7 +297,8 @@ impl KeychatClient {
             .as_secs() as i64;
         let msgid = format!("accept-{}", request_id);
         let accept_storage = self.inner.read().await.app_storage.clone();
-        if let Ok(store) = accept_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (accept friend request): {e}")) {
+        {
+            let store = crate::client::lock_app_storage(&accept_storage);
             if let Err(e) = store.transaction(|_| {
                 store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now))?;
                 store.update_app_contact(&peer_nostr_hex, &identity_pubkey, None, Some(&peer_name), None)?;
@@ -366,7 +368,8 @@ impl KeychatClient {
         if !sender_pubkey_hex.is_empty() && !identity_pubkey.is_empty() {
             let room_id = format!("{}:{}", sender_pubkey_hex, identity_pubkey);
             let rej_storage = self.inner.read().await.app_storage.clone();
-            if let Ok(store) = rej_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (reject friend request): {e}")) {
+            {
+                let store = crate::client::lock_app_storage(&rej_storage);
                 if let Err(e) = store.update_app_room(
                     &room_id, Some(-1), None, Some("[Friend Request Rejected]"), None,
                 ) {

@@ -91,7 +91,8 @@ impl KeychatClient {
         };
 
         let send_storage = self.inner.read().await.app_storage.clone();
-        if let Ok(store) = send_storage.lock().map_err(|e| tracing::error!("app_storage lock poisoned (send): {e}")) {
+        {
+            let store = crate::client::lock_app_storage(&send_storage);
             if let Err(e) = store.save_app_message(
                 &event_id, Some(&event_id), &full_room_id, &identity_pubkey,
                 &my_pubkey, &text, true, 0, now,
@@ -173,9 +174,7 @@ impl KeychatClient {
         // 1. Query failed messages from DB
         let failed_messages = {
             let storage = self.inner.read().await.app_storage.clone();
-            let store = storage.lock().map_err(|e| KeychatUniError::Storage {
-                msg: format!("app_storage lock: {e}"),
-            })?;
+            let store = crate::client::lock_app_storage_result(&storage)?;
             store
                 .get_app_failed_messages()
                 .map_err(|e| KeychatUniError::Storage {
@@ -207,7 +206,8 @@ impl KeychatClient {
 
             // Mark as sending (status=0)
             let retry_s1 = self.inner.read().await.app_storage.clone();
-            if let Ok(store) = retry_s1.lock().map_err(|e| tracing::error!("app_storage lock poisoned (retry mark sending): {e}")) {
+            {
+                let store = crate::client::lock_app_storage(&retry_s1);
                 if let Err(e) = store.update_app_message(
                     &msg.msgid, None, Some(0), None, None, None, None, None,
                 ) {
@@ -235,7 +235,8 @@ impl KeychatClient {
                     let relay_json = serde_json::to_string(&relays).unwrap_or_default();
 
                     let retry_s2 = self.inner.read().await.app_storage.clone();
-                    if let Ok(store) = retry_s2.lock().map_err(|e| tracing::error!("app_storage lock poisoned (retry result): {e}")) {
+                    {
+                        let store = crate::client::lock_app_storage(&retry_s2);
                         if let Err(e) = store.update_app_message(
                             &msg.msgid, None, Some(status), Some(&relay_json),
                             None, None, None, None,
@@ -267,7 +268,8 @@ impl KeychatClient {
                     );
                     // Mark as failed again
                     let retry_s3 = self.inner.read().await.app_storage.clone();
-                    if let Ok(store) = retry_s3.lock().map_err(|e| tracing::error!("app_storage lock poisoned (retry failed): {e}")) {
+                    {
+                        let store = crate::client::lock_app_storage(&retry_s3);
                         if let Err(e) = store.update_app_message(
                             &msg.msgid, None, Some(2), None, None, None, None, None,
                         ) {

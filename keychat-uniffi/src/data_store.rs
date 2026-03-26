@@ -12,9 +12,7 @@ impl KeychatClient {
 
     pub async fn get_identities(&self) -> Result<Vec<IdentityInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let rows = store.get_app_identities().map_err(|e| KeychatUniError::Storage {
             msg: format!("get_app_identities: {e}"),
         })?;
@@ -41,9 +39,7 @@ impl KeychatClient {
         is_default: bool,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .save_app_identity(&pubkey_hex, &npub, &name, index, is_default)
             .map_err(|e| KeychatUniError::Storage {
@@ -59,9 +55,7 @@ impl KeychatClient {
         is_default: Option<bool>,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .update_app_identity(
                 &pubkey_hex,
@@ -76,9 +70,7 @@ impl KeychatClient {
 
     pub async fn delete_app_identity_ffi(&self, pubkey_hex: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store.delete_app_identity(&pubkey_hex).map_err(|e| KeychatUniError::Storage {
             msg: format!("delete_app_identity: {e}"),
         })
@@ -88,9 +80,7 @@ impl KeychatClient {
 
     pub async fn get_rooms(&self, identity_pubkey: String) -> Result<Vec<RoomInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let rows = store
             .get_app_rooms(&identity_pubkey)
             .map_err(|e| KeychatUniError::Storage {
@@ -101,9 +91,7 @@ impl KeychatClient {
 
     pub async fn get_room(&self, room_id: String) -> Result<Option<RoomInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let row = store
             .get_app_room(&room_id)
             .map_err(|e| KeychatUniError::Storage {
@@ -114,9 +102,7 @@ impl KeychatClient {
 
     pub async fn mark_room_read(&self, room_id: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .mark_app_messages_read(&room_id)
             .map_err(|e| KeychatUniError::Storage {
@@ -138,9 +124,7 @@ impl KeychatClient {
         offset: i32,
     ) -> Result<Vec<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let rows = store
             .get_app_messages(&room_id, limit, offset)
             .map_err(|e| KeychatUniError::Storage {
@@ -154,9 +138,7 @@ impl KeychatClient {
         msgid: String,
     ) -> Result<Option<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let row = store
             .get_app_message_by_msgid(&msgid)
             .map_err(|e| KeychatUniError::Storage {
@@ -171,9 +153,7 @@ impl KeychatClient {
         context_count: i32,
     ) -> Result<Vec<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let rows = store
             .get_app_messages_unread_with_context(&room_id, context_count)
             .map_err(|e| KeychatUniError::Storage {
@@ -189,9 +169,7 @@ impl KeychatClient {
         limit: i32,
     ) -> Result<Vec<MessageInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let rows = store
             .get_app_messages_before(&room_id, before_ts, limit)
             .map_err(|e| KeychatUniError::Storage {
@@ -202,9 +180,7 @@ impl KeychatClient {
 
     pub async fn get_message_count(&self, room_id: String) -> Result<i32, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .get_app_message_count(&room_id)
             .map_err(|e| KeychatUniError::Storage {
@@ -219,9 +195,7 @@ impl KeychatClient {
         identity_pubkey: String,
     ) -> Result<Vec<ContactInfoFull>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         let rows = store
             .get_app_contacts(&identity_pubkey)
             .map_err(|e| KeychatUniError::Storage {
@@ -247,9 +221,7 @@ impl KeychatClient {
         petname: String,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .update_app_contact(&pubkey, &identity_pubkey, Some(&petname), None, None)
             .map_err(|e| KeychatUniError::Storage {
@@ -269,9 +241,7 @@ impl KeychatClient {
         parent_room_id: Option<String>,
     ) -> Result<String, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .save_app_room(&to_main_pubkey, &identity_pubkey, status.to_i32(), room_type.to_i32(), name.as_deref(), None, parent_room_id.as_deref())
             .map_err(|e| KeychatUniError::Storage {
@@ -292,9 +262,7 @@ impl KeychatClient {
         created_at: u64,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .save_app_message(
                 &msgid, event_id.as_deref(), &room_id, &identity_pubkey,
@@ -313,9 +281,7 @@ impl KeychatClient {
         name: Option<String>,
     ) -> Result<String, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .save_app_contact(&pubkey, &npubkey, &identity_pubkey, name.as_deref())
             .map_err(|e| KeychatUniError::Storage {
@@ -332,9 +298,7 @@ impl KeychatClient {
         last_message_at: Option<u64>,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .update_app_room(
                 &room_id, status.map(|s| s.to_i32()), name.as_deref(),
@@ -358,9 +322,7 @@ impl KeychatClient {
         reply_to_content: Option<String>,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .update_app_message(
                 &msgid, event_id.as_deref(), status.map(|s| s.to_i32()), relay_status_json.as_deref(),
@@ -377,9 +339,7 @@ impl KeychatClient {
         room_id: String,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .increment_app_room_unread(&room_id)
             .map_err(|e| KeychatUniError::Storage {
@@ -392,9 +352,7 @@ impl KeychatClient {
         event_id: String,
     ) -> Result<bool, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store
             .is_app_message_duplicate(&event_id)
             .map_err(|e| KeychatUniError::Storage {
@@ -424,9 +382,7 @@ impl KeychatClient {
         room_id: String,
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.app_storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("app_storage lock: {e}"),
-        })?;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
         store.delete_app_room(&room_id).map_err(|e| KeychatUniError::Storage {
             msg: format!("delete_app_room: {e}"),
         })

@@ -20,6 +20,25 @@ use crate::types::*;
 
 static TRACING_INIT: Once = Once::new();
 
+/// Lock app_storage Mutex, recovering from poison and logging if poisoned.
+pub(crate) fn lock_app_storage(
+    mutex: &std::sync::Mutex<crate::app_storage::AppStorage>,
+) -> std::sync::MutexGuard<'_, crate::app_storage::AppStorage> {
+    mutex.lock().unwrap_or_else(|e| {
+        tracing::error!("app_storage Mutex poisoned, recovering: {e}");
+        e.into_inner()
+    })
+}
+
+/// Lock app_storage Mutex, returning Result for functions that need error propagation.
+pub(crate) fn lock_app_storage_result(
+    mutex: &std::sync::Mutex<crate::app_storage::AppStorage>,
+) -> Result<std::sync::MutexGuard<'_, crate::app_storage::AppStorage>, KeychatUniError> {
+    mutex.lock().map_err(|e| KeychatUniError::Storage {
+        msg: format!("app_storage lock: {e}"),
+    })
+}
+
 pub(crate) struct ClientInner {
     pub identity: Option<Identity>,
     pub transport: Option<Transport>,
@@ -842,7 +861,8 @@ impl KeychatClient {
         }
         // Also clear application-layer data
         let app_storage = self.inner.read().await.app_storage.clone();
-        if let Ok(store) = app_storage.lock() {
+        {
+            let store = lock_app_storage(&app_storage);
             store
                 .delete_all_data()
                 .map_err(|e| KeychatUniError::Storage {
@@ -935,7 +955,8 @@ impl KeychatClient {
         if !identity_pubkey.is_empty() {
             let app_room_id = format!("{}:{}", room_id, identity_pubkey);
             let app_storage = self.inner.read().await.app_storage.clone();
-            if let Ok(store) = app_storage.lock() {
+            {
+                let store = lock_app_storage(&app_storage);
                 if let Err(e) = store.delete_app_room(&app_room_id) {
                     tracing::warn!("remove_room: delete_app_room: {e}");
                 }
