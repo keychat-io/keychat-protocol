@@ -2279,6 +2279,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "keychat-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "colored",
+ "dirs",
+ "http",
+ "http-body-util",
+ "keychat-uniffi",
+ "keyring",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "keychat-cli-agent"
 version = "0.1.0"
 dependencies = [

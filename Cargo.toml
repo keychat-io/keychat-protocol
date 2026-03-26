@@ -4,5 +4,6 @@ members = [
     "keychat-cli-human",
     "keychat-cli-agent",
     "keychat-uniffi",
+    "keychat-cli",
 ]
 resolver = "2"

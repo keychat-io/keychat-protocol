@@ -117,7 +117,7 @@ pub enum FileCategory {
     Other,
 }
 
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone, Debug)]
 pub enum MessageKind {
     // Common
     Text,
@@ -192,14 +192,14 @@ impl From<libkeychat::KCMessageKind> for MessageKind {
     }
 }
 
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone, Debug)]
 pub enum GroupChangeKind {
     MemberRemoved,
     SelfLeave,
     NameChanged,
 }
 
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone, Debug)]
 pub enum ClientEvent {
     FriendRequestReceived {
         request_id: String,
@@ -426,7 +426,7 @@ pub struct ContactInfoFull {
     pub avatar: Option<String>,
 }
 
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone, Debug)]
 pub enum DataChange {
     RoomUpdated { room_id: String },
     RoomDeleted { room_id: String },
