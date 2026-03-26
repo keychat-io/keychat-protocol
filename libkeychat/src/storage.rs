@@ -1657,23 +1657,21 @@ impl SecureStorage {
         Ok(())
     }
 
-    /// Delete a room and its messages.
+    /// Delete a room, its child topic rooms, and all associated messages atomically.
     pub fn delete_app_room(&self, room_id: &str) -> Result<()> {
-        // Delete messages for child topic rooms first
-        self.conn.execute(
-            "DELETE FROM app_messages WHERE room_id IN (SELECT id FROM app_rooms WHERE parent_room_id = ?1)",
-            rusqlite::params![room_id],
-        ).map_err(|e| KeychatError::Storage(format!("delete_app_room child messages: {e}")))?;
-        // Delete child topic rooms
-        self.conn.execute("DELETE FROM app_rooms WHERE parent_room_id = ?1", rusqlite::params![room_id])
-            .map_err(|e| KeychatError::Storage(format!("delete_app_room children: {e}")))?;
-        // Delete messages for this room
-        self.conn.execute("DELETE FROM app_messages WHERE room_id = ?1", rusqlite::params![room_id])
-            .map_err(|e| KeychatError::Storage(format!("delete_app_room messages: {e}")))?;
-        // Delete the room itself
-        self.conn.execute("DELETE FROM app_rooms WHERE id = ?1", rusqlite::params![room_id])
-            .map_err(|e| KeychatError::Storage(format!("delete_app_room: {e}")))?;
-        Ok(())
+        self.transaction(|conn| {
+            conn.execute(
+                "DELETE FROM app_messages WHERE room_id IN (SELECT id FROM app_rooms WHERE parent_room_id = ?1)",
+                rusqlite::params![room_id],
+            ).map_err(|e| KeychatError::Storage(format!("delete_app_room child messages: {e}")))?;
+            conn.execute("DELETE FROM app_rooms WHERE parent_room_id = ?1", rusqlite::params![room_id])
+                .map_err(|e| KeychatError::Storage(format!("delete_app_room children: {e}")))?;
+            conn.execute("DELETE FROM app_messages WHERE room_id = ?1", rusqlite::params![room_id])
+                .map_err(|e| KeychatError::Storage(format!("delete_app_room messages: {e}")))?;
+            conn.execute("DELETE FROM app_rooms WHERE id = ?1", rusqlite::params![room_id])
+                .map_err(|e| KeychatError::Storage(format!("delete_app_room: {e}")))?;
+            Ok(())
+        })
     }
 
     // ─── App Message CRUD ────────────────────────────────────

@@ -244,8 +244,8 @@ async_test!(app_identity_crud_via_ffi, {
     // Save identity
     client
         .save_app_identity_ffi(
-            "npub1test".into(),
             "abcd1234".into(),
+            "npub1test".into(),
             "Alice".into(),
             0,
             true,
@@ -262,7 +262,7 @@ async_test!(app_identity_crud_via_ffi, {
     // Update identity
     client
         .update_app_identity_ffi(
-            "npub1test".into(),
+            "abcd1234".into(),
             Some("Alice Updated".into()),
             None,
             None,
@@ -275,7 +275,7 @@ async_test!(app_identity_crud_via_ffi, {
 
     // Delete identity
     client
-        .delete_app_identity_ffi("npub1test".into())
+        .delete_app_identity_ffi("abcd1234".into())
         .await
         .unwrap();
 
@@ -298,7 +298,7 @@ async_test!(app_room_and_message_crud_via_ffi, {
     let room_id = client
         .save_app_room_ffi(
             "peer_pubkey_hex".into(), identity_npub.into(),
-            RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()),
+            RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()), None,
         )
         .await
         .unwrap();
@@ -420,7 +420,7 @@ async_test!(message_dedup_via_ffi, {
 
     // Create room
     let room_id = client
-        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None)
+        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None, None)
         .await
         .unwrap();
 
@@ -466,7 +466,7 @@ async_test!(message_reply_to_resolution_via_ffi, {
     let identity_npub = "npub1me";
 
     let room_id = client
-        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None)
+        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None, None)
         .await
         .unwrap();
 
@@ -520,7 +520,7 @@ async_test!(room_last_message_and_ordering, {
 
     // Room A - older last message
     let room_a_id = client
-        .save_app_room_ffi("peer_a".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Alice".into()))
+        .save_app_room_ffi("peer_a".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Alice".into()), None)
         .await
         .unwrap();
     client
@@ -530,7 +530,7 @@ async_test!(room_last_message_and_ordering, {
 
     // Room B - newer last message
     let room_b_id = client
-        .save_app_room_ffi("peer_b".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()))
+        .save_app_room_ffi("peer_b".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()), None)
         .await
         .unwrap();
     client
