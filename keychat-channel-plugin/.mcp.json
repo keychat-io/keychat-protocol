@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "keychat": {
+      "command": "npx",
+      "args": ["tsx", "${CLAUDE_PLUGIN_ROOT}/server.ts"]
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "keychat",
+  "description": "Keychat channel for Claude Code — E2E encrypted messaging over Nostr. Bridges Claude Code to keychat-cli daemon via HTTP API.",
+  "version": "0.1.0",
+  "keywords": ["keychat", "nostr", "e2e", "encrypted", "messaging", "channel", "mcp"]
+}
