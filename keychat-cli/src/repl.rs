@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use colored::Colorize;
 use keychat_uniffi::{
     ClientEvent, DataChange, GroupMemberInput, KeychatClient, MessageKind, RoomStatus, RoomType,
@@ -1082,21 +1082,7 @@ fn print_err(msg: &str) {
     eprintln!("  {} {msg}", "ERROR".red().bold());
 }
 
-/// Truncate a key/id to first 16 chars for display.
-fn short_key(key: &str) -> String {
-    if key.len() > 16 {
-        format!("{}...", &key[..16])
-    } else {
-        key.to_string()
-    }
-}
-
-fn format_timestamp(ts: u64) -> String {
-    Utc.timestamp_opt(ts as i64, 0)
-        .single()
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| ts.to_string())
-}
+use crate::commands::{short_key, format_timestamp};
 
 fn format_now() -> String {
     Utc::now().format("%H:%M:%S").to_string()

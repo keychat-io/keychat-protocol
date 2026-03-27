@@ -187,25 +187,9 @@ pub async fn run(
     data_tx: broadcast::Sender<DataChange>,
     port: u16,
 ) -> anyhow::Result<()> {
-    // Restore identity from saved mnemonic, then auto-connect
-    let has_identity = crate::commands::restore_identity(&client).await.is_some();
-    if has_identity {
-        tracing::info!("identity found, restoring sessions and connecting");
-        if let Err(e) = client.restore_sessions().await {
-            tracing::warn!("restore_sessions failed: {e}");
-        }
-        if let Err(e) = client.connect(vec![]).await {
-            tracing::warn!("auto-connect failed: {e}");
-        } else {
-            // Start event loop in background
-            let client_el = Arc::clone(&client);
-            tokio::spawn(async move {
-                if let Err(e) = client_el.start_event_loop().await {
-                    tracing::error!("event loop error: {e}");
-                }
-            });
-        }
-    }
+    // Shared startup: restore identity → sessions → connect → event loop
+    let relay_urls = keychat_uniffi::default_relays();
+    crate::commands::init_and_connect(&client, relay_urls).await;
 
     let router = build_router(client, event_tx, data_tx);
 

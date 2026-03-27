@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::TimeZone;
 use keychat_uniffi::{ClientEvent, DataChange, DataListener, EventListener, KeychatClient};
 use tokio::sync::broadcast;
 
@@ -127,6 +128,68 @@ pub async fn save_mnemonic(client: &KeychatClient, mnemonic: &str) {
     if let Err(e) = client.set_setting(SETTING_MNEMONIC.to_string(), mnemonic.to_string()).await {
         tracing::warn!("Failed to save mnemonic: {e}");
     }
+}
+
+/// Delete saved mnemonic from DB (used on identity reset/delete).
+pub async fn delete_mnemonic(client: &KeychatClient) {
+    if let Err(e) = client.delete_setting(SETTING_MNEMONIC.to_string()).await {
+        tracing::warn!("Failed to delete mnemonic: {e}");
+    }
+}
+
+// ─── Shared Utilities ───────────────────────────────────────────
+
+/// Truncate a hex key for display (first 16 chars + ellipsis).
+pub fn short_key(key: &str) -> String {
+    if key.len() > 16 {
+        format!("{}…", &key[..16])
+    } else {
+        key.to_string()
+    }
+}
+
+/// Format a unix timestamp as HH:MM:SS.
+pub fn format_timestamp(ts: u64) -> String {
+    chrono::Utc
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// Restore identity, restore sessions, connect to relays, and start event loop.
+/// Shared startup sequence for TUI and daemon modes.
+/// Returns the pubkey hex and session count if identity was found.
+pub async fn init_and_connect(client: &Arc<KeychatClient>, relay_urls: Vec<String>) -> Option<(String, u32)> {
+    let pubkey = restore_identity(client).await?;
+
+    let session_count = match client.restore_sessions().await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!("Restored {n} session(s)");
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!("restore_sessions failed: {e}");
+            0
+        }
+    };
+
+    let client_bg = Arc::clone(client);
+    tokio::spawn(async move {
+        tracing::info!("Connecting to {} relay(s)", relay_urls.len());
+        if let Err(e) = client_bg.connect(relay_urls).await {
+            tracing::warn!("Auto-connect failed: {e}");
+            return;
+        }
+        tracing::info!("Connected to relays, starting event loop");
+        if let Err(e) = client_bg.start_event_loop().await {
+            tracing::error!("event loop error: {e}");
+        }
+    });
+
+    Some((pubkey, session_count))
 }
 
 // ─── Event Listener ─────────────────────────────────────────────

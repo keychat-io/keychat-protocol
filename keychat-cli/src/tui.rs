@@ -318,15 +318,9 @@ pub async fn run(
     app.owner_pubkey = load_owner(&client).await;
     app.theme = load_theme_setting(&client).await;
 
-    // Load identity: try saved mnemonic from DB, then auto-connect
-    if let Some(mnemonic) = load_mnemonic(&client).await {
-        match client.import_identity(mnemonic).await {
-            Ok(pk) => tracing::info!("Identity restored from saved mnemonic: {}", &pk[..16]),
-            Err(e) => tracing::warn!("Failed to restore identity from mnemonic: {e}"),
-        }
-    }
-    if let Ok(pubkey) = client.get_pubkey_hex().await {
-        tracing::info!("Identity loaded: {}", &pubkey[..16]);
+    // Shared startup: restore identity → sessions → connect → event loop
+    let relay_urls = keychat_uniffi::default_relays();
+    if let Some((pubkey, session_count)) = crate::commands::init_and_connect(&client, relay_urls).await {
         app.identity_hex = Some(pubkey.clone());
         // Load identity display name from app storage
         if let Ok(identities) = client.get_identities().await {
@@ -334,29 +328,10 @@ pub async fn run(
                 app.identity_name = Some(id.name.clone());
             }
         }
-        match client.restore_sessions().await {
-            Ok(n) if n > 0 => {
-                tracing::info!("Restored {n} session(s)");
-                app.push_output(format!("Restored {n} session(s)"), Color::Cyan);
-            }
-            _ => {}
+        if session_count > 0 {
+            app.push_output(format!("Restored {session_count} session(s)"), Color::Cyan);
         }
-
-        // Auto-connect to relays in background (don't block UI startup)
         app.event_loop_started = true;
-        let client_bg = Arc::clone(&client);
-        tokio::spawn(async move {
-            let relay_urls = keychat_uniffi::default_relays();
-            tracing::info!("Background connecting to {} relay(s): {:?}", relay_urls.len(), relay_urls);
-            if let Err(e) = client_bg.connect(relay_urls).await {
-                tracing::warn!("Auto-connect failed: {e}");
-                return;
-            }
-            tracing::info!("Connected to relays, starting event loop");
-            if let Err(e) = client_bg.start_event_loop().await {
-                tracing::error!("event loop error: {e}");
-            }
-        });
         app.push_output("Connecting to relays...".into(), Color::Cyan);
     } else {
         tracing::info!("No identity found, waiting for /create");
@@ -2319,13 +2294,7 @@ async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32) {
 
 // ─── Helpers ────────────────────────────────────────────────
 
-fn short_key(key: &str) -> String {
-    if key.len() > 16 {
-        format!("{}…", &key[..16])
-    } else {
-        key.to_string()
-    }
-}
+use crate::commands::short_key;
 
 fn format_time(ts: u64) -> String {
     Utc.timestamp_opt(ts as i64, 0)
@@ -2378,21 +2347,7 @@ async fn save_theme_setting(client: &KeychatClient, theme: &str) {
     let _ = client.set_setting(SETTING_THEME.to_string(), theme.to_string()).await;
 }
 
-use crate::commands::SETTING_MNEMONIC;
-
-async fn load_mnemonic(client: &KeychatClient) -> Option<String> {
-    client.get_setting(SETTING_MNEMONIC.to_string()).await.ok().flatten()
-}
-
-async fn save_mnemonic(client: &KeychatClient, mnemonic: &str) {
-    crate::commands::save_mnemonic(client, mnemonic).await;
-}
-
-async fn delete_mnemonic(client: &KeychatClient) {
-    if let Err(e) = client.delete_setting(SETTING_MNEMONIC.to_string()).await {
-        tracing::warn!("Failed to delete mnemonic: {e}");
-    }
-}
+use crate::commands::{save_mnemonic, delete_mnemonic};
 
 // ─── QR code rendering ─────────────────────────────────────
 
