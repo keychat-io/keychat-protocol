@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
 #
-# One-click setup: Keychat Agent + OpenClaw bridge
-#
-# What this does:
-#   1. Starts agent daemon (background)
-#   2. Waits for agent to be ready
-#   3. Starts OpenClaw bridge (foreground)
+# Keychat Agent + OpenClaw — one-click installer
 #
 # Usage:
-#   ./setup-openclaw.sh                         # defaults
-#   ./setup-openclaw.sh --name MyBot            # custom agent name
-#   ./setup-openclaw.sh --port 9000             # custom port
-#   ./setup-openclaw.sh --agent my-agent-id     # specific OpenClaw agent
-#   ./setup-openclaw.sh --install-only          # start agent only, no bridge
+#   curl -fsSL https://raw.githubusercontent.com/keychat-io/keychat-protocol/main/keychat-cli/scripts/setup-openclaw.sh | bash
+#   curl -fsSL ... | bash -s -- --name MyBot --agent my-agent-id
+#
+# What this does:
+#   1. Downloads keychat binary (if not installed)
+#   2. Downloads bridge script
+#   3. Starts agent daemon (background)
+#   4. Starts OpenClaw bridge (foreground)
+#
+# Prerequisites: jq, openclaw CLI
 
 set -euo pipefail
 
-# ─── Defaults ────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BRIDGE_SCRIPT="$SCRIPT_DIR/bridges/openclaw-bridge.sh"
+# ─── Config ──────────────────────────────────────────────────
+GITHUB_REPO="keychat-io/keychat-protocol"
+INSTALL_DIR="$HOME/.keychat"
+BIN_DIR="$INSTALL_DIR/bin"
+BRIDGE_DIR="$INSTALL_DIR/bridges"
 AGENT_NAME="Keychat Agent"
 AGENT_PORT=10443
 OPENCLAW_AGENT=""
@@ -41,49 +43,123 @@ done
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
+BOLD='\033[1m'
 NC='\033[0m'
-info()  { echo -e "${GREEN}[setup]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[setup]${NC} $*"; }
-error() { echo -e "${RED}[setup]${NC} $*" >&2; }
+info()  { echo -e "${GREEN}▸${NC} $*"; }
+warn()  { echo -e "${YELLOW}▸${NC} $*"; }
+error() { echo -e "${RED}▸${NC} $*" >&2; }
+
+echo -e "${BOLD}Keychat Agent + OpenClaw Setup${NC}"
+echo ""
 
 # ─── Step 1: Check prerequisites ────────────────────────────
-info "Checking prerequisites..."
-
-if ! command -v keychat &>/dev/null; then
-  error "'keychat' not found. Install with: cargo install --path keychat-cli"
-  exit 1
-fi
-
 if ! command -v jq &>/dev/null; then
-  error "'jq' not found. Install with: brew install jq (macOS) or apt install jq (Linux)"
+  error "jq not found. Install with:"
+  echo "  macOS:  brew install jq"
+  echo "  Linux:  apt install jq"
   exit 1
 fi
 
 if ! $INSTALL_ONLY && ! command -v openclaw &>/dev/null; then
-  warn "'openclaw' not found. Bridge will fail without it."
-  warn "Install OpenClaw CLI first: https://docs.openclaw.ai/"
+  warn "openclaw CLI not found. Bridge will fail without it."
+  warn "Install: https://docs.openclaw.ai/"
 fi
 
-if [[ ! -f "$BRIDGE_SCRIPT" ]]; then
-  error "Bridge script not found at: $BRIDGE_SCRIPT"
-  exit 1
+info "jq: $(jq --version 2>/dev/null || echo 'installed')"
+mkdir -p "$BIN_DIR" "$BRIDGE_DIR"
+
+# ─── Step 2: Install keychat binary ─────────────────────────
+if command -v keychat &>/dev/null; then
+  info "keychat found: $(keychat --version 2>/dev/null || echo 'installed')"
+else
+  info "Downloading keychat binary..."
+
+  OS=$(uname -s)
+  ARCH=$(uname -m)
+
+  case "$OS-$ARCH" in
+    Darwin-arm64)  TARGET="aarch64-apple-darwin" ;;
+    Darwin-x86_64) TARGET="aarch64-apple-darwin" ;;
+    Linux-x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
+    Linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+    *)
+      error "Unsupported platform: $OS-$ARCH"
+      error "Build from source: cargo install --path keychat-cli"
+      exit 1
+      ;;
+  esac
+
+  LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/$GITHUB_REPO/releases?per_page=20" \
+    | grep -o '"tag_name": *"cli-v[^"]*"' | head -1 | grep -o 'cli-v[^"]*')
+
+  if [[ -z "$LATEST_TAG" ]]; then
+    error "Could not find latest release. Build from source:"
+    echo "  cargo install --path keychat-cli"
+    exit 1
+  fi
+
+  DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/$LATEST_TAG/keychat-$TARGET.tar.gz"
+  info "Downloading $LATEST_TAG for $TARGET..."
+
+  curl -fsSL "$DOWNLOAD_URL" | tar -xz -C "$BIN_DIR"
+  chmod +x "$BIN_DIR/keychat"
+
+  if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    export PATH="$BIN_DIR:$PATH"
+    SHELL_RC=""
+    if [[ -f "$HOME/.zshrc" ]]; then
+      SHELL_RC="$HOME/.zshrc"
+    elif [[ -f "$HOME/.bashrc" ]]; then
+      SHELL_RC="$HOME/.bashrc"
+    fi
+    if [[ -n "$SHELL_RC" ]] && ! grep -q "$BIN_DIR" "$SHELL_RC" 2>/dev/null; then
+      echo "export PATH=\"$BIN_DIR:\$PATH\"" >> "$SHELL_RC"
+      info "Added $BIN_DIR to PATH in $SHELL_RC"
+    fi
+  fi
+
+  info "Installed: $(keychat --version 2>/dev/null || echo 'keychat')"
 fi
 
-CLI_VERSION=$(keychat --version 2>/dev/null || echo "unknown")
-info "keychat: $CLI_VERSION"
+# ─── Step 3: Download bridge script ─────────────────────────
+info "Downloading OpenClaw bridge..."
 
-# ─── Step 2: Start agent daemon (background) ─────────────────
-info "Starting agent daemon on port $AGENT_PORT..."
+BRIDGE_SCRIPT="$BRIDGE_DIR/openclaw-bridge.sh"
+RAW_BASE="https://raw.githubusercontent.com/$GITHUB_REPO/main/keychat-cli/scripts/bridges"
+curl -fsSL "$RAW_BASE/openclaw-bridge.sh" -o "$BRIDGE_SCRIPT"
+chmod +x "$BRIDGE_SCRIPT"
+info "Bridge installed at $BRIDGE_SCRIPT"
 
-# Create a temp file for agent output so we can capture the token
+# ─── Step 4: Start agent daemon ─────────────────────────────
+echo ""
+echo "─────────────────────────────────────────────"
+echo -e "${GREEN} ✓ Installation complete${NC}"
+echo "─────────────────────────────────────────────"
+echo ""
+
+if $INSTALL_ONLY; then
+  echo "  Next steps:"
+  echo ""
+  echo "  1. Start the agent:"
+  echo "     keychat agent --name \"$AGENT_NAME\" --port $AGENT_PORT"
+  echo ""
+  echo "  2. Start the bridge:"
+  echo "     $BRIDGE_SCRIPT --token <token-from-step-1>"
+  echo ""
+  echo "  3. Add the agent's npub in your Keychat app"
+  echo ""
+  exit 0
+fi
+
+info "Starting agent daemon..."
+
 AGENT_OUTPUT=$(mktemp)
 trap 'rm -f "$AGENT_OUTPUT"; kill $AGENT_PID 2>/dev/null || true' EXIT
 
 keychat agent --name "$AGENT_NAME" --port "$AGENT_PORT" "${EXTRA_ARGS[@]}" > "$AGENT_OUTPUT" 2>&1 &
 AGENT_PID=$!
 
-# Wait for agent to be ready (up to 15s)
-info "Waiting for agent to be ready..."
+# Wait for ready
 for i in $(seq 1 15); do
   if grep -q "API token:" "$AGENT_OUTPUT" 2>/dev/null; then
     break
@@ -102,35 +178,19 @@ if ! grep -q "API token:" "$AGENT_OUTPUT" 2>/dev/null; then
   exit 1
 fi
 
-# Extract token and npub from output
 API_TOKEN=$(grep "API token:" "$AGENT_OUTPUT" | awk '{print $NF}')
 NPUB=$(grep "Agent ready:" "$AGENT_OUTPUT" | awk '{print $NF}')
 
 echo ""
-echo "─────────────────────────────────────────────"
 info "Agent running (PID: $AGENT_PID)"
 info "npub: $NPUB"
-info "API token: $API_TOKEN"
+info "token: $API_TOKEN"
 info "URL: http://127.0.0.1:$AGENT_PORT"
-echo "─────────────────────────────────────────────"
+echo ""
+echo "  Add this npub in your Keychat app: $NPUB"
 echo ""
 
-if $INSTALL_ONLY; then
-  info "Agent running in background (PID: $AGENT_PID)."
-  echo ""
-  echo "  To start the bridge manually:"
-  echo "    $BRIDGE_SCRIPT --token $API_TOKEN"
-  echo ""
-  echo "  To stop the agent:"
-  echo "    kill $AGENT_PID"
-  echo ""
-  # Keep agent running, remove trap
-  trap 'rm -f "$AGENT_OUTPUT"' EXIT
-  wait $AGENT_PID
-  exit 0
-fi
-
-# ─── Step 3: Start bridge (foreground) ────────────────────────
+# ─── Step 5: Start bridge ────────────────────────────────────
 info "Starting OpenClaw bridge..."
 echo ""
 
@@ -142,8 +202,4 @@ if $VERBOSE; then
   BRIDGE_ARGS+=(--verbose)
 fi
 
-echo "  Add agent's npub in your Keychat app: $NPUB"
-echo ""
-
-# Run bridge in foreground, agent stays in background
 exec "$BRIDGE_SCRIPT" "${BRIDGE_ARGS[@]}"

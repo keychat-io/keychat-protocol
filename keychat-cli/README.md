@@ -186,16 +186,17 @@ Agent mode connects with AI tools via bridge adapters. One-click setup scripts h
 Claude Code ←stdio MCP→ channel plugin ←HTTP→ agent daemon ←Nostr→ Users
 ```
 
-**One-click setup:**
+**One-click install:**
 
 ```bash
-./scripts/setup-claude-code.sh --name "MyBot"
+curl -fsSL https://raw.githubusercontent.com/keychat-io/keychat-protocol/main/keychat-cli/scripts/setup-claude-code.sh | bash
 ```
 
 This will:
-1. Install channel plugin npm dependencies
-2. Write Claude Code MCP config (`~/.claude/mcp.json`)
-3. Start the agent daemon
+1. Download keychat binary (if not installed)
+2. Download and install channel plugin (`~/.keychat/channel-plugin/`)
+3. Write Claude Code MCP config (`~/.claude/mcp.json`)
+4. Start the agent daemon
 
 After the agent starts, restart Claude Code and configure the token:
 
@@ -208,10 +209,9 @@ Then add the agent's npub in your Keychat app to start chatting.
 **Options:**
 
 ```bash
-./scripts/setup-claude-code.sh                  # defaults (port 10443)
-./scripts/setup-claude-code.sh --name MyBot     # custom name
-./scripts/setup-claude-code.sh --port 9000      # custom port
-./scripts/setup-claude-code.sh --install-only   # configure only, don't start agent
+curl -fsSL ... | bash -s -- --name MyBot        # custom name
+curl -fsSL ... | bash -s -- --port 9000         # custom port
+curl -fsSL ... | bash -s -- --install-only      # install only, don't start agent
 ```
 
 MCP tools: `reply`, `fetch_messages`, `list_rooms`, `list_contacts`, `get_identity`, `get_status`, `send_friend_request`, `pending_friends`, `approve_friend`, `reject_friend`.
@@ -224,25 +224,25 @@ See [keychat-channel-plugin/README.md](../keychat-channel-plugin/README.md) for 
 OpenClaw Gateway ←CLI→ bridge.sh ←HTTP+SSE→ agent daemon ←Nostr→ Users
 ```
 
-**One-click setup:**
+**One-click install:**
 
 ```bash
-./scripts/setup-openclaw.sh --name "MyBot"
+curl -fsSL https://raw.githubusercontent.com/keychat-io/keychat-protocol/main/keychat-cli/scripts/setup-openclaw.sh | bash
 ```
 
 This will:
-1. Start the agent daemon (background)
-2. Wait for it to be ready
-3. Start the OpenClaw bridge (foreground)
+1. Download keychat binary (if not installed)
+2. Download bridge script (`~/.keychat/bridges/`)
+3. Start the agent daemon (background)
+4. Start the OpenClaw bridge (foreground)
 
 **Options:**
 
 ```bash
-./scripts/setup-openclaw.sh                         # defaults
-./scripts/setup-openclaw.sh --name MyBot             # custom name
-./scripts/setup-openclaw.sh --agent my-agent-id      # specific OpenClaw agent
-./scripts/setup-openclaw.sh --verbose                # debug output
-./scripts/setup-openclaw.sh --install-only           # agent only, no bridge
+curl -fsSL ... | bash -s -- --name MyBot             # custom name
+curl -fsSL ... | bash -s -- --agent my-agent-id      # specific OpenClaw agent
+curl -fsSL ... | bash -s -- --verbose                # debug output
+curl -fsSL ... | bash -s -- --install-only           # install only, don't start
 ```
 
 The bridge routes messages to OpenClaw sessions by context:
