@@ -25,8 +25,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install protoc
-        run: brew install protobuf
+      - uses: arduino/setup-protoc@v3
 
       - name: Build
         run: cargo build --release -p keychat-cli --target ${{ matrix.target }}
