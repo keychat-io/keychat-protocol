@@ -97,6 +97,7 @@ jobs:
           FORMULA="homebrew-tap/Formula/keychat.rb"
 
           sed -i "s/version \".*\"/version \"${VERSION}\"/" "$FORMULA"
+          sed -i "s|download/cli-v[^/]*/|download/${TAG}/|g" "$FORMULA"
 
           update_sha() {
             local target=$1 sha=$2
