@@ -399,56 +399,57 @@ impl KeychatClient {
             }
         } // read lock dropped
 
-        // Fire-and-forget: push to relay websocket without waiting for OK
-        let mut relay_statuses = Vec::with_capacity(pending.len());
+        // 5b. Publish events to relays
         {
             let inner = self.inner.read().await;
             let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay. Please check your network.".into(),
             })?;
-            for p in pending {
-                match transport.publish_event_async(p.event).await {
-                    Ok(_) => {
-                        relay_statuses.push(format!(
-                            r#"{{"event_id":"{}","member":"{}","status":"success"}}"#,
-                            p.eid, p.member_name
-                        ));
-                    }
-                    Err(e) => {
-                        relay_statuses.push(format!(
-                            r#"{{"event_id":"{}","member":"{}","status":"failed","error":"{}"}}"#,
-                            p.eid, p.member_name, e
-                        ));
-                    }
+            for p in &pending {
+                if let Err(e) = transport.publish_event_async(p.event.clone()).await {
+                    tracing::warn!("group publish failed for member={}: {e}", p.member_name);
                 }
             }
         }
 
-        // 6. Update message with final status, event data, and relay tracking
-        let all_success = relay_statuses.iter().all(|s| s.contains("\"success\""));
-        let status = if event_ids.is_empty() { 2 } else if all_success { 1 } else { 1 }; // 1=success, 2=failed
-        let relay_status_json = format!("[{}]", relay_statuses.join(","));
-        // Store all Nostr events as a JSON array
-        let nostr_event_json = format!("[{}]", nostr_events_json.join(","));
+        // 6. Register with relay tracker — initial JSON written to DB immediately
+        let members: Vec<(String, String)> = pending
+            .iter()
+            .map(|p| (p.eid.clone(), p.member_name.clone()))
+            .collect();
+        let initial_relay_json = {
+            let mut tracker = self
+                .relay_tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tracker.track_group(
+                msgid.clone(),
+                full_room_id.clone(),
+                members,
+                connected_relays,
+            )
+        };
 
+        // Store nostr events, primary event_id, and initial relay status
+        let nostr_event_json = format!("[{}]", nostr_events_json.join(","));
         {
             let send_storage = self.inner.read().await.app_storage.clone();
             let store = crate::client::lock_app_storage(&send_storage);
             let event_id_ref = event_ids.first().map(|s| s.as_str());
             if let Err(e) = store.update_app_message(
                 &msgid,
-                event_id_ref,                   // event_id (first one as primary)
-                Some(status),                   // status
-                Some(&relay_status_json),        // relay_status_json
-                None,                           // payload already saved
-                Some(&nostr_event_json),         // all nostr events
+                event_id_ref,
+                None,                            // status stays 0=sending until tracker resolves
+                Some(&initial_relay_json),        // initial relay status (all "pending")
+                None,
+                Some(&nostr_event_json),
                 None, None,
             ) {
-                tracing::warn!("update_app_message (group send finalize): {e}");
+                tracing::warn!("update_app_message (group send metadata): {e}");
             }
         }
 
-        // 7. Emit MessageUpdated so Swift refreshes the status
+        // 7. Emit MessageUpdated so Swift sees initial relay status
         self.emit_data_change(DataChange::MessageUpdated {
             room_id: full_room_id,
             msgid: msgid.clone(),

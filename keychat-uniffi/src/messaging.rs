@@ -152,8 +152,8 @@ impl KeychatClient {
             connected.len()
         );
 
-        // 7. Register with relay tracker for status finalization
-        {
+        // 7. Register with relay tracker — initial JSON written to DB immediately
+        let initial_relay_json = {
             let mut tracker = self
                 .relay_tracker
                 .lock()
@@ -161,10 +161,25 @@ impl KeychatClient {
             tracker.track(
                 event_id.clone(),
                 event_id.clone(), // msgid = event_id for sent messages
-                full_room_id,
+                full_room_id.clone(),
                 connected.clone(),
+            )
+        };
+        // Persist initial relay status (all "pending")
+        {
+            let store_arc = self.inner.read().await.app_storage.clone();
+            let store = crate::client::lock_app_storage(&store_arc);
+            let _ = store.update_app_message(
+                &event_id, None, None, Some(&initial_relay_json),
+                None, None, None, None,
             );
         }
+        // Emit MessageUpdated so Swift sees initial relay status
+        self.emit_data_change(DataChange::MessageUpdated {
+            room_id: full_room_id,
+            msgid: event_id.clone(),
+        })
+        .await;
 
         Ok(SentMessage {
             event_id,

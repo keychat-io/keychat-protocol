@@ -1,132 +1,284 @@
-//! Relay send tracker: matches relay OK responses to pending outgoing messages.
+//! Relay send tracker — dynamic, incremental relay status updates.
 //!
-//! After a message is published to relays, this tracker records which relays are
-//! expected to respond. As relay OK responses arrive, they are matched to the pending
-//! entry. Once all relays respond or a timeout occurs, the entry is finalized with
-//! a success/failure status and per-relay JSON report.
+//! Data model:  Message → Event(s) → Relay(s)
+//!   - 1:1 message: 1 event → N relays
+//!   - Group message: M events (one per member) → N relays each
+//!
+//! Flow:
+//!   1. On send, `track` / `track_group` → returns initial JSON (all relays "pending")
+//!   2. Each relay OK → `handle_relay_ok` → returns updated JSON for immediate DB write
+//!   3. Timeout → `check_timeouts` → marks remaining "pending" as "timeout"
+//!   4. Re-broadcast → call `track` again with same msgid to reset/add event
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-/// A finalized relay tracking entry, ready for DB persistence.
-pub struct FinalizedEntry {
-    pub event_id: String,
+/// Returned on every status change so the caller can write to DB immediately.
+pub struct RelayStatusUpdate {
     pub msgid: String,
     pub room_id: String,
+    /// Full relay_status_json for the message (all events, all relays).
     pub relay_status_json: String,
-    pub success: bool,
+    /// True when every relay in every event has responded (no more "pending").
+    pub all_resolved: bool,
+    /// True if at least one relay in each event accepted the message.
+    pub has_success: bool,
 }
 
-struct PendingEntry {
+#[derive(Clone)]
+struct RelayState {
+    url: String,
+    status: String,      // "pending", "success", "failed", "timeout"
+    error: Option<String>,
+}
+
+struct TrackedEvent {
     msgid: String,
     room_id: String,
-    expected_relays: HashSet<String>,
-    success_relays: HashSet<String>,
-    failed_relays: HashMap<String, String>,
+    member: Option<String>,
+    relays: Vec<RelayState>,
     started_at: Instant,
 }
 
 pub struct RelaySendTracker {
-    pending: HashMap<String, PendingEntry>,
+    /// event_id → tracked event
+    events: HashMap<String, TrackedEvent>,
+    /// msgid → [event_ids] (ordering preserved for JSON output)
+    msgid_events: HashMap<String, Vec<String>>,
 }
 
 impl RelaySendTracker {
     pub fn new() -> Self {
         Self {
-            pending: HashMap::new(),
+            events: HashMap::new(),
+            msgid_events: HashMap::new(),
         }
     }
 
-    /// Register a sent event for relay tracking.
+    /// Track a 1:1 send. Returns initial relay_status_json (all relays "pending").
     pub fn track(
         &mut self,
         event_id: String,
         msgid: String,
         room_id: String,
-        expected_relays: Vec<String>,
-    ) {
-        self.pending.insert(
-            event_id,
-            PendingEntry {
-                msgid,
-                room_id,
-                expected_relays: expected_relays.into_iter().collect(),
-                success_relays: HashSet::new(),
-                failed_relays: HashMap::new(),
+        relay_urls: Vec<String>,
+    ) -> String {
+        let relays: Vec<RelayState> = relay_urls
+            .iter()
+            .map(|url| RelayState {
+                url: url.clone(),
+                status: "pending".into(),
+                error: None,
+            })
+            .collect();
+
+        self.events.insert(
+            event_id.clone(),
+            TrackedEvent {
+                msgid: msgid.clone(),
+                room_id: room_id.clone(),
+                member: None,
+                relays,
                 started_at: Instant::now(),
             },
         );
+        self.msgid_events
+            .entry(msgid.clone())
+            .or_default()
+            .push(event_id);
+
+        self.build_json(&msgid)
     }
 
-    /// Record a relay OK response. Returns `Some(FinalizedEntry)` if all relays have responded.
+    /// Track a group send (multiple events sharing one msgid).
+    /// Returns initial relay_status_json.
+    pub fn track_group(
+        &mut self,
+        msgid: String,
+        room_id: String,
+        members: Vec<(String, String)>, // (event_id, member_name)
+        relay_urls: Vec<String>,
+    ) -> String {
+        for (event_id, member_name) in &members {
+            let relays: Vec<RelayState> = relay_urls
+                .iter()
+                .map(|url| RelayState {
+                    url: url.clone(),
+                    status: "pending".into(),
+                    error: None,
+                })
+                .collect();
+            self.events.insert(
+                event_id.clone(),
+                TrackedEvent {
+                    msgid: msgid.clone(),
+                    room_id: room_id.clone(),
+                    member: Some(member_name.clone()),
+                    relays,
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let event_ids: Vec<String> = members.into_iter().map(|(eid, _)| eid).collect();
+        self.msgid_events.insert(msgid.clone(), event_ids);
+
+        self.build_json(&msgid)
+    }
+
+    /// Handle a relay OK response. Returns updated JSON if this event is tracked.
     pub fn handle_relay_ok(
         &mut self,
         event_id: &str,
         relay_url: &str,
         success: bool,
         message: &str,
-    ) -> Option<FinalizedEntry> {
-        let entry = self.pending.get_mut(event_id)?;
+    ) -> Option<RelayStatusUpdate> {
+        let entry = self.events.get_mut(event_id)?;
+        let msgid = entry.msgid.clone();
 
-        if success {
-            entry.success_relays.insert(relay_url.to_string());
-        } else {
-            entry
-                .failed_relays
-                .insert(relay_url.to_string(), message.to_string());
-        }
-
-        let responded = entry.success_relays.len() + entry.failed_relays.len();
-        if responded >= entry.expected_relays.len() {
-            return self.finalize(event_id);
-        }
-
-        None
-    }
-
-    /// Finalize all entries that have exceeded the timeout. Returns finalized entries.
-    pub fn check_timeouts(&mut self, timeout_secs: u64) -> Vec<FinalizedEntry> {
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-        let timed_out: Vec<String> = self
-            .pending
-            .iter()
-            .filter(|(_, e)| e.started_at.elapsed() >= timeout)
-            .map(|(eid, _)| eid.clone())
-            .collect();
-
-        timed_out
-            .into_iter()
-            .filter_map(|eid| self.finalize(&eid))
-            .collect()
-    }
-
-    fn finalize(&mut self, event_id: &str) -> Option<FinalizedEntry> {
-        let entry = self.pending.remove(event_id)?;
-        let success = !entry.success_relays.is_empty();
-
-        // Build per-relay status JSON array
-        let mut relays = Vec::new();
-        for url in &entry.success_relays {
-            relays.push(serde_json::json!({"url": url, "status": "ok"}));
-        }
-        for (url, err) in &entry.failed_relays {
-            relays.push(serde_json::json!({"url": url, "status": "failed", "error": err}));
-        }
-        // Mark unresponsive relays as timed out
-        for url in &entry.expected_relays {
-            if !entry.success_relays.contains(url) && !entry.failed_relays.contains_key(url) {
-                relays.push(serde_json::json!({"url": url, "status": "timeout"}));
+        // Update the specific relay's status
+        if let Some(relay) = entry.relays.iter_mut().find(|r| r.url == relay_url) {
+            if success {
+                relay.status = "success".into();
+                relay.error = None;
+            } else {
+                relay.status = "failed".into();
+                relay.error = Some(message.to_string());
             }
         }
 
-        let relay_status_json = serde_json::to_string(&relays).unwrap_or_default();
+        Some(self.build_update(&msgid))
+    }
 
-        Some(FinalizedEntry {
-            event_id: event_id.to_string(),
-            msgid: entry.msgid,
-            room_id: entry.room_id,
-            relay_status_json,
-            success,
-        })
+    /// Mark remaining "pending" relays as "timeout" for entries older than timeout_secs.
+    /// Returns updates for affected messages.
+    pub fn check_timeouts(&mut self, timeout_secs: u64) -> Vec<RelayStatusUpdate> {
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let mut affected_msgids = HashSet::new();
+
+        for entry in self.events.values_mut() {
+            if entry.started_at.elapsed() >= timeout {
+                for relay in &mut entry.relays {
+                    if relay.status == "pending" {
+                        relay.status = "timeout".into();
+                    }
+                }
+                affected_msgids.insert(entry.msgid.clone());
+            }
+        }
+
+        affected_msgids
+            .into_iter()
+            .map(|msgid| self.build_update(&msgid))
+            .collect()
+    }
+
+    /// Clean up fully resolved messages from memory.
+    /// Call periodically to prevent unbounded growth.
+    pub fn cleanup_resolved(&mut self) {
+        let resolved_msgids: Vec<String> = self
+            .msgid_events
+            .iter()
+            .filter(|(_, eids)| {
+                eids.iter().all(|eid| {
+                    self.events
+                        .get(eid)
+                        .map_or(true, |e| e.relays.iter().all(|r| r.status != "pending"))
+                })
+            })
+            .map(|(msgid, _)| msgid.clone())
+            .collect();
+
+        for msgid in resolved_msgids {
+            if let Some(eids) = self.msgid_events.remove(&msgid) {
+                for eid in eids {
+                    self.events.remove(&eid);
+                }
+            }
+        }
+    }
+
+    // ── Internal ──
+
+    fn build_update(&self, msgid: &str) -> RelayStatusUpdate {
+        let json = self.build_json(msgid);
+
+        // Check resolution status across all events for this message
+        let eids = self.msgid_events.get(msgid);
+        let (all_resolved, has_success) = eids
+            .map(|eids| {
+                let mut all_resolved = true;
+                let mut all_events_have_success = true;
+                for eid in eids {
+                    if let Some(entry) = self.events.get(eid) {
+                        let event_has_success =
+                            entry.relays.iter().any(|r| r.status == "success");
+                        let event_resolved =
+                            entry.relays.iter().all(|r| r.status != "pending");
+                        if !event_resolved {
+                            all_resolved = false;
+                        }
+                        if !event_has_success {
+                            all_events_have_success = false;
+                        }
+                    }
+                }
+                (all_resolved, all_events_have_success)
+            })
+            .unwrap_or((true, false));
+
+        let room_id = eids
+            .and_then(|eids| eids.first())
+            .and_then(|eid| self.events.get(eid))
+            .map(|e| e.room_id.clone())
+            .unwrap_or_default();
+
+        RelayStatusUpdate {
+            msgid: msgid.to_string(),
+            room_id,
+            relay_status_json: json,
+            all_resolved,
+            has_success,
+        }
+    }
+
+    fn build_json(&self, msgid: &str) -> String {
+        let Some(eids) = self.msgid_events.get(msgid) else {
+            return "[]".to_string();
+        };
+
+        let mut events_json: Vec<serde_json::Value> = Vec::new();
+        for eid in eids {
+            let Some(entry) = self.events.get(eid) else {
+                continue;
+            };
+
+            let relays: Vec<serde_json::Value> = entry
+                .relays
+                .iter()
+                .map(|r| {
+                    let mut obj = serde_json::json!({
+                        "url": r.url,
+                        "status": r.status,
+                    });
+                    if let Some(ref err) = r.error {
+                        obj["error"] = serde_json::Value::String(err.clone());
+                    }
+                    obj
+                })
+                .collect();
+
+            let mut event_obj = serde_json::json!({
+                "event_id": eid,
+                "relays": relays,
+            });
+            if let Some(ref member) = entry.member {
+                event_obj["member"] = serde_json::Value::String(member.clone());
+            }
+            events_json.push(event_obj);
+        }
+
+        serde_json::to_string(&events_json).unwrap_or_else(|_| "[]".to_string())
     }
 }

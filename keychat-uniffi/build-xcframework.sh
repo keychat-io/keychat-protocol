@@ -53,14 +53,14 @@ xcodebuild -create-xcframework \
 echo "==> Deploying to $IOS_DIR ..."
 rm -rf "$IOS_DIR/KeychatFFI.xcframework"
 cp -R "$TMP_DIR/KeychatFFI.xcframework" "$IOS_DIR/KeychatFFI.xcframework"
-cp "$TMP_DIR/swift/KeychatFFI.swift" "$IOS_DIR/keychat/Services/KeychatFFI.swift"
+cp "$TMP_DIR/swift/KeychatFFI.swift" "$IOS_DIR/agentChat/Services/KeychatFFI.swift"
 
 # Patch: UniFFI generates a function reference that Xcode 26 / Swift 6 rejects as
 # "a C function pointer can only be formed from a reference to a 'func' or a literal closure".
 # Wrap it in a literal closure to satisfy the compiler.
 echo "==> Patching Swift bindings for Xcode 26 compatibility..."
 sed -i '' 's/                uniffiFutureContinuationCallback,/                { handle, pollResult in uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult) },/' \
-    "$IOS_DIR/keychat/Services/KeychatFFI.swift"
+    "$IOS_DIR/agentChat/Services/KeychatFFI.swift"
 
 # Clean temp
 rm -rf "$TMP_DIR"
@@ -68,4 +68,4 @@ rm -rf "$TMP_DIR"
 echo ""
 echo "==> Done!"
 echo "    XCFramework → $IOS_DIR/KeychatFFI.xcframework"
-echo "    Swift bindings → $IOS_DIR/keychat/Services/KeychatFFI.swift"
+echo "    Swift bindings → $IOS_DIR/agentChat/Services/KeychatFFI.swift"
