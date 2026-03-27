@@ -442,42 +442,82 @@ async fn cmd_chat(
         if let Some(ref room_id) = active_room_id {
             print_sys(&format!("Active chat: {}", short_key(room_id).cyan()));
         } else {
-            print_err("Usage: /chat <room_id_or_contact_pubkey>");
+            print_err("Usage: /chat <number|name|room_id|pubkey>");
         }
         return Ok(());
     }
 
-    let room_id_or_pk = args.trim().to_string();
+    let query = args.trim();
+    let pubkey = client.get_pubkey_hex().await?;
+    let rooms = client.get_rooms(pubkey).await?;
 
-    // Try as a room_id first
-    if let Ok(Some(room)) = client.get_room(room_id_or_pk.clone()).await {
-        *active_room_id = Some(room.id.clone());
+    // Helper to select a room
+    let select = |room: &keychat_uniffi::RoomInfo, active: &mut Option<String>| {
+        *active = Some(room.id.clone());
         let fallback = short_key(&room.to_main_pubkey);
         let name = room.name.as_deref().unwrap_or(&fallback);
         print_ok(&format!("Chat selected: {}", name.cyan()));
+    };
+
+    // 1. Try as index number (1-based, matches /rooms output)
+    if let Ok(idx) = query.parse::<usize>() {
+        if idx >= 1 && idx <= rooms.len() {
+            select(&rooms[idx - 1], active_room_id);
+            return Ok(());
+        }
+        print_err(&format!("Room index {idx} out of range (1-{})", rooms.len()));
         return Ok(());
     }
 
-    // Try as a contact pubkey — find matching room
-    let normalized = keychat_uniffi::normalize_to_hex(room_id_or_pk.clone()).unwrap_or(room_id_or_pk.clone());
-    let pubkey = client.get_pubkey_hex().await?;
-    let rooms = client.get_rooms(pubkey).await?;
-    for room in &rooms {
-        if room.to_main_pubkey == normalized {
-            *active_room_id = Some(room.id.clone());
-            let fallback = short_key(&room.to_main_pubkey);
-            let name = room.name.as_deref().unwrap_or(&fallback);
-            print_ok(&format!("Chat selected: {}", name.cyan()));
-            return Ok(());
-        }
+    // 2. Try exact room_id match
+    if let Some(room) = rooms.iter().find(|r| r.id == query) {
+        select(room, active_room_id);
+        return Ok(());
     }
 
-    // Use the raw argument as room_id (user might know the exact ID)
-    *active_room_id = Some(room_id_or_pk.clone());
-    print_sys(&format!(
-        "Chat set to: {} (room may not exist yet)",
-        short_key(&room_id_or_pk).cyan()
-    ));
+    // 3. Try room_id prefix match
+    let prefix_matches: Vec<_> = rooms.iter().filter(|r| r.id.starts_with(query)).collect();
+    if prefix_matches.len() == 1 {
+        select(prefix_matches[0], active_room_id);
+        return Ok(());
+    } else if prefix_matches.len() > 1 {
+        print_err(&format!("Ambiguous ID prefix '{}' matches {} rooms — use more characters", query, prefix_matches.len()));
+        return Ok(());
+    }
+
+    // 4. Try name match (case-insensitive)
+    let query_lower = query.to_lowercase();
+    let name_matches: Vec<_> = rooms.iter().filter(|r| {
+        r.name.as_deref().map(|n| n.to_lowercase() == query_lower).unwrap_or(false)
+    }).collect();
+    if name_matches.len() == 1 {
+        select(name_matches[0], active_room_id);
+        return Ok(());
+    } else if name_matches.len() > 1 {
+        print_err(&format!("Ambiguous name '{}' matches {} rooms — use room index or ID", query, name_matches.len()));
+        return Ok(());
+    }
+
+    // 5. Try name substring match (case-insensitive)
+    let substr_matches: Vec<_> = rooms.iter().filter(|r| {
+        r.name.as_deref().map(|n| n.to_lowercase().contains(&query_lower)).unwrap_or(false)
+    }).collect();
+    if substr_matches.len() == 1 {
+        select(substr_matches[0], active_room_id);
+        return Ok(());
+    } else if substr_matches.len() > 1 {
+        print_err(&format!("Ambiguous name '{}' matches {} rooms — use room index or ID", query, substr_matches.len()));
+        return Ok(());
+    }
+
+    // 6. Try as contact pubkey (hex or npub)
+    let normalized = keychat_uniffi::normalize_to_hex(query.to_string()).unwrap_or(query.to_string());
+    if let Some(room) = rooms.iter().find(|r| r.to_main_pubkey == normalized) {
+        select(room, active_room_id);
+        return Ok(());
+    }
+
+    print_err(&format!("No room found matching '{}'", query));
     Ok(())
 }
 
@@ -489,7 +529,8 @@ async fn cmd_rooms(client: &KeychatClient) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("  {}", "Rooms:".bold());
-    for r in &rooms {
+    for (i, r) in rooms.iter().enumerate() {
+        let idx = format!("{:>2}", i + 1).cyan();
         let fallback = short_key(&r.to_main_pubkey);
         let name = r.name.as_deref().unwrap_or(&fallback);
         let room_type = match r.room_type {
@@ -521,14 +562,18 @@ async fn cmd_rooms(client: &KeychatClient) -> anyhow::Result<()> {
             })
             .unwrap_or_default();
         println!(
-            "    {status} [{room_type}] {name}{unread}{last_msg}",
+            "  {idx}. {status} [{room_type}] {name}{unread}{last_msg}",
         );
         println!(
-            "      {} {}",
+            "      {} {}  {} {}",
             "ID:".dimmed(),
-            short_key(&r.id).dimmed()
+            r.id.dimmed(),
+            "Peer:".dimmed(),
+            short_key(&r.to_main_pubkey).dimmed(),
         );
     }
+    println!();
+    print_sys("Use /chat <number> or /chat <name> to select a room");
     Ok(())
 }
 
