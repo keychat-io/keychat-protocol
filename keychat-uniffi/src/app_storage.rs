@@ -948,14 +948,15 @@ impl AppStorage {
 
     // ─── Bulk Deletion ───────────────────────────────────
 
-    /// Delete all application data.
+    /// Delete all application data including settings.
     pub fn delete_all_data(&self) -> Result<()> {
         self.transaction(|conn| {
             conn.execute_batch(
                 "DELETE FROM app_messages;
                  DELETE FROM app_rooms;
                  DELETE FROM app_contacts;
-                 DELETE FROM app_identities;",
+                 DELETE FROM app_identities;
+                 DELETE FROM app_settings;",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete all app data: {e}")))?;
             Ok(())

@@ -1376,21 +1376,10 @@ async fn process_command(app: &mut App, input: &str) {
                         app.theme.muted,
                     );
 
-                    // Auto-connect to relays in background (don't block UI)
+                    // Auto-connect to relays
                     if !app.event_loop_started {
+                        crate::commands::connect_and_start(&app.client, keychat_uniffi::default_relays());
                         app.event_loop_started = true;
-                        let client_bg = Arc::clone(&app.client);
-                        tokio::spawn(async move {
-                            let relay_urls = keychat_uniffi::default_relays();
-                            tracing::info!("Background connecting to {} relay(s)", relay_urls.len());
-                            if let Err(e) = client_bg.connect(relay_urls).await {
-                                tracing::warn!("Auto-connect failed: {e}");
-                                return;
-                            }
-                            if let Err(e) = client_bg.start_event_loop().await {
-                                tracing::error!("event loop error: {e}");
-                            }
-                        });
                     }
                     app.notify("Identity created! Connecting to relays...".into());
                 }
@@ -1412,6 +1401,11 @@ async fn process_command(app: &mut App, input: &str) {
                         }
                     }
                     app.push_output(format!("Identity imported: {}", short_key(&pubkey)), Color::Green);
+                    // Auto-connect to relays
+                    if !app.event_loop_started {
+                        crate::commands::connect_and_start(&app.client, keychat_uniffi::default_relays());
+                        app.event_loop_started = true;
+                    }
                     refresh_rooms(app).await;
                     refresh_contacts(app).await;
                 }
@@ -1484,22 +1478,8 @@ async fn process_command(app: &mut App, input: &str) {
                 args.split_whitespace().map(|s| s.to_string()).collect()
             };
             app.push_output(format!("Connecting to {} relay(s)...", relay_urls.len()), Color::Cyan);
-            match app.client.connect(relay_urls).await {
-                Ok(_) => {
-                    app.push_output("Connected".into(), Color::Green);
-                    refresh_relay_status(app).await;
-                    if !app.event_loop_started {
-                        let client_el = Arc::clone(&app.client);
-                        tokio::spawn(async move {
-                            if let Err(e) = client_el.start_event_loop().await {
-                                tracing::error!("event loop error: {e}");
-                            }
-                        });
-                        app.event_loop_started = true;
-                    }
-                }
-                Err(e) => app.notify(format!("Connect failed: {e}")),
-            }
+            crate::commands::connect_and_start(&app.client, relay_urls);
+            app.event_loop_started = true;
         }
         "/disconnect" => {
             let _ = app.client.disconnect().await;

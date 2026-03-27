@@ -23,6 +23,7 @@ pub async fn run(
     client: Arc<KeychatClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
+    data_dir: String,
 ) -> anyhow::Result<()> {
     print_banner();
 
@@ -66,7 +67,7 @@ pub async fn run(
                 }
                 let _ = rl.add_history_entry(&line);
 
-                match dispatch(Arc::clone(&client), &line, &mut active_room_id).await {
+                match dispatch(Arc::clone(&client), &line, &mut active_room_id, &data_dir).await {
                     Ok(should_quit) => {
                         if should_quit {
                             break;
@@ -99,6 +100,7 @@ async fn dispatch(
     client: Arc<KeychatClient>,
     line: &str,
     active_room_id: &mut Option<String>,
+    data_dir: &str,
 ) -> anyhow::Result<bool> {
     // Non-command text → send as message if in a chat
     if !line.starts_with('/') {
@@ -116,6 +118,7 @@ async fn dispatch(
         "/whoami" => cmd_whoami(&client).await?,
         "/backup" => cmd_backup(&client).await?,
         "/delete-identity" => cmd_delete_identity(&client, active_room_id).await?,
+        "/reset" => return cmd_reset(data_dir).await,
 
         // ── Connection ──
         "/connect" => cmd_connect(Arc::clone(&client), args).await?,
@@ -167,20 +170,9 @@ async fn cmd_create(client: Arc<KeychatClient>, name: &str) -> anyhow::Result<()
     println!("  {} {}", "npub:".dimmed(), npub.cyan());
     print_sys(&format!("Mnemonic (save this!): {}", mnemonic.yellow()));
 
-    // Auto-connect to relays (same as TUI)
-    let relay_urls = keychat_uniffi::default_relays();
-    print_sys(&format!("Connecting to {} relay(s)...", relay_urls.len()));
-    let client_bg = Arc::clone(&client);
-    tokio::spawn(async move {
-        if let Err(e) = client_bg.connect(relay_urls).await {
-            tracing::warn!("Auto-connect failed: {e}");
-            return;
-        }
-        if let Err(e) = client_bg.start_event_loop().await {
-            tracing::error!("event loop error: {e}");
-        }
-    });
-
+    // Auto-connect to relays
+    crate::commands::connect_and_start(&client, keychat_uniffi::default_relays());
+    print_sys("Connecting to relays...");
     Ok(())
 }
 
@@ -192,20 +184,9 @@ async fn cmd_import(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()
     let pubkey = crate::commands::import_identity(&client, args).await?;
     print_ok(&format!("Identity imported: {}", pubkey.cyan()));
 
-    // Auto-connect to relays (same as TUI)
-    let relay_urls = keychat_uniffi::default_relays();
-    print_sys(&format!("Connecting to {} relay(s)...", relay_urls.len()));
-    let client_bg = Arc::clone(&client);
-    tokio::spawn(async move {
-        if let Err(e) = client_bg.connect(relay_urls).await {
-            tracing::warn!("Auto-connect failed: {e}");
-            return;
-        }
-        if let Err(e) = client_bg.start_event_loop().await {
-            tracing::error!("event loop error: {e}");
-        }
-    });
-
+    // Auto-connect to relays
+    crate::commands::connect_and_start(&client, keychat_uniffi::default_relays());
+    print_sys("Connecting to relays...");
     Ok(())
 }
 
@@ -250,6 +231,27 @@ async fn cmd_delete_identity(
     Ok(())
 }
 
+/// Full reset: delete data directory and quit. Returns Ok(true) to signal quit.
+async fn cmd_reset(data_dir: &str) -> anyhow::Result<bool> {
+    print_sys("⚠ This will DELETE ALL DATA (identity, messages, contacts, sessions, databases).");
+    print_sys(&format!("  Data directory: {}", data_dir));
+    print_sys("Type 'yes' to confirm:");
+    let mut rl = rustyline::DefaultEditor::new()?;
+    match rl.readline("  Confirm> ") {
+        Ok(input) if input.trim() == "yes" => {
+            match std::fs::remove_dir_all(data_dir) {
+                Ok(_) => {
+                    print_ok("All data deleted. Restart keychat to begin fresh.");
+                    return Ok(true); // quit
+                }
+                Err(e) => print_err(&format!("Reset failed: {e}")),
+            }
+        }
+        _ => print_sys("Cancelled."),
+    }
+    Ok(false)
+}
+
 // ─── Connection commands ────────────────────────────────────────
 
 async fn cmd_connect(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()> {
@@ -260,17 +262,8 @@ async fn cmd_connect(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<(
     };
 
     print_sys(&format!("Connecting to {} relay(s)...", relay_urls.len()));
-    client.connect(relay_urls).await?;
-    print_ok("Connected to relays");
-
-    // Auto-start event loop in background so REPL prompt returns
-    let client_el = Arc::clone(&client);
-    tokio::spawn(async move {
-        if let Err(e) = client_el.start_event_loop().await {
-            eprintln!("{}", format!("  ✗ event loop error: {e}").red());
-        }
-    });
-    print_sys("Event loop started — incoming messages will appear automatically.");
+    crate::commands::connect_and_start(&client, relay_urls);
+    print_ok("Connecting to relays, event loop started.");
     Ok(())
 }
 
@@ -1050,6 +1043,7 @@ fn print_help() {
     println!("    {}   Show current pubkey", "/whoami".green());
     println!("    {}   Show backup info", "/backup".green());
     println!("    {}  Remove identity (with confirmation)", "/delete-identity".green());
+    println!("    {}    Delete ALL data and quit", "/reset".green());
     println!();
     println!("  {}", "Connection:".bold());
     println!(

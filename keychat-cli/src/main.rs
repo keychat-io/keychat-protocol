@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
             tui::run(client, event_tx, data_tx, cli.data_dir).await?;
         }
         Commands::Interactive => {
-            repl::run(client, event_tx, data_tx).await?;
+            repl::run(client, event_tx, data_tx, cli.data_dir).await?;
         }
         Commands::Daemon { port, interactive } => {
             if interactive {
@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::error!("daemon error: {e}");
                     }
                 });
-                repl::run(client, event_tx, data_tx).await?;
+                repl::run(client, event_tx, data_tx, cli.data_dir).await?;
                 daemon_handle.abort();
             } else {
                 daemon::run(client, event_tx, data_tx, port).await?;

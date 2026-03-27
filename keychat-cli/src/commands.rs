@@ -267,8 +267,25 @@ pub fn format_timestamp(ts: u64) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// Connect to relays and start event loop in background.
+/// Shared by all modes — the single source of truth for connect + event loop.
+pub fn connect_and_start(client: &Arc<KeychatClient>, relay_urls: Vec<String>) {
+    let client_bg = Arc::clone(client);
+    tokio::spawn(async move {
+        tracing::info!("Connecting to {} relay(s)", relay_urls.len());
+        if let Err(e) = client_bg.connect(relay_urls).await {
+            tracing::warn!("Auto-connect failed: {e}");
+            return;
+        }
+        tracing::info!("Connected to relays, starting event loop");
+        if let Err(e) = client_bg.start_event_loop().await {
+            tracing::error!("event loop error: {e}");
+        }
+    });
+}
+
 /// Restore identity, restore sessions, connect to relays, and start event loop.
-/// Shared startup sequence for TUI and daemon modes.
+/// Shared startup sequence for all modes.
 /// Returns the pubkey hex and session count if identity was found.
 pub async fn init_and_connect(client: &Arc<KeychatClient>, relay_urls: Vec<String>) -> Option<(String, u32)> {
     let pubkey = restore_identity(client).await?;
@@ -286,18 +303,7 @@ pub async fn init_and_connect(client: &Arc<KeychatClient>, relay_urls: Vec<Strin
         }
     };
 
-    let client_bg = Arc::clone(client);
-    tokio::spawn(async move {
-        tracing::info!("Connecting to {} relay(s)", relay_urls.len());
-        if let Err(e) = client_bg.connect(relay_urls).await {
-            tracing::warn!("Auto-connect failed: {e}");
-            return;
-        }
-        tracing::info!("Connected to relays, starting event loop");
-        if let Err(e) = client_bg.start_event_loop().await {
-            tracing::error!("event loop error: {e}");
-        }
-    });
+    connect_and_start(client, relay_urls);
 
     Some((pubkey, session_count))
 }
