@@ -60,7 +60,16 @@ impl KeychatClient {
 
         // 3. Lock only the specific peer session and encrypt
         let remote_addr = ProtocolAddress::new(peer_signal_hex.clone(), default_device_id());
-        let msg = KCMessage::text(&text);
+        let mut msg = KCMessage::text(&text);
+        if let Some(ref rt) = reply_to {
+            msg.reply_to = Some(libkeychat::ReplyTo {
+                target_id: None,
+                target_event_id: Some(rt.target_event_id.clone()),
+                content: rt.content.clone().unwrap_or_default(),
+                user_id: None,
+                user_name: None,
+            });
+        }
         let payload_json = msg.to_json().ok();
 
         let (event, addr_update) = {

@@ -620,7 +620,7 @@ async fn send_chat_message(
             RoomType::SignalGroup => {
                 // For signal groups, use send_group_text with the group_id
                 let result = client
-                    .send_group_text(room_id, text.to_string())
+                    .send_group_text(room_id, text.to_string(), None)
                     .await?;
                 print_sys(&format!(
                     "Sent to group ({} event(s))",

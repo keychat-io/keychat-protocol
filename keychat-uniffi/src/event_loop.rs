@@ -274,6 +274,16 @@ impl KeychatClient {
             let msgid = format!("fr-recv-{}", &request_id);
             let event_id_hex = event.id.to_hex();
 
+            // Check if this sender is already a friend (room exists with status=Enabled).
+            // If so, auto-approve instead of requiring manual confirmation.
+            let existing_room_status = {
+                let app_storage = self.inner.read().await.app_storage.clone();
+                let store = crate::client::lock_app_storage(&app_storage);
+                let room_id = format!("{}:{}", sender_pubkey, identity_pubkey);
+                store.get_app_room(&room_id).ok().flatten().map(|r| r.status)
+            };
+            let is_existing_friend = existing_room_status == Some(1); // 1 = Enabled
+
             // DB writes under sync lock (no await while lock held)
             let saved_room_id = {
                 let app_storage = self.inner.read().await.app_storage.clone();
@@ -283,9 +293,11 @@ impl KeychatClient {
                     tracing::info!("friend request event already persisted, skipping: {}", &event_id_hex[..16.min(event_id_hex.len())]);
                     None
                 } else {
+                    // If already a friend, keep status=Enabled (1); otherwise set Approving (2)
+                    let room_status = if is_existing_friend { 1 } else { 2 };
                     store.transaction(|_| {
                         let room_id = store.save_app_room(
-                            &sender_pubkey, &identity_pubkey, 2, 0, Some(&sender_name), None, None,
+                            &sender_pubkey, &identity_pubkey, room_status, 0, Some(&sender_name), None, None,
                         )?;
                         store.save_app_contact(&sender_pubkey, &sender_npub, &identity_pubkey, Some(&sender_name))?;
                         store.save_app_message(&msgid, Some(&event_id_hex), &room_id, &identity_pubkey, &sender_pubkey, fr_content, false, 1, created_at as i64)?;
@@ -295,6 +307,23 @@ impl KeychatClient {
                     }).ok()
                 }
             }; // app_storage + MutexGuard dropped
+
+            // Auto-approve if existing friend
+            if is_existing_friend {
+                tracing::info!(
+                    "auto-approving friend request from existing friend: {}",
+                    &sender_pubkey[..16.min(sender_pubkey.len())]
+                );
+                let my_name = {
+                    let app_storage = self.inner.read().await.app_storage.clone();
+                    let store = crate::client::lock_app_storage(&app_storage);
+                    store.get_setting("owner_name").unwrap_or(None).unwrap_or_default()
+                };
+                match self.accept_friend_request(request_id.clone(), my_name).await {
+                    Ok(_) => tracing::info!("auto-approved friend request from existing friend"),
+                    Err(e) => tracing::warn!("auto-approve failed: {e}"),
+                }
+            }
 
             if let Some(room_id) = saved_room_id {
                 self.emit_data_change(DataChange::RoomListChanged).await;

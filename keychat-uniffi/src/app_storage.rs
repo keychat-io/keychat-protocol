@@ -382,7 +382,11 @@ impl AppStorage {
                 "INSERT INTO app_rooms (id, to_main_pubkey, identity_pubkey, status, type, name, peer_signal_identity_key, parent_room_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
-                   status = CASE WHEN excluded.status > status THEN excluded.status ELSE status END,
+                   status = CASE
+                     WHEN status = 1 THEN status
+                     WHEN excluded.status > status THEN excluded.status
+                     ELSE status
+                   END,
                    name = COALESCE(excluded.name, name),
                    peer_signal_identity_key = COALESCE(excluded.peer_signal_identity_key, peer_signal_identity_key),
                    parent_room_id = COALESCE(excluded.parent_room_id, parent_room_id)",
@@ -486,9 +490,12 @@ impl AppStorage {
         params.push(Box::new(room_id.to_string()));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        self.conn
+        let rows = self.conn
             .execute(&sql, param_refs.as_slice())
             .map_err(|e| KeychatError::Storage(format!("update_app_room: {e}")))?;
+        if rows == 0 {
+            tracing::warn!("update_app_room: no rows affected for room_id={}", room_id);
+        }
         Ok(())
     }
 

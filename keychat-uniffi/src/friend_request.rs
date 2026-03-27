@@ -3,7 +3,7 @@ use std::sync::Arc;
 use libkeychat::{
     accept_friend_request_persistent, generate_prekey_material, send_friend_request_persistent,
     serialize_prekey_material, AddressManager, ChatSession, FriendRequestReceived,
-    KCFriendRequestPayload, KCMessage,
+    KCFriendRequestPayload, KCMessage, KeychatError,
 };
 use nostr::PublicKey;
 
@@ -291,6 +291,10 @@ impl KeychatClient {
         // 5. Write to app_* tables: update room status to enabled, create acceptance message
         let identity_pubkey = identity.pubkey_hex();
         let room_id = format!("{}:{}", peer_nostr_hex, identity_pubkey);
+        tracing::info!(
+            "accept_friend_request: updating app tables room_id={}, peer={}",
+            &room_id, &peer_nostr_hex[..16.min(peer_nostr_hex.len())]
+        );
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -299,17 +303,23 @@ impl KeychatClient {
         let accept_storage = self.inner.read().await.app_storage.clone();
         {
             let store = crate::client::lock_app_storage(&accept_storage);
-            if let Err(e) = store.transaction(|_| {
+            store.transaction(|conn| {
                 store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now))?;
-                store.update_app_contact(&peer_nostr_hex, &identity_pubkey, None, Some(&peer_name), None)?;
+                // Update contact name directly — don't call update_app_contact which wraps its own transaction
+                let contact_id = format!("{}:{}", peer_nostr_hex, identity_pubkey);
+                conn.execute(
+                    "UPDATE app_contacts SET name = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
+                    rusqlite::params![peer_name, contact_id],
+                ).map_err(|e| KeychatError::Storage(format!("update contact name: {e}")))?;
                 store.save_app_message(
                     &msgid, Some(&accept_event_id_hex), &room_id, &identity_pubkey,
                     &identity.pubkey_hex(), "[Friend Request Accepted]", true, 1, now,
                 )?;
                 Ok(())
-            }) {
-                tracing::warn!("accept_friend_request app tables: {e}");
-            }
+            }).map_err(|e| {
+                tracing::error!("accept_friend_request app tables failed: {e}");
+                KeychatUniError::Storage { msg: format!("accept app tables: {e}") }
+            })?;
         }
         drop(accept_storage);
 

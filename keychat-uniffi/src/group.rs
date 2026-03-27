@@ -14,7 +14,7 @@ use crate::error::KeychatUniError;
 use crate::types::*;
 
 impl KeychatClient {
-    /// Helper: send a list of (member_id, Event) tuples to relay (I-7).
+    /// Helper: send a list of (member_id, Event) tuples to relay (fire-and-forget).
     pub(crate) async fn broadcast_group_events(
         &self,
         events: Vec<(String, nostr::Event)>,
@@ -26,15 +26,15 @@ impl KeychatClient {
             .ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay. Please check your network.".into(),
             })?;
-        let nostr_client = transport.client();
-        let mut event_ids = Vec::new();
+
+        let mut event_ids = Vec::with_capacity(events.len());
         for (_member_id, event) in events {
-            let eid = event.id.to_hex();
-            if let Err(e) = nostr_client.send_event(event).await {
+            event_ids.push(event.id.to_hex());
+            if let Err(e) = transport.publish_event_async(event).await {
                 tracing::warn!("broadcast_group_events: send failed: {e}");
             }
-            event_ids.push(eid);
         }
+
         Ok(event_ids)
     }
 
@@ -49,23 +49,17 @@ impl KeychatClient {
         let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
-        let nostr_client = transport.client().clone();
 
+        // Encrypt sequentially (needs mutable session locks), collect events
+        let mut events = Vec::new();
         for member in group.other_members() {
-            let session_mutex = match inner.sessions.get(&member.signal_id).or_else(|| {
-                inner
-                    .peer_nostr_to_signal
-                    .get(&member.nostr_pubkey)
-                    .and_then(|sid| inner.sessions.get(sid))
-            }) {
+            let signal_id = match inner.peer_nostr_to_signal.get(&member.nostr_pubkey) {
+                Some(sid) => sid.clone(),
+                None => { continue; }
+            };
+            let session_mutex = match inner.sessions.get(&signal_id) {
                 Some(s) => s.clone(),
-                None => {
-                    tracing::warn!(
-                        "no session for group member {}",
-                        &member.signal_id[..16.min(member.signal_id.len())]
-                    );
-                    continue;
-                }
+                None => { continue; }
             };
 
             let event = {
@@ -73,7 +67,7 @@ impl KeychatClient {
                 let addr = session.addresses.clone();
                 encrypt_for_group_member(
                     &mut session.signal,
-                    &member.signal_id,
+                    &signal_id,
                     msg,
                     &addr,
                 )
@@ -81,10 +75,16 @@ impl KeychatClient {
                 .map_err(|e| KeychatUniError::Signal { msg: e.to_string() })?
             };
 
-            if let Err(e) = nostr_client.send_event(event).await {
+            events.push(event);
+        }
+
+        // Fire-and-forget: push to relay websocket without waiting for OK
+        for event in events {
+            if let Err(e) = transport.publish_event_async(event).await {
                 tracing::warn!("send group admin event failed: {e}");
             }
         }
+
         Ok(())
     }
 }
@@ -232,9 +232,10 @@ impl KeychatClient {
         &self,
         group_id: String,
         text: String,
+        reply_to: Option<ReplyToPayload>,
     ) -> Result<GroupSentMessage, KeychatUniError> {
-        // 1. Gather group, transport, identity under read lock
-        let (group, nostr_client, identity_pubkey, connected_relays) = {
+        // 1. Gather group, identity, check connectivity under read lock
+        let (group, identity_pubkey, connected_relays) = {
             let inner = self.inner.read().await;
 
             let group = inner
@@ -251,7 +252,6 @@ impl KeychatClient {
                 .ok_or(KeychatUniError::Transport {
                     msg: "Not connected to any relay. Please check your network.".into(),
                 })?;
-            let nostr_client = transport.client().clone();
             let connected = transport.connected_relays().await;
 
             let identity_pubkey = inner
@@ -260,7 +260,7 @@ impl KeychatClient {
                 .map(|id| id.pubkey_hex())
                 .unwrap_or_default();
 
-            (group, nostr_client, identity_pubkey, connected)
+            (group, identity_pubkey, connected)
         }; // read lock dropped
 
         if connected_relays.is_empty() {
@@ -272,6 +272,15 @@ impl KeychatClient {
         // 2. Build KCMessage and prepare metadata
         let mut msg = KCMessage::text(&text);
         msg.group_id = Some(group_id.clone());
+        if let Some(ref rt) = reply_to {
+            msg.reply_to = Some(libkeychat::ReplyTo {
+                target_id: None,
+                target_event_id: Some(rt.target_event_id.clone()),
+                content: rt.content.clone().unwrap_or_default(),
+                user_id: None,
+                user_name: None,
+            });
+        }
         let payload_json = msg.to_json().ok();
 
         let full_room_id = format!("{}:{}", group_id, identity_pubkey);
@@ -302,10 +311,12 @@ impl KeychatClient {
             ) {
                 tracing::warn!("save_app_message (group send): {e}");
             }
-            // Store payload immediately so raw data is viewable
+            // Store payload + reply_to metadata
             if let Err(e) = store.update_app_message(
                 &msgid, None, None, None,
-                payload_json.as_deref(), None, None, None,
+                payload_json.as_deref(), None,
+                reply_to.as_ref().map(|r| r.target_event_id.as_str()),
+                reply_to.as_ref().and_then(|r| r.content.as_deref()),
             ) {
                 tracing::warn!("update_app_message (group send payload): {e}");
             }
@@ -328,25 +339,39 @@ impl KeychatClient {
         })
         .await;
 
-        // 5. Encrypt and send to each member using their individual 1:1 session.
+        // 5. Encrypt for each member (sequential — needs mutable session locks),
+        //    then send all events concurrently.
         let mut event_ids = Vec::new();
         let mut nostr_events_json = Vec::new();
-        let mut relay_statuses = Vec::new();
+
+        // Collect encrypted events + metadata
+        struct PendingEvent {
+            event: nostr::Event,
+            eid: String,
+            member_name: String,
+        }
+        let mut pending: Vec<PendingEvent> = Vec::new();
 
         {
             let inner = self.inner.read().await;
             for member in group.other_members() {
-                let session_mutex = match inner.sessions.get(&member.signal_id).or_else(|| {
-                    inner
-                        .peer_nostr_to_signal
-                        .get(&member.nostr_pubkey)
-                        .and_then(|sid| inner.sessions.get(sid))
-                }) {
+                // Look up session by nostr_pubkey — the only globally stable identifier
+                let signal_id = match inner.peer_nostr_to_signal.get(&member.nostr_pubkey) {
+                    Some(sid) => sid.clone(),
+                    None => {
+                        tracing::warn!(
+                            "no signal_id for group member nostr={}",
+                            &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
+                        );
+                        continue;
+                    }
+                };
+                let session_mutex = match inner.sessions.get(&signal_id) {
                     Some(s) => s.clone(),
                     None => {
                         tracing::warn!(
-                            "no session for group member {}",
-                            &member.signal_id[..16.min(member.signal_id.len())]
+                            "no session for group member nostr={}",
+                            &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
                         );
                         continue;
                     }
@@ -357,7 +382,7 @@ impl KeychatClient {
                     let addr = session.addresses.clone();
                     encrypt_for_group_member(
                         &mut session.signal,
-                        &member.signal_id,
+                        &signal_id,
                         &msg,
                         &addr,
                     )
@@ -369,23 +394,35 @@ impl KeychatClient {
                 if let Ok(json) = serde_json::to_string(&event) {
                     nostr_events_json.push(json);
                 }
-                match nostr_client.send_event(event).await {
+                event_ids.push(eid.clone());
+                pending.push(PendingEvent { event, eid, member_name: member.name.clone() });
+            }
+        } // read lock dropped
+
+        // Fire-and-forget: push to relay websocket without waiting for OK
+        let mut relay_statuses = Vec::with_capacity(pending.len());
+        {
+            let inner = self.inner.read().await;
+            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
+            for p in pending {
+                match transport.publish_event_async(p.event).await {
                     Ok(_) => {
                         relay_statuses.push(format!(
                             r#"{{"event_id":"{}","member":"{}","status":"success"}}"#,
-                            eid, member.name
+                            p.eid, p.member_name
                         ));
                     }
                     Err(e) => {
                         relay_statuses.push(format!(
                             r#"{{"event_id":"{}","member":"{}","status":"failed","error":"{}"}}"#,
-                            eid, member.name, e
+                            p.eid, p.member_name, e
                         ));
                     }
                 }
-                event_ids.push(eid);
             }
-        } // read lock dropped
+        }
 
         // 6. Update message with final status, event data, and relay tracking
         let all_success = relay_statuses.iter().all(|s| s.contains("\"success\""));

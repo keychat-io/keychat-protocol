@@ -572,7 +572,7 @@ async fn send_group_message(
     Path(group_id): Path<String>,
     Json(req): Json<GroupTextReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.client.send_group_text(group_id, req.text).await {
+    match state.client.send_group_text(group_id, req.text, None).await {
         Ok(sent) => ok_json(serde_json::json!({
             "group_id": sent.group_id,
             "event_ids": sent.event_ids,

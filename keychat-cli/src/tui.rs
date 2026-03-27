@@ -57,6 +57,7 @@ struct MessageEntry {
     is_me: bool,
     status: MessageStatus,
     timestamp: u64,
+    reply_to_content: Option<String>,
 }
 
 /// Flat display row for the room list (may be a section header or a room)
@@ -160,6 +161,7 @@ struct App {
     show_help: bool,
     // Identity/connection
     identity_hex: Option<String>,
+    identity_name: Option<String>,
     owner_pubkey: Option<String>,
     connected_relays: usize,
     total_relays: usize,
@@ -193,6 +195,7 @@ impl App {
             command_output: Vec::new(),
             show_help: false,
             identity_hex: None,
+            identity_name: None,
             owner_pubkey: None,
             connected_relays: 0,
             total_relays: 0,
@@ -323,6 +326,12 @@ pub async fn run(
     if let Ok(pubkey) = client.get_pubkey_hex().await {
         tracing::info!("Identity loaded: {}", &pubkey[..16]);
         app.identity_hex = Some(pubkey.clone());
+        // Load identity display name from app storage
+        if let Ok(identities) = client.get_identities().await {
+            if let Some(id) = identities.iter().find(|i| i.nostr_pubkey_hex == pubkey) {
+                app.identity_name = Some(id.name.clone());
+            }
+        }
         match client.restore_sessions().await {
             Ok(n) if n > 0 => {
                 tracing::info!("Restored {n} session(s)");
@@ -412,6 +421,10 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
     // Hide room panel when: no identity, no rooms, or window too narrow
     let show_rooms = app.identity_hex.is_some() && !app.rooms.is_empty() && size.width >= 60;
 
+    // Dynamic input height: 3 lines base + 1 per extra newline, capped at 8
+    let line_count = app.input.chars().filter(|c| *c == '\n').count() + 1;
+    let input_height = (line_count as u16 + 2).min(8).max(3); // +2 for border
+
     if show_rooms {
         let content = Layout::default()
             .direction(Direction::Horizontal)
@@ -420,7 +433,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
 
         let right = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .constraints([Constraint::Min(5), Constraint::Length(input_height)])
             .split(content[1]);
 
         draw_rooms(f, app, content[0]);
@@ -429,7 +442,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         let right = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .constraints([Constraint::Min(5), Constraint::Length(input_height)])
             .split(outer[0]);
 
         draw_messages(f, app, right[0]);
@@ -476,7 +489,7 @@ fn draw_rooms(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 preview,
                 ..
             } => {
-                let indent = if *depth > 0 { "  └ " } else { "" };
+                let indent = if *depth > 0 { " └" } else { "" };
                 let name_display = if name.chars().count() > (20 - indent.len()) {
                     format!(
                         "{}…",
@@ -647,6 +660,17 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     ]));
                 }
 
+                // Reply quote (right-aligned)
+                if let Some(ref reply_content) = msg.reply_to_content {
+                    let truncated: String = reply_content.chars().take(30).collect();
+                    let quote = format!("↩ {truncated}");
+                    let rpad = inner_width.saturating_sub(quote.len() + 2);
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(rpad.max(2))),
+                        Span::styled(quote, Style::default().fg(t.muted).add_modifier(Modifier::ITALIC)),
+                    ]));
+                }
+
                 let msg_with_status = format!("{} {status_icon}", msg.content);
                 let rpad = inner_width.saturating_sub(msg_with_status.len() + 2);
                 lines.push(Line::from(vec![
@@ -672,6 +696,16 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                         Span::styled(format!("  {time}"), Style::default().fg(t.muted)),
                     ]));
                 }
+
+                // Reply quote (left-aligned)
+                if let Some(ref reply_content) = msg.reply_to_content {
+                    let truncated: String = reply_content.chars().take(30).collect();
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(format!("↩ {truncated}"), Style::default().fg(t.muted).add_modifier(Modifier::ITALIC)),
+                    ]));
+                }
+
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::raw(&msg.content),
@@ -759,7 +793,7 @@ fn draw_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let title = if app.input.starts_with('/') {
         " Command "
     } else if app.selected_room_id().is_some() {
-        " Message "
+        " Message (Alt+Enter: newline) "
     } else {
         " Input (/ for commands) "
     };
@@ -769,17 +803,36 @@ fn draw_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let input_text = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(t.accent)),
-        Span::raw(&app.input),
-    ]))
-    .block(block);
+    // Build multi-line display: prepend "> " to first line
+    let input_lines: Vec<Line> = app
+        .input
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(t.accent)),
+                    Span::raw(line),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("  ", Style::default().fg(t.accent)),
+                    Span::raw(line),
+                ])
+            }
+        })
+        .collect();
 
+    let input_text = Paragraph::new(input_lines).block(block);
     f.render_widget(input_text, area);
 
     if app.active_panel == Panel::Input {
-        let display_col = app.input[..app.cursor_pos].width() as u16;
-        f.set_cursor_position((area.x + 3 + display_col, area.y + 1));
+        // Find cursor row and column within the multi-line input
+        let before_cursor = &app.input[..app.cursor_pos];
+        let cursor_row = before_cursor.chars().filter(|c| *c == '\n').count() as u16;
+        let last_line_start = before_cursor.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let cursor_col = before_cursor[last_line_start..].width() as u16;
+        f.set_cursor_position((area.x + 3 + cursor_col, area.y + 1 + cursor_row));
     }
 }
 
@@ -872,7 +925,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
             " Friends & Messaging",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled("  /add <pk> [name]   /accept <id>   /reject <id>   /contacts", Style::default().fg(Color::Green))),
+        Line::from(Span::styled("  /add <pk> [greeting]  /accept <id>  /reject <id>  /contacts", Style::default().fg(Color::Green))),
         Line::from(Span::styled("  /history [n]       /retry         /read", Style::default().fg(Color::Green))),
         Line::from("  (type text without / to send a message)"),
         Line::from(""),
@@ -888,6 +941,13 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled("  /theme dark|light  — Switch theme", Style::default().fg(Color::Green))),
+        Line::from(Span::styled("  /reset             — Delete all data and start fresh", Style::default().fg(Color::Red))),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Tips",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  Alt+Enter    Insert newline (multi-line message)"),
         Line::from(""),
         Line::from(Span::styled(
             " Press Esc or F1 to close",
@@ -1031,7 +1091,13 @@ fn handle_messages_key(app: &mut App, key: KeyEvent) {
 async fn handle_input_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => {
-            if !app.input.is_empty() {
+            // Alt+Enter or Shift+Enter inserts a newline for multi-line input
+            if key.modifiers.contains(KeyModifiers::ALT)
+                || key.modifiers.contains(KeyModifiers::SHIFT)
+            {
+                app.input.insert(app.cursor_pos, '\n');
+                app.cursor_pos += 1;
+            } else if !app.input.is_empty() {
                 let input = app.input.clone();
                 app.input.clear();
                 app.cursor_pos = 0;
@@ -1120,6 +1186,8 @@ const COMMANDS: &[&str] = &[
     "/sg-rename",
     "/sg-kick",
     "/debug",
+    "/reset",
+    "/confirm-reset",
     "/help",
     "/quit",
     "/exit",
@@ -1201,7 +1269,7 @@ async fn send_message(app: &mut App, text: &str) {
                 let group_id = room.to_main_pubkey.clone();
                 match app
                     .client
-                    .send_group_text(group_id, text.to_string())
+                    .send_group_text(group_id, text.to_string(), None)
                     .await
                 {
                     Ok(result) => {
@@ -1259,6 +1327,7 @@ async fn process_command(app: &mut App, input: &str) {
             match app.client.create_identity().await {
                 Ok(result) => {
                     app.identity_hex = Some(result.pubkey_hex.clone());
+                    app.identity_name = Some(display_name.clone());
                     let npub =
                         keychat_uniffi::npub_from_hex(result.pubkey_hex.clone()).unwrap_or_default();
 
@@ -1330,6 +1399,12 @@ async fn process_command(app: &mut App, input: &str) {
             match app.client.import_identity(args.to_string()).await {
                 Ok(pubkey) => {
                     app.identity_hex = Some(pubkey.clone());
+                    // Restore identity name from app storage
+                    if let Ok(identities) = app.client.get_identities().await {
+                        if let Some(id) = identities.iter().find(|i| i.nostr_pubkey_hex == pubkey) {
+                            app.identity_name = Some(id.name.clone());
+                        }
+                    }
                     save_mnemonic(&app.client, args).await;
                     app.push_output(format!("Identity imported: {}", short_key(&pubkey)), Color::Green);
                     let _ = app.client.restore_sessions().await;
@@ -1372,6 +1447,7 @@ async fn process_command(app: &mut App, input: &str) {
             Ok(_) => {
                 delete_mnemonic(&app.client).await;
                 app.identity_hex = None;
+                app.identity_name = None;
                 app.owner_pubkey = None;
                 app.rooms.clear();
                 app.display_rows.clear();
@@ -1380,6 +1456,43 @@ async fn process_command(app: &mut App, input: &str) {
             }
             Err(e) => app.notify(format!("Delete failed: {e}")),
         },
+        "/reset" => {
+            app.push_output(
+                "⚠ This will DELETE ALL DATA (identity, messages, contacts, sessions).".into(),
+                Color::Red,
+            );
+            app.push_output(
+                "Type /confirm-reset to confirm.".into(),
+                Color::Yellow,
+            );
+        }
+        "/confirm-reset" => {
+            let data_dir = app.data_dir.clone();
+            // Disconnect first
+            let _ = app.client.disconnect().await;
+            // Delete the entire data directory
+            match std::fs::remove_dir_all(&data_dir) {
+                Ok(_) => {
+                    app.push_output("All data deleted.".into(), Color::Green);
+                    app.push_output(
+                        "Restart keychat to begin fresh.".into(),
+                        Color::Cyan,
+                    );
+                    app.identity_hex = None;
+                    app.identity_name = None;
+                    app.owner_pubkey = None;
+                    app.rooms.clear();
+                    app.display_rows.clear();
+                    app.messages.clear();
+                    app.contact_names.clear();
+                    app.connected_relays = 0;
+                    app.total_relays = 0;
+                    app.event_loop_started = false;
+                    app.should_quit = true;
+                }
+                Err(e) => app.notify(format!("Reset failed: {e}")),
+            }
+        }
         "/connect" => {
             let relay_urls: Vec<String> = if args.is_empty() {
                 keychat_uniffi::default_relays()
@@ -1476,7 +1589,7 @@ async fn process_command(app: &mut App, input: &str) {
         "/add" => {
             let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
             if parts.is_empty() || parts[0].is_empty() {
-                app.notify("Usage: /add <pubkey> [my_name]".into());
+                app.notify("Usage: /add <pubkey> [greeting]".into());
                 return;
             }
             let peer = match keychat_uniffi::normalize_to_hex(parts[0].to_string()) {
@@ -1486,7 +1599,12 @@ async fn process_command(app: &mut App, input: &str) {
                     return;
                 }
             };
-            let name = if parts.len() > 1 { parts[1].to_string() } else { "CLI User".to_string() };
+            // Use identity display name; greeting is optional second arg
+            let name = app.identity_name.clone().unwrap_or_else(|| "CLI User".to_string());
+            let greeting = if parts.len() > 1 { parts[1] } else { "" };
+            if !greeting.is_empty() {
+                app.push_output(format!("Greeting: {greeting}"), app.theme.muted);
+            }
             tracing::info!("Sending friend request to {}", short_key(&peer));
             match app
                 .client
@@ -2130,6 +2248,7 @@ async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32) {
                     is_me: m.is_me_send,
                     status: m.status,
                     timestamp: m.created_at,
+                    reply_to_content: m.reply_to_content,
                 })
                 .collect();
             app.command_output.clear();
