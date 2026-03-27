@@ -241,6 +241,7 @@ async fn cmd_delete_identity(
     match rl.readline("  Confirm> ") {
         Ok(input) if input.trim() == "yes" => {
             client.remove_identity().await?;
+            crate::commands::delete_mnemonic(client).await;
             *active_room_id = None;
             print_ok("Identity and all data deleted.");
         }
