@@ -1,0 +1,19 @@
+{
+  "name": "keychat-mcp-adapter",
+  "version": "0.2.0",
+  "description": "Keychat MCP adapter for Claude Code, Codex, and Gemini CLI",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "eventsource-parser": "^3.0.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
