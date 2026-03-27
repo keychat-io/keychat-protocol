@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 
 const HISTORY_FILE: &str = "repl_history.txt";
 const DEFAULT_HISTORY_COUNT: i32 = 20;
+const SETTING_MNEMONIC: &str = "identity_mnemonic";
 
 // ─── Public entry point ─────────────────────────────────────────
 
@@ -41,7 +42,13 @@ pub async fn run(
         .unwrap_or_else(|| HISTORY_FILE.into());
     let _ = rl.load_history(&hist_path);
 
-    // Try to restore identity if one exists
+    // Try to restore identity from saved mnemonic, then auto-connect
+    if let Ok(Some(mnemonic)) = client.get_setting(SETTING_MNEMONIC.to_string()).await {
+        match client.import_identity(mnemonic).await {
+            Ok(pk) => print_sys(&format!("Identity restored: {}", short_key(&pk).cyan())),
+            Err(e) => print_err(&format!("Failed to restore identity: {e}")),
+        }
+    }
     match client.get_pubkey_hex().await {
         Ok(pubkey) => {
             print_sys(&format!(
@@ -174,6 +181,8 @@ async fn cmd_create(client: &KeychatClient) -> anyhow::Result<()> {
     let result = client.create_identity().await?;
     print_ok(&format!("Identity created: {}", result.pubkey_hex.cyan()));
     print_sys(&format!("Mnemonic (save this!): {}", result.mnemonic.yellow()));
+    // Persist mnemonic so identity is restored on next launch
+    let _ = client.set_setting(SETTING_MNEMONIC.to_string(), result.mnemonic.clone()).await;
     Ok(())
 }
 
@@ -184,6 +193,8 @@ async fn cmd_import(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
     }
     let pubkey = client.import_identity(args.to_string()).await?;
     print_ok(&format!("Identity imported: {}", pubkey.cyan()));
+    // Persist mnemonic so identity is restored on next launch
+    let _ = client.set_setting(SETTING_MNEMONIC.to_string(), args.to_string()).await;
 
     // Auto-restore sessions
     match client.restore_sessions().await {

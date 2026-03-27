@@ -159,6 +159,7 @@ struct App {
     notification: Option<(String, std::time::Instant)>,
     command_output: Vec<(String, Color)>,
     show_help: bool,
+    show_whoami: bool,
     // Identity/connection
     identity_hex: Option<String>,
     identity_name: Option<String>,
@@ -194,6 +195,7 @@ impl App {
             notification: None,
             command_output: Vec::new(),
             show_help: false,
+            show_whoami: false,
             identity_hex: None,
             identity_name: None,
             owner_pubkey: None,
@@ -453,6 +455,9 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
 
     if app.show_help {
         draw_help_overlay(f, size);
+    }
+    if app.show_whoami {
+        draw_whoami_overlay(f, app, size);
     }
 }
 
@@ -966,6 +971,73 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(w, popup);
 }
 
+fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let pw = 62u16.min(area.width.saturating_sub(4));
+    let ph = 28u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(pw)) / 2;
+    let y = (area.height.saturating_sub(ph)) / 2;
+    let popup = Rect::new(x, y, pw, ph);
+
+    f.render_widget(Clear, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Identity",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    if let Some(ref pk) = app.identity_hex {
+        let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
+        if let Some(ref name) = app.identity_name {
+            lines.push(Line::from(vec![
+                Span::styled("  Name:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(name.as_str(), Style::default().fg(Color::Green)),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  Pubkey: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(pk.as_str(), Style::default().fg(Color::Cyan)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  npub:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(npub.clone(), Style::default().fg(Color::Cyan)),
+        ]));
+        if let Some(ref owner) = app.owner_pubkey {
+            lines.push(Line::from(vec![
+                Span::styled("  Owner:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(owner.as_str(), Style::default().fg(Color::Green)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        for qr_line in render_qr_lines(&npub) {
+            lines.push(Line::from(format!("  {qr_line}")));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  No identity. Use /create or /import.",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Press Esc to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let w = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Who Am I ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, popup);
+}
+
 // ─── Key event handling ─────────────────────────────────────
 
 async fn handle_key_event(app: &mut App, key: KeyEvent) {
@@ -978,6 +1050,13 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) {
     if app.show_help {
         if matches!(key.code, KeyCode::Esc | KeyCode::F(1)) {
             app.show_help = false;
+        }
+        return;
+    }
+
+    if app.show_whoami {
+        if matches!(key.code, KeyCode::Esc) {
+            app.show_whoami = false;
         }
         return;
     }
@@ -1415,27 +1494,7 @@ async fn process_command(app: &mut App, input: &str) {
             }
         }
         "/whoami" => {
-            if let Some(pk) = app.identity_hex.clone() {
-                let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
-                app.push_output(format!("Pubkey: {pk}"), Color::Cyan);
-                app.push_output(format!("npub:   {npub}"), Color::Cyan);
-                app.push_output(String::new(), Color::White);
-                for line in render_qr_lines(&npub) {
-                    app.push_output(line, Color::White);
-                }
-                if let Some(owner) = app.owner_pubkey.clone() {
-                    app.push_output(String::new(), Color::White);
-                    app.push_output(format!("Owner: {}", short_key(&owner)), Color::Green);
-                } else {
-                    app.push_output(String::new(), Color::White);
-                    app.push_output(
-                        "No owner — first friend request auto-approved.".into(),
-                        app.theme.muted,
-                    );
-                }
-            } else {
-                app.notify("No identity".into());
-            }
+            app.show_whoami = true;
         }
         "/delete-identity" => {
             app.push_output(
