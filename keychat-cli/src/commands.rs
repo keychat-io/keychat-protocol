@@ -1,8 +1,9 @@
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
-use keychat_uniffi::{ClientEvent, DataChange, DataListener, EventListener};
+use keychat_uniffi::{ClientEvent, DataChange, DataListener, EventListener, KeychatClient};
 use tokio::sync::broadcast;
 
 const KEYRING_SERVICE: &str = "keychat-cli";
@@ -99,6 +100,33 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+// ─── Identity Restore ───────────────────────────────────────────
+
+pub const SETTING_MNEMONIC: &str = "identity_mnemonic";
+
+/// Restore identity from saved mnemonic in DB. Shared by all modes.
+/// Returns the pubkey hex if successful.
+pub async fn restore_identity(client: &Arc<KeychatClient>) -> Option<String> {
+    if let Ok(Some(mnemonic)) = client.get_setting(SETTING_MNEMONIC.to_string()).await {
+        match client.import_identity(mnemonic).await {
+            Ok(pk) => {
+                tracing::info!("Identity restored from saved mnemonic: {}", &pk[..16.min(pk.len())]);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to restore identity from mnemonic: {e}");
+            }
+        }
+    }
+    client.get_pubkey_hex().await.ok()
+}
+
+/// Save mnemonic to DB so identity persists across restarts.
+pub async fn save_mnemonic(client: &KeychatClient, mnemonic: &str) {
+    if let Err(e) = client.set_setting(SETTING_MNEMONIC.to_string(), mnemonic.to_string()).await {
+        tracing::warn!("Failed to save mnemonic: {e}");
+    }
 }
 
 // ─── Event Listener ─────────────────────────────────────────────

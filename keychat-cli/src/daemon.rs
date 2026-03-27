@@ -187,8 +187,8 @@ pub async fn run(
     data_tx: broadcast::Sender<DataChange>,
     port: u16,
 ) -> anyhow::Result<()> {
-    // Auto-connect if identity exists
-    let has_identity = client.get_pubkey_hex().await.is_ok();
+    // Restore identity from saved mnemonic, then auto-connect
+    let has_identity = crate::commands::restore_identity(&client).await.is_some();
     if has_identity {
         tracing::info!("identity found, restoring sessions and connecting");
         if let Err(e) = client.restore_sessions().await {

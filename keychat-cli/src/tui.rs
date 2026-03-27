@@ -2355,7 +2355,7 @@ fn format_date(ts: u64) -> String {
 
 const SETTING_OWNER: &str = "owner_pubkey";
 const SETTING_THEME: &str = "theme";
-const SETTING_MNEMONIC: &str = "identity_mnemonic";
+
 
 async fn load_owner(client: &KeychatClient) -> Option<String> {
     client.get_setting(SETTING_OWNER.to_string()).await.ok().flatten()
@@ -2378,14 +2378,14 @@ async fn save_theme_setting(client: &KeychatClient, theme: &str) {
     let _ = client.set_setting(SETTING_THEME.to_string(), theme.to_string()).await;
 }
 
+use crate::commands::SETTING_MNEMONIC;
+
 async fn load_mnemonic(client: &KeychatClient) -> Option<String> {
     client.get_setting(SETTING_MNEMONIC.to_string()).await.ok().flatten()
 }
 
 async fn save_mnemonic(client: &KeychatClient, mnemonic: &str) {
-    if let Err(e) = client.set_setting(SETTING_MNEMONIC.to_string(), mnemonic.to_string()).await {
-        tracing::warn!("Failed to save mnemonic: {e}");
-    }
+    crate::commands::save_mnemonic(client, mnemonic).await;
 }
 
 async fn delete_mnemonic(client: &KeychatClient) {
