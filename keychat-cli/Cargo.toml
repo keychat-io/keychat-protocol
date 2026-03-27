@@ -1,6 +1,6 @@
 [package]
 name = "keychat-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Keychat unified CLI — interactive REPL and HTTP daemon modes"
 
