@@ -20,7 +20,6 @@ import {
 import { createParser, type EventSourceMessage } from "eventsource-parser";
 import * as fs from "fs";
 import * as path from "path";
-import * as http from "http";
 
 // ─── Configuration ──────────────────────────────────────────
 
@@ -37,7 +36,8 @@ const CONFIG_FILE = path.join(CHANNELS_DIR, "config.json");
 const ACCESS_FILE = path.join(CHANNELS_DIR, "access.json");
 
 interface Config {
-  daemonUrl: string; // e.g. "http://127.0.0.1:8080"
+  daemonUrl: string; // e.g. "http://127.0.0.1:10443"
+  apiToken?: string; // Bearer token for agent daemon auth
 }
 
 interface AccessConfig {
@@ -50,7 +50,7 @@ function loadConfig(): Config {
     const raw = fs.readFileSync(CONFIG_FILE, "utf-8");
     return JSON.parse(raw);
   } catch {
-    return { daemonUrl: "http://127.0.0.1:8080" };
+    return { daemonUrl: "http://127.0.0.1:10443" };
   }
 }
 
@@ -86,9 +86,17 @@ function isAllowed(senderPubkey: string): boolean {
 
 const config = loadConfig();
 
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...extra };
+  if (config.apiToken) {
+    headers["Authorization"] = `Bearer ${config.apiToken}`;
+  }
+  return headers;
+}
+
 async function daemonGet(path: string): Promise<any> {
   const url = `${config.daemonUrl}${path}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: authHeaders() });
   return res.json();
 }
 
@@ -96,7 +104,7 @@ async function daemonPost(path: string, body?: any): Promise<any> {
   const url = `${config.daemonUrl}${path}`;
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: body ? JSON.stringify(body) : undefined,
   });
   return res.json();
@@ -113,12 +121,14 @@ function startSSEListener(server: Server): void {
   sseAbortController = new AbortController();
   const signal = sseAbortController.signal;
 
-  const url = `${config.daemonUrl}/events`;
+  // SSE: use ?token= query param (some fetch implementations drop headers on streaming)
+  const tokenParam = config.apiToken ? `?token=${config.apiToken}` : "";
+  const url = `${config.daemonUrl}/events${tokenParam}`;
 
   const connectSSE = () => {
     if (signal.aborted) return;
 
-    fetch(url, { signal, headers: { Accept: "text/event-stream" } })
+    fetch(url, { signal, headers: authHeaders({ Accept: "text/event-stream" }) })
       .then(async (res) => {
         if (!res.ok || !res.body) {
           console.error(
@@ -340,6 +350,68 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {},
       },
     },
+    {
+      name: "get_identity",
+      description: "Get agent identity (pubkey, npub, name).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "send_friend_request",
+      description: "Send a friend request to a Nostr pubkey.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          pubkey: {
+            type: "string",
+            description: "Nostr hex pubkey of the user to add",
+          },
+          name: {
+            type: "string",
+            description: "Display name to show in the request",
+          },
+        },
+        required: ["pubkey"],
+      },
+    },
+    {
+      name: "pending_friends",
+      description: "List pending friend requests waiting for approval.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "approve_friend",
+      description: "Approve a pending friend request by request ID.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          request_id: {
+            type: "string",
+            description: "Request ID from pending_friends list",
+          },
+        },
+        required: ["request_id"],
+      },
+    },
+    {
+      name: "reject_friend",
+      description: "Reject a pending friend request by request ID.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          request_id: {
+            type: "string",
+            description: "Request ID from pending_friends list",
+          },
+        },
+        required: ["request_id"],
+      },
+    },
   ],
 }));
 
@@ -357,20 +429,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return errorResult("chat_id and text are required");
         }
 
-        // Determine if this is a group or DM by checking room info
-        const roomRes = await daemonGet(`/rooms`);
-        const rooms = roomRes?.data || [];
-        const room = rooms.find((r: any) => r.id === chatId);
-
-        let result: any;
-        if (room?.room_type === "SignalGroup") {
-          result = await daemonPost(`/rooms/${chatId}/send`, {
-            text,
-            group: true,
-          });
-        } else {
-          result = await daemonPost(`/rooms/${chatId}/send`, { text });
-        }
+        const result = await daemonPost("/send", {
+          room_id: chatId,
+          text,
+        });
 
         if (result?.ok) {
           return textResult(`sent (room: ${chatId.slice(0, 16)}…)`);
@@ -457,6 +519,79 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return textResult(JSON.stringify(res.data, null, 2));
       }
 
+      case "get_identity": {
+        const res = await daemonGet("/identity");
+        if (!res?.ok) {
+          return errorResult(res?.error || "fetch failed");
+        }
+        return textResult(JSON.stringify(res.data, null, 2));
+      }
+
+      case "send_friend_request": {
+        const pubkey = (args as any).pubkey;
+        const name = (args as any).name || "";
+        if (!pubkey) {
+          return errorResult("pubkey is required");
+        }
+        const res = await daemonPost("/friend-request", { pubkey, name });
+        if (res?.ok) {
+          return textResult(`Friend request sent to ${pubkey.slice(0, 16)}…`);
+        } else {
+          return errorResult(res?.error || "send failed");
+        }
+      }
+
+      case "pending_friends": {
+        const res = await daemonGet("/pending-friends");
+        if (!res?.ok) {
+          return errorResult(res?.error || "fetch failed");
+        }
+        const pending = res.data || [];
+        if (pending.length === 0) {
+          return textResult("(no pending friend requests)");
+        }
+        const formatted = pending
+          .map((p: any) => {
+            const name = p.sender_name || "unknown";
+            const pk = (p.sender_pubkey || "").slice(0, 16);
+            return `${name} (${pk}…) — id:${p.request_id}`;
+          })
+          .join("\n");
+        return textResult(formatted);
+      }
+
+      case "approve_friend": {
+        const requestId = (args as any).request_id;
+        if (!requestId) {
+          return errorResult("request_id is required");
+        }
+        const res = await daemonPost("/approve-friend", {
+          request_id: requestId,
+        });
+        if (res?.ok) {
+          return textResult(
+            `Approved. Sender: ${res.data?.sender_pubkey?.slice(0, 16) || "?"}…`
+          );
+        } else {
+          return errorResult(res?.error || "approve failed");
+        }
+      }
+
+      case "reject_friend": {
+        const requestId = (args as any).request_id;
+        if (!requestId) {
+          return errorResult("request_id is required");
+        }
+        const res = await daemonPost("/reject-friend", {
+          request_id: requestId,
+        });
+        if (res?.ok) {
+          return textResult("Rejected.");
+        } else {
+          return errorResult(res?.error || "reject failed");
+        }
+      }
+
       default:
         return errorResult(`Unknown tool: ${name}`);
     }
@@ -493,12 +628,12 @@ async function main() {
       }
     } else {
       console.error(
-        `[keychat] Warning: daemon at ${config.daemonUrl} returned error. Start it with: keychat daemon --port 8080`
+        `[keychat] Warning: daemon at ${config.daemonUrl} returned error. Start it with: keychat agent`
       );
     }
   } catch {
     console.error(
-      `[keychat] Warning: cannot reach daemon at ${config.daemonUrl}. Start it with: keychat daemon --port 8080`
+      `[keychat] Warning: cannot reach daemon at ${config.daemonUrl}. Start it with: keychat agent`
     );
   }
 
