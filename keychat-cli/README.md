@@ -178,64 +178,78 @@ Secret files are stored in `<data-dir>/secrets/` with `0600` permissions.
 
 ## AI Tool Integration
 
-Agent mode is designed to connect with AI tools via bridge adapters. Two official adapters are provided:
+Agent mode connects with AI tools via bridge adapters. One-click setup scripts handle everything.
 
 ### Claude Code (MCP Channel Plugin)
-
-The [keychat-channel-plugin](../keychat-channel-plugin/) bridges Claude Code to the agent daemon via the Model Context Protocol (MCP).
 
 ```
 Claude Code ←stdio MCP→ channel plugin ←HTTP→ agent daemon ←Nostr→ Users
 ```
 
-**Setup:**
+**One-click setup:**
 
 ```bash
-# 1. Start agent
-keychat agent --name "MyBot"
-
-# 2. Add to Claude Code MCP config (~/.claude/mcp.json)
-{
-  "mcpServers": {
-    "keychat": {
-      "command": "npx",
-      "args": ["tsx", "/path/to/keychat-channel-plugin/server.ts"]
-    }
-  }
-}
-
-# 3. Configure in Claude Code
-/keychat:configure token kc_abc123...
+./scripts/setup-claude-code.sh --name "MyBot"
 ```
 
-MCP tools provided: `reply`, `fetch_messages`, `list_rooms`, `list_contacts`, `get_identity`, `get_status`, `send_friend_request`, `pending_friends`, `approve_friend`, `reject_friend`.
+This will:
+1. Install channel plugin npm dependencies
+2. Write Claude Code MCP config (`~/.claude/mcp.json`)
+3. Start the agent daemon
 
-See [keychat-channel-plugin/README.md](../keychat-channel-plugin/README.md) for full documentation.
+After the agent starts, restart Claude Code and configure the token:
+
+```bash
+/keychat:configure token <token-from-output>
+```
+
+Then add the agent's npub in your Keychat app to start chatting.
+
+**Options:**
+
+```bash
+./scripts/setup-claude-code.sh                  # defaults (port 10443)
+./scripts/setup-claude-code.sh --name MyBot     # custom name
+./scripts/setup-claude-code.sh --port 9000      # custom port
+./scripts/setup-claude-code.sh --install-only   # configure only, don't start agent
+```
+
+MCP tools: `reply`, `fetch_messages`, `list_rooms`, `list_contacts`, `get_identity`, `get_status`, `send_friend_request`, `pending_friends`, `approve_friend`, `reject_friend`.
+
+See [keychat-channel-plugin/README.md](../keychat-channel-plugin/README.md) for details.
 
 ### OpenClaw (Skill + Bridge Script)
-
-The [keychat-agent-skill](../keychat-agent-skill/) provides an OpenClaw skill manifest and a bridge script that forwards messages to the `openclaw agent` CLI.
 
 ```
 OpenClaw Gateway ←CLI→ bridge.sh ←HTTP+SSE→ agent daemon ←Nostr→ Users
 ```
 
-**Setup:**
+**One-click setup:**
 
 ```bash
-# 1. Start agent
-keychat agent --name "MyBot"
+./scripts/setup-openclaw.sh --name "MyBot"
+```
 
-# 2. Run bridge
-cd keychat-agent-skill/scripts
-./bridge.sh --token kc_abc123... --verbose
+This will:
+1. Start the agent daemon (background)
+2. Wait for it to be ready
+3. Start the OpenClaw bridge (foreground)
+
+**Options:**
+
+```bash
+./scripts/setup-openclaw.sh                         # defaults
+./scripts/setup-openclaw.sh --name MyBot             # custom name
+./scripts/setup-openclaw.sh --agent my-agent-id      # specific OpenClaw agent
+./scripts/setup-openclaw.sh --verbose                # debug output
+./scripts/setup-openclaw.sh --install-only           # agent only, no bridge
 ```
 
 The bridge routes messages to OpenClaw sessions by context:
 - 1:1 DM → session `kcv2_dm_<sender_pubkey>`
 - Signal group → session `kcv2_sg_<group_id>`
 
-See [keychat-agent-skill/SKILL.md](../keychat-agent-skill/SKILL.md) for full documentation.
+See [keychat-agent-skill/SKILL.md](../keychat-agent-skill/SKILL.md) for details.
 
 ### Writing Your Own Adapter
 
