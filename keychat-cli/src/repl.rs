@@ -41,14 +41,14 @@ pub async fn run(
         .unwrap_or_else(|| HISTORY_FILE.into());
     let _ = rl.load_history(&hist_path);
 
-    // Restore identity from saved mnemonic (shared startup logic)
-    if let Some(pubkey) = crate::commands::restore_identity(&client).await {
+    // Shared startup: restore identity → sessions → connect → event loop
+    let relay_urls = keychat_uniffi::default_relays();
+    if let Some((pubkey, session_count)) = crate::commands::init_and_connect(&client, relay_urls).await {
         print_sys(&format!("Identity loaded: {}", short_key(&pubkey).cyan()));
-        match client.restore_sessions().await {
-            Ok(n) if n > 0 => print_sys(&format!("Restored {} session(s)", n)),
-            Err(e) => print_err(&format!("restore_sessions: {e}")),
-            _ => {}
+        if session_count > 0 {
+            print_sys(&format!("Restored {} session(s)", session_count));
         }
+        print_sys("Connecting to relays...");
     } else {
         print_sys("No identity found. Use /create or /import <mnemonic> to get started.");
     }
@@ -111,8 +111,8 @@ async fn dispatch(
 
     match cmd {
         // ── Identity ──
-        "/create" => cmd_create(&client, args).await?,
-        "/import" => cmd_import(&client, args).await?,
+        "/create" => cmd_create(Arc::clone(&client), args).await?,
+        "/import" => cmd_import(Arc::clone(&client), args).await?,
         "/whoami" => cmd_whoami(&client).await?,
         "/backup" => cmd_backup(&client).await?,
         "/delete-identity" => cmd_delete_identity(&client, active_room_id).await?,
@@ -160,22 +160,52 @@ async fn dispatch(
 
 // ─── Identity commands ──────────────────────────────────────────
 
-async fn cmd_create(client: &KeychatClient, name: &str) -> anyhow::Result<()> {
+async fn cmd_create(client: Arc<KeychatClient>, name: &str) -> anyhow::Result<()> {
     let display_name = if name.is_empty() { "CLI User" } else { name };
-    let (pubkey_hex, npub, mnemonic) = crate::commands::create_identity(client, display_name).await?;
+    let (pubkey_hex, npub, mnemonic) = crate::commands::create_identity(&client, display_name).await?;
     print_ok(&format!("Identity created: {} ({})", display_name.green(), short_key(&pubkey_hex).cyan()));
     println!("  {} {}", "npub:".dimmed(), npub.cyan());
     print_sys(&format!("Mnemonic (save this!): {}", mnemonic.yellow()));
+
+    // Auto-connect to relays (same as TUI)
+    let relay_urls = keychat_uniffi::default_relays();
+    print_sys(&format!("Connecting to {} relay(s)...", relay_urls.len()));
+    let client_bg = Arc::clone(&client);
+    tokio::spawn(async move {
+        if let Err(e) = client_bg.connect(relay_urls).await {
+            tracing::warn!("Auto-connect failed: {e}");
+            return;
+        }
+        if let Err(e) = client_bg.start_event_loop().await {
+            tracing::error!("event loop error: {e}");
+        }
+    });
+
     Ok(())
 }
 
-async fn cmd_import(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_import(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()> {
     if args.is_empty() {
         print_err("Usage: /import <mnemonic words>");
         return Ok(());
     }
-    let pubkey = crate::commands::import_identity(client, args).await?;
+    let pubkey = crate::commands::import_identity(&client, args).await?;
     print_ok(&format!("Identity imported: {}", pubkey.cyan()));
+
+    // Auto-connect to relays (same as TUI)
+    let relay_urls = keychat_uniffi::default_relays();
+    print_sys(&format!("Connecting to {} relay(s)...", relay_urls.len()));
+    let client_bg = Arc::clone(&client);
+    tokio::spawn(async move {
+        if let Err(e) = client_bg.connect(relay_urls).await {
+            tracing::warn!("Auto-connect failed: {e}");
+            return;
+        }
+        if let Err(e) = client_bg.start_event_loop().await {
+            tracing::error!("event loop error: {e}");
+        }
+    });
+
     Ok(())
 }
 
