@@ -386,7 +386,7 @@ fn build_group_invite_message(group: &SignalGroup) -> KCMessage {
 }
 
 /// Build a signalGroup admin operation message.
-fn build_group_admin_message(
+pub fn build_group_admin_message(
     kind: KCMessageKind,
     group: &SignalGroup,
     payload: serde_json::Value,
@@ -583,6 +583,24 @@ async fn send_to_all_members(
 
 use crate::chat::build_mode1_event;
 use crate::message::uuid_v4;
+
+/// Encrypt and build a kind:1059 event for a single group member.
+///
+/// This is the per-member primitive for architectures where each peer has
+/// its own SignalParticipant + AddressManager (e.g. UniFFI layer).
+/// The caller iterates group.other_members() and calls this once per member.
+pub async fn encrypt_for_group_member(
+    signal: &mut SignalParticipant,
+    member_signal_id: &str,
+    message: &KCMessage,
+    address_manager: &AddressManager,
+) -> Result<Event> {
+    let json = message.to_json()?;
+    let remote_address = ProtocolAddress::new(member_signal_id.to_string(), DeviceId::new(1).unwrap());
+    let to_address = address_manager.resolve_send_address(member_signal_id)?;
+    let ct = signal.encrypt(&remote_address, json.as_bytes())?;
+    build_mode1_event(&ct.bytes, &to_address).await
+}
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 

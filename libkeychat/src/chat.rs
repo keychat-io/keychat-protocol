@@ -386,7 +386,7 @@ pub fn parse_and_route(plaintext: &str) -> MessageAction {
 /// Build a kind:1059 Mode 1 event with ephemeral sender and base64 content.
 /// Build a Mode 1 event (kind:1059, base64 ciphertext, p-tag to receiver).
 /// Shared by chat, group, session, friend_request modules.
-pub(crate) async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
+pub async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
     let sender = EphemeralKeypair::generate();
     let content = base64::engine::general_purpose::STANDARD.encode(ciphertext);
     let to_pubkey = PublicKey::from_hex(to_address)
