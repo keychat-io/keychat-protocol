@@ -111,7 +111,7 @@ async fn dispatch(
 
     match cmd {
         // ── Identity ──
-        "/create" => cmd_create(&client).await?,
+        "/create" => cmd_create(&client, args).await?,
         "/import" => cmd_import(&client, args).await?,
         "/whoami" => cmd_whoami(&client).await?,
         "/backup" => cmd_backup(&client).await?,
@@ -160,11 +160,12 @@ async fn dispatch(
 
 // ─── Identity commands ──────────────────────────────────────────
 
-async fn cmd_create(client: &KeychatClient) -> anyhow::Result<()> {
-    let result = client.create_identity().await?;
-    print_ok(&format!("Identity created: {}", result.pubkey_hex.cyan()));
-    print_sys(&format!("Mnemonic (save this!): {}", result.mnemonic.yellow()));
-    crate::commands::save_mnemonic(client, &result.mnemonic).await;
+async fn cmd_create(client: &KeychatClient, name: &str) -> anyhow::Result<()> {
+    let display_name = if name.is_empty() { "CLI User" } else { name };
+    let (pubkey_hex, npub, mnemonic) = crate::commands::create_identity(client, display_name).await?;
+    print_ok(&format!("Identity created: {} ({})", display_name.green(), short_key(&pubkey_hex).cyan()));
+    println!("  {} {}", "npub:".dimmed(), npub.cyan());
+    print_sys(&format!("Mnemonic (save this!): {}", mnemonic.yellow()));
     Ok(())
 }
 
@@ -173,20 +174,8 @@ async fn cmd_import(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
         print_err("Usage: /import <mnemonic words>");
         return Ok(());
     }
-    let pubkey = client.import_identity(args.to_string()).await?;
+    let pubkey = crate::commands::import_identity(client, args).await?;
     print_ok(&format!("Identity imported: {}", pubkey.cyan()));
-    crate::commands::save_mnemonic(client, args).await;
-
-    // Auto-restore sessions
-    match client.restore_sessions().await {
-        Ok(n) => {
-            if n > 0 {
-                print_sys(&format!("Restored {} session(s)", n));
-            }
-        }
-        Err(e) => print_err(&format!("restore_sessions: {e}")),
-    }
-
     Ok(())
 }
 
@@ -651,37 +640,21 @@ async fn send_chat_message(
         }
     };
 
-    // Check if this is a signal group room and route accordingly
-    if let Ok(Some(room)) = client.get_room(room_id.clone()).await {
-        match room.room_type {
-            RoomType::SignalGroup => {
-                // For signal groups, use send_group_text with the group_id
-                let result = client
-                    .send_group_text(room_id, text.to_string(), None)
-                    .await?;
-                print_sys(&format!(
-                    "Sent to group ({} event(s))",
-                    result.event_ids.len()
-                ));
-                return Ok(false);
-            }
-            RoomType::MlsGroup => {
-                print_err("MLS groups are not yet supported in this CLI.");
-                return Ok(false);
-            }
-            _ => {}
+    match crate::commands::send_message(client, &room_id, text).await? {
+        crate::commands::SendResult::Dm { event_id, relay_count } => {
+            print_sys(&format!(
+                "Sent [{}] → {} relay(s)",
+                short_key(&event_id).dimmed(),
+                relay_count
+            ));
+        }
+        crate::commands::SendResult::Group { event_count } => {
+            print_sys(&format!("Sent to group ({event_count} event(s))"));
+        }
+        crate::commands::SendResult::MlsNotSupported => {
+            print_err("MLS groups are not yet supported in this CLI.");
         }
     }
-
-    // Default: 1:1 DM
-    let result = client
-        .send_text(room_id, text.to_string(), None, None, None)
-        .await?;
-    print_sys(&format!(
-        "Sent [{}] → {} relay(s)",
-        short_key(&result.event_id).dimmed(),
-        result.connected_relays.len()
-    ));
     Ok(false)
 }
 

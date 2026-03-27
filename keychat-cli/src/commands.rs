@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::TimeZone;
-use keychat_uniffi::{ClientEvent, DataChange, DataListener, EventListener, KeychatClient};
+use keychat_uniffi::{
+    ClientEvent, DataChange, DataListener, EventListener, KeychatClient, KeychatUniError, RoomType,
+};
 use tokio::sync::broadcast;
 
 const KEYRING_SERVICE: &str = "keychat-cli";
@@ -135,6 +137,114 @@ pub async fn delete_mnemonic(client: &KeychatClient) {
     if let Err(e) = client.delete_setting(SETTING_MNEMONIC.to_string()).await {
         tracing::warn!("Failed to delete mnemonic: {e}");
     }
+}
+
+// ─── Shared Business Logic ───────────────────────────────────────
+
+/// Result of sending a message to a room (DM or group).
+pub enum SendResult {
+    /// DM sent successfully — event_id, relay count.
+    Dm { event_id: String, relay_count: usize },
+    /// Signal group sent — number of events.
+    Group { event_count: usize },
+    /// MLS not supported.
+    MlsNotSupported,
+}
+
+/// Send a text message to a room, routing to the correct API based on room type.
+/// This is the single source of truth for message routing — all modes must use this.
+pub async fn send_to_room(
+    client: &KeychatClient,
+    room_id: &str,
+) -> Result<RoomType, KeychatUniError> {
+    // Just resolve room type — caller handles sending with the right API
+    if let Some(room) = client.get_room(room_id.to_string()).await? {
+        Ok(room.room_type)
+    } else {
+        // Room not found in DB — assume DM (legacy behavior)
+        Ok(RoomType::Dm)
+    }
+}
+
+/// Send a text message to a room, handling DM vs Signal Group vs MLS routing.
+pub async fn send_message(
+    client: &KeychatClient,
+    room_id: &str,
+    text: &str,
+) -> Result<SendResult, KeychatUniError> {
+    if let Some(room) = client.get_room(room_id.to_string()).await? {
+        match room.room_type {
+            RoomType::SignalGroup => {
+                let group_id = room.to_main_pubkey.clone();
+                let result = client
+                    .send_group_text(group_id, text.to_string(), None)
+                    .await?;
+                return Ok(SendResult::Group {
+                    event_count: result.event_ids.len(),
+                });
+            }
+            RoomType::MlsGroup => {
+                return Ok(SendResult::MlsNotSupported);
+            }
+            RoomType::Dm => {}
+        }
+    }
+    // DM (or room not found — try anyway)
+    let result = client
+        .send_text(room_id.to_string(), text.to_string(), None, None, None)
+        .await?;
+    Ok(SendResult::Dm {
+        event_id: result.event_id,
+        relay_count: result.connected_relays.len(),
+    })
+}
+
+/// Create identity with full persistence: save to app storage + save mnemonic.
+/// Returns (pubkey_hex, npub, mnemonic).
+pub async fn create_identity(
+    client: &KeychatClient,
+    display_name: &str,
+) -> Result<(String, String, String), KeychatUniError> {
+    let result = client.create_identity().await?;
+    let npub = keychat_uniffi::npub_from_hex(result.pubkey_hex.clone()).unwrap_or_default();
+
+    // Save identity with display name to app storage
+    if let Err(e) = client
+        .save_app_identity_ffi(
+            result.pubkey_hex.clone(),
+            npub.clone(),
+            display_name.to_string(),
+            0,
+            true,
+        )
+        .await
+    {
+        tracing::warn!("Failed to save identity name: {e}");
+    }
+
+    // Persist mnemonic for auto-restore on next startup
+    save_mnemonic(client, &result.mnemonic).await;
+
+    Ok((result.pubkey_hex, npub, result.mnemonic))
+}
+
+/// Import identity from mnemonic with full persistence.
+/// Returns pubkey_hex.
+pub async fn import_identity(
+    client: &KeychatClient,
+    mnemonic: &str,
+) -> Result<String, KeychatUniError> {
+    let pubkey = client.import_identity(mnemonic.to_string()).await?;
+    save_mnemonic(client, mnemonic).await;
+
+    // Restore sessions after import
+    match client.restore_sessions().await {
+        Ok(n) if n > 0 => tracing::info!("Restored {n} session(s) after import"),
+        Err(e) => tracing::warn!("restore_sessions after import: {e}"),
+        _ => {}
+    }
+
+    Ok(pubkey)
 }
 
 // ─── Shared Utilities ───────────────────────────────────────────

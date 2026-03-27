@@ -1316,50 +1316,19 @@ async fn send_message(app: &mut App, text: &str) {
     };
     tracing::info!("Sending message to room={}, len={}", &room_id[..16.min(room_id.len())], text.len());
 
-    if let Ok(Some(room)) = app.client.get_room(room_id.clone()).await {
-        match room.room_type {
-            RoomType::SignalGroup => {
-                // room_id is "group_id:identity_pubkey", extract group_id
-                let group_id = room.to_main_pubkey.clone();
-                match app
-                    .client
-                    .send_group_text(group_id, text.to_string(), None)
-                    .await
-                {
-                    Ok(result) => {
-                        app.push_output(
-                            format!("Sent to group ({} event(s))", result.event_ids.len()),
-                            Color::Green,
-                        );
-                    }
-                    Err(e) => {
-                        app.notify(format!("Send failed: {e}"));
-                        return;
-                    }
-                }
-            }
-            RoomType::MlsGroup => {
-                app.notify("MLS groups not yet supported".into());
-                return;
-            }
-            RoomType::Dm => {
-                if let Err(e) = app
-                    .client
-                    .send_text(room_id.clone(), text.to_string(), None, None, None)
-                    .await
-                {
-                    app.notify(format!("Send failed: {e}"));
-                    return;
-                }
-            }
+    match crate::commands::send_message(&app.client, &room_id, text).await {
+        Ok(crate::commands::SendResult::Dm { .. }) => {}
+        Ok(crate::commands::SendResult::Group { event_count }) => {
+            app.push_output(format!("Sent to group ({event_count} event(s))"), Color::Green);
         }
-    } else if let Err(e) = app
-        .client
-        .send_text(room_id.clone(), text.to_string(), None, None, None)
-        .await
-    {
-        app.notify(format!("Send failed: {e}"));
-        return;
+        Ok(crate::commands::SendResult::MlsNotSupported) => {
+            app.notify("MLS groups not yet supported".into());
+            return;
+        }
+        Err(e) => {
+            app.notify(format!("Send failed: {e}"));
+            return;
+        }
     }
 
     load_messages(app, &room_id).await;
@@ -1378,31 +1347,15 @@ async fn process_command(app: &mut App, input: &str) {
                 return;
             }
             let display_name = args.to_string();
-            match app.client.create_identity().await {
-                Ok(result) => {
-                    app.identity_hex = Some(result.pubkey_hex.clone());
+            match crate::commands::create_identity(&app.client, &display_name).await {
+                Ok((pubkey_hex, npub, mnemonic)) => {
+                    app.identity_hex = Some(pubkey_hex.clone());
                     app.identity_name = Some(display_name.clone());
-                    let npub =
-                        keychat_uniffi::npub_from_hex(result.pubkey_hex.clone()).unwrap_or_default();
-
-                    // Save identity with display name to app storage
-                    if let Err(e) = app.client.save_app_identity_ffi(
-                        result.pubkey_hex.clone(),
-                        npub.clone(),
-                        display_name.clone(),
-                        0,
-                        true,
-                    ).await {
-                        tracing::warn!("Failed to save identity name: {e}");
-                    }
-
-                    // Persist mnemonic for auto-restore on next startup
-                    save_mnemonic(&app.client, &result.mnemonic).await;
 
                     app.push_output(format!("Identity created! Name: {display_name}"), Color::Green);
                     app.push_output(String::new(), Color::White);
                     app.push_output("Pubkey (hex):".into(), Color::DarkGray);
-                    app.push_output(result.pubkey_hex.clone(), Color::Cyan);
+                    app.push_output(pubkey_hex, Color::Cyan);
                     app.push_output(String::new(), Color::White);
                     app.push_output("npub:".into(), Color::DarkGray);
                     app.push_output(npub.clone(), Color::Cyan);
@@ -1413,8 +1366,7 @@ async fn process_command(app: &mut App, input: &str) {
                     }
                     app.push_output(String::new(), Color::White);
                     app.push_output("Mnemonic (SAVE THIS!):".into(), Color::Yellow);
-                    // Split mnemonic into lines of ~4 words for readability
-                    let words: Vec<&str> = result.mnemonic.split_whitespace().collect();
+                    let words: Vec<&str> = mnemonic.split_whitespace().collect();
                     for chunk in words.chunks(4) {
                         app.push_output(chunk.join(" "), Color::Yellow);
                     }
@@ -1450,7 +1402,7 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /import <mnemonic words>".into());
                 return;
             }
-            match app.client.import_identity(args.to_string()).await {
+            match crate::commands::import_identity(&app.client, args).await {
                 Ok(pubkey) => {
                     app.identity_hex = Some(pubkey.clone());
                     // Restore identity name from app storage
@@ -1459,9 +1411,7 @@ async fn process_command(app: &mut App, input: &str) {
                             app.identity_name = Some(id.name.clone());
                         }
                     }
-                    save_mnemonic(&app.client, args).await;
                     app.push_output(format!("Identity imported: {}", short_key(&pubkey)), Color::Green);
-                    let _ = app.client.restore_sessions().await;
                     refresh_rooms(app).await;
                     refresh_contacts(app).await;
                 }
@@ -2347,7 +2297,7 @@ async fn save_theme_setting(client: &KeychatClient, theme: &str) {
     let _ = client.set_setting(SETTING_THEME.to_string(), theme.to_string()).await;
 }
 
-use crate::commands::{save_mnemonic, delete_mnemonic};
+use crate::commands::delete_mnemonic;
 
 // ─── QR code rendering ─────────────────────────────────────
 

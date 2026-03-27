@@ -226,12 +226,13 @@ async fn get_identity(
 async fn create_identity(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.client.create_identity().await {
-        Ok(result) => {
+    match crate::commands::create_identity(&state.client, "CLI User").await {
+        Ok((pubkey_hex, npub, mnemonic)) => {
             tracing::warn!("⚠️  Mnemonic returned in HTTP response — save it immediately, it will not be shown again");
             ok_json(serde_json::json!({
-                "pubkey_hex": result.pubkey_hex,
-                "mnemonic": result.mnemonic,
+                "pubkey_hex": pubkey_hex,
+                "npub": npub,
+                "mnemonic": mnemonic,
                 "warning": "Save this mnemonic immediately. It will not be shown again.",
             }))
         }
@@ -248,7 +249,7 @@ async fn import_identity(
     State(state): State<AppState>,
     Json(req): Json<ImportIdentityReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.client.import_identity(req.mnemonic).await {
+    match crate::commands::import_identity(&state.client, &req.mnemonic).await {
         Ok(pubkey) => ok_json(serde_json::json!({ "pubkey_hex": pubkey })),
         Err(e) => bad_request(e),
     }
@@ -411,15 +412,24 @@ async fn send_message(
     State(state): State<AppState>,
     Json(req): Json<SendMessageReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state
-        .client
-        .send_text(req.room_id, req.text, None, None, None)
-        .await
-    {
-        Ok(sent) => ok_json(serde_json::json!({
-            "event_id": sent.event_id,
-            "connected_relays": sent.connected_relays,
-        })),
+    match crate::commands::send_message(&state.client, &req.room_id, &req.text).await {
+        Ok(crate::commands::SendResult::Dm { event_id, relay_count }) => {
+            ok_json(serde_json::json!({
+                "event_id": event_id,
+                "relay_count": relay_count,
+            }))
+        }
+        Ok(crate::commands::SendResult::Group { event_count }) => {
+            ok_json(serde_json::json!({
+                "type": "group",
+                "event_count": event_count,
+            }))
+        }
+        Ok(crate::commands::SendResult::MlsNotSupported) => {
+            bad_request(keychat_uniffi::KeychatUniError::InvalidArgument {
+                msg: "MLS groups not yet supported".into(),
+            })
+        }
         Err(e) => bad_request(e),
     }
 }
