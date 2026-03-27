@@ -26,6 +26,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
         run: cargo build --release -p keychat-cli --target ${{ matrix.target }}
