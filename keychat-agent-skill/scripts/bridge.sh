@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 #
-# Keychat ↔ OpenClaw bridge
+# Keychat Agent ↔ OpenClaw bridge
 #
-# Connects keychat-cli daemon (SSE) to OpenClaw agent CLI.
-# Inbound:  keychat-cli SSE → openclaw agent → reply → keychat-cli POST /send
-# Outbound: Agent uses exec to call keychat-cli POST /send directly.
+# Connects keychat agent daemon (SSE) to OpenClaw agent CLI.
+# Inbound:  keychat SSE message_received → openclaw agent → reply → POST /send
 #
 # Usage: ./bridge.sh [options]
-#   --url <base>       keychat-cli HTTP base URL (default: http://127.0.0.1:7700)
+#   --url <base>       Agent HTTP base URL (default: http://127.0.0.1:10443)
+#   --token <token>    API Bearer token (required, or set KEYCHAT_API_TOKEN env)
 #   --agent <id>       OpenClaw agent id (optional, uses default routing)
 #   --timeout <sec>    openclaw agent timeout (default: 300)
 #   --verbose          Print debug info to stderr
 
 set -euo pipefail
 
-KEYCHAT_URL="${KEYCHAT_URL:-http://127.0.0.1:7700}"
+KEYCHAT_URL="${KEYCHAT_URL:-http://127.0.0.1:10443}"
+API_TOKEN="${KEYCHAT_API_TOKEN:-}"
 AGENT_ID=""
 AGENT_TIMEOUT=300
 VERBOSE=false
@@ -22,6 +23,7 @@ VERBOSE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url)      KEYCHAT_URL="$2"; shift 2 ;;
+    --token)    API_TOKEN="$2"; shift 2 ;;
     --agent)    AGENT_ID="$2"; shift 2 ;;
     --timeout)  AGENT_TIMEOUT="$2"; shift 2 ;;
     --verbose)  VERBOSE=true; shift ;;
@@ -29,46 +31,45 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$API_TOKEN" ]]; then
+  echo "[bridge] ERROR: API token required. Use --token or set KEYCHAT_API_TOKEN env." >&2
+  exit 1
+fi
+
+AUTH_HEADER="Authorization: Bearer $API_TOKEN"
 log() { $VERBOSE && echo "[bridge] $*" >&2 || true; }
 
-# Wait for keychat-cli daemon to be ready
-echo "[bridge] Waiting for keychat-cli at $KEYCHAT_URL ..." >&2
+# Wait for agent daemon to be ready
+echo "[bridge] Waiting for keychat agent at $KEYCHAT_URL ..." >&2
 for i in $(seq 1 30); do
-  if curl -sf "$KEYCHAT_URL/health" >/dev/null 2>&1; then
+  if curl -sf -H "$AUTH_HEADER" "$KEYCHAT_URL/status" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
 
-if ! curl -sf "$KEYCHAT_URL/health" >/dev/null 2>&1; then
-  echo "[bridge] ERROR: keychat-cli daemon not responding at $KEYCHAT_URL" >&2
+if ! curl -sf -H "$AUTH_HEADER" "$KEYCHAT_URL/status" >/dev/null 2>&1; then
+  echo "[bridge] ERROR: agent not responding at $KEYCHAT_URL" >&2
   exit 1
 fi
 
-IDENTITY=$(curl -sf "$KEYCHAT_URL/identity")
-NPUB=$(echo "$IDENTITY" | jq -r .npub)
-NAME=$(echo "$IDENTITY" | jq -r .name)
+IDENTITY=$(curl -sf -H "$AUTH_HEADER" "$KEYCHAT_URL/identity")
+NPUB=$(echo "$IDENTITY" | jq -r '.data.npub // .npub // empty')
+NAME=$(echo "$IDENTITY" | jq -r '.data.name // .name // empty')
 echo "[bridge] Connected. Identity: $NAME ($NPUB)" >&2
 echo "[bridge] Listening for SSE events..." >&2
 
-# Build openclaw agent command with proper routing
+# Build openclaw agent command with session routing
 build_agent_cmd() {
   local sender="$1"
-  local message="$2"
-  local group_id="$3"
-  local kind="$4"
+  local group_id="$2"
 
   # Route to the correct session:
-  #   1:1 chat:      kcv2_dm_<sender_npub>
+  #   1:1 DM:        kcv2_dm_<sender_pubkey>
   #   Signal group:  kcv2_sg_<group_id>
-  #   MLS group:     kcv2_mls_<group_id>
   local session_id
   if [[ -n "$group_id" && "$group_id" != "null" ]]; then
-    if [[ "$kind" == "mls_group" ]]; then
-      session_id="kcv2_mls_${group_id}"
-    else
-      session_id="kcv2_sg_${group_id}"
-    fi
+    session_id="kcv2_sg_${group_id}"
   else
     session_id="kcv2_dm_${sender}"
   fi
@@ -84,40 +85,44 @@ build_agent_cmd() {
   echo "$cmd"
 }
 
-# Process a single SSE message event
+# Process a message_received SSE event
 handle_message() {
   local data="$1"
-  local sender sender_name message kind group_id group_name
+  local sender_pubkey content kind room_id group_id
 
-  sender=$(echo "$data" | jq -r '.sender // empty')
-  sender_name=$(echo "$data" | jq -r '.sender_name // empty')
-  message=$(echo "$data" | jq -r '.message // empty')
-  kind=$(echo "$data" | jq -r '.kind // "dm"')
+  sender_pubkey=$(echo "$data" | jq -r '.sender_pubkey // empty')
+  content=$(echo "$data" | jq -r '.content // empty')
+  kind=$(echo "$data" | jq -r '.kind // "text"')
+  room_id=$(echo "$data" | jq -r '.room_id // empty')
   group_id=$(echo "$data" | jq -r '.group_id // empty')
-  group_name=$(echo "$data" | jq -r '.group_name // empty')
 
-  if [[ -z "$sender" || -z "$message" ]]; then
-    log "Skipping event with missing sender/message"
+  # Only process text messages
+  if [[ "$kind" != "text" ]]; then
+    log "Skipping non-text message (kind: $kind)"
     return
   fi
 
-  # Log with context
-  if [[ -n "$group_id" && "$group_id" != "null" ]]; then
-    log "← [${group_name:-$group_id}] $sender_name: $message"
-  else
-    log "← [$sender_name] $message"
+  if [[ -z "$sender_pubkey" || -z "$content" ]]; then
+    log "Skipping event with missing sender/content"
+    return
   fi
 
-  # Call openclaw agent with proper routing
+  if [[ -n "$group_id" && "$group_id" != "null" ]]; then
+    log "← [group:${group_id:0:8}] ${sender_pubkey:0:8}: $content"
+  else
+    log "← [${sender_pubkey:0:8}] $content"
+  fi
+
+  # Call openclaw agent
   local cmd
-  cmd=$(build_agent_cmd "$sender" "$message" "$group_id" "$kind")
+  cmd=$(build_agent_cmd "$sender_pubkey" "$group_id")
   local result
-  result=$($cmd "$message" 2>/dev/null) || {
+  result=$($cmd "$content" 2>/dev/null) || {
     log "openclaw agent failed"
     return
   }
 
-  # Extract reply
+  # Extract reply text
   local reply
   reply=$(echo "$result" | jq -r '.result.payloads[0].text // empty' 2>/dev/null)
 
@@ -126,51 +131,36 @@ handle_message() {
     return
   fi
 
-  # Route reply to the correct destination
-  if [[ -n "$group_id" && "$group_id" != "null" ]]; then
-    # Group message — send to group
-    log "→ [${group_name:-$group_id}] $reply"
+  # Send reply back via keychat
+  if [[ -n "$room_id" && "$room_id" != "null" ]]; then
+    log "→ [room:${room_id:0:8}] $reply"
     local send_payload
-    send_payload=$(jq -n --arg gid "$group_id" --arg msg "$reply" '{group_id: $gid, message: $msg}')
-
-    local endpoint="send-group"
-    if [[ "$kind" == "mls_group" ]]; then
-      endpoint="send-mls-group"
-    fi
-
-    curl -sf -X POST "$KEYCHAT_URL/$endpoint" \
-      -H 'Content-Type: application/json' \
-      -d "$send_payload" >/dev/null 2>&1 || {
-      log "Failed to send group reply"
-    }
-  else
-    # 1:1 message — reply to sender
-    log "→ [$sender_name] $reply"
-    local send_payload
-    send_payload=$(jq -n --arg to "$sender" --arg msg "$reply" '{to: $to, message: $msg}')
+    send_payload=$(jq -n --arg rid "$room_id" --arg msg "$reply" '{room_id: $rid, text: $msg}')
 
     curl -sf -X POST "$KEYCHAT_URL/send" \
+      -H "$AUTH_HEADER" \
       -H 'Content-Type: application/json' \
       -d "$send_payload" >/dev/null 2>&1 || {
       log "Failed to send reply"
     }
+  else
+    log "No room_id, cannot reply"
   fi
 }
 
-# Process friend request events
-handle_friend_request() {
+# Process pending_friend_request SSE event
+handle_pending_friend() {
   local data="$1"
-  local sender_name auto_accepted
+  local sender_name request_id
   sender_name=$(echo "$data" | jq -r '.sender_name // "unknown"')
-  auto_accepted=$(echo "$data" | jq -r '.auto_accepted // false')
-  log "Friend request from $sender_name (auto_accepted: $auto_accepted)"
+  request_id=$(echo "$data" | jq -r '.request_id // empty')
+  log "Pending friend request from $sender_name (id: $request_id)"
+  # AI could decide to approve here — for now just log
 }
 
-# Main SSE loop
-# curl -N for no-buffer, parse SSE format
+# Main SSE loop with auto-reconnect
 while true; do
-  curl -sfN "$KEYCHAT_URL/events" 2>/dev/null | while IFS= read -r line; do
-    # SSE format: "event: <type>\ndata: <json>\n\n"
+  curl -sfN -H "$AUTH_HEADER" "$KEYCHAT_URL/events?token=$API_TOKEN" 2>/dev/null | while IFS= read -r line; do
     if [[ "$line" =~ ^event:\ (.+)$ ]]; then
       current_event="${BASH_REMATCH[1]}"
       continue
@@ -179,12 +169,21 @@ while true; do
     if [[ "$line" =~ ^data:\ (.+)$ ]]; then
       event_data="${BASH_REMATCH[1]}"
 
-      case "${current_event:-message}" in
-        message)
+      case "${current_event:-}" in
+        message_received)
           handle_message "$event_data" &
           ;;
-        friend_request)
-          handle_friend_request "$event_data"
+        pending_friend_request)
+          handle_pending_friend "$event_data"
+          ;;
+        friend_request_accepted)
+          log "Friend request accepted: $(echo "$event_data" | jq -r '.peer_name // empty')"
+          ;;
+        connection_status_changed)
+          log "Connection: $(echo "$event_data" | jq -r '.status // empty')"
+          ;;
+        *)
+          log "Event: ${current_event:-unknown}"
           ;;
       esac
 
@@ -193,7 +192,6 @@ while true; do
     fi
   done
 
-  # SSE connection dropped — reconnect after delay
   echo "[bridge] SSE disconnected, reconnecting in 3s..." >&2
   sleep 3
 done

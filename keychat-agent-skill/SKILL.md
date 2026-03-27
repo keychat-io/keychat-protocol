@@ -1,167 +1,159 @@
 ---
 name: keychat-v2
-description: "E2E encrypted messaging via Keychat v2 (Signal Protocol + Nostr). Runs as independent daemon; bridge connects to OpenClaw via `openclaw agent` CLI. No gateway config changes needed."
+description: "E2E encrypted messaging via Keychat (Signal Protocol + Nostr). Agent daemon with Bearer token auth; bridge connects to OpenClaw via `openclaw agent` CLI."
 metadata:
   openclaw:
     emoji: "🔐"
     homepage: "https://github.com/keychat-io/keychat-cli"
 ---
 
-# Keychat v2 — OpenClaw Skill
+# Keychat — OpenClaw Skill
 
-E2E encrypted messaging using Signal Protocol (PQXDH) over Nostr relays. Runs as an independent daemon with a bridge script — no gateway restart required.
+E2E encrypted messaging using Signal Protocol (PQXDH) over Nostr relays. Runs as an agent daemon with a bridge script — no gateway restart required.
 
 ## Architecture
 
 ```
-User ←→ Keychat App ←→ Nostr Relay ←→ keychat-agent daemon (decrypt)
-                                            ↕ HTTP API
+User ←→ Keychat App ←→ Nostr Relay ←→ keychat agent daemon (:10443)
+                                            ↕ HTTP API + Bearer Auth
                                        bridge.sh
                                             ↕
                                     openclaw agent CLI → Gateway
 ```
 
-### Single-agent mode
-One daemon per agent. Each has its own identity, data-dir, port.
-
-### Multi-agent mode
-One daemon manages multiple agents. Each agent has its own subdirectory under `<data-dir>/agents/<id>/`.
-
-```bash
-# Single agent
-keychat-agent --data-dir /data/assistant --listen 127.0.0.1:7700
-
-# Multi-agent (auto-detects new agent directories)
-keychat-agent --multi --data-dir /data/keychat --listen 127.0.0.1:7700
-```
+One daemon per agent. Each has its own identity, data directory, and port.
 
 ## Install
 
 ```bash
 # From source (requires Rust toolchain)
-cargo install --path keychat-cli-agent
+cargo install --path keychat-cli
 
-# Or download pre-built binary
-# curl -L https://github.com/keychat-io/keychat-cli/releases/latest/download/keychat-agent-$(uname -s)-$(uname -m) -o /usr/local/bin/keychat-agent
+# Verify
+keychat --version
+keychat agent --help
 ```
 
 ## Setup
 
-### 1. Start daemon
+### 1. Start agent daemon
 
 ```bash
-keychat-agent --listen 127.0.0.1:7700 &
+keychat agent --name "MyBot"
+# Output:
+#   Agent ready: npub1xxx...
+#   API token: kc_abc123...
+#   Listening on http://0.0.0.0:10443
 ```
 
-First run:
+First run automatically:
 - Generates a new BIP-39 identity
-- Stores mnemonic + DB key in **OS keychain** (never in config files)
-- Creates `config.json` with non-sensitive settings only
-- First peer to add this agent becomes the **owner** (DM Policy)
+- Creates encrypted DB with auto-generated key
+- Stores secrets in `~/.keychat/secrets/` (mnemonic, dbkey, api-token)
+- First peer to add this agent becomes the **owner**
 
 ### 2. Start bridge
 
 ```bash
-./bridge.sh &
+./scripts/bridge.sh --token kc_abc123... --verbose
 ```
 
 ### 3. Add agent as friend
 
-Get the agent's npub: `curl -s http://127.0.0.1:7700/identity | jq .npub`
+Get the agent's npub from the startup output, or:
+```bash
+curl -H "Authorization: Bearer kc_abc123..." http://127.0.0.1:10443/identity | jq '.data.npub'
+```
 
 Add this npub in your Keychat app. The first person to add becomes owner.
 
-## Multi-Agent: Creating Agents
-
-```bash
-# Via API (daemon auto-starts the new agent)
-curl -X POST http://127.0.0.1:7700/agents \
-  -d '{"id":"reviewer","name":"Code Reviewer"}'
-
-# Or: create directory with config.json → daemon auto-detects within 5s
-```
-
-Each agent gets its own mnemonic (in OS keychain), npub, Signal sessions, and DB.
-
 ## Message Routing
 
-bridge.sh routes messages to separate OpenClaw sessions by context:
+The bridge routes messages to separate OpenClaw sessions by context:
 
-| Context | Session ID | Reply endpoint |
-|---------|-----------|----------------|
-| 1:1 DM | `kcv2_dm_<sender_npub>` | `POST /send` |
-| Signal group | `kcv2_sg_<group_id>` | `POST /send-group` |
-| MLS group | `kcv2_mls_<group_id>` | `POST /send-mls-group` |
+| Context | Session ID | Description |
+|---------|-----------|-------------|
+| 1:1 DM | `kcv2_dm_<sender_pubkey>` | Per-user conversation |
+| Signal group | `kcv2_sg_<group_id>` | Per-group conversation |
 
-Multi-agent SSE events include `agent_id` and `agent_npub` for per-agent routing.
+## Owner Policy
 
-## DM Policy (Owner Model)
+- **First friend = owner**: auto-accepted, stored in DB
+- **Owner messages**: always auto-accepted
+- **Others**: queued as pending, need owner approval via API or bridge logic
 
-- **First friend = owner**: auto-accepted, stored in config
-- **Owner adds again** (e.g., after reset): auto-accepted
-- **Others**: queued as pending, need owner approval via `POST /approve-friend`
-
-## Agent: Sending Messages
+## Agent CLI Options
 
 ```bash
-# Send 1:1 message
-curl -X POST http://127.0.0.1:7700/send \
-  -d '{"to":"<npub>","message":"Hello!"}'
+keychat agent [OPTIONS]
 
-# Send to Signal group
-curl -X POST http://127.0.0.1:7700/send-group \
-  -d '{"group_id":"<gid>","message":"Hello group!"}'
-
-# Add a friend
-curl -X POST http://127.0.0.1:7700/add-friend \
-  -d '{"npub":"<hex>"}'
-
-# Get identity / list contacts
-curl -s http://127.0.0.1:7700/identity
-curl -s http://127.0.0.1:7700/peers
+Options:
+  --port <PORT>          Listen port (default: 10443)
+  --no-auto-accept       Disable auto-accept friend requests
+  --name <NAME>          Agent display name (default: "Keychat Agent")
+  --relay <URLS>         Relay URLs, comma-separated (overrides defaults)
+  --api-token <TOKEN>    API token (auto-generated if not provided)
+  --data-dir <DIR>       Data directory (default: ~/.keychat)
 ```
+
+## Headless Secrets
+
+Secrets resolve in priority order (env → file → auto-generate):
+
+| Secret | Env Var | File | Fallback |
+|--------|---------|------|----------|
+| DB key | `KEYCHAT_DB_KEY` | `secrets/dbkey` | OS keyring / auto-gen |
+| Mnemonic | `KEYCHAT_MNEMONIC` | `secrets/mnemonic` | Create new identity |
+| API token | `KEYCHAT_API_TOKEN` | `secrets/api-token` | `kc_` + random hex |
 
 ## HTTP API Reference
 
-### Single-agent mode
+All endpoints require `Authorization: Bearer <token>` header.
+
+### Core Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/events` | SSE stream (message, friend_request) |
-| POST | `/send` | Send 1:1 message `{"to":"...","message":"..."}` |
-| POST | `/send-group` | Send Signal group message `{"group_id":"...","message":"..."}` |
-| POST | `/send-mls-group` | Send MLS group message `{"group_id":"...","message":"..."}` |
-| POST | `/add-friend` | Send friend request `{"npub":"..."}` |
-| POST | `/approve-friend` | Approve pending request `{"npub":"..."}` |
-| POST | `/reject-friend` | Reject pending request `{"npub":"..."}` |
-| GET | `/pending-friends` | List pending friend requests |
-| GET | `/owner` | Get current owner |
-| POST | `/backup-mnemonic` | Backup mnemonic (owner only) `{"owner_npub":"..."}` |
-| GET | `/identity` | Get npub, name, relays |
-| GET | `/peers` | List contacts |
-| GET | `/health` | Liveness check |
+| GET | `/identity` | Agent pubkey, npub, name |
+| GET | `/status` | Connection status |
+| GET | `/rooms` | List chat rooms |
+| GET | `/rooms/{id}/messages` | Message history `?limit=50&offset=0` |
+| GET | `/contacts` | Contact list |
+| POST | `/send` | Send message `{"room_id":"...","text":"..."}` |
+| GET | `/events` | SSE event stream (also accepts `?token=`) |
+| GET | `/relays` | Relay connection status |
+| POST | `/connect` | Connect to relays |
+| POST | `/friend-request` | Send friend request |
+| POST | `/retry` | Retry failed messages |
 
-### Multi-agent mode
+### Agent Endpoints
 
-All per-agent endpoints are prefixed with `/agents/:id/`:
-- `GET /agents` — list all agents
-- `POST /agents` — create new agent `{"id":"...","name":"..."}`
-- `/agents/:id/send`, `/agents/:id/peers`, etc.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/pending-friends` | Pending friend requests |
+| POST | `/approve-friend` | Accept request `{"request_id":"..."}` |
+| POST | `/reject-friend` | Reject request `{"request_id":"..."}` |
+| GET | `/owner` | Current owner pubkey |
+| POST | `/owner` | Transfer ownership |
+| POST | `/backup-mnemonic` | Export mnemonic (owner only) |
+
+### SSE Events
+
+Subscribe: `GET /events` with `Authorization: Bearer <token>` or `?token=<token>`.
+
+| Event | Payload |
+|-------|---------|
+| `message_received` | room_id, sender_pubkey, kind, content, event_id, group_id |
+| `friend_request_received` | request_id, sender_pubkey, sender_name, created_at |
+| `friend_request_accepted` | peer_pubkey, peer_name |
+| `pending_friend_request` | request_id, sender_pubkey, sender_name, created_at |
+| `connection_status_changed` | status, message |
+| `room_updated` | room_id |
+| `message_added` | room_id, msgid |
 
 ## Security
 
-- **Mnemonic**: OS keychain only (macOS Keychain / Linux keyring). Never in config files.
-- **DB key**: Auto-generated, stored in OS keychain.
-- **config.json**: Contains only name, relays, owner, pubkey_hex. No secrets.
-- **Backup**: `POST /backup-mnemonic` requires owner identity verification.
-
-## Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--data-dir` | `~/.local/share/keychat-agent` | Config + DB directory |
-| `--relay` | `wss://nos.lol` | Nostr relay(s), comma-separated |
-| `--listen` | `127.0.0.1:7700` | HTTP listen address |
-| `--auto-accept` | `true` | Auto-accept (with DM Policy) |
-| `--name` | `keychat-agent` | Agent display name |
-| `--multi` | `false` | Multi-agent mode |
+- **Mnemonic**: `secrets/mnemonic` with 0600 permissions, or env var
+- **DB key**: `secrets/dbkey` with 0600 permissions, or OS keyring
+- **API token**: Required for all HTTP access, auto-generated with `kc_` prefix
+- **Transport**: Signal Protocol (PQXDH) end-to-end encryption, NIP-17 gift-wrap on Nostr
