@@ -1,23 +1,26 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use keychat_cli::{commands, daemon, repl, tui};
+use keychat_cli::{agent_daemon, commands, daemon, repl, tui};
 use keychat_uniffi::KeychatClient;
 
 #[derive(Parser)]
 #[command(
     name = "keychat",
     about = "Keychat — E2E encrypted messaging over Nostr",
-    long_about = "Keychat CLI provides three interface modes:\n\n\
+    long_about = "Keychat CLI provides four interface modes:\n\n\
         • tui (default)   — Full terminal UI with room list, messages, and input\n\
         • interactive      — Simple REPL with slash commands\n\
-        • daemon           — HTTP REST API + SSE event stream\n\n\
+        • daemon           — HTTP REST API + SSE event stream\n\
+        • agent            — Headless daemon for AI frameworks\n\n\
         Examples:\n\
         \x20 keychat                          Start TUI mode\n\
         \x20 keychat tui                      Start TUI mode (explicit)\n\
         \x20 keychat interactive              Start REPL mode\n\
         \x20 keychat daemon --port 9000       Start HTTP daemon on port 9000\n\
         \x20 keychat daemon --interactive     Daemon + REPL together\n\
+        \x20 keychat agent                    Start agent on port 10443\n\
+        \x20 keychat agent --name MyBot       Agent with custom name\n\
         \x20 keychat --data-dir /tmp/bob tui  Use custom data directory",
     version
 )]
@@ -44,6 +47,24 @@ enum Commands {
         /// Also start interactive REPL alongside the daemon
         #[arg(long)]
         interactive: bool,
+    },
+    /// Start headless agent daemon for AI frameworks
+    Agent {
+        /// Port to listen on
+        #[arg(long, default_value = "10443")]
+        port: u16,
+        /// Disable auto-accept friend requests
+        #[arg(long)]
+        no_auto_accept: bool,
+        /// Agent display name
+        #[arg(long, default_value = "Keychat Agent")]
+        name: String,
+        /// Relay URLs (comma-separated, overrides defaults)
+        #[arg(long)]
+        relay: Option<String>,
+        /// API authentication token (auto-generated if not provided)
+        #[arg(long)]
+        api_token: Option<String>,
     },
 }
 
@@ -89,6 +110,12 @@ async fn main() -> anyhow::Result<()> {
                 .init();
             tracing::info!("=== keychat-cli started (daemon mode, port {port}) ===");
         }
+        Commands::Agent { port, .. } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+            tracing::info!("=== keychat-cli started (agent mode, port {port}) ===");
+        }
         _ => {
             tracing_subscriber::fmt()
                 .with_env_filter(env_filter)
@@ -97,7 +124,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Ensure data directory exists
+    // Agent mode manages its own client lifecycle
+    if let Commands::Agent {
+        port,
+        no_auto_accept,
+        name,
+        relay,
+        api_token,
+    } = command
+    {
+        agent_daemon::run(cli.data_dir, port, !no_auto_accept, name, relay, api_token).await?;
+        return Ok(());
+    }
+
+    // Standard modes: shared client initialization
     std::fs::create_dir_all(&cli.data_dir)?;
 
     let db_path = format!("{}/protocol.db", cli.data_dir);
@@ -137,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 daemon::run(client, event_tx, data_tx, port).await?;
             }
         }
+        Commands::Agent { .. } => unreachable!(),
     }
 
     Ok(())

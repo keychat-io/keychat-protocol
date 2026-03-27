@@ -34,12 +34,12 @@ struct AppState {
 
 // ─── JSON Envelope ──────────────────────────────────────────────
 
-fn ok_json<T: Serialize>(data: T) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn ok_json<T: Serialize>(data: T) -> (StatusCode, Json<serde_json::Value>) {
     let body = serde_json::json!({ "ok": true, "data": data });
     (StatusCode::OK, Json(body))
 }
 
-fn err_json(status: StatusCode, msg: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn err_json(status: StatusCode, msg: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
     let body = serde_json::json!({ "ok": false, "error": msg.to_string() });
     (status, Json(body))
 }
@@ -48,7 +48,7 @@ fn internal_err(msg: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
     err_json(StatusCode::INTERNAL_SERVER_ERROR, msg)
 }
 
-fn bad_request(msg: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn bad_request(msg: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
     err_json(StatusCode::BAD_REQUEST, msg)
 }
 

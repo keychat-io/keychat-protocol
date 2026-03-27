@@ -78,7 +78,7 @@ fn get_or_create_via_file(data_dir: &str) -> anyhow::Result<String> {
 }
 
 /// Generate a random 32-byte hex string (64 hex chars).
-fn generate_hex_key() -> anyhow::Result<String> {
+pub(crate) fn generate_hex_key() -> anyhow::Result<String> {
     let mut buf = [0u8; 32];
 
     #[cfg(unix)]
@@ -97,7 +97,7 @@ fn generate_hex_key() -> anyhow::Result<String> {
     Ok(bytes_to_hex(&buf))
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         let _ = write!(s, "{b:02x}");
