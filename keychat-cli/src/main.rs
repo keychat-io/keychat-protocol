@@ -30,7 +30,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
     /// Start full terminal UI with room list and message panels (default)
     Tui,
@@ -55,14 +55,47 @@ fn default_data_dir() -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "keychat=info,keychat_uniffi=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+    let command = cli.command.clone().unwrap_or(Commands::Tui);
+
+    // TUI mode: log to file to avoid corrupting the terminal UI
+    // Other modes: log to stderr as usual
+    let default_filter = "keychat=info,keychat_uniffi=info,keychat_cli=info";
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
+
+    match &command {
+        Commands::Tui => {
+            let log_path = format!("{}/keychat.log", cli.data_dir);
+            std::fs::create_dir_all(&cli.data_dir)?;
+            // Truncate log file on each startup to avoid unbounded growth
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(std::sync::Mutex::new(log_file))
+                .with_ansi(false)
+                .init();
+            tracing::info!("=== keychat-cli started (TUI mode) ===");
+            tracing::info!("Log: {log_path}");
+            tracing::info!("Data: {}", cli.data_dir);
+        }
+        Commands::Daemon { port, .. } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+            tracing::info!("=== keychat-cli started (daemon mode, port {port}) ===");
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+            tracing::info!("=== keychat-cli started (interactive mode) ===");
+        }
+    }
 
     // Ensure data directory exists
     std::fs::create_dir_all(&cli.data_dir)?;
@@ -80,9 +113,6 @@ async fn main() -> anyhow::Result<()> {
     let data_listener = commands::CliDataListener::new(data_tx.clone());
     client.set_event_listener(Box::new(event_listener)).await;
     client.set_data_listener(Box::new(data_listener)).await;
-
-    // Default to TUI mode if no subcommand given
-    let command = cli.command.unwrap_or(Commands::Tui);
 
     match command {
         Commands::Tui => {

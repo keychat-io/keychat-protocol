@@ -76,6 +76,32 @@ impl KeychatClient {
         })
     }
 
+    // ─── Settings ──────────────────────────────────────────────
+
+    pub async fn get_setting(&self, key: String) -> Result<Option<String>, KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
+        store.get_setting(&key).map_err(|e| KeychatUniError::Storage {
+            msg: format!("get_setting: {e}"),
+        })
+    }
+
+    pub async fn set_setting(&self, key: String, value: String) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
+        store.set_setting(&key, &value).map_err(|e| KeychatUniError::Storage {
+            msg: format!("set_setting: {e}"),
+        })
+    }
+
+    pub async fn delete_setting(&self, key: String) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
+        store.delete_setting(&key).map_err(|e| KeychatUniError::Storage {
+            msg: format!("delete_setting: {e}"),
+        })
+    }
+
     // ─── Room Queries ────────────────────────────────────────
 
     pub async fn get_rooms(&self, identity_pubkey: String) -> Result<Vec<RoomInfo>, KeychatUniError> {

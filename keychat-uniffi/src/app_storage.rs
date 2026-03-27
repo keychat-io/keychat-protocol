@@ -5,6 +5,7 @@
 //! encrypted SQLite file so libkeychat stays protocol-only.
 
 use libkeychat::error::{KeychatError, Result};
+use rusqlite::params;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
@@ -226,6 +227,11 @@ impl AppStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_app_contacts_identity ON app_contacts(identity_pubkey);
 
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             PRAGMA user_version = 1;
 
             COMMIT;",
@@ -233,6 +239,35 @@ impl AppStorage {
         .map_err(|e| KeychatError::Storage(format!("app migration v0→v1 failed: {e}")))?;
 
         tracing::info!("app migration v0 → v1 complete");
+        Ok(())
+    }
+
+    // ─── App Settings CRUD ──────────────────────────────
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM app_settings WHERE key = ?1",
+        ).map_err(|e| KeychatError::Storage(format!("get_setting prepare: {e}")))?;
+
+        let result = stmt.query_row(params![key], |row| row.get(0)).optional()
+            .map_err(|e| KeychatError::Storage(format!("get_setting: {e}")))?;
+        Ok(result)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        ).map_err(|e| KeychatError::Storage(format!("set_setting: {e}")))?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM app_settings WHERE key = ?1",
+            params![key],
+        ).map_err(|e| KeychatError::Storage(format!("delete_setting: {e}")))?;
         Ok(())
     }
 

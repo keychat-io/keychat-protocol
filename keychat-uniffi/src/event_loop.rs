@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use libkeychat::{
     receive_friend_request, receive_group_invite, receive_signal_message,
-    serialize_prekey_material, AddressManager, ChatSession, DeviceId, Event, KCMessageKind, Kind,
+    serialize_prekey_material, AddressManager, ChatSession, Event, KCMessageKind, Kind,
     ProtocolAddress, PublicKey, RelayMessage, RelayPoolNotification, Timestamp,
 };
 

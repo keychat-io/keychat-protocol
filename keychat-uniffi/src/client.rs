@@ -75,12 +75,12 @@ impl KeychatClient {
             } else {
                 tracing::Level::INFO
             };
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_max_level(level)
                 .with_target(true)
                 .with_thread_names(true)
                 .without_time() // os_log already timestamps
-                .init();
+                .try_init();
         });
 
         let storage = SecureStorage::open(&db_path, &db_key)?;

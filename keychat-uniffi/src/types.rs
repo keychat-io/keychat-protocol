@@ -98,6 +98,14 @@ pub struct SignalGroupInfo {
 }
 
 #[derive(uniffi::Record)]
+pub struct GroupMemberInfo {
+    pub nostr_pubkey: String,
+    pub name: String,
+    pub is_admin: bool,
+    pub is_me: bool,
+}
+
+#[derive(uniffi::Record)]
 pub struct GroupSentMessage {
     pub group_id: String,
     pub event_ids: Vec<String>,
