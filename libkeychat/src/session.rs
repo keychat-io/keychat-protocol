@@ -136,18 +136,9 @@ impl ChatSession {
             KeychatError::Signal("decrypted content is not a valid KCMessage v2".into())
         })?;
 
-        let received_on = event
-            .tags
-            .iter()
-            .find_map(|tag| {
-                let values = tag.as_slice();
-                if values.len() >= 2 && values[0] == "p" {
-                    Some(values[1].clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        // Extract p-tags (§3.6: may contain dual p-tags for public agent routing)
+        let p_tags = crate::chat::extract_p_tags(event);
+        let received_on = p_tags.first().cloned().unwrap_or_default();
 
         let metadata = MessageMetadata {
             is_prekey_message: is_prekey,
@@ -155,6 +146,7 @@ impl ChatSession {
             event_id: event.id,
             event_pubkey: event.pubkey,
             received_on_address: received_on,
+            p_tags,
         };
 
         tracing::info!(
