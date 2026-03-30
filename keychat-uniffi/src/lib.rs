@@ -6,6 +6,7 @@ mod error;
 mod event_loop;
 mod friend_request;
 mod group;
+mod media;
 mod messaging;
 mod relay_tracker;
 mod types;
