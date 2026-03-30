@@ -123,6 +123,33 @@ impl KeychatClient {
         })
     }
 
+    // ─── Media Upload/Download (delegates to free functions, runs in client's runtime) ──
+
+    /// Encrypt and upload data to a Blossom server.
+    /// This is a method wrapper around the free function `encrypt_and_upload`,
+    /// ensuring it runs in the client's tokio runtime (needed for Swift/UniFFI).
+    pub async fn upload_encrypted(
+        &self,
+        plaintext: Vec<u8>,
+        server_url: String,
+    ) -> Result<crate::media::FileUploadResult, KeychatUniError> {
+        crate::media::encrypt_and_upload(plaintext, server_url).await
+    }
+
+    /// Download and decrypt data from a Blossom server.
+    /// Method wrapper around the free function `download_and_decrypt`.
+    pub async fn download_decrypted(
+        &self,
+        url: String,
+        key: String,
+        iv: String,
+        hash: String,
+    ) -> Result<Vec<u8>, KeychatUniError> {
+        crate::media::download_and_decrypt(url, key, iv, hash).await
+    }
+
+    // ─── Identity ──
+
     pub async fn create_identity(&self) -> Result<CreateIdentityResult, KeychatUniError> {
         let result = Identity::generate().map_err(|e| {
             tracing::error!("create_identity failed: {e}");
