@@ -72,6 +72,36 @@ pub fn decrypt_file_data(
         })
 }
 
+// ─── Blossom upload authorization ───────────────────────────────
+
+/// Sign a Blossom (BUD-01) upload authorization event (kind 24242).
+///
+/// Uses an ephemeral secp256k1 keypair — does not expose the user's identity.
+/// Returns a base64-encoded signed Nostr event JSON, ready for the
+/// `Authorization: Nostr <base64>` header.
+#[uniffi::export]
+pub fn sign_blossom_upload_auth(hash: String) -> Result<String, KeychatUniError> {
+    use nostr::prelude::*;
+
+    // Ephemeral keypair — no identity leak
+    let keys = Keys::generate();
+    let expiration = Timestamp::now() + 30 * 24 * 3600; // 30 days
+
+    let event = EventBuilder::new(Kind::Custom(24242), &hash)
+        .tag(Tag::custom(TagKind::t(), vec!["upload"]))
+        .tag(Tag::custom(TagKind::Custom("x".into()), vec![hash.clone()]))
+        .tag(Tag::expiration(expiration))
+        .sign_with_keys(&keys)
+        .map_err(|e| KeychatUniError::Crypto {
+            msg: format!("Failed to sign Blossom auth event: {e}"),
+        })?;
+
+    let json = event.as_json();
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    Ok(b64)
+}
+
 // ─── FileCategory conversion helpers ────────────────────────────
 
 /// Convert a reference to uniffi FileCategory to libkeychat FileCategory.
