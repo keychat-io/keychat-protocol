@@ -16,8 +16,8 @@ use axum::{
     Router,
 };
 use keychat_uniffi::{
-    ClientEvent, ConnectionStatus, DataChange, GroupChangeKind, GroupMemberInput, KeychatClient,
-    MessageKind, MessageStatus, RoomStatus, RoomType,
+    ClientEvent, ConnectionStatus, DataChange, FileCategory, GroupChangeKind, GroupMemberInput,
+    KeychatClient, MessageKind, MessageStatus, RoomStatus, RoomType,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -162,6 +162,7 @@ pub fn build_router(
         .route("/friend-request/reject", post(reject_friend_request))
         // Messaging
         .route("/send", post(send_message))
+        .route("/send-file", post(send_file))
         .route("/rooms", get(list_rooms))
         .route("/rooms/{room_id}/messages", get(get_messages))
         .route("/retry", post(retry_failed))
@@ -429,6 +430,99 @@ async fn send_message(
             bad_request(keychat_uniffi::KeychatUniError::InvalidArgument {
                 msg: "MLS groups not yet supported".into(),
             })
+        }
+        Err(e) => bad_request(e),
+    }
+}
+
+// ─── Send File ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SendFileReq {
+    room_id: String,
+    /// Local file paths to upload and send.
+    file_paths: Vec<String>,
+    /// Optional text message to include with the files.
+    #[serde(default)]
+    message: Option<String>,
+    /// Blossom server URL (optional, defaults to blossom.band).
+    #[serde(default)]
+    server: Option<String>,
+}
+
+fn file_category_str(c: &FileCategory) -> &'static str {
+    match c {
+        FileCategory::Image => "image",
+        FileCategory::Video => "video",
+        FileCategory::Voice => "voice",
+        FileCategory::Audio => "audio",
+        FileCategory::Document => "document",
+        FileCategory::Text => "text",
+        FileCategory::Archive => "archive",
+        FileCategory::Other => "other",
+    }
+}
+
+async fn send_file(
+    State(state): State<AppState>,
+    Json(req): Json<SendFileReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if req.file_paths.is_empty() {
+        return bad_request("file_paths cannot be empty");
+    }
+
+    let server = req
+        .server
+        .unwrap_or_else(|| "https://blossom.band".to_string());
+
+    // Upload each file
+    let mut payloads = Vec::with_capacity(req.file_paths.len());
+    for path_str in &req.file_paths {
+        let path = std::path::Path::new(path_str);
+        if !path.exists() {
+            return bad_request(format!("File not found: {path_str}"));
+        }
+        match crate::commands::upload_and_prepare_file(path, &server).await {
+            Ok(payload) => payloads.push(payload),
+            Err(e) => return bad_request(format!("Upload failed for {path_str}: {e}")),
+        }
+    }
+
+    // Build summary before sending (payloads will be moved)
+    let files_json: Vec<_> = payloads
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "url": p.url,
+                "category": file_category_str(&p.category),
+                "size": p.size,
+                "source_name": p.source_name,
+            })
+        })
+        .collect();
+
+    // Send the file message
+    match crate::commands::send_file_message(&state.client, &req.room_id, payloads, req.message)
+        .await
+    {
+        Ok(crate::commands::SendResult::Dm {
+            event_id,
+            relay_count,
+        }) => {
+            ok_json(serde_json::json!({
+                "event_id": event_id,
+                "relay_count": relay_count,
+                "files": files_json,
+            }))
+        }
+        Ok(crate::commands::SendResult::Group { event_count }) => {
+            ok_json(serde_json::json!({
+                "type": "group",
+                "event_count": event_count,
+            }))
+        }
+        Ok(crate::commands::SendResult::MlsNotSupported) => {
+            bad_request("MLS groups not yet supported")
         }
         Err(e) => bad_request(e),
     }

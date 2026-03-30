@@ -18,6 +18,8 @@ pub enum KeychatUniError {
     Serialization { msg: String },
     #[error("Media crypto error: {msg}")]
     MediaCrypto { msg: String },
+    #[error("Media transfer error: {msg}")]
+    MediaTransfer { msg: String },
     #[error("Peer not found: {peer_id}")]
     PeerNotFound { peer_id: String },
     #[error("Invalid argument: {msg}")]

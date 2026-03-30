@@ -6,13 +6,17 @@ mod error;
 mod event_loop;
 mod friend_request;
 mod group;
-mod media;
+pub mod media;
 mod messaging;
 mod relay_tracker;
 mod types;
 
 pub use client::KeychatClient;
 pub use error::KeychatUniError;
+pub use media::{
+    encrypt_and_upload, download_and_decrypt, encrypt_file_data, decrypt_file_data,
+    sign_blossom_upload_auth, EncryptedFileResult, FileUploadResult,
+};
 pub use types::*;
 
 uniffi::setup_scaffolding!();

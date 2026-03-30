@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use chrono::TimeZone;
 use keychat_uniffi::{
-    ClientEvent, DataChange, DataListener, EventListener, KeychatClient, KeychatUniError, RoomType,
+    ClientEvent, DataChange, DataListener, EventListener, FileCategory, FilePayload,
+    KeychatClient, KeychatUniError, RoomType,
 };
 use tokio::sync::broadcast;
 
@@ -197,6 +198,117 @@ pub async fn send_message(
         event_id: result.event_id,
         relay_count: result.connected_relays.len(),
     })
+}
+
+/// Send a file message to a room, handling DM vs Signal Group vs MLS routing.
+/// `files` contains pre-uploaded FilePayload items (already encrypted + uploaded to Blossom).
+pub async fn send_file_message(
+    client: &KeychatClient,
+    room_id: &str,
+    files: Vec<FilePayload>,
+    message: Option<String>,
+) -> Result<SendResult, KeychatUniError> {
+    if files.is_empty() {
+        return Err(KeychatUniError::InvalidArgument {
+            msg: "files list cannot be empty".into(),
+        });
+    }
+
+    // For now, send_file only supports DM rooms.
+    // Signal group file sending can be added when the FFI supports it.
+    let result = client
+        .send_file(room_id.to_string(), files, message, None)
+        .await?;
+    Ok(SendResult::Dm {
+        event_id: result.event_id,
+        relay_count: result.connected_relays.len(),
+    })
+}
+
+/// Upload a local file and return the FilePayload ready for sending.
+/// Reads the file, encrypts + uploads via Blossom, and builds the FilePayload.
+pub async fn upload_and_prepare_file(
+    file_path: &Path,
+    server_url: &str,
+) -> Result<FilePayload, KeychatUniError> {
+    let data = fs::read(file_path).map_err(|e| KeychatUniError::InvalidArgument {
+        msg: format!("Failed to read file {}: {e}", file_path.display()),
+    })?;
+
+    let result =
+        keychat_uniffi::encrypt_and_upload(data, server_url.to_string()).await?;
+
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let category = category_from_extension(ext);
+    let mime_type = mime_from_extension(ext);
+
+    Ok(FilePayload {
+        category,
+        url: result.url,
+        mime_type,
+        suffix: if ext.is_empty() { None } else { Some(ext.to_string()) },
+        size: result.encrypted_size,
+        key: result.key,
+        iv: result.iv,
+        hash: result.hash,
+        source_name: file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string()),
+        audio_duration: None,
+        amplitude_samples: None,
+    })
+}
+
+/// Map file extension to FileCategory.
+fn category_from_extension(ext: &str) -> FileCategory {
+    match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "bmp" | "svg" => {
+            FileCategory::Image
+        }
+        "mp4" | "mov" | "avi" | "mkv" | "webm" => FileCategory::Video,
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" => FileCategory::Audio,
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" => FileCategory::Document,
+        "txt" | "md" | "csv" | "json" | "xml" | "yaml" | "yml" | "toml" => FileCategory::Text,
+        "zip" | "tar" | "gz" | "rar" | "7z" | "bz2" => FileCategory::Archive,
+        _ => FileCategory::Other,
+    }
+}
+
+/// Map file extension to MIME type.
+fn mime_from_extension(ext: &str) -> Option<String> {
+    let mime = match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        _ => return None,
+    };
+    Some(mime.to_string())
 }
 
 /// Create identity with full persistence: save to app storage + save mnemonic.

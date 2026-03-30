@@ -140,6 +140,7 @@ async fn dispatch(
         "/rooms" => cmd_rooms(&client).await?,
         "/read" => cmd_read(&client, active_room_id).await?,
         "/history" => cmd_history(&client, args, active_room_id).await?,
+        "/sendfile" => cmd_sendfile(&client, args, active_room_id).await?,
 
         // ── Signal Groups ──
         "/sg-create" => cmd_sg_create(&client, args).await?,
@@ -682,6 +683,79 @@ async fn send_chat_message(
     Ok(false)
 }
 
+// ─── File Transfer ──────────────────────────────────────────────
+
+async fn cmd_sendfile(
+    client: &KeychatClient,
+    args: &str,
+    active_room_id: &Option<String>,
+) -> anyhow::Result<()> {
+    let room_id = match active_room_id {
+        Some(id) => id.clone(),
+        None => {
+            print_err("No active chat. Use /chat <room_id> first.");
+            return Ok(());
+        }
+    };
+
+    let paths: Vec<&str> = args.split_whitespace().collect();
+    if paths.is_empty() {
+        print_err("Usage: /sendfile <path> [path...]");
+        return Ok(());
+    }
+
+    let server = "https://blossom.band".to_string();
+    let mut payloads = Vec::with_capacity(paths.len());
+
+    for path_str in &paths {
+        let path = std::path::Path::new(path_str);
+        if !path.exists() {
+            print_err(&format!("File not found: {path_str}"));
+            return Ok(());
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path_str);
+        print_sys(&format!("Uploading {}...", file_name));
+        match crate::commands::upload_and_prepare_file(path, &server).await {
+            Ok(payload) => {
+                print_ok(&format!(
+                    "Uploaded {} ({} bytes)",
+                    file_name, payload.size
+                ));
+                payloads.push(payload);
+            }
+            Err(e) => {
+                print_err(&format!("Upload failed for {file_name}: {e}"));
+                return Ok(());
+            }
+        }
+    }
+
+    match crate::commands::send_file_message(client, &room_id, payloads, None).await? {
+        crate::commands::SendResult::Dm {
+            event_id,
+            relay_count,
+        } => {
+            print_ok(&format!(
+                "File message sent [{}] → {} relay(s)",
+                short_key(&event_id).dimmed(),
+                relay_count
+            ));
+        }
+        crate::commands::SendResult::Group { event_count } => {
+            print_ok(&format!(
+                "File message sent to group ({event_count} event(s))"
+            ));
+        }
+        crate::commands::SendResult::MlsNotSupported => {
+            print_err("MLS groups are not yet supported.");
+        }
+    }
+    Ok(())
+}
+
 // ─── Signal Group commands ──────────────────────────────────────
 
 async fn cmd_sg_create(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
@@ -1079,6 +1153,10 @@ fn print_help() {
     println!(
         "    {}  Show message history",
         "/history [count]".green()
+    );
+    println!(
+        "    {}  Send file(s) to active chat",
+        "/sendfile <path> [path...]".green()
     );
     println!(
         "    {}",
