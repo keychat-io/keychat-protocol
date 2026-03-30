@@ -189,6 +189,16 @@ Kind 1059 Event:
   content:     base64(signal_or_mls_ciphertext)
 ```
 
+**Public Agent mode** (§3.6): When the receiver has declared `publicAgent: true`, the sender adds a second `p`-tag with the receiver's npub:
+
+```
+Kind 1059 Event (Public Agent mode):
+  pubkey:      ephemeral one-time key
+  created_at:  real current timestamp
+  tags:        [["p", <ratchet_derived_address>], ["p", <agent_npub>]]
+  content:     base64(signal_ciphertext)
+```
+
 **Note**: Unlike NIP-17 Gift Wrap, Mode 1 uses the **real timestamp** — no random offset. The content is already encrypted by Signal/MLS, so timestamp randomization provides no additional privacy benefit.
 
 Used for:
@@ -253,6 +263,7 @@ Used only for MLS large groups. Each member derives a shared receiving address (
 
 #### Subscription Filter
 
+Normal client:
 ```json
 {
   "kinds": [1059],
@@ -264,6 +275,15 @@ Used only for MLS large groups. Each member derives a shared receiving address (
     "<mls_temp_inbox_group1>", "<mls_temp_inbox_group2>",
     ...
   ],
+  "since": <unix_timestamp>
+}
+```
+
+Public Agent (§3.6): only subscribes to its own npub:
+```json
+{
+  "kinds": [1059],
+  "#p": ["<agent_npub>"],
   "since": <unix_timestamp>
 }
 ```
@@ -280,10 +300,85 @@ Received kind 1059 event:
   ├── p-tag matches a Signal ratchet receiving address?
   │     → Signal message (Mode 1), decrypt with Signal Protocol
   │
+  ├── Public Agent mode: event has dual p-tags (§3.6)?
+  │     → Extract the non-npub p-tag as ratchet address
+  │     → Match ratchet address to room → decrypt with Signal Protocol
+  │
   └── Neither?
         → Try NIP-17 Gift Wrap unwrap (Mode 2)
         → Parse KCMessage.kind to route (friendRequest, mlsGroupInvite, etc.)
 ```
+
+### 3.6 Public Agent Routing
+
+#### Problem
+
+In normal Keychat operation, each peer's Signal ratchet produces unique receiving addresses that rotate on every direction change. The receiver must subscribe to all active ratchet addresses across all peers — typically a sliding window of 2–3 addresses per peer.
+
+For a regular user with dozens of contacts, this is manageable. But a **public agent** — an agent that accepts friend requests from anyone and may serve thousands or tens of thousands of concurrent peers — faces a fundamentally different scaling challenge:
+
+- **Subscription explosion**: With 10,000 peers × 2 addresses each = 20,000 addresses in the relay subscription filter. Nostr relays are not designed for filters of this magnitude; query performance degrades, and some relays impose filter size limits.
+- **State management**: The agent must track, rotate, and garbage-collect addresses for every peer. A restart requires reconstructing the full subscription set from persistent state.
+- **Relay reconnection**: On any relay reconnect, the agent must resubmit the entire address set. This becomes a bottleneck proportional to peer count.
+
+The ratchet-derived address mechanism provides unlinkability — an observer cannot correlate messages from different peers to the same receiver. But a public agent's identity is already public by definition; there is no unlinkability to protect. The privacy cost of revealing the receiver's npub is zero.
+
+#### Solution: Dual p-tag
+
+When a sender knows the receiver is a public agent, it includes **two `p`-tags** in the kind 1059 event:
+
+```
+tags: [["p", <ratchet_derived_address>], ["p", <agent_npub>]]
+```
+
+- **First `p`-tag** (`ratchet_derived_address`): The standard ratchet-derived address for this peer. Used by the agent to **route the message to the correct room/session**. The ratchet continues to operate normally — addresses rotate, sliding windows are maintained — but they are used for routing only, not for relay subscription.
+- **Second `p`-tag** (`agent_npub`): The agent's permanent Nostr identity pubkey. This is the **only address the agent subscribes to** on relays.
+
+The agent's relay subscription reduces to O(1) regardless of peer count:
+
+```json
+{ "kinds": [1059], "#p": ["<agent_npub>"], "since": <timestamp> }
+```
+
+Upon receiving an event, the agent inspects the `p`-tags, ignores its own npub, and matches the remaining ratchet address to a room — exactly as it would in normal mode.
+
+#### Signaling
+
+A public agent declares its mode in the `friendApprove` message by including a `publicAgent` field:
+
+```json
+{
+  "v": 2,
+  "kind": "friendApprove",
+  "friendApprove": {
+    "requestId": "fr-uuid-001",
+    "message": "Welcome!",
+    "publicAgent": true
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `publicAgent` | `bool` | No | If `true`, the sender requests dual p-tag routing. Default: `false`. |
+
+The receiving client MUST persist this flag on the room. All subsequent Mode 1 messages to this peer MUST include the dual `p`-tag.
+
+#### Backward Compatibility
+
+- **Old client → new agent**: The old client does not recognize `publicAgent`, ignores the field, and continues sending single `p`-tag messages. The agent MUST maintain a fallback subscription for ratchet addresses of peers that have not adopted dual `p`-tag. Over time, as clients upgrade, the fallback set shrinks to zero.
+- **New client → old agent**: The new client sends dual `p`-tags. The relay delivers the event because it matches the ratchet address (which the old agent subscribes to). The extra `p`-tag is harmless — the old agent ignores it.
+- **No protocol break**: Dual `p`-tag is purely additive. Clients that do not understand it work exactly as before.
+
+#### Privacy Considerations
+
+The second `p`-tag reveals the receiver's npub to relay operators and network observers. This is an acceptable trade-off because:
+
+1. Public agents are discoverable by design — their npub is published for anyone to initiate contact.
+2. The message content remains fully encrypted by Signal Protocol — only the receiver identity is exposed, not the sender or the payload.
+3. Users communicating with each other (non-agent) continue to use single `p`-tag with full unlinkability.
+
+This mode SHOULD NOT be used for 1:1 communication between regular users.
 
 ---
 
@@ -528,13 +623,14 @@ The prekey bundle for establishing a Signal session with PQXDH. Sent via NIP-17 
 #### KCFriendApprovePayload / KCFriendRejectPayload
 
 ```json
-{ "requestId": "fr-uuid-001", "message": "Nice to meet you!" }
+{ "requestId": "fr-uuid-001", "message": "Nice to meet you!", "publicAgent": true }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `requestId` | `string` | Yes | The `KCMessage.id` of the original friendRequest |
 | `message` | `string?` | No | Optional text |
+| `publicAgent` | `bool?` | No | If `true`, receiver is a public agent — sender should use dual `p`-tag routing (§3.6). Default: `false`. |
 
 #### KCCashuPayload
 

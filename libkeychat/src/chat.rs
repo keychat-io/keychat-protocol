@@ -34,7 +34,12 @@ pub struct MessageMetadata {
     /// The ephemeral sender pubkey from the Nostr event (NOT the real sender).
     pub event_pubkey: PublicKey,
     /// Which p-tag address this event was delivered to.
+    /// For dual p-tag (Public Agent mode, §3.6), this is the ratchet-derived address
+    /// (first p-tag), used for room routing.
     pub received_on_address: String,
+    /// All p-tag values from the event. For normal messages this contains one address;
+    /// for Public Agent mode (§3.6) this contains two: [ratchet_address, agent_npub].
+    pub p_tags: Vec<String>,
 }
 
 // ─── MessageAction (KCMessage routing) ──────────────────────────────────────
@@ -219,19 +224,9 @@ pub fn receive_encrypted_message(
         is_prekey
     );
 
-    // Extract the p-tag receiving address
-    let received_on = event
-        .tags
-        .iter()
-        .find_map(|tag| {
-            let values = tag.as_slice();
-            if values.len() >= 2 && values[0] == "p" {
-                Some(values[1].clone())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    // Extract p-tags (§3.6: may contain dual p-tags for public agent routing)
+    let p_tags = extract_p_tags(event);
+    let received_on = p_tags.first().cloned().unwrap_or_default();
 
     let metadata = MessageMetadata {
         is_prekey_message: is_prekey,
@@ -239,6 +234,7 @@ pub fn receive_encrypted_message(
         event_id: event.id,
         event_pubkey: event.pubkey,
         received_on_address: received_on,
+        p_tags,
     };
 
     Ok((message, metadata))
@@ -276,18 +272,9 @@ pub fn receive_encrypted_message_flexible(
 
     let message = KCMessage::try_parse(&plaintext_str);
 
-    let received_on = event
-        .tags
-        .iter()
-        .find_map(|tag| {
-            let values = tag.as_slice();
-            if values.len() >= 2 && values[0] == "p" {
-                Some(values[1].clone())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    // Extract p-tags (§3.6: may contain dual p-tags for public agent routing)
+    let p_tags = extract_p_tags(event);
+    let received_on = p_tags.first().cloned().unwrap_or_default();
 
     let metadata = MessageMetadata {
         is_prekey_message: is_prekey,
@@ -295,6 +282,7 @@ pub fn receive_encrypted_message_flexible(
         event_id: event.id,
         event_pubkey: event.pubkey,
         received_on_address: received_on,
+        p_tags,
     };
 
     Ok((message, plaintext_str, metadata))
@@ -383,17 +371,59 @@ pub fn parse_and_route(plaintext: &str) -> MessageAction {
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
+/// Extract all p-tag values from a Nostr event.
+///
+/// For normal messages, returns a single ratchet-derived address.
+/// For Public Agent mode (§3.6), returns two values: [ratchet_address, agent_npub].
+/// The first p-tag is always the ratchet address used for room routing.
+pub fn extract_p_tags(event: &Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let values = tag.as_slice();
+            if values.len() >= 2 && values[0] == "p" {
+                Some(values[1].clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Build a kind:1059 Mode 1 event with ephemeral sender and base64 content.
 /// Build a Mode 1 event (kind:1059, base64 ciphertext, p-tag to receiver).
 /// Shared by chat, group, session, friend_request modules.
 pub async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Event> {
+    build_mode1_event_with_routing(ciphertext, to_address, None).await
+}
+
+/// Build a Mode 1 event with optional Public Agent routing (§3.6).
+///
+/// When `agent_npub` is `Some`, the event includes dual p-tags:
+///   `[["p", <ratchet_address>], ["p", <agent_npub>]]`
+/// The agent subscribes only to its npub, then uses the ratchet address for room routing.
+///
+/// When `agent_npub` is `None`, behaves identically to `build_mode1_event`.
+pub async fn build_mode1_event_with_routing(
+    ciphertext: &[u8],
+    to_address: &str,
+    agent_npub: Option<&str>,
+) -> Result<Event> {
     let sender = EphemeralKeypair::generate();
     let content = base64::engine::general_purpose::STANDARD.encode(ciphertext);
     let to_pubkey = PublicKey::from_hex(to_address)
         .map_err(|e| KeychatError::Signal(format!("invalid to_address: {e}")))?;
 
-    let event = EventBuilder::new(Kind::GiftWrap, &content)
-        .tag(Tag::public_key(to_pubkey))
+    let mut builder = EventBuilder::new(Kind::GiftWrap, &content).tag(Tag::public_key(to_pubkey));
+
+    if let Some(npub_hex) = agent_npub {
+        let npub_pubkey = PublicKey::from_hex(npub_hex)
+            .map_err(|e| KeychatError::Signal(format!("invalid agent_npub: {e}")))?;
+        builder = builder.tag(Tag::public_key(npub_pubkey));
+    }
+
+    let event = builder
         .sign(sender.keys())
         .await
         .map_err(|e| KeychatError::Signal(format!("failed to sign event: {e}")))?;
@@ -1047,6 +1077,52 @@ mod tests {
         // Both should be valid 64-char hex pubkeys
         assert_eq!(event1.pubkey.to_hex().len(), 64);
         assert_eq!(event2.pubkey.to_hex().len(), 64);
+    }
+
+    // ─── Test: Public Agent dual p-tag (§3.6) ─────────────────────────────
+
+    #[tokio::test]
+    async fn build_mode1_event_dual_p_tag() {
+        let ratchet_addr = EphemeralKeypair::generate().pubkey_hex();
+        let agent_npub = EphemeralKeypair::generate().pubkey_hex();
+
+        // Normal mode: single p-tag
+        let event_normal = build_mode1_event(b"ciphertext", &ratchet_addr).await.unwrap();
+        let p_tags_normal = extract_p_tags(&event_normal);
+        assert_eq!(p_tags_normal.len(), 1);
+        assert_eq!(p_tags_normal[0], ratchet_addr);
+
+        // Public Agent mode: dual p-tags
+        let event_dual =
+            build_mode1_event_with_routing(b"ciphertext", &ratchet_addr, Some(&agent_npub))
+                .await
+                .unwrap();
+        let p_tags_dual = extract_p_tags(&event_dual);
+        assert_eq!(p_tags_dual.len(), 2);
+        assert_eq!(p_tags_dual[0], ratchet_addr, "first p-tag should be ratchet address");
+        assert_eq!(p_tags_dual[1], agent_npub, "second p-tag should be agent npub");
+    }
+
+    #[test]
+    fn friend_approve_public_agent_serialization() {
+        let msg = KCMessage::friend_approve_public_agent("fr-001".into(), Some("Welcome".into()));
+        let json = msg.to_json().unwrap();
+        assert!(json.contains("\"publicAgent\":true"), "should contain publicAgent field");
+
+        let parsed = KCMessage::try_parse(&json).unwrap();
+        let payload = parsed.friend_approve.unwrap();
+        assert_eq!(payload.public_agent, Some(true));
+    }
+
+    #[test]
+    fn friend_approve_without_public_agent() {
+        let msg = KCMessage::friend_approve("fr-002".into(), None);
+        let json = msg.to_json().unwrap();
+        assert!(!json.contains("publicAgent"), "should not contain publicAgent when None");
+
+        let parsed = KCMessage::try_parse(&json).unwrap();
+        let payload = parsed.friend_approve.unwrap();
+        assert_eq!(payload.public_agent, None);
     }
 
     /// Helper to create an empty KCMessage shell.

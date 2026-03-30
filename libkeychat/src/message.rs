@@ -293,6 +293,11 @@ pub struct KCFriendApprovePayload {
     pub request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// If `true`, the approver is a public agent and requests dual p-tag routing (§3.6).
+    /// The sender should include both the ratchet-derived address and the agent's npub
+    /// in subsequent Mode 1 events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_agent: Option<bool>,
 }
 
 /// Friend reject payload (§4.5).
@@ -479,6 +484,23 @@ impl KCMessage {
             friend_approve: Some(KCFriendApprovePayload {
                 request_id,
                 message,
+                public_agent: None,
+            }),
+            ..Self::empty()
+        }
+    }
+
+    /// Create a friend approve message for a public agent (§3.6).
+    /// Sets `publicAgent: true` to signal dual p-tag routing.
+    pub fn friend_approve_public_agent(request_id: String, message: Option<String>) -> Self {
+        Self {
+            v: 2,
+            id: Some(uuid_v4()),
+            kind: KCMessageKind::FriendApprove,
+            friend_approve: Some(KCFriendApprovePayload {
+                request_id,
+                message,
+                public_agent: Some(true),
             }),
             ..Self::empty()
         }
