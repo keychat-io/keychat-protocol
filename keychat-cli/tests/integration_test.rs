@@ -468,3 +468,132 @@ async_test!(test_daemon_rooms_route_empty, {
         .await
         .unwrap();
 });
+
+// ─── File Attachments Integration ──────────────────────────────
+
+async_test!(test_file_attachments_send_path, {
+    let dir = tempfile::tempdir().unwrap();
+    // Create subdir structure so files_dir resolves correctly
+    let db_dir = dir.path().join("libkeychat");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("test.db").to_str().unwrap().to_string();
+
+    let client = KeychatClient::new(db_path.clone(), "test-key".into()).unwrap();
+    let files_dir = client.get_files_dir();
+
+    // 1. save_file_locally — simulates the send path
+    let test_data = b"fake image data for testing".to_vec();
+    let room_id = "room123".to_string();
+    let file_name = "photo_12345.jpg".to_string();
+
+    let abs_path = client.save_file_locally(
+        test_data.clone(), file_name.clone(), room_id.clone()
+    ).unwrap();
+
+    // Verify file exists on disk
+    assert!(std::path::Path::new(&abs_path).exists());
+    assert_eq!(std::fs::read(&abs_path).unwrap(), test_data);
+
+    // 2. upsert_attachment — record sent file
+    let msgid = "evt-send-001".to_string();
+    let file_hash = "abc123hash".to_string();
+    let relative_path = format!("{room_id}/{file_name}");
+
+    client.upsert_attachment(
+        msgid.clone(), file_hash.clone(), room_id.clone(),
+        Some(relative_path.clone()), 2
+    ).await.unwrap();
+
+    // 3. resolve_local_file — should find it
+    let resolved = client.resolve_local_file(msgid.clone(), file_hash.clone()).await;
+    assert!(resolved.is_some(), "resolve_local_file should find the file");
+    assert_eq!(resolved.unwrap(), abs_path);
+
+    // 4. Non-existent hash — should return None
+    let missing = client.resolve_local_file(msgid.clone(), "nonexistent".to_string()).await;
+    assert!(missing.is_none());
+
+    // 5. Multi-file: same msgid, different hashes
+    let file_name_b = "doc_67890.pdf".to_string();
+    let test_data_b = b"fake pdf data".to_vec();
+    let abs_path_b = client.save_file_locally(
+        test_data_b.clone(), file_name_b.clone(), room_id.clone()
+    ).unwrap();
+    let relative_path_b = format!("{room_id}/{file_name_b}");
+    let hash_b = "def456hash".to_string();
+
+    client.upsert_attachment(
+        msgid.clone(), hash_b.clone(), room_id.clone(),
+        Some(relative_path_b), 2
+    ).await.unwrap();
+
+    // Both files should resolve independently
+    let resolved_a = client.resolve_local_file(msgid.clone(), file_hash.clone()).await;
+    let resolved_b = client.resolve_local_file(msgid.clone(), hash_b.clone()).await;
+    assert!(resolved_a.is_some());
+    assert!(resolved_b.is_some());
+    assert_eq!(resolved_a.unwrap(), abs_path);
+    assert_eq!(resolved_b.unwrap(), abs_path_b);
+
+    // 6. Audio played state
+    assert!(!client.is_audio_played(msgid.clone(), file_hash.clone()).await);
+    client.set_audio_played(msgid.clone(), file_hash.clone()).await.unwrap();
+    assert!(client.is_audio_played(msgid.clone(), file_hash.clone()).await);
+
+    // 7. Pending state — should NOT resolve
+    let pending_hash = "pending123".to_string();
+    client.upsert_attachment(
+        "msg-pending".to_string(), pending_hash.clone(), room_id.clone(),
+        None, 0  // transfer_state = 0 (pending)
+    ).await.unwrap();
+    let pending_resolve = client.resolve_local_file("msg-pending".to_string(), pending_hash).await;
+    assert!(pending_resolve.is_none(), "pending attachment should not resolve");
+
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
+});
+
+async_test!(test_file_attachments_download_path, {
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join("libkeychat");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("test.db").to_str().unwrap().to_string();
+
+    let client = KeychatClient::new(db_path, "test-key".into()).unwrap();
+    let files_dir = client.get_files_dir();
+
+    let room_id = "room-dl-test".to_string();
+    let msgid = "evt-dl-001".to_string();
+    let hash = "dlhash789".to_string();
+    let file_name = "received_99999.jpg";
+    let relative_path = format!("{room_id}/{file_name}");
+
+    // Simulate what download_and_save does: write file + upsert record
+    let room_dir = std::path::Path::new(&files_dir).join(&room_id);
+    std::fs::create_dir_all(&room_dir).unwrap();
+    let file_path = room_dir.join(file_name);
+    std::fs::write(&file_path, b"decrypted image bytes").unwrap();
+
+    client.upsert_attachment(
+        msgid.clone(), hash.clone(), room_id.clone(),
+        Some(relative_path), 2
+    ).await.unwrap();
+
+    // Resolve should return absolute path
+    let resolved = client.resolve_local_file(msgid.clone(), hash.clone()).await;
+    assert!(resolved.is_some());
+    let abs = resolved.unwrap();
+    assert!(abs.contains(&room_id));
+    assert!(abs.contains(file_name));
+    assert!(std::path::Path::new(&abs).exists());
+
+    // Delete file from disk — resolve should return None
+    std::fs::remove_file(&file_path).unwrap();
+    let resolved_after_delete = client.resolve_local_file(msgid.clone(), hash.clone()).await;
+    assert!(resolved_after_delete.is_none(), "should return None after file deleted from disk");
+
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
+});

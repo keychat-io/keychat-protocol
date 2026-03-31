@@ -141,69 +141,6 @@ impl KeychatClient {
             })
     }
 
-    pub async fn update_local_meta(&self, msgid: String, local_meta: String) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
-        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
-        store
-            .update_local_meta(&msgid, &local_meta)
-            .map_err(|e| KeychatUniError::Storage {
-                msg: format!("update_local_meta: {e}"),
-            })
-    }
-
-    /// Merge fields into a message's localMeta JSON atomically.
-    /// Reads existing localMeta, merges the provided JSON key-value pairs, writes back.
-    /// Keys with JSON null values are removed from the meta.
-    pub async fn merge_local_meta(
-        &self,
-        msgid: String,
-        updates_json: String,
-    ) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
-        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
-
-        // Read existing localMeta
-        let existing_row = store
-            .get_app_message_by_msgid(&msgid)
-            .map_err(|e| KeychatUniError::Storage {
-                msg: format!("get message for merge: {e}"),
-            })?;
-
-        let mut meta: serde_json::Map<String, serde_json::Value> = match existing_row
-            .and_then(|r| r.local_meta)
-            .and_then(|s| serde_json::from_str(&s).ok())
-        {
-            Some(serde_json::Value::Object(m)) => m,
-            _ => serde_json::Map::new(),
-        };
-
-        // Parse updates
-        let updates: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&updates_json).map_err(|e| KeychatUniError::InvalidArgument {
-                msg: format!("invalid updates JSON: {e}"),
-            })?;
-
-        // Merge: null removes key, otherwise upsert
-        for (k, v) in updates {
-            if v.is_null() {
-                meta.remove(&k);
-            } else {
-                meta.insert(k, v);
-            }
-        }
-
-        let merged = serde_json::to_string(&serde_json::Value::Object(meta))
-            .map_err(|e| KeychatUniError::Serialization {
-                msg: e.to_string(),
-            })?;
-
-        store
-            .update_local_meta(&msgid, &merged)
-            .map_err(|e| KeychatUniError::Storage {
-                msg: format!("update_local_meta: {e}"),
-            })
-    }
-
     /// Check if a file should auto-download based on the "autoDownloadLimitMB" setting.
     /// Default threshold is 20 MB. 0 means never auto-download.
     pub async fn should_auto_download(&self, file_size: u64) -> Result<bool, KeychatUniError> {

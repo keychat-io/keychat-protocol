@@ -645,6 +645,7 @@ impl KeychatClient {
         );
 
         Ok(GroupSentMessage {
+            msgid,
             group_id,
             event_ids,
         })

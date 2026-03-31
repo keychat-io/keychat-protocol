@@ -107,6 +107,7 @@ pub struct GroupMemberInfo {
 
 #[derive(uniffi::Record)]
 pub struct GroupSentMessage {
+    pub msgid: String,
     pub group_id: String,
     pub event_ids: Vec<String>,
 }

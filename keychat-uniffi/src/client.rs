@@ -143,22 +143,57 @@ impl KeychatClient {
         self.files_dir.clone()
     }
 
-    /// Resolve a downloaded file's absolute path from its localMeta JSON.
-    /// Returns the path if localMeta contains a valid localPath and the file exists on disk.
-    /// Returns None if not downloaded or the file has been deleted.
-    pub fn resolve_local_file(&self, local_meta: Option<String>) -> Option<String> {
-        let meta_str = local_meta?;
-        let meta: serde_json::Value = serde_json::from_str(&meta_str).ok()?;
-        if meta.get("downloaded")?.as_bool()? != true {
-            return None;
-        }
-        let relative_path = meta.get("localPath")?.as_str()?;
-        let abs_path = std::path::Path::new(&self.files_dir).join(relative_path);
+    /// Resolve a downloaded file's absolute path from the file_attachments table.
+    /// Returns None if not downloaded or the file has been deleted from disk.
+    pub async fn resolve_local_file(&self, msgid: String, file_hash: String) -> Option<String> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage(&inner.app_storage);
+        let local_path = store.get_attachment_local_path(&msgid, &file_hash).ok()??;
+        let abs_path = std::path::Path::new(&self.files_dir).join(&local_path);
         if abs_path.exists() {
             Some(abs_path.to_string_lossy().to_string())
         } else {
             None
         }
+    }
+
+    /// Insert or update a file attachment record.
+    /// transfer_state: 0=pending, 1=downloading, 2=downloaded, 3=failed
+    pub async fn upsert_attachment(
+        &self,
+        msgid: String,
+        file_hash: String,
+        room_id: String,
+        local_path: Option<String>,
+        transfer_state: u32,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        store
+            .upsert_attachment(&msgid, &file_hash, &room_id, local_path.as_deref(), transfer_state as i32)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("upsert_attachment: {e}"),
+            })
+    }
+
+    /// Mark a voice attachment as played.
+    pub async fn set_audio_played(
+        &self,
+        msgid: String,
+        file_hash: String,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        store.set_audio_played(&msgid, &file_hash).map_err(|e| KeychatUniError::Storage {
+            msg: format!("set_audio_played: {e}"),
+        })
+    }
+
+    /// Check if a voice attachment has been played.
+    pub async fn is_audio_played(&self, msgid: String, file_hash: String) -> bool {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage(&inner.app_storage);
+        store.is_audio_played(&msgid, &file_hash)
     }
 
     /// Get the files directory for a specific room.
@@ -208,9 +243,9 @@ impl KeychatClient {
         crate::media::download_and_decrypt(url, key, iv, hash).await
     }
 
-    /// Download, decrypt, save to {files_dir}/{room_id}/{local_file_name}, and update localMeta.
+    /// Download, decrypt, save to {files_dir}/{room_id}/{local_file_name}, and record in file_attachments.
     /// Returns the absolute path of the saved file.
-    /// If the file already exists locally, skips download and returns the existing path.
+    /// Idempotent: if the attachment is already downloaded, returns the existing path.
     pub async fn download_and_save(
         &self,
         url: String,
@@ -222,22 +257,24 @@ impl KeychatClient {
         room_id: String,
         msgid: Option<String>,
     ) -> Result<String, KeychatUniError> {
+        // Idempotent: check attachment table first
+        if let Some(ref mid) = msgid {
+            if let Some(abs) = self.resolve_local_file(mid.clone(), hash.clone()).await {
+                return Ok(abs);
+            }
+        }
+
         let file_name =
             crate::media::local_file_name(source_name, hash.clone(), suffix);
         let room_dir = std::path::Path::new(&self.files_dir).join(&room_id);
         let file_path = room_dir.join(&file_name);
-
         let relative_path = format!("{room_id}/{file_name}");
 
-        // Return existing file without re-downloading
+        // File exists on disk but no record — backfill the record
         if file_path.exists() {
             if let Some(ref mid) = msgid {
                 let _ = self
-                    .merge_local_meta(
-                        mid.clone(),
-                        serde_json::json!({"downloaded": true, "localPath": relative_path})
-                            .to_string(),
-                    )
+                    .upsert_attachment(mid.clone(), hash.clone(), room_id.clone(), Some(relative_path), 2)
                     .await;
             }
             return Ok(file_path.to_string_lossy().to_string());
@@ -250,7 +287,7 @@ impl KeychatClient {
 
         // Download + decrypt
         let plaintext =
-            crate::media::download_and_decrypt(url, key, iv, hash).await?;
+            crate::media::download_and_decrypt(url, key, iv, hash.clone()).await?;
 
         // Atomic write via temp file
         let tmp_path = room_dir.join(format!(".{file_name}.tmp"));
@@ -267,13 +304,10 @@ impl KeychatClient {
             plaintext.len()
         );
 
-        // Update localMeta
+        // Record in file_attachments
         if let Some(ref mid) = msgid {
             let _ = self
-                .merge_local_meta(
-                    mid.clone(),
-                    serde_json::json!({"downloaded": true, "localPath": relative_path}).to_string(),
-                )
+                .upsert_attachment(mid.clone(), hash.clone(), room_id.clone(), Some(relative_path), 2)
                 .await;
         }
 

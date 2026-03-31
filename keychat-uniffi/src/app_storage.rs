@@ -137,7 +137,7 @@ impl AppStorage {
 
     // ─── Migrations ──────────────────────────────────────
 
-    const SCHEMA_VERSION: u32 = 2;
+    const SCHEMA_VERSION: u32 = 3;
 
     fn run_migrations(conn: &Connection) -> Result<()> {
         let current: u32 = conn
@@ -154,6 +154,9 @@ impl AppStorage {
         }
         if current < 2 {
             Self::migrate_v1_to_v2(conn)?;
+        }
+        if current < 3 {
+            Self::migrate_v2_to_v3(conn)?;
         }
         Ok(())
     }
@@ -236,6 +239,17 @@ impl AppStorage {
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS file_attachments (
+                msgid TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                local_path TEXT,
+                transfer_state INTEGER NOT NULL DEFAULT 0,
+                audio_played INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (msgid, file_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_attachments_room ON file_attachments(room_id);
+
             PRAGMA user_version = 1;
 
             COMMIT;",
@@ -257,6 +271,29 @@ impl AppStorage {
         .map_err(|e| KeychatError::Storage(format!("app migration v1→v2 failed: {e}")))?;
 
         tracing::info!("app migration v1 → v2 complete");
+        Ok(())
+    }
+
+    fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+        tracing::info!("running app migration v2 → v3: add file_attachments table");
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE IF NOT EXISTS file_attachments (
+                msgid TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                local_path TEXT,
+                transfer_state INTEGER NOT NULL DEFAULT 0,
+                audio_played INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (msgid, file_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_attachments_room ON file_attachments(room_id);
+            PRAGMA user_version = 3;
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("app migration v2→v3 failed: {e}")))?;
+
+        tracing::info!("app migration v2 → v3 complete");
         Ok(())
     }
 
@@ -981,7 +1018,8 @@ impl AppStorage {
     pub fn delete_all_data(&self) -> Result<()> {
         self.transaction(|conn| {
             conn.execute_batch(
-                "DELETE FROM app_messages;
+                "DELETE FROM file_attachments;
+                 DELETE FROM app_messages;
                  DELETE FROM app_rooms;
                  DELETE FROM app_contacts;
                  DELETE FROM app_identities;
@@ -990,6 +1028,72 @@ impl AppStorage {
             .map_err(|e| KeychatError::Storage(format!("Failed to delete all app data: {e}")))?;
             Ok(())
         })
+    }
+
+    // ─── File Attachments CRUD ──────────────────────────
+
+    /// Insert or update a file attachment record.
+    /// transfer_state: 0=pending, 1=downloading, 2=downloaded, 3=failed
+    pub fn upsert_attachment(
+        &self,
+        msgid: &str,
+        file_hash: &str,
+        room_id: &str,
+        local_path: Option<&str>,
+        transfer_state: i32,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO file_attachments (msgid, file_hash, room_id, local_path, transfer_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(msgid, file_hash) DO UPDATE SET
+                   local_path = ?4, transfer_state = ?5",
+                params![msgid, file_hash, room_id, local_path, transfer_state],
+            )
+            .map_err(|e| KeychatError::Storage(format!("upsert_attachment: {e}")))?;
+        Ok(())
+    }
+
+    /// Get the local_path of a downloaded attachment.
+    pub fn get_attachment_local_path(
+        &self,
+        msgid: &str,
+        file_hash: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT local_path FROM file_attachments
+                 WHERE msgid = ?1 AND file_hash = ?2 AND transfer_state = 2",
+                params![msgid, file_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| KeychatError::Storage(format!("get_attachment_local_path: {e}")))
+    }
+
+    /// Mark a voice attachment as played.
+    pub fn set_audio_played(&self, msgid: &str, file_hash: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE file_attachments SET audio_played = 1
+                 WHERE msgid = ?1 AND file_hash = ?2",
+                params![msgid, file_hash],
+            )
+            .map_err(|e| KeychatError::Storage(format!("set_audio_played: {e}")))?;
+        Ok(())
+    }
+
+    /// Check if a voice attachment has been played.
+    pub fn is_audio_played(&self, msgid: &str, file_hash: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT audio_played FROM file_attachments
+                 WHERE msgid = ?1 AND file_hash = ?2",
+                params![msgid, file_hash],
+                |row| row.get::<_, i32>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false)
     }
 }
 
@@ -1108,5 +1212,40 @@ mod tests {
 
         s.delete_app_contact("pub1", "id1").unwrap();
         assert!(s.get_app_contact("pub1", "id1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_file_attachment_crud() {
+        let s = test_storage();
+
+        // Insert attachment
+        s.upsert_attachment("msg1", "hash1", "room1", Some("room1/file_123.jpg"), 2).unwrap();
+        let path = s.get_attachment_local_path("msg1", "hash1").unwrap();
+        assert_eq!(path, Some("room1/file_123.jpg".to_string()));
+
+        // Non-existent attachment
+        let path = s.get_attachment_local_path("msg1", "hash_missing").unwrap();
+        assert_eq!(path, None);
+
+        // Pending state — not returned by get_attachment_local_path
+        s.upsert_attachment("msg2", "hash2", "room1", None, 0).unwrap();
+        let path = s.get_attachment_local_path("msg2", "hash2").unwrap();
+        assert_eq!(path, None);
+
+        // Multi-file: same msgid, different hashes
+        s.upsert_attachment("msg3", "hashA", "room1", Some("room1/a.jpg"), 2).unwrap();
+        s.upsert_attachment("msg3", "hashB", "room1", Some("room1/b.png"), 2).unwrap();
+        assert_eq!(s.get_attachment_local_path("msg3", "hashA").unwrap(), Some("room1/a.jpg".to_string()));
+        assert_eq!(s.get_attachment_local_path("msg3", "hashB").unwrap(), Some("room1/b.png".to_string()));
+
+        // Audio played
+        assert!(!s.is_audio_played("msg1", "hash1"));
+        s.set_audio_played("msg1", "hash1").unwrap();
+        assert!(s.is_audio_played("msg1", "hash1"));
+
+        // Upsert updates existing
+        s.upsert_attachment("msg1", "hash1", "room1", Some("room1/file_456.jpg"), 2).unwrap();
+        let path = s.get_attachment_local_path("msg1", "hash1").unwrap();
+        assert_eq!(path, Some("room1/file_456.jpg".to_string()));
     }
 }
