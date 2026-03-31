@@ -5,8 +5,9 @@
 //! is encrypted individually for every member.
 
 use libkeychat::{
-    build_group_admin_message, create_signal_group, encrypt_for_group_member, send_group_invite,
-    KCMessage, KCMessageKind, SignalGroup,
+    build_group_admin_message, build_multi_file_message, create_signal_group,
+    encrypt_for_group_member, send_group_invite, KCFilePayload, KCMessage, KCMessageKind,
+    SignalGroup,
 };
 
 use crate::client::KeychatClient;
@@ -227,51 +228,13 @@ impl KeychatClient {
     }
 
     /// Send a text message to a Signal group.
-    /// The message is encrypted and sent individually to each member.
     pub async fn send_group_text(
         &self,
         group_id: String,
         text: String,
         reply_to: Option<ReplyToPayload>,
     ) -> Result<GroupSentMessage, KeychatUniError> {
-        // 1. Gather group, identity, check connectivity under read lock
-        let (group, identity_pubkey, connected_relays) = {
-            let inner = self.inner.read().await;
-
-            let group = inner
-                .group_manager
-                .get_group(&group_id)
-                .ok_or(KeychatUniError::PeerNotFound {
-                    peer_id: group_id.clone(),
-                })?
-                .clone();
-
-            let transport = inner
-                .transport
-                .as_ref()
-                .ok_or(KeychatUniError::Transport {
-                    msg: "Not connected to any relay. Please check your network.".into(),
-                })?;
-            let connected = transport.connected_relays().await;
-
-            let identity_pubkey = inner
-                .identity
-                .as_ref()
-                .map(|id| id.pubkey_hex())
-                .unwrap_or_default();
-
-            (group, identity_pubkey, connected)
-        }; // read lock dropped
-
-        if connected_relays.is_empty() {
-            return Err(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            });
-        }
-
-        // 2. Build KCMessage and prepare metadata
         let mut msg = KCMessage::text(&text);
-        msg.group_id = Some(group_id.clone());
         if let Some(ref rt) = reply_to {
             msg.reply_to = Some(libkeychat::ReplyTo {
                 target_id: None,
@@ -281,191 +244,63 @@ impl KeychatClient {
                 user_name: None,
             });
         }
-        let payload_json = msg.to_json().ok();
+        let display = if text.is_empty() { "[Message]" } else { &text };
+        self.send_group_message(group_id, msg, display, &reply_to).await
+    }
 
-        let full_room_id = format!("{}:{}", group_id, identity_pubkey);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let msgid = format!(
-            "gsend-{}-{}",
-            &group_id[..16.min(group_id.len())],
-            now
-        );
-
-        // 3. Save message to DB FIRST (status=0 sending) — Swift shows it immediately
-        {
-            let send_storage = self.inner.read().await.app_storage.clone();
-            let store = crate::client::lock_app_storage(&send_storage);
-            if let Err(e) = store.save_app_message(
-                &msgid,
-                Some(&msgid),
-                &full_room_id,
-                &identity_pubkey,
-                &identity_pubkey,
-                &text,
-                true,
-                0,
-                now,
-            ) {
-                tracing::warn!("save_app_message (group send): {e}");
-            }
-            // Store payload + reply_to metadata
-            if let Err(e) = store.update_app_message(
-                &msgid, None, None, None,
-                payload_json.as_deref(), None,
-                reply_to.as_ref().map(|r| r.target_event_id.as_str()),
-                reply_to.as_ref().and_then(|r| r.content.as_deref()),
-            ) {
-                tracing::warn!("update_app_message (group send payload): {e}");
-            }
-            let display = if text.is_empty() { "[Message]" } else { &text };
-            if let Err(e) =
-                store.update_app_room(&full_room_id, None, None, Some(display), Some(now))
-            {
-                tracing::warn!("update_app_room (group send): {e}");
-            }
+    /// Send file(s) to a Signal group.
+    pub async fn send_group_file(
+        &self,
+        group_id: String,
+        files: Vec<FilePayload>,
+        message: Option<String>,
+        reply_to: Option<ReplyToPayload>,
+    ) -> Result<GroupSentMessage, KeychatUniError> {
+        if files.is_empty() {
+            return Err(KeychatUniError::InvalidArgument {
+                msg: "files list cannot be empty".into(),
+            });
         }
 
-        // 4. Emit DataChange BEFORE relay publish — Swift shows message immediately
-        self.emit_data_change(DataChange::MessageAdded {
-            room_id: full_room_id.clone(),
-            msgid: msgid.clone(),
-        })
-        .await;
-        self.emit_data_change(DataChange::RoomUpdated {
-            room_id: full_room_id.clone(),
-        })
-        .await;
-
-        // 5. Encrypt for each member (sequential — needs mutable session locks),
-        //    then send all events concurrently.
-        let mut event_ids = Vec::new();
-        let mut nostr_events_json = Vec::new();
-
-        // Collect encrypted events + metadata
-        struct PendingEvent {
-            event: nostr::Event,
-            eid: String,
-            member_name: String,
-        }
-        let mut pending: Vec<PendingEvent> = Vec::new();
-
-        {
-            let inner = self.inner.read().await;
-            for member in group.other_members() {
-                // Look up session by nostr_pubkey — the only globally stable identifier
-                let signal_id = match inner.peer_nostr_to_signal.get(&member.nostr_pubkey) {
-                    Some(sid) => sid.clone(),
-                    None => {
-                        tracing::warn!(
-                            "no signal_id for group member nostr={}",
-                            &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
-                        );
-                        continue;
-                    }
-                };
-                let session_mutex = match inner.sessions.get(&signal_id) {
-                    Some(s) => s.clone(),
-                    None => {
-                        tracing::warn!(
-                            "no session for group member nostr={}",
-                            &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
-                        );
-                        continue;
-                    }
-                };
-
-                let event = {
-                    let mut session = session_mutex.lock().await;
-                    let addr = session.addresses.clone();
-                    encrypt_for_group_member(
-                        &mut session.signal,
-                        &signal_id,
-                        &msg,
-                        &addr,
-                    )
-                    .await
-                    .map_err(|e| KeychatUniError::Signal { msg: e.to_string() })?
-                };
-
-                let eid = event.id.to_hex();
-                if let Ok(json) = serde_json::to_string(&event) {
-                    nostr_events_json.push(json);
-                }
-                event_ids.push(eid.clone());
-                pending.push(PendingEvent { event, eid, member_name: member.name.clone() });
-            }
-        } // read lock dropped
-
-        // 5b. Publish events to relays
-        {
-            let inner = self.inner.read().await;
-            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
-            for p in &pending {
-                if let Err(e) = transport.publish_event_async(p.event.clone()).await {
-                    tracing::warn!("group publish failed for member={}: {e}", p.member_name);
-                }
-            }
-        }
-
-        // 6. Register with relay tracker — initial JSON written to DB immediately
-        let members: Vec<(String, String)> = pending
+        let kc_files: Vec<KCFilePayload> = files
             .iter()
-            .map(|p| (p.eid.clone(), p.member_name.clone()))
+            .map(|f| KCFilePayload {
+                category: crate::media::file_category_to_lib(&f.category),
+                url: f.url.clone(),
+                type_: f.mime_type.clone(),
+                suffix: f.suffix.clone(),
+                size: Some(f.size),
+                key: Some(f.key.clone()),
+                iv: Some(f.iv.clone()),
+                hash: Some(f.hash.clone()),
+                source_name: f.source_name.clone(),
+                audio_duration: f.audio_duration.map(|d| d as f64),
+                amplitude_samples: f.amplitude_samples.clone(),
+                ecash_token: None,
+            })
             .collect();
-        let initial_relay_json = {
-            let mut tracker = self
-                .relay_tracker
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            tracker.track_group(
-                msgid.clone(),
-                full_room_id.clone(),
-                members,
-                connected_relays,
-            )
-        };
 
-        // Store nostr events, primary event_id, and initial relay status
-        let nostr_event_json = format!("[{}]", nostr_events_json.join(","));
-        {
-            let send_storage = self.inner.read().await.app_storage.clone();
-            let store = crate::client::lock_app_storage(&send_storage);
-            let event_id_ref = event_ids.first().map(|s| s.as_str());
-            if let Err(e) = store.update_app_message(
-                &msgid,
-                event_id_ref,
-                None,                            // status stays 0=sending until tracker resolves
-                Some(&initial_relay_json),        // initial relay status (all "pending")
-                None,
-                Some(&nostr_event_json),
-                None, None,
-            ) {
-                tracing::warn!("update_app_message (group send metadata): {e}");
+        let mut msg = build_multi_file_message(kc_files);
+        if let Some(ref m) = message {
+            if let Some(ref mut fs) = msg.files {
+                fs.message = Some(m.clone());
             }
         }
+        if let Some(ref rt) = reply_to {
+            msg.reply_to = Some(libkeychat::ReplyTo {
+                target_id: None,
+                target_event_id: Some(rt.target_event_id.clone()),
+                content: rt.content.clone().unwrap_or_default(),
+                user_id: None,
+                user_name: None,
+            });
+        }
 
-        // 7. Emit MessageUpdated so Swift sees initial relay status
-        self.emit_data_change(DataChange::MessageUpdated {
-            room_id: full_room_id,
-            msgid: msgid.clone(),
-        })
-        .await;
-
-        tracing::info!(
-            "sent group text to {} members, group={}",
-            event_ids.len(),
-            &group_id[..16.min(group_id.len())]
-        );
-
-        Ok(GroupSentMessage {
-            group_id,
-            event_ids,
-        })
+        let display = match message.as_deref() {
+            Some(m) if !m.is_empty() => m,
+            _ => "[File]",
+        };
+        self.send_group_message(group_id, msg, display, &reply_to).await
     }
 
     /// Leave a Signal group. Notifies all members.
@@ -584,5 +419,234 @@ impl KeychatClient {
             new_name
         );
         Ok(())
+    }
+}
+
+// Non-exported helpers (not exposed via UniFFI)
+impl KeychatClient {
+    /// Shared fan-out logic for all group message types.
+    /// Encrypts the KCMessage for each member and publishes to relays.
+    async fn send_group_message(
+        &self,
+        group_id: String,
+        mut msg: KCMessage,
+        display_text: &str,
+        reply_to: &Option<ReplyToPayload>,
+    ) -> Result<GroupSentMessage, KeychatUniError> {
+        // 1. Gather group, identity, check connectivity
+        let (group, identity_pubkey, connected_relays) = {
+            let inner = self.inner.read().await;
+
+            let group = inner
+                .group_manager
+                .get_group(&group_id)
+                .ok_or(KeychatUniError::PeerNotFound {
+                    peer_id: group_id.clone(),
+                })?
+                .clone();
+
+            let transport = inner
+                .transport
+                .as_ref()
+                .ok_or(KeychatUniError::Transport {
+                    msg: "Not connected to any relay. Please check your network.".into(),
+                })?;
+            let connected = transport.connected_relays().await;
+
+            let identity_pubkey = inner
+                .identity
+                .as_ref()
+                .map(|id| id.pubkey_hex())
+                .unwrap_or_default();
+
+            (group, identity_pubkey, connected)
+        };
+
+        if connected_relays.is_empty() {
+            return Err(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            });
+        }
+
+        // 2. Stamp group_id onto the message
+        msg.group_id = Some(group_id.clone());
+        let payload_json = msg.to_json().ok();
+
+        let full_room_id = format!("{}:{}", group_id, identity_pubkey);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let msgid = format!(
+            "gsend-{}-{}",
+            &group_id[..16.min(group_id.len())],
+            now
+        );
+
+        // 3. Save message to DB (status=0 sending) — Swift shows it immediately
+        {
+            let send_storage = self.inner.read().await.app_storage.clone();
+            let store = crate::client::lock_app_storage(&send_storage);
+            if let Err(e) = store.save_app_message(
+                &msgid,
+                Some(&msgid),
+                &full_room_id,
+                &identity_pubkey,
+                &identity_pubkey,
+                display_text,
+                true,
+                0,
+                now,
+            ) {
+                tracing::warn!("save_app_message (group send): {e}");
+            }
+            if let Err(e) = store.update_app_message(
+                &msgid, None, None, None,
+                payload_json.as_deref(), None,
+                reply_to.as_ref().map(|r| r.target_event_id.as_str()),
+                reply_to.as_ref().and_then(|r| r.content.as_deref()),
+            ) {
+                tracing::warn!("update_app_message (group send payload): {e}");
+            }
+            if let Err(e) =
+                store.update_app_room(&full_room_id, None, None, Some(display_text), Some(now))
+            {
+                tracing::warn!("update_app_room (group send): {e}");
+            }
+        }
+
+        // 4. Emit DataChange BEFORE relay publish
+        self.emit_data_change(DataChange::MessageAdded {
+            room_id: full_room_id.clone(),
+            msgid: msgid.clone(),
+        })
+        .await;
+        self.emit_data_change(DataChange::RoomUpdated {
+            room_id: full_room_id.clone(),
+        })
+        .await;
+
+        // 5. Encrypt for each member, collect events
+        struct PendingEvent {
+            event: nostr::Event,
+            eid: String,
+            member_name: String,
+        }
+        let mut event_ids = Vec::new();
+        let mut nostr_events_json = Vec::new();
+        let mut pending: Vec<PendingEvent> = Vec::new();
+
+        {
+            let inner = self.inner.read().await;
+            for member in group.other_members() {
+                let signal_id = match inner.peer_nostr_to_signal.get(&member.nostr_pubkey) {
+                    Some(sid) => sid.clone(),
+                    None => {
+                        tracing::warn!(
+                            "no signal_id for group member nostr={}",
+                            &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
+                        );
+                        continue;
+                    }
+                };
+                let session_mutex = match inner.sessions.get(&signal_id) {
+                    Some(s) => s.clone(),
+                    None => {
+                        tracing::warn!(
+                            "no session for group member nostr={}",
+                            &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
+                        );
+                        continue;
+                    }
+                };
+
+                let event = {
+                    let mut session = session_mutex.lock().await;
+                    let addr = session.addresses.clone();
+                    encrypt_for_group_member(
+                        &mut session.signal,
+                        &signal_id,
+                        &msg,
+                        &addr,
+                    )
+                    .await
+                    .map_err(|e| KeychatUniError::Signal { msg: e.to_string() })?
+                };
+
+                let eid = event.id.to_hex();
+                if let Ok(json) = serde_json::to_string(&event) {
+                    nostr_events_json.push(json);
+                }
+                event_ids.push(eid.clone());
+                pending.push(PendingEvent { event, eid, member_name: member.name.clone() });
+            }
+        }
+
+        // 5b. Publish events to relays
+        {
+            let inner = self.inner.read().await;
+            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
+            for p in &pending {
+                if let Err(e) = transport.publish_event_async(p.event.clone()).await {
+                    tracing::warn!("group publish failed for member={}: {e}", p.member_name);
+                }
+            }
+        }
+
+        // 6. Register with relay tracker
+        let members: Vec<(String, String)> = pending
+            .iter()
+            .map(|p| (p.eid.clone(), p.member_name.clone()))
+            .collect();
+        let initial_relay_json = {
+            let mut tracker = self
+                .relay_tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            tracker.track_group(
+                msgid.clone(),
+                full_room_id.clone(),
+                members,
+                connected_relays,
+            )
+        };
+
+        let nostr_event_json = format!("[{}]", nostr_events_json.join(","));
+        {
+            let send_storage = self.inner.read().await.app_storage.clone();
+            let store = crate::client::lock_app_storage(&send_storage);
+            let event_id_ref = event_ids.first().map(|s| s.as_str());
+            if let Err(e) = store.update_app_message(
+                &msgid,
+                event_id_ref,
+                None,
+                Some(&initial_relay_json),
+                None,
+                Some(&nostr_event_json),
+                None, None,
+            ) {
+                tracing::warn!("update_app_message (group send metadata): {e}");
+            }
+        }
+
+        // 7. Emit MessageUpdated so Swift sees initial relay status
+        self.emit_data_change(DataChange::MessageUpdated {
+            room_id: full_room_id,
+            msgid: msgid.clone(),
+        })
+        .await;
+
+        tracing::info!(
+            "sent group message to {} members, group={}",
+            event_ids.len(),
+            &group_id[..16.min(group_id.len())]
+        );
+
+        Ok(GroupSentMessage {
+            group_id,
+            event_ids,
+        })
     }
 }

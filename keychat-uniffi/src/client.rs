@@ -61,6 +61,8 @@ pub struct KeychatClient {
     pub(crate) inner: tokio::sync::RwLock<ClientInner>,
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
     pub(crate) db_path: String,
+    /// Base directory for file storage: {app_support}/files/
+    pub(crate) files_dir: String,
     pub(crate) relay_tracker: std::sync::Mutex<RelaySendTracker>,
 }
 
@@ -95,6 +97,16 @@ impl KeychatClient {
             KeychatUniError::Storage { msg: format!("open app database: {e}") }
         })?;
 
+        // Derive files directory: db_path is {app_support}/libkeychat/libkeychat.db
+        // files_dir becomes {app_support}/files/
+        let files_dir = {
+            let db_dir = std::path::Path::new(&db_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            let base = db_dir.parent().unwrap_or(db_dir);
+            base.join("files").to_string_lossy().to_string()
+        };
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -119,8 +131,42 @@ impl KeychatClient {
             }),
             runtime: Arc::new(runtime),
             db_path,
+            files_dir,
             relay_tracker: std::sync::Mutex::new(RelaySendTracker::new()),
         })
+    }
+
+    // ─── File Storage ────────────────────────────────────────────────
+
+    /// Get the base files directory path.
+    pub fn get_files_dir(&self) -> String {
+        self.files_dir.clone()
+    }
+
+    /// Resolve a downloaded file's absolute path from its localMeta JSON.
+    /// Returns the path if localMeta contains a valid localPath and the file exists on disk.
+    /// Returns None if not downloaded or the file has been deleted.
+    pub fn resolve_local_file(&self, local_meta: Option<String>) -> Option<String> {
+        let meta_str = local_meta?;
+        let meta: serde_json::Value = serde_json::from_str(&meta_str).ok()?;
+        if meta.get("downloaded")?.as_bool()? != true {
+            return None;
+        }
+        let relative_path = meta.get("localPath")?.as_str()?;
+        let abs_path = std::path::Path::new(&self.files_dir).join(relative_path);
+        if abs_path.exists() {
+            Some(abs_path.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Get the files directory for a specific room.
+    pub fn get_room_files_dir(&self, room_id: String) -> String {
+        std::path::Path::new(&self.files_dir)
+            .join(&room_id)
+            .to_string_lossy()
+            .to_string()
     }
 
     // ─── Media Upload/Download (delegates to free functions, runs in client's runtime) ──
@@ -136,6 +182,20 @@ impl KeychatClient {
         crate::media::encrypt_and_upload(plaintext, server_url).await
     }
 
+    /// Encrypt and upload, routing to relay or Blossom based on server URL.
+    /// If server_url is None, uses the active media server from settings.
+    pub async fn upload_encrypted_routed(
+        &self,
+        plaintext: Vec<u8>,
+        server_url: Option<String>,
+    ) -> Result<crate::media::FileUploadResult, KeychatUniError> {
+        let server = match server_url {
+            Some(s) => s,
+            None => self.get_active_media_server().await?,
+        };
+        crate::media::encrypt_and_upload_routed(plaintext, server).await
+    }
+
     /// Download and decrypt data from a Blossom server.
     /// Method wrapper around the free function `download_and_decrypt`.
     pub async fn download_decrypted(
@@ -146,6 +206,105 @@ impl KeychatClient {
         hash: String,
     ) -> Result<Vec<u8>, KeychatUniError> {
         crate::media::download_and_decrypt(url, key, iv, hash).await
+    }
+
+    /// Download, decrypt, save to {files_dir}/{room_id}/{local_file_name}, and update localMeta.
+    /// Returns the absolute path of the saved file.
+    /// If the file already exists locally, skips download and returns the existing path.
+    pub async fn download_and_save(
+        &self,
+        url: String,
+        key: String,
+        iv: String,
+        hash: String,
+        source_name: Option<String>,
+        suffix: Option<String>,
+        room_id: String,
+        msgid: Option<String>,
+    ) -> Result<String, KeychatUniError> {
+        let file_name =
+            crate::media::local_file_name(source_name, hash.clone(), suffix);
+        let room_dir = std::path::Path::new(&self.files_dir).join(&room_id);
+        let file_path = room_dir.join(&file_name);
+
+        let relative_path = format!("{room_id}/{file_name}");
+
+        // Return existing file without re-downloading
+        if file_path.exists() {
+            if let Some(ref mid) = msgid {
+                let _ = self
+                    .merge_local_meta(
+                        mid.clone(),
+                        serde_json::json!({"downloaded": true, "localPath": relative_path})
+                            .to_string(),
+                    )
+                    .await;
+            }
+            return Ok(file_path.to_string_lossy().to_string());
+        }
+
+        // Create directory
+        std::fs::create_dir_all(&room_dir).map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("create dir {}: {e}", room_dir.display()),
+        })?;
+
+        // Download + decrypt
+        let plaintext =
+            crate::media::download_and_decrypt(url, key, iv, hash).await?;
+
+        // Atomic write via temp file
+        let tmp_path = room_dir.join(format!(".{file_name}.tmp"));
+        std::fs::write(&tmp_path, &plaintext).map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("write temp file: {e}"),
+        })?;
+        std::fs::rename(&tmp_path, &file_path).map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("rename temp file: {e}"),
+        })?;
+
+        tracing::info!(
+            "Downloaded {} ({} bytes)",
+            file_name,
+            plaintext.len()
+        );
+
+        // Update localMeta
+        if let Some(ref mid) = msgid {
+            let _ = self
+                .merge_local_meta(
+                    mid.clone(),
+                    serde_json::json!({"downloaded": true, "localPath": relative_path}).to_string(),
+                )
+                .await;
+        }
+
+        Ok(file_path.to_string_lossy().to_string())
+    }
+
+    /// Save plaintext data to {files_dir}/{room_id}/{file_name} for local caching.
+    /// Used by the send path to cache sent files for immediate display.
+    /// Returns the absolute path of the saved file.
+    pub fn save_file_locally(
+        &self,
+        data: Vec<u8>,
+        file_name: String,
+        room_id: String,
+    ) -> Result<String, KeychatUniError> {
+        let room_dir = std::path::Path::new(&self.files_dir).join(&room_id);
+        let file_path = room_dir.join(&file_name);
+
+        if file_path.exists() {
+            return Ok(file_path.to_string_lossy().to_string());
+        }
+
+        std::fs::create_dir_all(&room_dir).map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("create dir: {e}"),
+        })?;
+
+        std::fs::write(&file_path, &data).map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("write file: {e}"),
+        })?;
+
+        Ok(file_path.to_string_lossy().to_string())
     }
 
     // ─── Identity ──

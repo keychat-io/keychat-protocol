@@ -421,6 +421,7 @@ pub struct MessageInfo {
     pub nostr_event_json: Option<String>,
     pub relay_status_json: Option<String>,
     pub local_file_path: Option<String>,
+    pub local_meta: Option<String>,
     pub created_at: u64,
 }
 

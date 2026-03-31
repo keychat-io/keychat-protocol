@@ -1,6 +1,95 @@
 use crate::error::KeychatUniError;
 use crate::types::FileCategory;
 
+// ─── Constants ──────────────────────────────────────────────────
+
+/// Built-in media server (Ecash-Presigned protocol).
+pub const BUILT_IN_SERVER: &str = "https://relay.keychat.io";
+/// Default Blossom server.
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.band";
+/// Auto-download limit in MB (default 20). 0 means "never auto-download".
+pub const DEFAULT_AUTO_DOWNLOAD_LIMIT_MB: u64 = 20;
+/// Max file size: 100 MB.
+pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+/// Max files per message.
+pub const MAX_FILES_PER_MESSAGE: u32 = 10;
+
+// ─── Utility functions ──────────────────────────────────────────
+
+/// Check if a server URL uses the relay presigned-S3 protocol.
+#[uniffi::export]
+pub fn is_relay_server(server_url: String) -> bool {
+    // Simple host check without pulling in the `url` crate
+    server_url
+        .strip_prefix("https://")
+        .or_else(|| server_url.strip_prefix("http://"))
+        .map(|rest| {
+            let host = rest.split('/').next().unwrap_or("");
+            host == "relay.keychat.io"
+        })
+        .unwrap_or(false)
+}
+
+/// Deterministic local file name for a payload.
+/// Uses source_name if available, otherwise "{hash_prefix_12}.{suffix}".
+#[uniffi::export]
+pub fn local_file_name(
+    source_name: Option<String>,
+    _hash: String,
+    suffix: Option<String>,
+) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    if let Some(name) = source_name {
+        // Split name from extension: "photo.jpg" -> ("photo", "jpg")
+        if let Some(dot) = name.rfind('.') {
+            let stem = &name[..dot];
+            let ext = &name[dot + 1..];
+            format!("{stem}_{ts}.{ext}")
+        } else {
+            // No extension in source_name, use suffix if available
+            let ext = suffix.as_deref().unwrap_or("bin");
+            format!("{name}_{ts}.{ext}")
+        }
+    } else {
+        let ext = suffix.as_deref().unwrap_or("bin");
+        format!("file_{ts}.{ext}")
+    }
+}
+
+/// Return the built-in media server URL.
+#[uniffi::export]
+pub fn built_in_media_server() -> String {
+    BUILT_IN_SERVER.to_string()
+}
+
+/// Return the default Blossom server URL.
+#[uniffi::export]
+pub fn default_blossom_server() -> String {
+    DEFAULT_BLOSSOM_SERVER.to_string()
+}
+
+/// Return the default auto-download limit in MB.
+#[uniffi::export]
+pub fn default_auto_download_limit_mb() -> u64 {
+    DEFAULT_AUTO_DOWNLOAD_LIMIT_MB
+}
+
+/// Return the max file size in bytes.
+#[uniffi::export]
+pub fn max_file_size() -> u64 {
+    MAX_FILE_SIZE
+}
+
+/// Return the max files per message.
+#[uniffi::export]
+pub fn max_files_per_message() -> u32 {
+    MAX_FILES_PER_MESSAGE
+}
+
 // ─── UniFFI Record for encryption result ────────────────────────
 
 #[derive(uniffi::Record)]
@@ -184,6 +273,131 @@ pub async fn encrypt_and_upload(
         hash: hash_hex,
         encrypted_size,
     })
+}
+
+// ─── Relay presigned-S3 upload ──────────────────────────────────
+
+/// Encrypt and upload via relay presigned-S3 protocol.
+/// 1. Encrypt locally
+/// 2. POST to {server}/api/v1/object with cashu="", length, sha256(base64)
+/// 3. PUT encrypted data to presigned URL with returned headers
+/// 4. Return FileUploadResult with access_url
+async fn upload_via_relay(
+    plaintext: Vec<u8>,
+    server_url: String,
+) -> Result<FileUploadResult, KeychatUniError> {
+    let enc = libkeychat::encrypt_file(&plaintext);
+    let key_hex = hex::encode(enc.key);
+    let iv_hex = hex::encode(enc.iv);
+    let hash_hex = hex::encode(enc.hash);
+    let encrypted_size = enc.ciphertext.len() as u64;
+
+    // Convert hash to base64 for relay API
+    let hash_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&enc.hash)
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("HTTP client error: {e}"),
+        })?;
+
+    // 1. Request presigned URL from relay
+    let api_url = format!("{server_url}/api/v1/object");
+    let params = serde_json::json!({
+        "cashu": "",
+        "length": encrypted_size,
+        "sha256": hash_b64,
+    });
+
+    let resp = client
+        .post(&api_url)
+        .json(&params)
+        .send()
+        .await
+        .map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("Relay params request failed: {e}"),
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(KeychatUniError::MediaTransfer {
+            msg: format!("Relay params HTTP {status}: {body}"),
+        });
+    }
+
+    let json: serde_json::Value =
+        resp.json().await.map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("Relay params parse error: {e}"),
+        })?;
+
+    let presigned_url = json["url"].as_str().ok_or_else(|| KeychatUniError::MediaTransfer {
+        msg: "Missing 'url' in relay response".into(),
+    })?;
+    let access_url = json["access_url"]
+        .as_str()
+        .ok_or_else(|| KeychatUniError::MediaTransfer {
+            msg: "Missing 'access_url' in relay response".into(),
+        })?
+        .to_string();
+    let headers = json["headers"]
+        .as_object()
+        .ok_or_else(|| KeychatUniError::MediaTransfer {
+            msg: "Missing 'headers' in relay response".into(),
+        })?;
+
+    // 2. PUT encrypted data to presigned S3 URL
+    let mut put_req = client.put(presigned_url);
+    for (k, v) in headers {
+        if let Some(val) = v.as_str() {
+            put_req = put_req.header(k.as_str(), val);
+        }
+    }
+    put_req = put_req.header("Content-Type", "multipart/form-data");
+
+    let put_resp = put_req
+        .body(enc.ciphertext)
+        .send()
+        .await
+        .map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("S3 PUT failed: {e}"),
+        })?;
+
+    if !put_resp.status().is_success() {
+        let status = put_resp.status().as_u16();
+        return Err(KeychatUniError::MediaTransfer {
+            msg: format!("S3 upload HTTP {status}"),
+        });
+    }
+
+    tracing::info!("Relay upload complete → {}…", &access_url[..access_url.len().min(60)]);
+
+    Ok(FileUploadResult {
+        url: access_url,
+        key: key_hex,
+        iv: iv_hex,
+        hash: hash_hex,
+        encrypted_size,
+    })
+}
+
+// ─── Unified upload (routes to relay or Blossom) ────────────────
+
+/// Encrypt and upload, routing to relay or Blossom based on server URL.
+#[uniffi::export]
+pub async fn encrypt_and_upload_routed(
+    plaintext: Vec<u8>,
+    server_url: String,
+) -> Result<FileUploadResult, KeychatUniError> {
+    if is_relay_server(server_url.clone()) {
+        upload_via_relay(plaintext, server_url).await
+    } else {
+        encrypt_and_upload(plaintext, server_url).await
+    }
 }
 
 // ─── Blossom download (HTTP) ────────────────────────────────────

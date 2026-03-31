@@ -59,6 +59,7 @@ pub struct MessageRow {
     pub nostr_event_json: Option<String>,
     pub relay_status_json: Option<String>,
     pub local_file_path: Option<String>,
+    pub local_meta: Option<String>,
     pub created_at: i64,
 }
 
@@ -136,7 +137,7 @@ impl AppStorage {
 
     // ─── Migrations ──────────────────────────────────────
 
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 
     fn run_migrations(conn: &Connection) -> Result<()> {
         let current: u32 = conn
@@ -150,6 +151,9 @@ impl AppStorage {
 
         if current < 1 {
             Self::migrate_v0_to_v1(conn)?;
+        }
+        if current < 2 {
+            Self::migrate_v1_to_v2(conn)?;
         }
         Ok(())
     }
@@ -239,6 +243,20 @@ impl AppStorage {
         .map_err(|e| KeychatError::Storage(format!("app migration v0→v1 failed: {e}")))?;
 
         tracing::info!("app migration v0 → v1 complete");
+        Ok(())
+    }
+
+    fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+        tracing::info!("running app migration v1 → v2: add local_meta column");
+        conn.execute_batch(
+            "BEGIN;
+            ALTER TABLE app_messages ADD COLUMN local_meta TEXT;
+            PRAGMA user_version = 2;
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("app migration v1→v2 failed: {e}")))?;
+
+        tracing::info!("app migration v1 → v2 complete");
         Ok(())
     }
 
@@ -558,7 +576,7 @@ impl AppStorage {
             .prepare(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages WHERE room_id = ?1
                  ORDER BY created_at ASC, rowid ASC LIMIT ?2 OFFSET ?3",
             )
@@ -578,7 +596,7 @@ impl AppStorage {
             .prepare(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages WHERE room_id = ?1
                  ORDER BY created_at DESC, rowid DESC LIMIT ?2",
             )
@@ -612,7 +630,7 @@ impl AppStorage {
             .prepare(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages
                  WHERE room_id = ?1 AND created_at < ?2
                  ORDER BY created_at DESC, rowid DESC LIMIT ?3",
@@ -631,7 +649,7 @@ impl AppStorage {
             .prepare(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages
                  WHERE room_id = ?1 AND created_at >= ?2
                  ORDER BY created_at ASC, rowid ASC",
@@ -651,7 +669,7 @@ impl AppStorage {
             .prepare(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages
                  WHERE room_id = ?1 AND created_at <= ?2
                  ORDER BY created_at DESC, rowid DESC LIMIT ?3",
@@ -685,7 +703,8 @@ impl AppStorage {
             nostr_event_json: row.get(12)?,
             relay_status_json: row.get(13)?,
             local_file_path: row.get(14)?,
-            created_at: row.get(15)?,
+            local_meta: row.get(15)?,
+            created_at: row.get(16)?,
         })
     }
 
@@ -715,7 +734,7 @@ impl AppStorage {
             .query_row(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages WHERE event_id = ?1 LIMIT 1",
                 rusqlite::params![event_id],
                 Self::map_message_row,
@@ -729,7 +748,7 @@ impl AppStorage {
             .query_row(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages WHERE msgid = ?1 LIMIT 1",
                 rusqlite::params![msgid],
                 Self::map_message_row,
@@ -813,12 +832,22 @@ impl AppStorage {
         Ok(())
     }
 
+    pub fn update_local_meta(&self, msgid: &str, local_meta: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE app_messages SET local_meta = ?1 WHERE msgid = ?2",
+                rusqlite::params![local_meta, msgid],
+            )
+            .map_err(|e| KeychatError::Storage(format!("update_local_meta: {e}")))?;
+        Ok(())
+    }
+
     pub fn get_app_failed_messages(&self) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn
             .prepare(
                 "SELECT msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
                         is_me_send, is_read, status, reply_to_event_id, reply_to_content,
-                        payload_json, nostr_event_json, relay_status_json, local_file_path, created_at
+                        payload_json, nostr_event_json, relay_status_json, local_file_path, local_meta, created_at
                  FROM app_messages WHERE is_me_send = 1 AND status = 2
                  ORDER BY created_at ASC",
             )
