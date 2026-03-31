@@ -97,35 +97,40 @@ start_agent() {
   return 1
 }
 
-# ─── Generate text QR code ──────────────────────────────────
+# ─── Generate QR code image ─────────────────────────────────
 generate_qr() {
   local data="$1"
+  local out_path="${DATA_DIR}/npub-qr.png"
 
-  # Try qrencode first
+  # Try qrencode (PNG image)
   if command -v qrencode &>/dev/null; then
-    qrencode -t UTF8 "$data" 2>/dev/null && return 0
+    qrencode -t PNG -o "$out_path" -s 10 -m 2 "$data" 2>/dev/null
+    if [[ -f "$out_path" ]]; then
+      echo "$out_path"
+      return 0
+    fi
   fi
 
   # Try python
   if command -v python3 &>/dev/null; then
     python3 -c "
-import subprocess, sys
+import sys
 try:
     import qrcode
-    qr = qrcode.QRCode(border=1)
-    qr.add_data('$data')
-    qr.print_ascii(invert=True)
+    img = qrcode.make('$data', box_size=10, border=2)
+    img.save('$out_path')
+    print('$out_path')
 except ImportError:
-    # Minimal QR via segno (often pre-installed)
     try:
         import segno
-        segno.make('$data').terminal(compact=True)
+        segno.make('$data').save('$out_path', scale=10, border=2)
+        print('$out_path')
     except ImportError:
-        print('[no QR library available]')
+        pass
 " 2>/dev/null && return 0
   fi
 
-  echo "[QR code generation requires qrencode or python3 qrcode library]"
+  echo ""
 }
 
 # ─── Main ────────────────────────────────────────────────────
@@ -150,15 +155,22 @@ if [[ -z "$npub" ]]; then
   exit 1
 fi
 
-# 4. Output result
+# 4. Generate QR code image
+qr_path=$(generate_qr "$npub")
+
+# 5. Output result
 echo ""
 echo "✅ Keychat installed"
 echo ""
 echo "npub: ${npub}"
 echo ""
-echo "Scan with Keychat app to add as friend:"
-echo ""
-generate_qr "$npub"
+if [[ -n "$qr_path" && -f "$qr_path" ]]; then
+  echo "QR_IMAGE: ${qr_path}"
+  echo ""
+  echo "Scan the QR code with Keychat app to add as friend."
+else
+  echo "Add this npub in Keychat app to connect."
+fi
 echo ""
 echo "Agent listening on http://127.0.0.1:${PORT}"
 echo ""
