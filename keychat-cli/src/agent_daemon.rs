@@ -197,16 +197,13 @@ pub async fn run(
         .route("/agent/events", get(agent_sse_events))
         .with_state(agent_state);
 
-    let token_state = ApiToken(api_token.clone());
-    let router = base_router
-        .merge(agent_routes)
-        .route_layer(middleware::from_fn_with_state(token_state, auth_middleware));
+    // No auth middleware — agent binds 127.0.0.1 only, localhost is the security boundary.
+    let router = base_router.merge(agent_routes);
 
     // 8. Start server
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
 
     println!("Agent ready: {npub}");
-    println!("API token: {api_token}");
     println!("Listening on http://{addr}");
 
     tracing::info!("Agent {agent_name} ({}) listening on {addr}", &pubkey[..16.min(pubkey.len())]);

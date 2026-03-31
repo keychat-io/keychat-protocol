@@ -16,21 +16,24 @@ const KEY_FILE_NAME: &str = "db.key";
 /// Get or create the database encryption key.
 ///
 /// Strategy:
-/// 1. Try OS keyring (macOS Keychain / Linux secret-service).
-/// 2. If keyring unavailable or fails, fall back to a file at `{data_dir}/db.key`.
+/// 1. Try file at `{data_dir}/db.key` (always works, no UI prompt).
+/// 2. If no file, generate key and save to file.
+///
+/// Keyring is NOT used — it blocks on macOS when no GUI session is available
+/// (e.g., launchd daemons, SSH sessions, agent processes).
 pub fn get_or_create_db_key(data_dir: &str) -> anyhow::Result<String> {
-    // Try keyring first
-    match get_or_create_via_keyring() {
-        Ok(key) => {
-            tracing::info!("DB key loaded from OS keyring");
+    // 1. Try file first
+    let key_path = Path::new(data_dir).join(KEY_FILE_NAME);
+    if key_path.exists() {
+        let key = fs::read_to_string(&key_path)?.trim().to_string();
+        if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+            tracing::info!("DB key loaded from file: {}", key_path.display());
             return Ok(key);
         }
-        Err(e) => {
-            tracing::warn!("Keyring unavailable, falling back to file: {e}");
-        }
+        tracing::warn!("Invalid key in {}, regenerating", key_path.display());
     }
 
-    // Fallback: file-based key
+    // 2. Generate and save to file
     get_or_create_via_file(data_dir)
 }
 
