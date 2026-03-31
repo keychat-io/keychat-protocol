@@ -4,17 +4,25 @@ use crate::error::KeychatUniError;
 impl KeychatClient {
     /// Re-subscribe to current identity + all receiving addresses.
     /// Called after address rotation or on reconnect.
+    /// Uses cursor-based `since` for identity keys, `now()` for ratchet keys.
     pub(crate) async fn refresh_subscriptions(&self) -> Result<(), KeychatUniError> {
-        let pubkeys = self.collect_subscribe_pubkeys().await;
-        if pubkeys.is_empty() {
+        let (identity_pubkeys, ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+        let total = identity_pubkeys.len() + ratchet_pubkeys.len();
+        if total == 0 {
             tracing::debug!("📡 SUB: no pubkeys to subscribe");
             return Ok(());
         }
 
+        let all_pubkeys: Vec<_> = identity_pubkeys
+            .iter()
+            .chain(ratchet_pubkeys.iter())
+            .collect();
         tracing::info!(
-            "📡 SUB: subscribing to {} pubkeys: [{}]",
-            pubkeys.len(),
-            pubkeys
+            "📡 SUB: subscribing to {} pubkeys ({} identity, {} ratchet): [{}]",
+            total,
+            identity_pubkeys.len(),
+            ratchet_pubkeys.len(),
+            all_pubkeys
                 .iter()
                 .map(|pk| {
                     let h = pk.to_hex();
@@ -24,6 +32,20 @@ impl KeychatClient {
                 .join(", ")
         );
 
+        // Read cursor for identity key since parameter
+        let identity_since = {
+            let inner = self.inner.read().await;
+            let storage = inner.storage.lock().unwrap_or_else(|e| e.into_inner());
+            let cursor = storage.get_min_relay_cursor().unwrap_or(0);
+            if cursor > 0 {
+                let two_days_secs: u64 = 2 * 24 * 60 * 60;
+                Some(libkeychat::Timestamp::from(cursor.saturating_sub(two_days_secs)))
+            } else {
+                None
+            }
+        };
+        let ratchet_since = Some(libkeychat::Timestamp::now());
+
         let inner = self.inner.read().await;
         let transport = inner
             .transport
@@ -31,7 +53,13 @@ impl KeychatClient {
             .ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay. Please check your network.".into(),
             })?;
-        transport.subscribe(pubkeys, None).await?;
+
+        if !identity_pubkeys.is_empty() {
+            transport.subscribe(identity_pubkeys, identity_since).await?;
+        }
+        if !ratchet_pubkeys.is_empty() {
+            transport.subscribe(ratchet_pubkeys, ratchet_since).await?;
+        }
         Ok(())
     }
 }

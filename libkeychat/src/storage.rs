@@ -106,7 +106,7 @@ impl SecureStorage {
     }
 
     /// Schema version. Increment when adding a new migration.
-    const SCHEMA_VERSION: u32 = 2;
+    const SCHEMA_VERSION: u32 = 3;
 
     /// Run all pending migrations sequentially.
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -124,6 +124,9 @@ impl SecureStorage {
         }
         if current < 2 {
             Self::migrate_v1_to_v2(conn)?;
+        }
+        if current < 3 {
+            Self::migrate_v2_to_v3(conn)?;
         }
         Ok(())
     }
@@ -238,7 +241,8 @@ impl SecureStorage {
 
             CREATE TABLE IF NOT EXISTS relays (
                 url TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                last_event_ts INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_processed_events_at ON processed_events(processed_at);
@@ -278,6 +282,18 @@ impl SecureStorage {
             .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
 
         tracing::info!("migration v1 → v2 complete");
+        Ok(())
+    }
+
+    /// V2 → V3: Add last_event_ts to relays table for subscription cursor tracking.
+    fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+        tracing::info!("running migration v2 → v3: add relay subscription cursor");
+        let _ = conn.execute_batch(
+            "ALTER TABLE relays ADD COLUMN last_event_ts INTEGER NOT NULL DEFAULT 0;",
+        );
+        conn.pragma_update(None, "user_version", 3)
+            .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
+        tracing::info!("migration v2 → v3 complete");
         Ok(())
     }
 
@@ -1166,6 +1182,51 @@ impl SecureStorage {
         Ok(results)
     }
 
+    /// Update a relay's subscription cursor (only advances forward, never backwards).
+    /// `event_ts` is the outer GiftWrap created_at timestamp (unix seconds).
+    pub fn update_relay_cursor(&self, url: &str, event_ts: u64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE relays SET last_event_ts = MAX(last_event_ts, ?1) WHERE url = ?2",
+                rusqlite::params![event_ts as i64, url],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to update relay cursor: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Get a relay's subscription cursor (last received event timestamp).
+    /// Returns 0 if the relay has no cursor yet.
+    pub fn get_relay_cursor(&self, url: &str) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT last_event_ts FROM relays WHERE url = ?1",
+                rusqlite::params![url],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to get relay cursor: {e}"))
+            })
+    }
+
+    /// Get the minimum subscription cursor across all relays.
+    /// Used to determine the `since` parameter for identity key subscriptions.
+    /// Returns 0 if no relays or all cursors are 0.
+    pub fn get_min_relay_cursor(&self) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MIN(last_event_ts), 0) FROM relays",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to get min relay cursor: {e}"))
+            })
+    }
+
     // ─── Inbound Friend Requests ─────────────────────────────
 
     /// Save a received (inbound) friend request.
@@ -1874,6 +1935,56 @@ mod tests {
         // Delete last
         store.delete_relay("wss://relay2.example.com").unwrap();
         assert!(store.list_relays().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_relay_cursor() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store.save_relay("wss://relay.example.com").unwrap();
+
+        // Initial cursor is 0
+        assert_eq!(store.get_relay_cursor("wss://relay.example.com").unwrap(), 0);
+        assert_eq!(store.get_min_relay_cursor().unwrap(), 0);
+
+        // Update cursor
+        store
+            .update_relay_cursor("wss://relay.example.com", 1000)
+            .unwrap();
+        assert_eq!(
+            store.get_relay_cursor("wss://relay.example.com").unwrap(),
+            1000
+        );
+
+        // Cursor only advances forward (MAX semantics)
+        store
+            .update_relay_cursor("wss://relay.example.com", 500)
+            .unwrap();
+        assert_eq!(
+            store.get_relay_cursor("wss://relay.example.com").unwrap(),
+            1000,
+            "cursor should not go backwards"
+        );
+
+        // Advances when larger
+        store
+            .update_relay_cursor("wss://relay.example.com", 2000)
+            .unwrap();
+        assert_eq!(
+            store.get_relay_cursor("wss://relay.example.com").unwrap(),
+            2000
+        );
+
+        // Min cursor across multiple relays
+        store.save_relay("wss://relay2.example.com").unwrap();
+        store
+            .update_relay_cursor("wss://relay2.example.com", 1500)
+            .unwrap();
+        assert_eq!(
+            store.get_min_relay_cursor().unwrap(),
+            1500,
+            "min should be the smaller cursor"
+        );
     }
 
     #[test]

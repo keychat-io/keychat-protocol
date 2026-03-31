@@ -184,28 +184,42 @@ impl KeychatClient {
             &event_hex[..16.min(event_hex.len())]
         );
 
+        let handled;
+
         // Step 1: Try as inbound friend request
         if self.try_handle_friend_request(event).await {
-            return;
+            handled = true;
         }
-
         // Step 2: Try as friend approve/reject on pending outbound
-        if self.try_handle_friend_approve(event).await {
-            return;
+        else if self.try_handle_friend_approve(event).await {
+            handled = true;
         }
-
         // Step 3: Try decrypt with existing sessions
-        if self
-            .try_handle_session_message(event, relay_url, nostr_event_json)
+        else if self
+            .try_handle_session_message(event, relay_url.clone(), nostr_event_json)
             .await
         {
-            return;
+            handled = true;
+        } else {
+            handled = false;
+            tracing::debug!(
+                "[UNHANDLED]: no step matched event_id={}",
+                &event_hex[..16.min(event_hex.len())]
+            );
         }
 
-        tracing::debug!(
-            "[UNHANDLED]: no step matched event_id={}",
-            &event_hex[..16.min(event_hex.len())]
-        );
+        // Update relay subscription cursor after successfully processing an event.
+        // Uses the outer GiftWrap created_at (what relays filter on for `since`).
+        if handled {
+            if let Some(ref url) = relay_url {
+                let event_ts = event.created_at.as_u64();
+                let inner = self.inner.read().await;
+                let storage = inner.storage.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = storage.update_relay_cursor(url, event_ts) {
+                    tracing::error!("failed to update relay cursor for {}: {e}", url);
+                }
+            }
+        }
     }
 
     /// Step 1: Try to parse as an inbound friend request.
@@ -1317,9 +1331,14 @@ impl KeychatClient {
         }
     }
 
-    /// Collect all pubkeys we should subscribe to for incoming events.
+    /// Collect pubkeys for subscription, split into identity keys and ratchet keys.
+    /// Identity keys receive NIP-59 GiftWrap with ±2 day timestamp randomization,
+    /// so they need `since = cursor - 2 days`. Ratchet keys are newly derived
+    /// and have no historical messages, so they use `since = now()`.
     /// C-FFI1: uses .lock().await instead of try_lock() to avoid silently skipping busy sessions.
-    pub(crate) async fn collect_subscribe_pubkeys(&self) -> Vec<PublicKey> {
+    pub(crate) async fn collect_subscribe_pubkeys(
+        &self,
+    ) -> (Vec<PublicKey>, Vec<PublicKey>) {
         // Collect session Arcs under read lock, then drop the lock before awaiting session mutexes
         let (identity_pk, session_arcs, pending_pks) = {
             let inner = self.inner.read().await;
@@ -1336,25 +1355,27 @@ impl KeychatClient {
             (identity_pk, session_arcs, pending_pks)
         }; // RwLock dropped
 
-        let mut pubkeys = Vec::new();
+        // Identity keys: receive NIP-59 with randomized outer timestamps
+        let mut identity_pubkeys = Vec::new();
         if let Some(pk) = identity_pk {
-            pubkeys.push(pk);
+            identity_pubkeys.push(pk);
+        }
+        // Pending outbound first-inbox keys also receive NIP-59 friend request responses
+        for pk in pending_pks {
+            identity_pubkeys.push(pk);
         }
 
-        // Now lock each session individually (no outer lock held)
+        // Ratchet keys: newly derived Signal addresses, no historical messages
+        let mut ratchet_pubkeys = Vec::new();
         for session_mutex in &session_arcs {
             let session = session_mutex.lock().await;
             for addr_str in session.addresses.get_all_receiving_address_strings() {
                 if let Ok(pk) = PublicKey::from_hex(&addr_str) {
-                    pubkeys.push(pk);
+                    ratchet_pubkeys.push(pk);
                 }
             }
         }
 
-        for pk in pending_pks {
-            pubkeys.push(pk);
-        }
-
-        pubkeys
+        (identity_pubkeys, ratchet_pubkeys)
     }
 }

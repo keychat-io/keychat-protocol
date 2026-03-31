@@ -1207,17 +1207,54 @@ impl KeychatClient {
     ///
     /// Uses `Arc<Self>` so the event loop task can hold a reference.
     pub async fn start_event_loop(self: Arc<Self>) -> Result<(), KeychatUniError> {
-        // Collect pubkeys to subscribe to
-        let pubkeys = self.collect_subscribe_pubkeys().await;
-        tracing::info!("event loop: subscribing to {} pubkeys", pubkeys.len());
-        if pubkeys.is_empty() {
+        // Collect pubkeys split by type: identity keys vs ratchet keys
+        let (identity_pubkeys, ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+        let total = identity_pubkeys.len() + ratchet_pubkeys.len();
+        tracing::info!(
+            "event loop: subscribing to {} pubkeys ({} identity, {} ratchet)",
+            total,
+            identity_pubkeys.len(),
+            ratchet_pubkeys.len()
+        );
+        if identity_pubkeys.is_empty() && ratchet_pubkeys.is_empty() {
             tracing::error!("event loop: no pubkeys to subscribe — no identity set");
             return Err(KeychatUniError::NotInitialized {
                 msg: "no pubkeys to subscribe to — set identity first".into(),
             });
         }
 
-        // Subscribe via Transport
+        // Read relay subscription cursor for identity key `since` parameter.
+        // Identity keys receive NIP-59 GiftWrap with ±2 day outer timestamp randomization,
+        // so we subtract 2 days from the cursor as a safety window.
+        // Ratchet keys are newly derived addresses with no history — use now().
+        let identity_since = {
+            let inner = self.inner.read().await;
+            let storage = inner.storage.lock().unwrap_or_else(|e| e.into_inner());
+            let cursor = storage.get_min_relay_cursor().unwrap_or(0);
+            drop(storage);
+            drop(inner);
+
+            if cursor > 0 {
+                let two_days_secs: u64 = 2 * 24 * 60 * 60;
+                let since_ts = cursor.saturating_sub(two_days_secs);
+                tracing::info!(
+                    "event loop: identity since = cursor({}) - 2days = {}",
+                    cursor,
+                    since_ts
+                );
+                Some(libkeychat::Timestamp::from(since_ts))
+            } else {
+                // First launch — no cursor yet. Subscribe without `since` to get
+                // initial history. The relay's own retention policy limits the result.
+                // After the first event is processed, the cursor will be set.
+                tracing::info!("event loop: no cursor yet, subscribing without since for initial sync");
+                None
+            }
+        };
+
+        let ratchet_since = Some(libkeychat::Timestamp::now());
+
+        // Subscribe via Transport — separate subscriptions for identity and ratchet keys
         {
             let inner = self.inner.read().await;
             let transport = inner
@@ -1226,10 +1263,26 @@ impl KeychatClient {
                 .ok_or(KeychatUniError::Transport {
                     msg: "Not connected to any relay. Please check your network.".into(),
                 })?;
-            transport.subscribe(pubkeys, None).await.map_err(|e| {
-                tracing::error!("event loop: subscribe failed: {e}");
-                e
-            })?;
+
+            if !identity_pubkeys.is_empty() {
+                transport
+                    .subscribe(identity_pubkeys, identity_since)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("event loop: identity subscribe failed: {e}");
+                        e
+                    })?;
+            }
+
+            if !ratchet_pubkeys.is_empty() {
+                transport
+                    .subscribe(ratchet_pubkeys, ratchet_since)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("event loop: ratchet subscribe failed: {e}");
+                        e
+                    })?;
+            }
         } // lock dropped
 
         // Create stop channel
