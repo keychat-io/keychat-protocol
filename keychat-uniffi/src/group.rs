@@ -193,6 +193,19 @@ impl KeychatClient {
             let _ = inner.group_manager.save_group(&gid, &store);
         }
 
+        // Create app_room for the group (same as receiver side in event_loop)
+        {
+            let app_storage = inner.app_storage.clone();
+            let store = crate::client::lock_app_storage(&app_storage);
+            if let Err(e) = store.save_app_room(
+                &group_id, &my_nostr_pubkey, 1, 1, Some(&name), None, None,
+            ) {
+                tracing::warn!("save_app_room for group: {e}");
+            }
+        }
+        drop(inner);
+        self.emit_data_change(crate::types::DataChange::RoomListChanged).await;
+
         Ok(SignalGroupInfo {
             group_id,
             name: group_name,
