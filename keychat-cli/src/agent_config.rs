@@ -15,12 +15,11 @@ const SECRETS_DIR: &str = "secrets";
 
 // ─── DB Encryption Key ─────────────────────────────────────────
 
-/// Resolve the database encryption key with agent-friendly fallback chain.
+/// Resolve the database encryption key.
 ///
 /// Priority:
-/// 1. `KEYCHAT_DB_KEY` env var
-/// 2. `{data_dir}/secrets/dbkey` file
-/// 3. `commands::get_or_create_db_key()` (OS keyring → file fallback)
+/// 1. `KEYCHAT_DB_KEY` env var (container/CI injection)
+/// 2. System keychain (via commands::get_or_create_db_key, which also handles legacy file migration)
 pub fn resolve_db_key(data_dir: &str) -> anyhow::Result<String> {
     // 1. Environment variable
     if let Ok(key) = std::env::var("KEYCHAT_DB_KEY") {
@@ -32,22 +31,8 @@ pub fn resolve_db_key(data_dir: &str) -> anyhow::Result<String> {
         tracing::warn!("KEYCHAT_DB_KEY env var invalid (expected 64 hex chars), trying next source");
     }
 
-    // 2. Secrets file
-    if let Some(key) = read_secret_file(data_dir, "dbkey")? {
-        if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
-            tracing::info!("DB key loaded from secrets/dbkey");
-            return Ok(key);
-        }
-        tracing::warn!("secrets/dbkey invalid, trying next source");
-    }
-
-    // 3. Standard resolution (keyring → file fallback)
-    let key = commands::get_or_create_db_key(data_dir)?;
-
-    // Persist to secrets file for container restarts
-    write_secret_file(data_dir, "dbkey", &key)?;
-
-    Ok(key)
+    // 2. Keychain (handles legacy file migration internally)
+    commands::get_or_create_db_key(data_dir)
 }
 
 // ─── Mnemonic (Identity) ───────────────────────────────────────
@@ -68,21 +53,30 @@ pub fn resolve_mnemonic(data_dir: &str) -> anyhow::Result<Option<String>> {
         }
     }
 
-    // 2. Secrets file
-    if let Some(mnemonic) = read_secret_file(data_dir, "mnemonic")? {
-        if !mnemonic.is_empty() {
-            tracing::info!("Mnemonic loaded from secrets/mnemonic");
+    // 2. System keychain (macOS Keychain / Linux keyring)
+    match crate::secrets::retrieve("mnemonic") {
+        Ok(Some(mnemonic)) if !mnemonic.is_empty() => {
+            tracing::info!("Mnemonic loaded from system keychain");
             return Ok(Some(mnemonic));
         }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Keychain mnemonic read failed: {e}"),
     }
 
     // 3. Not found — caller decides what to do
     Ok(None)
 }
 
-/// Persist mnemonic to secrets file (called after identity creation).
-pub fn save_mnemonic(data_dir: &str, mnemonic: &str) -> anyhow::Result<()> {
-    write_secret_file(data_dir, "mnemonic", mnemonic)
+/// Persist mnemonic to system keychain only (never to file).
+pub fn save_mnemonic(_data_dir: &str, mnemonic: &str) -> anyhow::Result<()> {
+    match crate::secrets::store("mnemonic", mnemonic) {
+        Ok(true) => {
+            tracing::info!("Mnemonic stored in system keychain");
+            Ok(())
+        }
+        Ok(false) => Err(anyhow::anyhow!("System keychain not available — cannot store mnemonic securely")),
+        Err(e) => Err(anyhow::anyhow!("Keychain store failed: {e}")),
+    }
 }
 
 // ─── API Token ─────────────────────────────────────────────────
