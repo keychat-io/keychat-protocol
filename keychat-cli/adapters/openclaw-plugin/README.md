@@ -4,15 +4,21 @@ OpenClaw channel plugin for [keychat-cli](https://github.com/keychat-io/keychat-
 
 ## Install
 
+### Command Line (for developers)
+
 ```bash
-openclaw plugin add @keychat-io/keychat-cli
+# Step 1: Install the plugin (triggers gateway restart)
+openclaw plugins install @keychat-io/keychat-cli
+
+# Step 2: Install keychat-cli binary, start daemon, generate identities
+bash ~/.openclaw/extensions/keychat-cli/scripts/postinstall.sh
 ```
 
-This will:
-1. Download the keychat-cli binary for your platform
-2. Start the agent daemon
-3. Create a new Keychat identity
-4. Output your agent's npub + QR code
+After installation, ask your agent for its Keychat npub on any existing channel (Discord, Telegram, etc.), then add it as a friend in the [Keychat app](https://www.keychat.io).
+
+### Via Agent (for non-technical users)
+
+Simply tell your agent: **"Install keychat-cli"**. The agent will handle everything and send you the npub + QR code.
 
 ## Architecture
 
@@ -26,20 +32,24 @@ Keychat App ←→ Nostr Relay ←→ keychat-cli agent (:7800)
 
 ## How It Works
 
-- **Inbound**: SSE from `GET /events` → DM policy check → dispatch to agent
-- **Outbound**: Agent reply → `POST /send` → daemon encrypts → Nostr relay
+- **Inbound**: SSE from `GET /agents/{id}/events` → DM policy check → dispatch to agent
+- **Outbound**: Agent reply → `POST /agents/{id}/send` → daemon encrypts → Nostr relay
+- **Multi-agent**: Each OpenClaw agent gets its own Keychat identity (npub), managed by a single daemon process
 - **Friend requests**: First person = owner (auto-accept). Others → notify owner → owner approves via natural language
 
 ## Config
 
-Add to `openclaw.json`:
+Automatically configured by `postinstall.sh`. Manual config:
 
 ```json
 {
   "channels": {
     "keychat-cli": {
       "enabled": true,
-      "url": "http://127.0.0.1:7800"
+      "url": "http://127.0.0.1:7800",
+      "accounts": {
+        "main": { "enabled": true, "dmPolicy": "open", "allowFrom": ["*"] }
+      }
     }
   }
 }
@@ -49,4 +59,4 @@ Add to `openclaw.json`:
 |-------|---------|-------------|
 | `url` | `http://127.0.0.1:7800` | Daemon URL |
 | `dmPolicy` | `pairing` | `open` / `allowlist` / `pairing` / `disabled` |
-| `allowFrom` | `[]` | Allowed sender pubkeys |
+| `allowFrom` | `[]` | Allowed sender pubkeys (`["*"]` for open access) |
