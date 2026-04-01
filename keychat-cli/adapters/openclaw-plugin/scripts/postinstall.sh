@@ -292,8 +292,8 @@ if [[ "$is_multi" == "true" ]]; then
   for aid in $agents; do
     local_npub=$(curl -s "http://127.0.0.1:${PORT}/agents/${aid}/identity" 2>/dev/null | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
     if [[ -n "$local_npub" ]]; then
-      local contact_url="https://www.keychat.io/u/?k=${local_npub}"
-      local qr_file="${DATA_DIR}/qr-${aid}.png"
+      contact_url="https://www.keychat.io/u/?k=${local_npub}"
+      qr_file="${DATA_DIR}/qr-${aid}.png"
       qr_path=$(generate_qr "$contact_url" "$qr_file")
 
       echo "Agent: ${aid}"
@@ -314,7 +314,7 @@ else
     exit 1
   fi
 
-  local contact_url="https://www.keychat.io/u/?k=${npub}"
+  contact_url="https://www.keychat.io/u/?k=${npub}"
   qr_path=$(generate_qr "$contact_url" "${DATA_DIR}/npub-qr.png")
 
   echo "npub: ${npub}"
