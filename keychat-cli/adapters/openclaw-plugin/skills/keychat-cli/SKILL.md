@@ -26,14 +26,38 @@ This runs `postinstall.sh` which:
 
 ## After Install
 
-1. **Read the output** — look for `npub:` and `QR_IMAGE:` lines
-2. **Send the QR image** to the user who requested the install (use the message tool with the image path from `QR_IMAGE:`)
-3. **Send the npub** as text so the user can copy it
-4. **Restart the gateway** so the plugin loads:
-   ```bash
-   openclaw gateway restart
-   ```
-5. Tell the user: "Scan the QR code or add this npub in Keychat app. The first person to add me becomes the owner."
+postinstall outputs `npub:` and `QR_IMAGE:` lines for each agent. You MUST:
+
+1. **Parse the output** — extract each agent's npub and QR image path
+2. **Send to the CURRENT channel/room** (the one where the user asked to install) using the message tool:
+   - For each agent: send npub text + QR image (use `media` parameter, not file path text)
+   - Add: "⏳ 1分钟后可以加 agent" (gives time for plugin + gateway restart)
+   - Do NOT send links, only npub and QR image
+   - Send to the current room/group, NOT to the user's DM
+3. **Configure the plugin** in openclaw.json (add channels.keychat-cli config with accounts matching agents.list)
+4. **Restart the gateway** so the plugin loads and connects to the daemon SSE
+5. After restart, plugin auto-connects to daemon — messages start flowing
+
+### Message format example
+```
+🔑 Keychat CLI installed!
+
+Main Agent npub:
+npub1xxx...
+[QR image attached]
+
+Test Agent npub:
+npub1yyy...
+[QR image attached]
+
+⏳ 1分钟后可以加 agent
+```
+
+### Critical rules
+- Send npub + QR BEFORE restarting gateway (restart may disconnect your session)
+- Send to the current channel/room, not DM
+- Use message tool with `media` parameter for QR images
+- The first person to add the agent becomes the owner (auto-approved)
 
 ## Config
 
