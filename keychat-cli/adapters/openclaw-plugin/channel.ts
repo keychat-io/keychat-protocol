@@ -28,11 +28,16 @@ const DEFAULT_ACCOUNT_ID = "default";
 // Types
 // ═══════════════════════════════════════════════════════════════════════════
 
-interface ChannelConfig {
+interface AccountConfig {
   enabled?: boolean;
   url?: string;
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;
+}
+
+interface ChannelConfig extends AccountConfig {
+  /** Multi-account: each key is an accountId with its own config. */
+  accounts?: Record<string, AccountConfig>;
 }
 
 interface ResolvedAccount {
@@ -70,16 +75,54 @@ function getChannelConfig(cfg: any): ChannelConfig | undefined {
   return (cfg.channels as Record<string, unknown> | undefined)?.[CHANNEL_ID] as ChannelConfig | undefined;
 }
 
+function isMultiAccount(cfg: any): boolean {
+  const cc = getChannelConfig(cfg);
+  return !!(cc?.accounts && Object.keys(cc.accounts).length > 0);
+}
+
 function resolveAccount(cfg: any, accountId?: string | null): ResolvedAccount {
   const cc = getChannelConfig(cfg) ?? {};
+  const id = accountId ?? DEFAULT_ACCOUNT_ID;
+
+  // Multi-account: merge per-account config over top-level defaults
+  const acctCfg = cc.accounts && Object.keys(cc.accounts).length > 0
+    ? cc.accounts[id]
+    : undefined;
+
+  if (acctCfg) {
+    return {
+      accountId: id,
+      enabled: acctCfg.enabled !== false,
+      configured: true,
+      url: acctCfg.url ?? cc.url ?? DEFAULT_URL,
+      dmPolicy: acctCfg.dmPolicy ?? cc.dmPolicy ?? "pairing",
+      allowFrom: acctCfg.allowFrom ?? cc.allowFrom ?? [],
+    };
+  }
+
   return {
-    accountId: accountId ?? DEFAULT_ACCOUNT_ID,
+    accountId: id,
     enabled: cc.enabled !== false,
     configured: true,
     url: cc.url ?? DEFAULT_URL,
     dmPolicy: cc.dmPolicy ?? "pairing",
     allowFrom: cc.allowFrom ?? [],
   };
+}
+
+function getAllowFrom(cfg: any, accountId: string): string[] {
+  if (isMultiAccount(cfg)) {
+    return (cfg.channels?.[CHANNEL_ID]?.accounts?.[accountId]?.allowFrom ?? []).map(String);
+  }
+  return (cfg.channels?.[CHANNEL_ID]?.allowFrom ?? []).map(String);
+}
+
+function patchAllowFrom(accountId: string, cfg: any, allowFrom: string[]): void {
+  if (isMultiAccount(cfg)) {
+    getRuntime().config.patchConfig({ channels: { [CHANNEL_ID]: { accounts: { [accountId]: { allowFrom } } } } });
+  } else {
+    getRuntime().config.patchConfig({ channels: { [CHANNEL_ID]: { allowFrom } } });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -230,7 +273,16 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
   configSchema: emptyPluginConfigSchema(),
 
   config: {
-    listAccountIds: (cfg) => { const cc = getChannelConfig(cfg); return cc && cc.enabled !== false ? [DEFAULT_ACCOUNT_ID] : []; },
+    listAccountIds: (cfg) => {
+      const cc = getChannelConfig(cfg);
+      if (!cc || cc.enabled === false) return [];
+      if (cc.accounts && Object.keys(cc.accounts).length > 0) {
+        return Object.entries(cc.accounts)
+          .filter(([_, acct]) => acct.enabled !== false)
+          .map(([id]) => id);
+      }
+      return [DEFAULT_ACCOUNT_ID];
+    },
     resolveAccount: (cfg, accountId) => resolveAccount(cfg, accountId),
     defaultAccountId: () => DEFAULT_ACCOUNT_ID,
     isConfigured: (account) => account.configured,
@@ -243,11 +295,18 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
   pairing: { idLabel: "keychatPubkey", normalizeAllowEntry: normalizePubkey },
 
   security: {
-    resolveDmPolicy: ({ account }) => ({
-      policy: account.dmPolicy, allowFrom: account.allowFrom ?? [],
-      policyPath: `channels.${CHANNEL_ID}.dmPolicy`, allowFromPath: `channels.${CHANNEL_ID}.allowFrom`,
-      approveHint: `/approve ${CHANNEL_ID} <pubkey>`, normalizeEntry: normalizePubkey,
-    }),
+    resolveDmPolicy: ({ account }) => {
+      const cfg = getRuntime().config.loadConfig();
+      const multi = isMultiAccount(cfg);
+      const prefix = multi
+        ? `channels.${CHANNEL_ID}.accounts.${account.accountId}`
+        : `channels.${CHANNEL_ID}`;
+      return {
+        policy: account.dmPolicy, allowFrom: account.allowFrom ?? [],
+        policyPath: `${prefix}.dmPolicy`, allowFromPath: `${prefix}.allowFrom`,
+        approveHint: `/approve ${CHANNEL_ID} <pubkey>`, normalizeEntry: normalizePubkey,
+      };
+    },
   },
 
   messaging: {
@@ -311,10 +370,10 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
             if (ownerData.owner && normalizePubkey(ownerData.owner) === normalizePubkey(senderPk)) {
               ctx.log?.info(`Owner ${senderNm} auto-added to allowFrom`);
               const cfg = getRuntime().config.loadConfig();
-              const currentAllowFrom: string[] = (cfg.channels?.[CHANNEL_ID]?.allowFrom ?? []).map(String);
+              const currentAllowFrom = getAllowFrom(cfg, account.accountId);
               if (!currentAllowFrom.includes(normalizePubkey(senderPk)) && !currentAllowFrom.includes("*")) {
                 currentAllowFrom.push(normalizePubkey(senderPk));
-                getRuntime().config.patchConfig({ channels: { [CHANNEL_ID]: { allowFrom: currentAllowFrom } } });
+                patchAllowFrom(account.accountId, cfg, currentAllowFrom);
               }
               return;
             }
@@ -470,7 +529,21 @@ export async function daemonPostJson(url: string, path: string, body: unknown): 
   return json.data;
 }
 
-export function getResolvedAccount(): { url: string } {
+export function getResolvedAccount(accountId?: string): ResolvedAccount {
   const cfg = getRuntime().config.loadConfig();
-  return resolveAccount(cfg);
+  return resolveAccount(cfg, accountId);
 }
+
+export function listActiveAccountIds(): string[] {
+  const cfg = getRuntime().config.loadConfig();
+  const cc = getChannelConfig(cfg);
+  if (!cc || cc.enabled === false) return [];
+  if (cc.accounts && Object.keys(cc.accounts).length > 0) {
+    return Object.entries(cc.accounts)
+      .filter(([_, acct]) => acct.enabled !== false)
+      .map(([id]) => id);
+  }
+  return [DEFAULT_ACCOUNT_ID];
+}
+
+export { isMultiAccount, getAllowFrom, patchAllowFrom };

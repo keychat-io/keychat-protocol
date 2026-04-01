@@ -14,6 +14,10 @@ import {
   daemonFetchJson,
   daemonPostJson,
   getResolvedAccount,
+  listActiveAccountIds,
+  isMultiAccount,
+  getAllowFrom,
+  patchAllowFrom,
 } from "./channel.js";
 
 const CHANNEL_ID = "keychat-cli";
@@ -58,19 +62,25 @@ const plugin = {
     api.registerTool({
       name: "keychat_pending_friends",
       label: "Keychat Pending Friends",
-      description: "List pending friend requests waiting for owner approval.",
-      parameters: { type: "object", properties: {}, required: [] },
-      async execute() {
+      description: "List pending friend requests waiting for owner approval. Optionally specify accountId for multi-account setups.",
+      parameters: {
+        type: "object",
+        properties: {
+          accountId: { type: "string", description: "Account ID (optional, defaults to 'default')" },
+        },
+        required: [],
+      },
+      async execute({ accountId }: { accountId?: string }) {
         try {
-          const account = getResolvedAccount();
+          const account = getResolvedAccount(accountId);
           const data = await daemonFetchJson(account.url, "/pending-friends") as any[];
           if (!data || data.length === 0) {
-            return { details: null, content: [{ type: "text" as const, text: "No pending friend requests." }] };
+            return { details: null, content: [{ type: "text" as const, text: `[${account.accountId}] No pending friend requests.` }] };
           }
           const text = data
             .map((p: any) => `• ${p.sender_name ?? "unknown"} (${(p.sender_pubkey ?? "").slice(0, 16)}…) — request_id: ${p.request_id}`)
             .join("\n");
-          return { details: null, content: [{ type: "text" as const, text }] };
+          return { details: null, content: [{ type: "text" as const, text: `[${account.accountId}]\n${text}` }] };
         } catch (err) {
           return { details: null, content: [{ type: "text" as const, text: `Error: ${err}` }] };
         }
@@ -88,28 +98,28 @@ const plugin = {
         type: "object",
         properties: {
           request_id: { type: "string", description: "Request ID from pending friends list" },
+          accountId: { type: "string", description: "Account ID (optional, defaults to 'default')" },
         },
         required: ["request_id"],
       },
-      async execute({ request_id }: { request_id: string }) {
+      async execute({ request_id, accountId }: { request_id: string; accountId?: string }) {
         try {
-          const account = getResolvedAccount();
+          const account = getResolvedAccount(accountId);
           const result = await daemonPostJson(account.url, "/approve-friend", { request_id }) as any;
           const senderPubkey = result?.sender_pubkey;
 
           if (senderPubkey) {
-            const runtime = api.runtime;
-            const cfg = runtime.config.loadConfig();
-            const currentAllowFrom: string[] = (cfg.channels?.[CHANNEL_ID]?.allowFrom ?? []).map(String);
+            const cfg = api.runtime.config.loadConfig();
+            const currentAllowFrom = getAllowFrom(cfg, account.accountId);
             if (!currentAllowFrom.includes(senderPubkey) && !currentAllowFrom.includes("*")) {
               currentAllowFrom.push(senderPubkey);
-              runtime.config.patchConfig({ channels: { [CHANNEL_ID]: { allowFrom: currentAllowFrom } } });
+              patchAllowFrom(account.accountId, cfg, currentAllowFrom);
             }
           }
 
           return {
             details: null,
-            content: [{ type: "text" as const, text: `Approved. ${senderPubkey ? `Sender ${senderPubkey.slice(0, 16)}… added to allowFrom.` : "Signal session established."}` }],
+            content: [{ type: "text" as const, text: `[${account.accountId}] Approved. ${senderPubkey ? `Sender ${senderPubkey.slice(0, 16)}… added to allowFrom.` : "Signal session established."}` }],
           };
         } catch (err) {
           return { details: null, content: [{ type: "text" as const, text: `Error: ${err}` }] };
@@ -127,14 +137,15 @@ const plugin = {
         type: "object",
         properties: {
           request_id: { type: "string", description: "Request ID from pending friends list" },
+          accountId: { type: "string", description: "Account ID (optional, defaults to 'default')" },
         },
         required: ["request_id"],
       },
-      async execute({ request_id }: { request_id: string }) {
+      async execute({ request_id, accountId }: { request_id: string; accountId?: string }) {
         try {
-          const account = getResolvedAccount();
+          const account = getResolvedAccount(accountId);
           await daemonPostJson(account.url, "/reject-friend", { request_id });
-          return { details: null, content: [{ type: "text" as const, text: "Rejected." }] };
+          return { details: null, content: [{ type: "text" as const, text: `[${account.accountId}] Rejected.` }] };
         } catch (err) {
           return { details: null, content: [{ type: "text" as const, text: `Error: ${err}` }] };
         }
