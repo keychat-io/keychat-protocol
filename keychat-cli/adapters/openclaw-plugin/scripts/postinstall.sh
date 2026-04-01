@@ -328,6 +328,53 @@ else
   fi
 fi
 
+# 6. Auto-configure channel accounts in openclaw.json
+log "Configuring channel accounts..."
+if command -v python3 &>/dev/null; then
+  python3 << PYEOF
+import json, os, sys
+
+config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+try:
+    with open(config_path) as f:
+        cfg = json.load(f)
+except:
+    print("[keychat] WARNING: Could not read openclaw.json", file=sys.stderr)
+    sys.exit(0)
+
+# Read agent ids
+agents_list = cfg.get("agents", {}).get("list", [])
+agent_ids = [a.get("id") for a in agents_list if a.get("id")]
+if not agent_ids:
+    agent_ids = ["default"]
+
+# Build accounts config
+accounts = {}
+for aid in agent_ids:
+    accounts[aid] = {"enabled": True, "dmPolicy": "open", "allowFrom": ["*"]}
+
+# Merge into existing config
+channels = cfg.setdefault("channels", {})
+kc_cli = channels.setdefault("keychat-cli", {})
+kc_cli["enabled"] = True
+kc_cli["url"] = "http://127.0.0.1:${PORT}"
+
+# Merge accounts (don't overwrite existing per-account settings)
+existing_accounts = kc_cli.get("accounts", {})
+for aid, acct in accounts.items():
+    if aid not in existing_accounts:
+        existing_accounts[aid] = acct
+kc_cli["accounts"] = existing_accounts
+
+with open(config_path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+print(f"[keychat] Configured {len(agent_ids)} account(s): {', '.join(agent_ids)}", file=sys.stderr)
+PYEOF
+else
+  log "WARNING: python3 not found, skipping auto-config. Manual config needed."
+fi
+
 echo ""
 echo "Agent listening on http://127.0.0.1:${PORT}"
 echo ""
