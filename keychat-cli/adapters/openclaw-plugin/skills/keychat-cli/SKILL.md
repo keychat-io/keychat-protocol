@@ -11,34 +11,29 @@ Keychat adds E2E encrypted messaging to your OpenClaw agent. Users talk to your 
 
 - `qrencode` for QR code generation (install with `brew install qrencode` on macOS or `apt install qrencode` on Linux)
 
-## Install
+## Install Steps (execute in order)
+
+### Step 1: Install plugin
 
 ```bash
 openclaw plugins install @keychat-io/keychat-cli
 ```
 
-This runs `postinstall.sh` which:
-1. Downloads the keychat-cli binary for the current platform
-2. Starts the agent daemon on `127.0.0.1:7800`
-3. Creates a Keychat identity (stored in system keychain)
-4. Generates a QR code image (`~/.keychat/npub-qr.png`)
-5. Outputs the npub and QR image path
+This installs the plugin TS code and triggers a gateway restart. Wait for gateway to come back (~10s).
 
-## After Install
+### Step 2: Run postinstall
 
-postinstall outputs `npub:` and `QR_IMAGE:` lines for each agent. You MUST:
+```bash
+bash ~/.openclaw/extensions/keychat-cli/scripts/postinstall.sh
+```
 
-1. **Parse the output** — extract each agent's npub and QR image path
-2. **Send to the CURRENT channel/room** (the one where the user asked to install) using the message tool:
-   - For each agent: send npub text + QR image (use `media` parameter, not file path text)
-   - Add: "⏳ 1分钟后可以加 agent" (gives time for plugin + gateway restart)
-   - Do NOT send links, only npub and QR image
-   - Send to the current room/group, NOT to the user's DM
-3. **Configure the plugin** in openclaw.json (add channels.keychat-cli config with accounts matching agents.list)
-4. **Restart the gateway** so the plugin loads and connects to the daemon SSE
-5. After restart, plugin auto-connects to daemon — messages start flowing
+This installs the keychat-cli binary, starts the daemon (launchd/systemd), and generates an identity + QR code for each agent.
 
-### Message template
+Parse the output — look for `npub:` and `QR_IMAGE:` lines for each agent.
+
+### Step 3: Send npub + QR to user
+
+Send to the CURRENT channel/room where the user asked to install. Use the message tool.
 
 Total messages = 1 + number of agents.
 Use the user's language (match the language they used to request the install).
@@ -67,41 +62,45 @@ Please wait 1 minute, then add these agents in Keychat app. You can also scan th
 **Message 2..N (one per agent, image with caption):**
 ```
 Agent "<agent_id>" QR:
-[attach ~/.keychat/qr-<agent_id>.png]
+[attach ~/.keychat/qr-<agent_id>.png via message tool filePath parameter]
 ```
+
+### Step 4: Configure channel accounts
+
+Use the gateway config.patch tool to write channel config:
+
+```json
+{
+  "channels": {
+    "keychat-cli": {
+      "enabled": true,
+      "url": "http://127.0.0.1:7800",
+      "accounts": {
+        "<agent_id>": { "enabled": true, "dmPolicy": "open", "allowFrom": ["*"] }
+      }
+    }
+  }
+}
+```
+
+Build accounts from the agent IDs in the postinstall output. This triggers a hot-reload — plugin connects to daemon SSE automatically.
 
 ### Critical rules
-- Send ALL messages BEFORE configuring plugin / restarting gateway
+- Steps MUST be in this order: plugin install → postinstall → send messages → config.patch
+- Send npub + QR BEFORE config.patch (config.patch is safe but messages should go out first)
 - Send to the current channel/room (use group:ID for group chats), NOT to user's DM
 - Use `message` tool with `filePath` for QR images — do NOT use MEDIA: inline syntax
-- Text message and QR images are separate messages (keychat doesn't support text + image in one message)
 - The first person to add the agent becomes the owner (auto-approved)
-
-## Config
-
-After install, the plugin auto-configures. If you need to adjust:
-
-```bash
-openclaw config set channels.keychat-cli.enabled true
-openclaw config set channels.keychat-cli.url "http://127.0.0.1:7800"
-```
 
 ## Friend Approval
 
 - **First person** to add the agent as friend becomes the **owner** (auto-approved)
 - **Others** are held as pending — the agent notifies the owner and waits for approval
 - Owner says "approve" → agent uses `keychat_approve_friend` tool
-- One approval = Signal session + agent access (both layers synced)
 
 ## Troubleshooting
 
-If the agent daemon isn't running:
+Check daemon status:
 ```bash
-keychat agent --port 7800 &
-```
-
-Check status:
-```bash
-curl http://127.0.0.1:7800/identity
-curl http://127.0.0.1:7800/status
+curl http://127.0.0.1:7800/agents
 ```
