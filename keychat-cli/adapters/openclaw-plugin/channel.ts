@@ -142,21 +142,52 @@ async function daemonJson<T>(url: string, path: string): Promise<T> {
   return body.data as T;
 }
 
-async function daemonSend(url: string, roomId: string, text: string): Promise<void> {
-  const res = await daemonFetch(url, "/send", {
+async function daemonSend(url: string, roomId: string, text: string, agentId?: string): Promise<void> {
+  const path = agentId ? `/agents/${agentId}/send` : "/send";
+  const res = await daemonFetch(url, path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ room_id: roomId, text }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`/send ${res.status}: ${body}`);
+    throw new Error(`${path} ${res.status}: ${body}`);
   }
 }
 
-async function fetchIdentity(url: string): Promise<DaemonIdentity> {
-  const data = await daemonJson<{ pubkey_hex: string; npub: string; name?: string }>(url, "/identity");
+async function fetchIdentity(url: string, agentId?: string): Promise<DaemonIdentity> {
+  const path = agentId ? `/agents/${agentId}/identity` : "/identity";
+  const data = await daemonJson<{ pubkey_hex: string; npub: string; name?: string }>(url, path);
   return { pubkey_hex: data.pubkey_hex, npub: data.npub, name: data.name };
+}
+
+/** Check if daemon is in multi-agent mode */
+async function isDaemonMultiAgent(url: string): Promise<boolean> {
+  try {
+    const res = await daemonFetch(url, "/agents");
+    return res.ok;
+  } catch { return false; }
+}
+
+/** Ensure agent identity exists in daemon; create if missing */
+async function ensureAgentIdentity(url: string, agentId: string, log?: any): Promise<DaemonIdentity> {
+  try {
+    return await fetchIdentity(url, agentId);
+  } catch {
+    log?.info(`Agent ${agentId} not found, creating...`);
+    const data = await daemonJson<{ agent_id: string; npub: string; pubkey_hex: string }>(
+      url, `/agents/${agentId}/identity/create`,
+    ).catch(async () => {
+      // POST endpoint
+      const res = await daemonFetch(url, `/agents/${agentId}/identity/create`, { method: "POST" });
+      if (!res.ok) throw new Error(`create ${agentId}: ${res.status}`);
+      const body = await res.json() as { ok: boolean; data?: any; error?: string };
+      if (!body.ok) throw new Error(`create ${agentId}: ${body.error}`);
+      return body.data;
+    });
+    log?.info(`Agent ${agentId} created: ${data.npub}`);
+    return { npub: data.npub, pubkey_hex: data.pubkey_hex };
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -170,6 +201,7 @@ function connectSse(
   onEvent: (event: string, data: SseEvent) => void,
   log?: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void },
   abortSignal?: AbortSignal,
+  ssePath?: string,
 ): SseConnection {
   let stopped = false;
   let controller = new AbortController();
@@ -179,7 +211,7 @@ function connectSse(
   async function connect() {
     if (stopped) return;
     try {
-      const sseUrl = `${url.replace(/\/+$/, "")}/events`;
+      const sseUrl = `${url.replace(/\/+$/, "")}${ssePath || "/events"}`;
       log?.info(`SSE connecting to ${sseUrl}`);
       const res = await fetch(sseUrl, { headers: { Accept: "text/event-stream" }, signal: controller.signal });
       if (!res.ok) throw new Error(`SSE ${res.status}`);
@@ -323,7 +355,8 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
     sendText: async ({ to, text, accountId }) => {
       const cfg = getRuntime().config.loadConfig();
       const account = resolveAccount(cfg, accountId);
-      await daemonSend(account.url, normalizePubkey(to), text ?? "");
+      const multi = await isDaemonMultiAgent(account.url);
+      await daemonSend(account.url, normalizePubkey(to), text ?? "", multi ? account.accountId : undefined);
       return { channel: CHANNEL_ID as any, to: normalizePubkey(to), messageId: `kc-${Date.now()}` };
     },
   },
@@ -340,21 +373,33 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
   gateway: {
     startAccount: async (ctx: ChannelGatewayContext<ResolvedAccount>) => {
       const { account } = ctx;
-      ctx.log?.info(`Starting keychat-cli (${account.url})`);
+      ctx.log?.info(`[${account.accountId}] Starting keychat-cli (${account.url})`);
       activeConnections.get(account.accountId)?.stop();
 
+      // Detect if daemon supports multi-agent mode
+      const multiAgent = await isDaemonMultiAgent(account.url);
+      const agentId = multiAgent ? account.accountId : undefined;
+
       try {
-        const id = await fetchIdentity(account.url);
+        let id: DaemonIdentity;
+        if (multiAgent) {
+          id = await ensureAgentIdentity(account.url, account.accountId, ctx.log);
+        } else {
+          id = await fetchIdentity(account.url);
+        }
         identityCache.set(account.accountId, id);
-        ctx.log?.info(`Identity: ${id.npub}`);
+        ctx.log?.info(`[${account.accountId}] Identity: ${id.npub}`);
         ctx.setStatus({ accountId: account.accountId, publicKey: id.pubkey_hex, running: true, connected: true, lastStartAt: Date.now() });
       } catch (err) {
-        ctx.log?.error(`Identity fetch failed: ${err}`);
+        ctx.log?.error(`[${account.accountId}] Identity fetch failed: ${err}`);
         ctx.setStatus({ accountId: account.accountId, running: true, connected: false, lastError: String(err) });
       }
 
       const core = ctx.channelRuntime;
       if (!core) { ctx.log?.error("channelRuntime unavailable"); return; }
+
+      // SSE: per-agent stream if multi-agent, global stream otherwise
+      const ssePath = agentId ? `/agents/${agentId}/events` : "/events";
 
       const connection = connectSse(account.url, async (eventType, data) => {
         // ─── Friend request handling ───────────────────────
@@ -365,7 +410,8 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
           ctx.log?.info(`Friend request from ${senderNm} (${senderPk.slice(0, 16)})`);
 
           try {
-            const ownerData = await daemonJson<{ owner?: string | null }>(account.url, "/owner");
+            const ownerPath = agentId ? `/agents/${agentId}/owner` : "/owner";
+            const ownerData = await daemonJson<{ owner?: string | null }>(account.url, ownerPath);
             // Owner's own request → auto-add to allowFrom
             if (ownerData.owner && normalizePubkey(ownerData.owner) === normalizePubkey(senderPk)) {
               ctx.log?.info(`Owner ${senderNm} auto-added to allowFrom`);
@@ -380,17 +426,18 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
 
             // Non-owner → notify owner
             if (ownerData.owner) {
-              const rooms = await daemonJson<Array<{ id: string; to_main_pubkey: string; status: string }>>(account.url, "/rooms");
+              const roomsPath = agentId ? `/agents/${agentId}/rooms` : "/rooms";
+              const rooms = await daemonJson<Array<{ id: string; to_main_pubkey: string; status: string }>>(account.url, roomsPath);
               const ownerRoom = (rooms ?? []).find((r) => r.to_main_pubkey === ownerData.owner && r.status === "enabled");
               const notifyText = `🔔 Friend request from ${senderNm} (pubkey: ${senderPk}). Request ID: ${reqId}`;
 
               if (ownerRoom) {
-                await daemonSend(account.url, ownerRoom.id, notifyText);
+                await daemonSend(account.url, ownerRoom.id, notifyText, agentId);
                 ctx.log?.info(`Notified owner about friend request from ${senderNm}`);
               }
 
               // Also dispatch to agent session so agent has context
-              await dispatchToAgent(core, account, normalizePubkey(ownerData.owner), "system", notifyText, ownerRoom?.id, undefined, ctx);
+              await dispatchToAgent(core, account, normalizePubkey(ownerData.owner), "system", notifyText, ownerRoom?.id, undefined, ctx, agentId);
             }
           } catch (err) {
             ctx.log?.error(`Friend request notification failed: ${err}`);
@@ -420,13 +467,13 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
           ctx.log?.info(`Pairing required: ${sender.slice(0, 12)}`);
           try {
             const reply = core.pairing.buildPairingReply({ channel: CHANNEL_ID, senderId: sender, senderName });
-            if (roomId) await daemonSend(currentAccount.url, roomId, reply);
+            if (roomId) await daemonSend(currentAccount.url, roomId, reply, agentId);
           } catch (err) { ctx.log?.error(`Pairing reply failed: ${err}`); }
           return;
         }
 
-        await dispatchToAgent(core, account, sender, senderName, data.content, roomId, groupId, ctx);
-      }, ctx.log as any, ctx.abortSignal);
+        await dispatchToAgent(core, account, sender, senderName, data.content, roomId, groupId, ctx, agentId);
+      }, ctx.log as any, ctx.abortSignal, ssePath);
 
       activeConnections.set(account.accountId, connection);
       const healthTimer = setInterval(() => { ctx.setStatus({ lastEventAt: Date.now() }); }, 20 * 60 * 1000);
@@ -455,6 +502,7 @@ async function dispatchToAgent(
   account: ResolvedAccount, sender: string, senderName: string,
   text: string, roomId: string | undefined, groupId: string | undefined,
   ctx: { log?: any; setStatus: (s: any) => void },
+  agentId?: string,
 ): Promise<void> {
   const cfg = getRuntime().config.loadConfig();
   const isGroup = !!groupId;
@@ -484,7 +532,7 @@ async function dispatchToAgent(
     deliverBuffer = [];
     if (!merged || !roomId) return;
     try {
-      await daemonSend(account.url, roomId, merged);
+      await daemonSend(account.url, roomId, merged, agentId);
       ctx.setStatus({ lastOutboundAt: Date.now() });
     } catch (err) { ctx.log?.error(`Reply failed: ${err}`); }
   };
