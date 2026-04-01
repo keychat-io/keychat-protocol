@@ -400,7 +400,7 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
             // Fallback: try known locations
             const candidates = [
               resolve(process.cwd(), "scripts"),
-              resolve(process.env.HOME ?? "~", ".openclaw/extensions/keychat-cli/scripts"),
+              resolve((await import("node:os")).homedir(), ".openclaw/extensions/keychat-cli/scripts"),
             ];
             for (const c of candidates) {
               if (existsSync(resolve(c, "postinstall.sh"))) { scriptDir = c; break; }
@@ -413,7 +413,7 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
             const output = execFileSync("bash", [postinstallPath], {
               timeout: 120000,
               encoding: "utf-8",
-              env: { ...process.env, PATH: `${process.env.HOME}/.local/bin:${process.env.PATH}` },
+              env: { ...process.env, PATH: `${(await import("node:os")).homedir()}/.local/bin:${process.env.PATH}` },
             });
             ctx.log?.info(`[${account.accountId}] Postinstall complete`);
             // Log npub lines for debugging
@@ -448,7 +448,7 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
         // Notify agent about this identity (once per install, using marker file)
         try {
           const { existsSync, writeFileSync, mkdirSync } = await import("node:fs");
-          const markerDir = `${process.env.HOME ?? "~"}/.keychat`;
+          const markerDir = `${(await import("node:os")).homedir()}/.keychat`;
           const markerFile = `${markerDir}/.notified-${account.accountId}`;
           if (!existsSync(markerFile)) {
             const contactUrl = `https://www.keychat.io/u/?k=${id.npub}`;
