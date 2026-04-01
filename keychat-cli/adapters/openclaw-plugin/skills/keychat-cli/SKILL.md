@@ -40,32 +40,26 @@ postinstall outputs `npub:` and `QR_IMAGE:` lines for each agent. You MUST:
 
 ### Message template (MUST follow exactly)
 
-**Message 1 (text only, no media):**
+Total messages = 1 + number of agents.
+
+**Message 1 (text only, no media) — summary:**
 ```
 🔑 Keychat CLI 安装完成！
 
-Agent "main" 的 npub:
+Agent "main" 的 ID:
 <main_npub>
 
-Agent "test" 的 npub:
+Agent "test" 的 ID:
 <test_npub>
 
 请在1分钟后使用 Keychat app 添加这两个 agent。你也可以通过扫描下方二维码加 agent。
 ```
 
-**Message 2 (image, use message tool with `filePath` parameter):**
+**Message 2..N (one per agent, image with caption):**
 ```
-Main Agent QR:
-[attach ~/.keychat/qr-main.png]
+Agent "<agent_id>" QR:
+[attach ~/.keychat/qr-<agent_id>.png]
 ```
-
-**Message 3 (image, use message tool with `filePath` parameter):**
-```
-Test Agent QR:
-[attach ~/.keychat/qr-test.png]
-```
-
-For single-agent installs, omit the test agent messages.
 
 ### Critical rules
 - Send ALL messages BEFORE configuring plugin / restarting gateway
