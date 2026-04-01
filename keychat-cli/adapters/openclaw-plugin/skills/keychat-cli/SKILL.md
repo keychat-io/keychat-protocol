@@ -38,21 +38,43 @@ postinstall outputs `npub:` and `QR_IMAGE:` lines for each agent. You MUST:
 4. **Restart the gateway** so the plugin loads and connects to the daemon SSE
 5. After restart, plugin auto-connects to daemon — messages start flowing
 
-### Message template (MUST follow exactly)
+### Message template
 
 Total messages = 1 + number of agents.
+Use the user's language (match the language they used to request the install).
 
 **Message 1 (text only, no media) — summary:**
+
+Content (adapt to user's language):
+- 🔑 Keychat CLI installed!
+- List each agent's ID (npub)
+- Tell user to wait 1 minute before adding agents via Keychat app
+- Mention they can also scan QR codes below
+
+Example (Chinese):
 ```
 🔑 Keychat CLI 安装完成！
 
 Agent "main" 的 ID:
-<main_npub>
+npub1xxx...
 
 Agent "test" 的 ID:
-<test_npub>
+npub1yyy...
 
-请在1分钟后使用 Keychat app 添加这两个 agent。你也可以通过扫描下方二维码加 agent。
+请在1分钟后使用 Keychat app 添加 agent。你也可以扫描下方二维码。
+```
+
+Example (English):
+```
+🔑 Keychat CLI installed!
+
+Agent "main" ID:
+npub1xxx...
+
+Agent "test" ID:
+npub1yyy...
+
+Please wait 1 minute, then add these agents in Keychat app. You can also scan the QR codes below.
 ```
 
 **Message 2..N (one per agent, image with caption):**
