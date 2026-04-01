@@ -420,56 +420,26 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
               ].filter(Boolean);
 
               const { execFile: ef } = await import("node:child_process");
+              const { execFile: ef } = await import("node:child_process");
               const { promisify } = await import("node:util");
+              const { readFileSync: readFs } = await import("node:fs");
+              const { homedir } = await import("node:os");
               const execFileAsync = promisify(ef);
 
-              // 1. Inject system event to agent session
+              // Read gateway token for CLI auth
+              let tokenArgs: string[] = [];
               try {
-                await execFileAsync("openclaw", ["system", "event", "--text", lines.join("\n"), "--mode", "now"], { timeout: 10000 });
+                const cfgRaw = JSON.parse(readFs(`${homedir()}/.openclaw/openclaw.json`, "utf-8"));
+                const token = cfgRaw?.gateway?.auth?.token;
+                if (token) tokenArgs = ["--token", token];
+              } catch { /* skip */ }
+
+              // Inject system event to agent session — agent forwards to the right channel
+              try {
+                await execFileAsync("openclaw", ["system", "event", "--text", lines.join("\n"), "--mode", "now", ...tokenArgs], { timeout: 10000 });
                 ctx.log?.info(`[${account.accountId}] Identity notification sent to agent session`);
               } catch (e) {
                 ctx.log?.warn?.(`[${account.accountId}] Failed to send system event: ${e}`);
-              }
-
-              // 2. Push npub + QR to all recently active channels (keychat, discord, etc.)
-              try {
-                const qrExists = existsSync(qrPath);
-                // Find active channel sessions
-                let sessions: Array<{ key: string; updatedAt?: number }> = [];
-                try {
-                  const { stdout } = await execFileAsync("openclaw", ["sessions", "--json"], { timeout: 10000 });
-                  const parsed = JSON.parse(stdout);
-                  sessions = Array.isArray(parsed) ? parsed : (parsed.sessions ?? []);
-                } catch { /* skip */ }
-
-                const SKIP = new Set(["webchat", "main", "internal", "cron", "system", "keychat-cli"]);
-                const now = Date.now();
-                const maxAge = 7 * 24 * 60 * 60 * 1000;
-                const sent = new Set<string>();
-
-                for (const s of sessions) {
-                  const key: string = s.key ?? "";
-                  if (!key.startsWith("agent:")) continue;
-                  const parts = key.split(":");
-                  if (parts.length < 5) continue;
-                  const channel = parts[2];
-                  const target = parts.slice(4).join(":");
-                  if (!channel || !target || SKIP.has(channel)) continue;
-                  if ((s.updatedAt ?? 0) < now - maxAge) continue;
-                  const dedup = `${channel}:${target}`;
-                  if (sent.has(dedup)) continue;
-                  sent.add(dedup);
-
-                  const msg = `🔑 Keychat agent "${account.accountId}" is ready!\nnpub: ${id.npub}\n📱 Add: ${contactUrl}`;
-                  const args = ["message", "send", "--channel", channel, "--target", target, "--message", msg];
-                  if (qrExists) args.push("--media", qrPath);
-                  try {
-                    await execFileAsync("openclaw", args, { timeout: 15000 });
-                    ctx.log?.info(`[${account.accountId}] Identity pushed to ${channel}:${target}`);
-                  } catch { /* best effort */ }
-                }
-              } catch (e) {
-                ctx.log?.warn?.(`[${account.accountId}] Failed to push to channels: ${e}`);
               }
 
               writeFileSync(markerFile, new Date().toISOString());
