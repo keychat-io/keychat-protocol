@@ -67,7 +67,7 @@ check_existing() {
   return 1
 }
 
-# ─── Start agent daemon ─────────────────────────────────────
+# ─── Start agent daemon (launchd on macOS, systemd on Linux) ─
 start_agent() {
   # Check if already running
   if curl -s "http://127.0.0.1:${PORT}/identity" >/dev/null 2>&1; then
@@ -80,14 +80,70 @@ start_agent() {
 
   local keychat_bin
   keychat_bin=$(command -v keychat 2>/dev/null || echo "${INSTALL_DIR}/${BINARY_NAME}")
+  local real_bin
+  real_bin=$(realpath "$keychat_bin" 2>/dev/null || echo "$keychat_bin")
 
-  nohup "$keychat_bin" agent --port "$PORT" > /tmp/keychat-agent.log 2>&1 &
-  local pid=$!
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    # macOS: use launchd for persistent daemon
+    local plist_path="$HOME/Library/LaunchAgents/io.keychat.cli-agent.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$plist_path" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.keychat.cli-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${real_bin}</string>
+        <string>agent</string>
+        <string>--port</string>
+        <string>${PORT}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/keychat-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/keychat-agent.log</string>
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+</dict>
+</plist>
+PLIST
+    launchctl unload "$plist_path" 2>/dev/null
+    launchctl load "$plist_path" 2>&1
+  else
+    # Linux: use systemd user service
+    local service_dir="$HOME/.config/systemd/user"
+    mkdir -p "$service_dir"
+    cat > "$service_dir/keychat-agent.service" << UNIT
+[Unit]
+Description=Keychat CLI Agent
+After=network.target
+
+[Service]
+ExecStart=${real_bin} agent --port ${PORT}
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/keychat-agent.log
+StandardError=append:/tmp/keychat-agent.log
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable keychat-agent
+    systemctl --user start keychat-agent
+  fi
 
   # Wait for agent to start
   for i in $(seq 1 15); do
     if curl -s "http://127.0.0.1:${PORT}/identity" >/dev/null 2>&1; then
-      log "Agent started (pid: $pid)"
+      log "Agent started"
       return 0
     fi
     sleep 1
