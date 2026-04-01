@@ -376,17 +376,12 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
       ctx.log?.info(`[${account.accountId}] Starting keychat-cli (${account.url})`);
       activeConnections.get(account.accountId)?.stop();
 
-      // Detect if daemon supports multi-agent mode
-      const multiAgent = await isDaemonMultiAgent(account.url);
-      const agentId = multiAgent ? account.accountId : undefined;
+      // Always use multi-agent API — daemon always runs in multi-agent mode
+      const agentId = account.accountId;
 
       try {
         let id: DaemonIdentity;
-        if (multiAgent) {
-          id = await ensureAgentIdentity(account.url, account.accountId, ctx.log);
-        } else {
-          id = await fetchIdentity(account.url);
-        }
+        id = await ensureAgentIdentity(account.url, agentId, ctx.log);
         identityCache.set(account.accountId, id);
         ctx.log?.info(`[${account.accountId}] Identity: ${id.npub}`);
         ctx.setStatus({ accountId: account.accountId, publicKey: id.pubkey_hex, running: true, connected: true, lastStartAt: Date.now() });

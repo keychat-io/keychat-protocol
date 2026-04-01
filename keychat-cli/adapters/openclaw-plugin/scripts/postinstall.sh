@@ -210,17 +210,10 @@ except:
 }
 
 # ─── Setup multi-agent directories ──────────────────────────
-setup_multi_agent() {
+setup_agents() {
   local agents="$1"
-  local agent_count
-  agent_count=$(echo "$agents" | wc -w | tr -d ' ')
 
-  if [[ "$agent_count" -le 1 ]]; then
-    # Single agent — no agents/ subdirectory needed (legacy mode)
-    return 1
-  fi
-
-  # Multi-agent: create agents/{id}/ directories
+  # Always create agents/{id}/ directories for consistent multi-agent mode
   for aid in $agents; do
     mkdir -p "${DATA_DIR}/agents/${aid}"
     log "Agent directory: ${DATA_DIR}/agents/${aid}"
@@ -270,11 +263,8 @@ agents=$(get_openclaw_agents)
 agent_count=$(echo "$agents" | wc -w | tr -d ' ')
 log "Detected ${agent_count} agent(s): ${agents}"
 
-# 3. Setup multi-agent directories if needed
-is_multi=false
-if setup_multi_agent "$agents"; then
-  is_multi=true
-fi
+# 3. Setup agent directories (always multi-agent mode)
+setup_agents "$agents"
 
 # 4. Start agent daemon
 start_agent || exit 1
@@ -284,49 +274,24 @@ echo ""
 echo "✅ Keychat installed"
 echo ""
 
-if [[ "$is_multi" == "true" ]]; then
-  # Multi-agent mode: ensure each agent has identity
-  wait_for_agents "$agents"
-  echo ""
+wait_for_agents "$agents"
+echo ""
 
-  for aid in $agents; do
-    local_npub=$(curl -s "http://127.0.0.1:${PORT}/agents/${aid}/identity" 2>/dev/null | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
-    if [[ -n "$local_npub" ]]; then
-      contact_url="https://www.keychat.io/u/?k=${local_npub}"
-      qr_file="${DATA_DIR}/qr-${aid}.png"
-      qr_path=$(generate_qr "$contact_url" "$qr_file")
+for aid in $agents; do
+  local_npub=$(curl -s "http://127.0.0.1:${PORT}/agents/${aid}/identity" 2>/dev/null | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
+  if [[ -n "$local_npub" ]]; then
+    contact_url="https://www.keychat.io/u/?k=${local_npub}"
+    qr_file="${DATA_DIR}/qr-${aid}.png"
+    qr_path=$(generate_qr "$contact_url" "$qr_file")
 
-      echo "Agent: ${aid}"
-      echo "npub: ${local_npub}"
-      if [[ -n "$qr_path" && -f "$qr_path" ]]; then
-        echo "QR_IMAGE: ${qr_path}"
-      fi
-      echo ""
+    echo "Agent: ${aid}"
+    echo "npub: ${local_npub}"
+    if [[ -n "$qr_path" && -f "$qr_path" ]]; then
+      echo "QR_IMAGE: ${qr_path}"
     fi
-  done
-else
-  # Single agent mode (legacy)
-  identity=$(curl -s "http://127.0.0.1:${PORT}/identity" 2>/dev/null)
-  npub=$(echo "$identity" | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
-
-  if [[ -z "$npub" ]]; then
-    log "Failed to get agent identity"
-    exit 1
-  fi
-
-  contact_url="https://www.keychat.io/u/?k=${npub}"
-  qr_path=$(generate_qr "$contact_url" "${DATA_DIR}/npub-qr.png")
-
-  echo "npub: ${npub}"
-  echo ""
-  if [[ -n "$qr_path" && -f "$qr_path" ]]; then
-    echo "QR_IMAGE: ${qr_path}"
     echo ""
-    echo "Scan the QR code with Keychat app to add as friend."
-  else
-    echo "Add this npub in Keychat app to connect."
   fi
-fi
+done
 
 # 6. Auto-configure channel accounts in openclaw.json
 log "Configuring channel accounts..."
