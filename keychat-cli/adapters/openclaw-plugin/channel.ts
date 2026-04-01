@@ -419,27 +419,19 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
                 `Send this info to the user so they can add this agent in Keychat app.`,
               ].filter(Boolean);
 
-              const { execFile: ef } = await import("node:child_process");
-              const { execFile: ef } = await import("node:child_process");
-              const { promisify } = await import("node:util");
-              const { readFileSync: readFs } = await import("node:fs");
-              const { homedir } = await import("node:os");
-              const execFileAsync = promisify(ef);
-
-              // Read gateway token for CLI auth
-              let tokenArgs: string[] = [];
+              // Notify agent session via runtime API (no subprocess needed)
               try {
-                const cfgRaw = JSON.parse(readFs(`${homedir()}/.openclaw/openclaw.json`, "utf-8"));
-                const token = cfgRaw?.gateway?.auth?.token;
-                if (token) tokenArgs = ["--token", token];
-              } catch { /* skip */ }
-
-              // Inject system event to agent session — agent forwards to the right channel
-              try {
-                await execFileAsync("openclaw", ["system", "event", "--text", lines.join("\n"), "--mode", "now", ...tokenArgs], { timeout: 10000 });
-                ctx.log?.info(`[${account.accountId}] Identity notification sent to agent session`);
+                const rt = getRuntime();
+                const sessionKey = `agent:${account.accountId}:main`;
+                const notifyText = lines.join("\n");
+                if (rt.enqueueSystemEvent) {
+                  rt.enqueueSystemEvent(notifyText, { sessionKey, trusted: true });
+                  // Trigger heartbeat so agent processes the event immediately
+                  try { rt.requestHeartbeatNow?.(); } catch { /* best effort */ }
+                  ctx.log?.info(`[${account.accountId}] Identity notification enqueued for agent`);
+                }
               } catch (e) {
-                ctx.log?.warn?.(`[${account.accountId}] Failed to send system event: ${e}`);
+                ctx.log?.warn?.(`[${account.accountId}] Failed to enqueue notification: ${e}`);
               }
 
               writeFileSync(markerFile, new Date().toISOString());
