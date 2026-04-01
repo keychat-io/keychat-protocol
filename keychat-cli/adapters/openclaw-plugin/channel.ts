@@ -390,6 +390,31 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
         identityCache.set(account.accountId, id);
         ctx.log?.info(`[${account.accountId}] Identity: ${id.npub}`);
         ctx.setStatus({ accountId: account.accountId, publicKey: id.pubkey_hex, running: true, connected: true, lastStartAt: Date.now() });
+
+        // Notify agent about this identity (once per install, using marker file)
+        try {
+          const { existsSync, writeFileSync, mkdirSync } = await import("node:fs");
+          const markerDir = `${process.env.HOME ?? "~"}/.keychat`;
+          const markerFile = `${markerDir}/.notified-${account.accountId}`;
+          if (!existsSync(markerFile)) {
+            const contactUrl = `https://www.keychat.io/u/?k=${id.npub}`;
+            const qrPath = `${markerDir}/qr-${account.accountId}.png`;
+            const lines = [
+              `[Keychat CLI] Agent "${account.accountId}" is online.`,
+              `ID: ${id.npub}`,
+              existsSync(qrPath) ? `QR: ${qrPath}` : "",
+              `Send this agent's ID and QR code to the user who requested the install.`,
+            ].filter(Boolean);
+            const rt = getRuntime();
+            if (rt.enqueueSystemEvent) {
+              rt.enqueueSystemEvent(lines.join("\n"), { sessionKey: `agent:main:main`, trusted: true });
+              try { rt.requestHeartbeatNow?.(); } catch { /* best effort */ }
+              ctx.log?.info(`[${account.accountId}] Identity notification enqueued`);
+            }
+            mkdirSync(markerDir, { recursive: true });
+            writeFileSync(markerFile, new Date().toISOString());
+          }
+        } catch { /* best effort */ }
       } catch (err) {
         ctx.log?.error(`[${account.accountId}] Identity fetch failed: ${err}`);
         ctx.setStatus({ accountId: account.accountId, running: true, connected: false, lastError: String(err) });
