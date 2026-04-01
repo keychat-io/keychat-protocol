@@ -267,6 +267,7 @@ function connectSse(
 let pluginRuntime: any = null;
 const activeConnections = new Map<string, SseConnection>();
 const identityCache = new Map<string, DaemonIdentity>();
+const notifiedAccounts = new Set<string>();
 
 export function setRuntime(rt: any) { pluginRuntime = rt; }
 function getRuntime() { if (!pluginRuntime) throw new Error("runtime not set"); return pluginRuntime; }
@@ -390,6 +391,48 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
         identityCache.set(account.accountId, id);
         ctx.log?.info(`[${account.accountId}] Identity: ${id.npub}`);
         ctx.setStatus({ accountId: account.accountId, publicKey: id.pubkey_hex, running: true, connected: true, lastStartAt: Date.now() });
+
+        // Notify owner about this agent's identity (once per process lifetime)
+        if (!notifiedAccounts.has(account.accountId)) {
+          notifiedAccounts.add(account.accountId);
+          const markerDir = `${process.env.HOME ?? "~"}/.keychat`;
+          const markerFile = `${markerDir}/.notified-${account.accountId}`;
+          try {
+            const { existsSync, writeFileSync, mkdirSync } = await import("node:fs");
+            if (!existsSync(markerFile)) {
+              const contactUrl = `https://www.keychat.io/u/?k=${id.npub}`;
+              const qrPath = `${markerDir}/qr-${account.accountId}.png`;
+
+              // Generate QR code (best effort)
+              try {
+                const { execFileSync } = await import("node:child_process");
+                mkdirSync(markerDir, { recursive: true });
+                execFileSync("qrencode", ["-t", "PNG", "-o", qrPath, "-s", "10", "-m", "2", contactUrl], { timeout: 5000 });
+              } catch { /* qrencode not installed, skip */ }
+
+              // Inject system event so agent can forward to owner
+              const lines = [
+                `[Keychat CLI] Agent "${account.accountId}" is online.`,
+                `npub: ${id.npub}`,
+                `Contact: ${contactUrl}`,
+                existsSync(qrPath) ? `QR: ${qrPath}` : "",
+                `Send this info to the user so they can add this agent in Keychat app.`,
+              ].filter(Boolean);
+
+              try {
+                const { execFile: ef } = await import("node:child_process");
+                const { promisify } = await import("node:util");
+                const execFileAsync = promisify(ef);
+                await execFileAsync("openclaw", ["system", "event", "--text", lines.join("\n"), "--mode", "now"], { timeout: 10000 });
+                ctx.log?.info(`[${account.accountId}] Identity notification sent to agent session`);
+              } catch (e) {
+                ctx.log?.warn?.(`[${account.accountId}] Failed to send identity notification: ${e}`);
+              }
+
+              writeFileSync(markerFile, new Date().toISOString());
+            }
+          } catch { /* best effort */ }
+        }
       } catch (err) {
         ctx.log?.error(`[${account.accountId}] Identity fetch failed: ${err}`);
         ctx.setStatus({ accountId: account.accountId, running: true, connected: false, lastError: String(err) });
