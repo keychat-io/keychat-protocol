@@ -73,7 +73,9 @@ const plugin = {
       async execute({ accountId }: { accountId?: string }) {
         try {
           const account = getResolvedAccount(accountId);
-          const data = await daemonFetchJson(account.url, "/pending-friends") as any[];
+          const path = account.accountId !== "default" || listActiveAccountIds().length > 1
+            ? `/agents/${account.accountId}/pending-friends` : "/pending-friends";
+          const data = await daemonFetchJson(account.url, path) as any[];
           if (!data || data.length === 0) {
             return { details: null, content: [{ type: "text" as const, text: `[${account.accountId}] No pending friend requests.` }] };
           }
@@ -105,7 +107,9 @@ const plugin = {
       async execute({ request_id, accountId }: { request_id: string; accountId?: string }) {
         try {
           const account = getResolvedAccount(accountId);
-          const result = await daemonPostJson(account.url, "/approve-friend", { request_id }) as any;
+          const path = account.accountId !== "default" || listActiveAccountIds().length > 1
+            ? `/agents/${account.accountId}/approve-friend` : "/approve-friend";
+          const result = await daemonPostJson(account.url, path, { request_id }) as any;
           const senderPubkey = result?.sender_pubkey;
 
           if (senderPubkey) {
@@ -144,7 +148,9 @@ const plugin = {
       async execute({ request_id, accountId }: { request_id: string; accountId?: string }) {
         try {
           const account = getResolvedAccount(accountId);
-          await daemonPostJson(account.url, "/reject-friend", { request_id });
+          const path = account.accountId !== "default" || listActiveAccountIds().length > 1
+            ? `/agents/${account.accountId}/reject-friend` : "/reject-friend";
+          await daemonPostJson(account.url, path, { request_id });
           return { details: null, content: [{ type: "text" as const, text: `[${account.accountId}] Rejected.` }] };
         } catch (err) {
           return { details: null, content: [{ type: "text" as const, text: `Error: ${err}` }] };

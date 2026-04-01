@@ -156,7 +156,7 @@ UNIT
 # ─── Generate QR code image ─────────────────────────────────
 generate_qr() {
   local data="$1"
-  local out_path="${DATA_DIR}/npub-qr.png"
+  local out_path="$2"
 
   # Try qrencode (PNG image)
   if command -v qrencode &>/dev/null; then
@@ -189,6 +189,72 @@ except ImportError:
   echo ""
 }
 
+# ─── Detect OpenClaw agents from config ─────────────────────
+get_openclaw_agents() {
+  # Try to read agent list from openclaw config
+  local config_file="$HOME/.openclaw/openclaw.json"
+  if [[ -f "$config_file" ]] && command -v python3 &>/dev/null; then
+    python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$config_file'))
+    agents = cfg.get('agents', {}).get('list', [])
+    ids = [a.get('id', '') for a in agents if a.get('id')]
+    print(' '.join(ids) if ids else 'default')
+except:
+    print('default')
+" 2>/dev/null
+    return
+  fi
+  echo "default"
+}
+
+# ─── Setup multi-agent directories ──────────────────────────
+setup_multi_agent() {
+  local agents="$1"
+  local agent_count
+  agent_count=$(echo "$agents" | wc -w | tr -d ' ')
+
+  if [[ "$agent_count" -le 1 ]]; then
+    # Single agent — no agents/ subdirectory needed (legacy mode)
+    return 1
+  fi
+
+  # Multi-agent: create agents/{id}/ directories
+  for aid in $agents; do
+    mkdir -p "${DATA_DIR}/agents/${aid}"
+    log "Agent directory: ${DATA_DIR}/agents/${aid}"
+  done
+  return 0
+}
+
+# ─── Wait for multi-agent identities ────────────────────────
+wait_for_agents() {
+  local agents="$1"
+  local base_url="http://127.0.0.1:${PORT}"
+
+  for aid in $agents; do
+    log "Ensuring identity for agent: ${aid}"
+    # Check if agent exists
+    local id_json
+    id_json=$(curl -s "${base_url}/agents/${aid}/identity" 2>/dev/null)
+    local npub
+    npub=$(echo "$id_json" | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
+
+    if [[ -z "$npub" ]]; then
+      # Create new identity
+      id_json=$(curl -s -X POST "${base_url}/agents/${aid}/identity/create" 2>/dev/null)
+      npub=$(echo "$id_json" | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
+    fi
+
+    if [[ -n "$npub" ]]; then
+      log "Agent ${aid}: ${npub}"
+    else
+      log "WARNING: Failed to get identity for agent ${aid}"
+    fi
+  done
+}
+
 # ─── Main ────────────────────────────────────────────────────
 
 log "Setting up Keychat CLI for OpenClaw..."
@@ -199,34 +265,69 @@ if ! check_existing; then
   download_binary "$platform"
 fi
 
-# 2. Start agent
-start_agent || exit 1
+# 2. Detect OpenClaw agents
+agents=$(get_openclaw_agents)
+agent_count=$(echo "$agents" | wc -w | tr -d ' ')
+log "Detected ${agent_count} agent(s): ${agents}"
 
-# 3. Get identity
-identity=$(curl -s "http://127.0.0.1:${PORT}/identity" 2>/dev/null)
-npub=$(echo "$identity" | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
-
-if [[ -z "$npub" ]]; then
-  log "Failed to get agent identity"
-  exit 1
+# 3. Setup multi-agent directories if needed
+is_multi=false
+if setup_multi_agent "$agents"; then
+  is_multi=true
 fi
 
-# 4. Generate QR code image
-qr_path=$(generate_qr "$npub")
+# 4. Start agent daemon
+start_agent || exit 1
 
-# 5. Output result
+# 5. Get identities and generate QR codes
 echo ""
 echo "✅ Keychat installed"
 echo ""
-echo "npub: ${npub}"
-echo ""
-if [[ -n "$qr_path" && -f "$qr_path" ]]; then
-  echo "QR_IMAGE: ${qr_path}"
+
+if [[ "$is_multi" == "true" ]]; then
+  # Multi-agent mode: ensure each agent has identity
+  wait_for_agents "$agents"
   echo ""
-  echo "Scan the QR code with Keychat app to add as friend."
+
+  for aid in $agents; do
+    local_npub=$(curl -s "http://127.0.0.1:${PORT}/agents/${aid}/identity" 2>/dev/null | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
+    if [[ -n "$local_npub" ]]; then
+      local contact_url="https://www.keychat.io/u/?k=${local_npub}"
+      local qr_file="${DATA_DIR}/qr-${aid}.png"
+      qr_path=$(generate_qr "$contact_url" "$qr_file")
+
+      echo "Agent: ${aid}"
+      echo "npub: ${local_npub}"
+      if [[ -n "$qr_path" && -f "$qr_path" ]]; then
+        echo "QR_IMAGE: ${qr_path}"
+      fi
+      echo ""
+    fi
+  done
 else
-  echo "Add this npub in Keychat app to connect."
+  # Single agent mode (legacy)
+  identity=$(curl -s "http://127.0.0.1:${PORT}/identity" 2>/dev/null)
+  npub=$(echo "$identity" | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
+
+  if [[ -z "$npub" ]]; then
+    log "Failed to get agent identity"
+    exit 1
+  fi
+
+  local contact_url="https://www.keychat.io/u/?k=${npub}"
+  qr_path=$(generate_qr "$contact_url" "${DATA_DIR}/npub-qr.png")
+
+  echo "npub: ${npub}"
+  echo ""
+  if [[ -n "$qr_path" && -f "$qr_path" ]]; then
+    echo "QR_IMAGE: ${qr_path}"
+    echo ""
+    echo "Scan the QR code with Keychat app to add as friend."
+  else
+    echo "Add this npub in Keychat app to connect."
+  fi
 fi
+
 echo ""
 echo "Agent listening on http://127.0.0.1:${PORT}"
 echo ""
