@@ -394,7 +394,8 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
         // Notify agent about this identity (once per install, using marker file)
         try {
           const { existsSync, writeFileSync, mkdirSync } = await import("node:fs");
-          const markerDir = `${process.env.HOME ?? "~"}/.keychat`;
+          const { homedir: _hd } = await import("node:os");
+          const markerDir = `${_hd()}/.keychat`;
           const markerFile = `${markerDir}/.notified-${account.accountId}`;
           if (!existsSync(markerFile)) {
             const contactUrl = `https://www.keychat.io/u/?k=${id.npub}`;
