@@ -43,7 +43,7 @@ Use the user's language (match the language they used to request the install).
 Content (adapt to user's language):
 - 🔑 Keychat CLI installed!
 - List each agent's ID (npub)
-- Tell user to wait 1 minute before adding agents via Keychat app
+- Tell user they can add agents now via Keychat app
 - Mention they can also scan QR codes below
 
 Example:
@@ -56,7 +56,7 @@ npub1xxx...
 Agent "test" ID:
 npub1yyy...
 
-Please wait 1 minute, then add these agents in Keychat app. You can also scan the QR codes below.
+You can now add these agents in Keychat app, or scan the QR codes below.
 ```
 
 **Message 2..N (one per agent, image with caption):**
