@@ -376,6 +376,60 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
       ctx.log?.info(`[${account.accountId}] Starting keychat-cli (${account.url})`);
       activeConnections.get(account.accountId)?.stop();
 
+      // Auto-install: if daemon is not running, run postinstall to install binary + start daemon
+      let daemonReady = false;
+      try {
+        const res = await daemonFetch(account.url, "/identity");
+        daemonReady = res.ok;
+      } catch { /* not running */ }
+
+      if (!daemonReady) {
+        ctx.log?.info(`[${account.accountId}] Daemon not running, auto-installing...`);
+        try {
+          const { execFileSync } = await import("node:child_process");
+          const { existsSync } = await import("node:fs");
+          const { resolve, dirname } = await import("node:path");
+          const { fileURLToPath } = await import("node:url");
+
+          // Find postinstall.sh relative to this plugin
+          let scriptDir = "";
+          try {
+            const thisFile = fileURLToPath(import.meta.url);
+            scriptDir = resolve(dirname(thisFile), "scripts");
+          } catch {
+            // Fallback: try known locations
+            const candidates = [
+              resolve(process.cwd(), "scripts"),
+              resolve(process.env.HOME ?? "~", ".openclaw/extensions/keychat-cli/scripts"),
+            ];
+            for (const c of candidates) {
+              if (existsSync(resolve(c, "postinstall.sh"))) { scriptDir = c; break; }
+            }
+          }
+
+          const postinstallPath = resolve(scriptDir, "postinstall.sh");
+          if (existsSync(postinstallPath)) {
+            ctx.log?.info(`[${account.accountId}] Running postinstall: ${postinstallPath}`);
+            const output = execFileSync("bash", [postinstallPath], {
+              timeout: 120000,
+              encoding: "utf-8",
+              env: { ...process.env, PATH: `${process.env.HOME}/.local/bin:${process.env.PATH}` },
+            });
+            ctx.log?.info(`[${account.accountId}] Postinstall complete`);
+            // Log npub lines for debugging
+            for (const line of output.split("\n")) {
+              if (line.includes("npub:") || line.includes("QR_IMAGE:")) {
+                ctx.log?.info(`[${account.accountId}] ${line.trim()}`);
+              }
+            }
+          } else {
+            ctx.log?.error(`[${account.accountId}] postinstall.sh not found at ${postinstallPath}`);
+          }
+        } catch (err) {
+          ctx.log?.error(`[${account.accountId}] Auto-install failed: ${err}`);
+        }
+      }
+
       // Detect if daemon supports multi-agent mode
       const multiAgent = await isDaemonMultiAgent(account.url);
       const agentId = multiAgent ? account.accountId : undefined;
