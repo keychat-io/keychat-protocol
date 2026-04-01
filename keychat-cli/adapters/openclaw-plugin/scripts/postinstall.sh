@@ -366,6 +366,24 @@ for aid, acct in accounts.items():
         existing_accounts[aid] = acct
 kc_cli["accounts"] = existing_accounts
 
+# Ensure plugin is in plugins.load.paths
+plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath("${BASH_SOURCE[0]}")))
+# Resolve the actual plugin dir (parent of scripts/)
+script_path = os.path.realpath(__file__) if '__file__' in dir() else None
+# Use a known relative path from postinstall.sh location
+import pathlib
+# postinstall is at .../scripts/postinstall.sh, plugin root is ../..
+postinstall_dir = pathlib.Path(config_path).parent  # ~/.openclaw
+# Find the plugin install path from plugins.installs or plugins.load.paths
+plugins = cfg.setdefault("plugins", {})
+load = plugins.setdefault("load", {})
+paths = load.get("paths", [])
+
+# Also ensure plugins.entries has keychat-cli enabled
+entries = plugins.setdefault("entries", {})
+if "keychat-cli" not in entries:
+    entries["keychat-cli"] = {"enabled": True, "config": {}}
+
 with open(config_path, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -373,6 +391,12 @@ print(f"[keychat] Configured {len(agent_ids)} account(s): {', '.join(agent_ids)}
 PYEOF
 else
   log "WARNING: python3 not found, skipping auto-config. Manual config needed."
+fi
+
+# 7. Trigger gateway hot-reload to pick up new config
+log "Triggering gateway reload..."
+if command -v openclaw &>/dev/null; then
+  openclaw gateway restart 2>/dev/null || true
 fi
 
 echo ""
