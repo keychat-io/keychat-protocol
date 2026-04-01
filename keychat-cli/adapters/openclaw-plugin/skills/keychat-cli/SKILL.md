@@ -38,25 +38,40 @@ postinstall outputs `npub:` and `QR_IMAGE:` lines for each agent. You MUST:
 4. **Restart the gateway** so the plugin loads and connects to the daemon SSE
 5. After restart, plugin auto-connects to daemon — messages start flowing
 
-### Message format example
+### Message template (MUST follow exactly)
+
+**Message 1 (text only, no media):**
 ```
-🔑 Keychat CLI installed!
+🔑 Keychat CLI 安装完成！
 
-Main Agent npub:
-npub1xxx...
-[QR image attached]
+Agent "main" 的 npub:
+<main_npub>
 
-Test Agent npub:
-npub1yyy...
-[QR image attached]
+Agent "test" 的 npub:
+<test_npub>
 
-⏳ 1分钟后可以加 agent
+请在1分钟后使用 Keychat app 添加这两个 agent。你也可以通过扫描下方二维码加 agent。
 ```
+
+**Message 2 (image, use message tool with `filePath` parameter):**
+```
+Main Agent QR:
+[attach ~/.keychat/qr-main.png]
+```
+
+**Message 3 (image, use message tool with `filePath` parameter):**
+```
+Test Agent QR:
+[attach ~/.keychat/qr-test.png]
+```
+
+For single-agent installs, omit the test agent messages.
 
 ### Critical rules
-- Send npub + QR BEFORE restarting gateway (restart may disconnect your session)
-- Send to the current channel/room, not DM
-- Use message tool with `media` parameter for QR images
+- Send ALL messages BEFORE configuring plugin / restarting gateway
+- Send to the current channel/room (use group:ID for group chats), NOT to user's DM
+- Use `message` tool with `filePath` for QR images — do NOT use MEDIA: inline syntax
+- Text message and QR images are separate messages (keychat doesn't support text + image in one message)
 - The first person to add the agent becomes the owner (auto-approved)
 
 ## Config
