@@ -51,20 +51,7 @@ Content (adapt to user's language):
 - Tell user to wait 1 minute before adding agents via Keychat app
 - Mention they can also scan QR codes below
 
-Example (Chinese):
-```
-🔑 Keychat CLI 安装完成！
-
-Agent "main" 的 ID:
-npub1xxx...
-
-Agent "test" 的 ID:
-npub1yyy...
-
-请在1分钟后使用 Keychat app 添加 agent。你也可以扫描下方二维码。
-```
-
-Example (English):
+Example:
 ```
 🔑 Keychat CLI installed!
 
