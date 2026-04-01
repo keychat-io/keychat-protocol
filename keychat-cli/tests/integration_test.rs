@@ -1251,3 +1251,467 @@ async_test!(test_group_db_state, {
     .await
     .unwrap();
 });
+
+// ─── Phase 2: Reliability Tests ──────────────────────────────────
+
+/// Helper: create two connected clients with friendship established.
+/// Returns (alice, bob, alice_pubkey, bob_pubkey, alice_rx, bob_rx).
+async fn create_friends() -> (
+    Arc<KeychatClient>,
+    Arc<KeychatClient>,
+    String,
+    String,
+    broadcast::Receiver<ClientEvent>,
+    broadcast::Receiver<ClientEvent>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_dir = dir.path().join("libkeychat");
+    std::fs::create_dir_all(&db_dir).unwrap();
+
+    let alice = Arc::new(
+        KeychatClient::new(
+            db_dir.join("alice.db").to_str().unwrap().to_string(),
+            "test-key".into(),
+        )
+        .unwrap(),
+    );
+    let bob = Arc::new(
+        KeychatClient::new(
+            db_dir.join("bob.db").to_str().unwrap().to_string(),
+            "test-key".into(),
+        )
+        .unwrap(),
+    );
+
+    let alice_id = alice.create_identity().await.unwrap();
+    let bob_id = bob.create_identity().await.unwrap();
+    let alice_pubkey = alice_id.pubkey_hex.clone();
+    let bob_pubkey = bob_id.pubkey_hex.clone();
+
+    let (alice_listener, mut alice_rx) = TestListener::new();
+    let (bob_listener, mut bob_rx) = TestListener::new();
+    alice.set_event_listener(Box::new(alice_listener)).await;
+    bob.set_event_listener(Box::new(bob_listener)).await;
+
+    alice.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
+    bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
+
+    let alice_clone = alice.clone();
+    tokio::spawn(async move { let _ = alice_clone.start_event_loop().await; });
+    let bob_clone = bob.clone();
+    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+
+    assert!(wait_for_relay_connection(&alice, 15).await);
+    assert!(wait_for_relay_connection(&bob, 15).await);
+
+    // Establish friendship
+    alice
+        .send_friend_request(bob_pubkey.clone(), "Alice".into(), "test-dev".into())
+        .await
+        .unwrap();
+
+    let fr_event = wait_for_event(&mut bob_rx, 30, |e| {
+        matches!(e, ClientEvent::FriendRequestReceived { .. })
+    })
+    .await
+    .expect("Bob should receive friend request");
+
+    let request_id = match fr_event {
+        ClientEvent::FriendRequestReceived { request_id, .. } => request_id,
+        _ => unreachable!(),
+    };
+
+    bob.accept_friend_request(request_id, "Bob".into())
+        .await
+        .unwrap();
+
+    wait_for_event(&mut alice_rx, 30, |e| {
+        matches!(e, ClientEvent::FriendRequestAccepted { .. })
+    })
+    .await
+    .expect("Alice should receive acceptance");
+
+    // Wait for Signal session to stabilize
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    (alice, bob, alice_pubkey, bob_pubkey, alice_rx, bob_rx, dir)
+}
+
+/// Get the actual room_id for a DM between two users.
+async fn get_dm_room_id(client: &KeychatClient, my_pubkey: &str, peer_pubkey: &str) -> String {
+    let rooms = client.get_rooms(my_pubkey.to_string()).await.unwrap();
+    rooms
+        .iter()
+        .find(|r| r.to_main_pubkey == peer_pubkey)
+        .expect("DM room should exist")
+        .id
+        .clone()
+}
+
+// ─── Reliability: Message Ordering (rapid-fire) ──────────────────
+
+async_test!(test_message_ordering_rapid_fire, {
+    let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
+        create_friends().await;
+
+    let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
+
+    // Alice rapid-fires 10 messages
+    let mut sent_texts = Vec::new();
+    for i in 0..10 {
+        let text = format!("rapid-{:02}", i);
+        alice
+            .send_text(alice_room_id.clone(), text.clone(), None, None, None)
+            .await
+            .unwrap();
+        sent_texts.push(text);
+        // Minimal delay to preserve ordering
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Wait for Bob to receive all messages
+    let mut received_count = 0;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while received_count < 10 {
+        match tokio::time::timeout_at(deadline, bob_rx.recv()).await {
+            Ok(Ok(ClientEvent::MessageReceived {
+                content: Some(c), ..
+            })) if c.starts_with("rapid-") => {
+                received_count += 1;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert_eq!(received_count, 10, "Bob should receive all 10 messages");
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // DB Assertion: messages should be in correct order
+    let bob_room_id = get_dm_room_id(&bob, &bob_pubkey, &alice_pubkey).await;
+    let bob_msgs = bob
+        .get_messages(bob_room_id, 50, 0)
+        .await
+        .unwrap();
+    let rapid_msgs: Vec<_> = bob_msgs
+        .iter()
+        .filter(|m| m.content.starts_with("rapid-"))
+        .collect();
+    assert_eq!(rapid_msgs.len(), 10, "Bob DB should have all 10 rapid messages");
+
+    // Verify ordering
+    for (i, msg) in rapid_msgs.iter().enumerate() {
+        assert_eq!(
+            msg.content,
+            format!("rapid-{:02}", i),
+            "Message {} should be in order",
+            i
+        );
+    }
+
+    let _ = alice.stop_event_loop().await;
+    let _ = bob.stop_event_loop().await;
+    let _ = alice.disconnect().await;
+    let _ = bob.disconnect().await;
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
+});
+
+// ─── Reliability: Offline Message Delivery ───────────────────────
+
+async_test!(test_offline_message_delivery, {
+    let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, _bob_rx, _dir) =
+        create_friends().await;
+
+    let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
+
+    // Bob goes offline
+    bob.stop_event_loop().await;
+    bob.disconnect().await.ok();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Alice sends 3 messages while Bob is offline
+    for i in 0..3 {
+        let text = format!("offline-msg-{}", i);
+        alice
+            .send_text(alice_room_id.clone(), text, None, None, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Bob comes back online
+    let (bob_listener2, mut bob_rx2) = TestListener::new();
+    bob.set_event_listener(Box::new(bob_listener2)).await;
+    bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
+
+    let bob_clone = bob.clone();
+    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+
+    assert!(
+        wait_for_relay_connection(&bob, 15).await,
+        "Bob should reconnect"
+    );
+
+    // Wait for offline messages to arrive
+    let mut received_count = 0;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while received_count < 3 {
+        match tokio::time::timeout_at(deadline, bob_rx2.recv()).await {
+            Ok(Ok(ClientEvent::MessageReceived {
+                content: Some(c), ..
+            })) if c.starts_with("offline-msg-") => {
+                received_count += 1;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert_eq!(
+        received_count, 3,
+        "Bob should receive all 3 offline messages"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // DB Assertion
+    let bob_room_id = get_dm_room_id(&bob, &bob_pubkey, &alice_pubkey).await;
+    let bob_msgs = bob
+        .get_messages(bob_room_id, 50, 0)
+        .await
+        .unwrap();
+    let offline_msgs: Vec<_> = bob_msgs
+        .iter()
+        .filter(|m| m.content.starts_with("offline-msg-"))
+        .collect();
+    assert_eq!(
+        offline_msgs.len(),
+        3,
+        "Bob DB should have all 3 offline messages"
+    );
+
+    let _ = alice.stop_event_loop().await;
+    let _ = bob.stop_event_loop().await;
+    let _ = alice.disconnect().await;
+    let _ = bob.disconnect().await;
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
+});
+
+// ─── Reliability: Reconnect After Disconnect ─────────────────────
+
+async_test!(test_reconnect_no_message_loss, {
+    let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
+        create_friends().await;
+
+    let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
+    let bob_room_id = get_dm_room_id(&bob, &bob_pubkey, &alice_pubkey).await;
+
+    // Phase 1: send message before disconnect
+    alice
+        .send_text(alice_room_id.clone(), "before-disconnect".into(), None, None, None)
+        .await
+        .unwrap();
+    wait_for_event(&mut bob_rx, 30, |e| {
+        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "before-disconnect")
+    })
+    .await
+    .expect("Bob should receive pre-disconnect message");
+
+    // Phase 2: Bob disconnects and reconnects
+    bob.stop_event_loop().await;
+    bob.disconnect().await.ok();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let (bob_listener2, mut bob_rx2) = TestListener::new();
+    bob.set_event_listener(Box::new(bob_listener2)).await;
+    bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
+
+    let bob_clone = bob.clone();
+    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    assert!(wait_for_relay_connection(&bob, 15).await);
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Phase 3: send message after reconnect
+    alice
+        .send_text(alice_room_id.clone(), "after-reconnect".into(), None, None, None)
+        .await
+        .unwrap();
+    let post_msg = wait_for_event(&mut bob_rx2, 30, |e| {
+        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "after-reconnect")
+    })
+    .await;
+    assert!(
+        post_msg.is_some(),
+        "Bob should receive post-reconnect message"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // DB Assertion: both messages should be in DB
+    let bob_msgs = bob
+        .get_messages(bob_room_id, 50, 0)
+        .await
+        .unwrap();
+    let text_msgs: Vec<_> = bob_msgs
+        .iter()
+        .filter(|m| !m.content.starts_with('['))
+        .collect();
+    assert!(
+        text_msgs.iter().any(|m| m.content == "before-disconnect"),
+        "pre-disconnect message should be in DB"
+    );
+    assert!(
+        text_msgs.iter().any(|m| m.content == "after-reconnect"),
+        "post-reconnect message should be in DB"
+    );
+
+    let _ = alice.stop_event_loop().await;
+    let _ = bob.stop_event_loop().await;
+    let _ = alice.disconnect().await;
+    let _ = bob.disconnect().await;
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
+});
+
+// ─── Reliability: Concurrent Bidirectional Send ──────────────────
+
+async_test!(test_concurrent_bidirectional, {
+    let (alice, bob, alice_pubkey, bob_pubkey, mut alice_rx, mut bob_rx, _dir) =
+        create_friends().await;
+
+    let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
+    let bob_room_id_send = get_dm_room_id(&bob, &bob_pubkey, &alice_pubkey).await;
+
+    // Both send 3 messages concurrently
+    let alice_clone = alice.clone();
+    let alice_rid = alice_room_id.clone();
+    let alice_task = tokio::spawn(async move {
+        for i in 0..3 {
+            let text = format!("alice-concurrent-{}", i);
+            alice_clone
+                .send_text(alice_rid.clone(), text, None, None, None)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+
+    let bob_clone = bob.clone();
+    let bob_rid = bob_room_id_send.clone();
+    let bob_task = tokio::spawn(async move {
+        for i in 0..3 {
+            let text = format!("bob-concurrent-{}", i);
+            bob_clone
+                .send_text(bob_rid.clone(), text, None, None, None)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+
+    alice_task.await.unwrap();
+    bob_task.await.unwrap();
+
+    // Wait for messages to propagate
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Collect events with timeout
+    let mut bob_received = Vec::new();
+    let mut alice_received = Vec::new();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout_at(deadline, bob_rx.recv()).await {
+            Ok(Ok(ClientEvent::MessageReceived {
+                content: Some(c), ..
+            })) if c.starts_with("alice-concurrent-") => {
+                bob_received.push(c);
+                if bob_received.len() >= 3 { break; }
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout_at(deadline, alice_rx.recv()).await {
+            Ok(Ok(ClientEvent::MessageReceived {
+                content: Some(c), ..
+            })) if c.starts_with("bob-concurrent-") => {
+                alice_received.push(c);
+                if alice_received.len() >= 3 { break; }
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        bob_received.len(),
+        3,
+        "Bob should receive all 3 of Alice's concurrent messages"
+    );
+    assert_eq!(
+        alice_received.len(),
+        3,
+        "Alice should receive all 3 of Bob's concurrent messages"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // DB Assertion: both sides should have all 6 text messages
+    let bob_room_id = get_dm_room_id(&bob, &bob_pubkey, &alice_pubkey).await;
+    let bob_msgs = bob.get_messages(bob_room_id, 50, 0).await.unwrap();
+    let bob_concurrent: Vec<_> = bob_msgs
+        .iter()
+        .filter(|m| m.content.contains("concurrent"))
+        .collect();
+    assert_eq!(
+        bob_concurrent.len(),
+        6,
+        "Bob DB should have all 6 concurrent messages (3 sent + 3 received)"
+    );
+
+    let alice_room_id2 = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
+    let alice_msgs = alice.get_messages(alice_room_id2, 50, 0).await.unwrap();
+    let alice_concurrent: Vec<_> = alice_msgs
+        .iter()
+        .filter(|m| m.content.contains("concurrent"))
+        .collect();
+    assert_eq!(
+        alice_concurrent.len(),
+        6,
+        "Alice DB should have all 6 concurrent messages (3 sent + 3 received)"
+    );
+
+    let _ = alice.stop_event_loop().await;
+    let _ = bob.stop_event_loop().await;
+    let _ = alice.disconnect().await;
+    let _ = bob.disconnect().await;
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
+});

@@ -389,6 +389,20 @@ impl KeychatClient {
             })
     }
 
+    pub async fn update_local_meta_ffi(
+        &self,
+        msgid: String,
+        local_meta: String,
+    ) -> Result<(), KeychatUniError> {
+        let inner = self.inner.read().await;
+        let store = crate::client::lock_app_storage_result(&inner.app_storage)?;
+        store
+            .update_local_meta(&msgid, &local_meta)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("update_local_meta: {e}"),
+            })
+    }
+
     pub async fn increment_app_room_unread_ffi(
         &self,
         room_id: String,
