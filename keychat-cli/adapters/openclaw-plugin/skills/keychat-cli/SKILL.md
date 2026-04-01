@@ -11,15 +11,22 @@ Keychat adds E2E encrypted messaging to your OpenClaw agent. Users talk to your 
 
 - `qrencode` for QR code generation (install with `brew install qrencode` on macOS or `apt install qrencode` on Linux)
 
-## Install Steps (execute in order)
+## Install Steps (execute in order, do NOT reorder)
 
-### Step 1: Install plugin
+### Step 1: Install plugin files (NO restart)
+
+Copy plugin files to extensions directory. Do NOT use `openclaw plugins install` — it triggers a gateway restart that breaks the session.
 
 ```bash
-openclaw plugins install @keychat-io/keychat-cli
+cp -r <plugin_source_path> ~/.openclaw/extensions/keychat-cli
 ```
 
-This installs the plugin TS code and triggers a gateway restart. Wait for gateway to come back (~10s).
+If installing from npm, download and extract manually:
+```bash
+npm pack @keychat-io/keychat-cli --pack-destination /tmp
+mkdir -p ~/.openclaw/extensions/keychat-cli
+tar xzf /tmp/keychat-io-keychat-cli-*.tgz -C ~/.openclaw/extensions/keychat-cli --strip-components=1
+```
 
 ### Step 2: Run postinstall
 
@@ -33,12 +40,12 @@ Parse the output — look for `npub:` and `QR_IMAGE:` lines for each agent.
 
 ### Step 3: Send npub + QR to user
 
-Send to the CURRENT channel/room where the user asked to install. Use the message tool.
+Send IMMEDIATELY to the CURRENT channel/room. Do this BEFORE any restart.
 
 Total messages = 1 + number of agents.
-Use the user's language (match the language they used to request the install).
+Use the user's language.
 
-**Message 1 (text only, no media) — summary:**
+**Message 1 (text only):**
 
 Content (adapt to user's language):
 - 🔑 Keychat CLI installed!
@@ -59,18 +66,22 @@ npub1yyy...
 You can now add these agents in Keychat app, or scan the QR codes below.
 ```
 
-**Message 2..N (one per agent, image with caption):**
+**Message 2..N (one per agent, QR image):**
 ```
 Agent "<agent_id>" QR:
 [attach ~/.keychat/qr-<agent_id>.png via message tool filePath parameter]
 ```
 
-### Step 4: Configure channel accounts
+### Step 4: Configure plugin + channel (triggers restart)
 
-Use the gateway config.patch tool to write channel config:
+Use gateway config.patch to write BOTH plugin entry AND channel config in one call:
 
 ```json
 {
+  "plugins": {
+    "load": { "paths": ["~/.openclaw/extensions/keychat-cli"] },
+    "entries": { "keychat-cli": { "enabled": true, "config": {} } }
+  },
   "channels": {
     "keychat-cli": {
       "enabled": true,
@@ -83,11 +94,11 @@ Use the gateway config.patch tool to write channel config:
 }
 ```
 
-Build accounts from the agent IDs in the postinstall output. This triggers a hot-reload — plugin connects to daemon SSE automatically.
+Build accounts from agent IDs in postinstall output. This triggers gateway restart — plugin loads and connects to daemon.
 
 ### Critical rules
-- Steps MUST be in this order: plugin install → postinstall → send messages → config.patch
-- Send npub + QR BEFORE config.patch (config.patch is safe but messages should go out first)
+- Steps MUST be in this order: copy files → postinstall → send messages → config.patch
+- Gateway restart happens ONLY at the end (step 4), AFTER messages are sent
 - Send to the current channel/room (use group:ID for group chats), NOT to user's DM
 - Use `message` tool with `filePath` for QR images — do NOT use MEDIA: inline syntax
 - The first person to add the agent becomes the owner (auto-approved)
