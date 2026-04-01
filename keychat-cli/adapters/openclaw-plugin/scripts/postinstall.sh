@@ -240,6 +240,20 @@ wait_for_agents() {
       npub=$(echo "$id_json" | grep -o '"npub":"[^"]*"' | sed 's/"npub":"//;s/"//')
     fi
 
+    # Fallback: try /agents list endpoint
+    if [[ -z "$npub" ]]; then
+      npub=$(curl -s "${base_url}/agents" 2>/dev/null | python3 -c "
+import json,sys
+try:
+  data = json.load(sys.stdin).get('data',[])
+  for a in data:
+    if a.get('id') == '${aid}':
+      print(a.get('npub',''))
+      break
+except: pass
+" 2>/dev/null)
+    fi
+
     if [[ -n "$npub" ]]; then
       log "Agent ${aid}: ${npub}"
     else

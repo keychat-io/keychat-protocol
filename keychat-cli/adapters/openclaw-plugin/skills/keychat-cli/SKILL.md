@@ -67,34 +67,38 @@ You can now add these agents in Keychat app, or scan the QR codes below.
 ```
 
 **Message 2..N (one per agent, QR image):**
+
+QR images are at `~/.keychat/qr-<agent_id>.png`. If the message tool rejects this path, first copy to workspace:
+```bash
+cp ~/.keychat/qr-<agent_id>.png ~/.openclaw/workspace/qr-<agent_id>.png
 ```
-Agent "<agent_id>" QR:
-[attach ~/.keychat/qr-<agent_id>.png via message tool filePath parameter]
-```
+Then send with `filePath: ~/.openclaw/workspace/qr-<agent_id>.png`.
 
 ### Step 4: Configure plugin + channel (triggers restart)
 
-Use gateway config.patch to write BOTH plugin entry AND channel config in one call:
+Use the `gateway` tool with `action: config.patch` to write plugin entry + channel config.
 
-```json
-{
-  "plugins": {
-    "load": { "paths": ["~/.openclaw/extensions/keychat-cli"] },
-    "entries": { "keychat-cli": { "enabled": true, "config": {} } }
-  },
-  "channels": {
-    "keychat-cli": {
-      "enabled": true,
-      "url": "http://127.0.0.1:7800",
-      "accounts": {
-        "<agent_id>": { "enabled": true, "dmPolicy": "open", "allowFrom": ["*"] }
-      }
-    }
-  }
-}
+If `config.patch` fails (e.g. "unknown channel id"), edit `~/.openclaw/openclaw.json` directly with python3:
+
+```bash
+python3 -c "
+import json, os
+p = os.path.expanduser('~/.openclaw/openclaw.json')
+c = json.load(open(p))
+c.setdefault('plugins',{}).setdefault('load',{}).setdefault('paths',[]).append(os.path.expanduser('~/.openclaw/extensions/keychat-cli'))
+c['plugins'].setdefault('entries',{})['keychat-cli'] = {'enabled': True, 'config': {}}
+c.setdefault('channels',{})['keychat-cli'] = {'enabled': True, 'url': 'http://127.0.0.1:7800', 'accounts': {<AGENTS_DICT>}}
+json.dump(c, open(p,'w'), indent=2, ensure_ascii=False)
+"
 ```
 
-Build accounts from agent IDs in postinstall output. This triggers gateway restart — plugin loads and connects to daemon.
+Replace `<AGENTS_DICT>` with accounts built from agent IDs, e.g.:
+`'main': {'enabled': True, 'dmPolicy': 'open', 'allowFrom': ['*']}, 'test': {'enabled': True, 'dmPolicy': 'open', 'allowFrom': ['*']}`
+
+Then restart gateway:
+```bash
+openclaw gateway restart
+```
 
 ### Critical rules
 - Steps MUST be in this order: copy files → postinstall → send messages → config.patch

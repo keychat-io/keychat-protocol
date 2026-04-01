@@ -447,6 +447,14 @@ async fn create_agent_identity(
     State(reg): State<AgentRegistry>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // If agent already exists, return its identity
+    if let Some(existing) = reg.get_agent(&id).await {
+        return ok_json(serde_json::json!({
+            "agent_id": existing.id,
+            "npub": existing.npub,
+            "pubkey_hex": existing.pubkey_hex,
+        }));
+    }
     match reg.boot_agent(&id, &default_agent_name(), None).await {
         Ok(inst) => ok_json(serde_json::json!({
             "agent_id": inst.id,
@@ -488,15 +496,23 @@ async fn get_agent_identity(
         None => return err_json(StatusCode::NOT_FOUND, format!("agent {id} not found")),
     };
 
+    // Use cached npub/pubkey from AgentInstance (consistent with list_agents)
+    if !agent.npub.is_empty() {
+        return ok_json(serde_json::json!({
+            "agent_id": id,
+            "pubkey_hex": agent.pubkey_hex,
+            "name": agent.id.clone(),
+            "npub": agent.npub,
+        }));
+    }
     match agent.client.get_pubkey_hex().await {
         Ok(pubkey) => {
-            let identities = agent.client.get_identities().await.unwrap_or_default();
-            let current = identities.iter().find(|i| i.nostr_pubkey_hex == pubkey);
+            let npub = keychat_uniffi::npub_from_hex(pubkey.clone()).unwrap_or_default();
             ok_json(serde_json::json!({
                 "agent_id": id,
                 "pubkey_hex": pubkey,
-                "name": current.map(|i| i.name.clone()).unwrap_or_default(),
-                "npub": current.map(|i| i.npub.clone()).unwrap_or_default(),
+                "name": agent.id.clone(),
+                "npub": npub,
             }))
         }
         Err(_) => err_json(StatusCode::NOT_FOUND, "no identity set"),
