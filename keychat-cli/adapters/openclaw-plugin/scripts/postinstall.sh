@@ -358,11 +358,7 @@ else
   log "WARNING: python3 not found, skipping auto-config. Manual config needed."
 fi
 
-# 7. Trigger gateway hot-reload to pick up new config
-log "Triggering gateway reload..."
-if command -v openclaw &>/dev/null; then
-  openclaw gateway restart 2>/dev/null || true
-fi
+# Note: gateway restart is handled by 'openclaw plugins install', not here
 
 echo ""
 echo "Agent listening on http://127.0.0.1:${PORT}"
