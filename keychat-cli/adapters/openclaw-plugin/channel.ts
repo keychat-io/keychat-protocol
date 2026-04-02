@@ -431,8 +431,10 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
           ctx.log?.info(`Friend request from ${senderNm} (${senderPk.slice(0, 16)})`);
 
           try {
-            const ownerPath = agentId ? `/agents/${agentId}/owner` : "/owner";
-            const ownerData = await daemonJson<{ owner?: string | null }>(account.url, ownerPath);
+            const ownerPath = `/agents/${agentId}/owner`;
+            ctx.log?.info(`[${account.accountId}] Checking owner at ${ownerPath}`);
+            const ownerData = await daemonJson<{ owner?: string | null; agent_id?: string }>(account.url, ownerPath);
+            ctx.log?.info(`[${account.accountId}] Owner: ${ownerData.owner ?? 'none'}`);
             // Owner's own request → auto-add to allowFrom
             if (ownerData.owner && normalizePubkey(ownerData.owner) === normalizePubkey(senderPk)) {
               ctx.log?.info(`Owner ${senderNm} auto-added to allowFrom`);
@@ -449,7 +451,9 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
             if (ownerData.owner) {
               const roomsPath = agentId ? `/agents/${agentId}/rooms` : "/rooms";
               const rooms = await daemonJson<Array<{ id: string; to_main_pubkey: string; status: string }>>(account.url, roomsPath);
+              ctx.log?.info(`[${account.accountId}] Found ${(rooms ?? []).length} rooms, looking for owner ${ownerData.owner?.slice(0, 16)}`);
               const ownerRoom = (rooms ?? []).find((r) => r.to_main_pubkey === ownerData.owner && r.status === "enabled");
+              ctx.log?.info(`[${account.accountId}] Owner room: ${ownerRoom ? ownerRoom.id.slice(0, 16) : 'NOT FOUND'}`);
               const notifyText = `🔔 Friend request from ${senderNm} (pubkey: ${senderPk}). Request ID: ${reqId}`;
 
               if (ownerRoom) {
