@@ -6,3 +6,14 @@ keychat-cli-human/Cargo.lock
 keychat-cli-agent/Cargo.lock
 keychat-uniffi/Cargo.lock
 keychat-uniffi/generated/
+node_modules/
+dist/
+build/
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+.idea/
+.vscode/
+.backup

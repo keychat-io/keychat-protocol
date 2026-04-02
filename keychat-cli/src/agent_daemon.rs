@@ -115,10 +115,11 @@ impl AgentRegistry {
 
         // 1. Resolve data dir and secrets
         let agent_data = agent_config::agent_data_dir(&self.data_dir, agent_id);
-        std::fs::create_dir_all(&agent_data)?;
+        let agent_db_dir = format!("{}/db", agent_data);
+        std::fs::create_dir_all(&agent_db_dir)?;
 
         let db_key = agent_config::resolve_db_key_for_agent(agent_id)?;
-        let db_path = format!("{}/protocol.db", agent_data);
+        let db_path = format!("{}/protocol.db", agent_db_dir);
 
         // 2. Initialize client
         let client = Arc::new(KeychatClient::new(db_path, db_key)?);
@@ -255,7 +256,9 @@ pub async fn run(
     relay_override: Option<String>,
     api_token_override: Option<String>,
 ) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&data_dir)?;
+    // Create subdirectories: db/, files/, logs/
+    let db_dir = format!("{}/db", data_dir);
+    std::fs::create_dir_all(&db_dir)?;
 
     let relay_urls = match relay_override {
         Some(r) => r.split(',').map(|s| s.trim().to_string()).collect(),
@@ -295,7 +298,7 @@ pub async fn run(
     } else {
         // ─── Legacy Single-Agent Mode ──────────────────────
         let db_key = agent_config::resolve_db_key(&data_dir)?;
-        let db_path = format!("{}/protocol.db", data_dir);
+        let db_path = format!("{}/protocol.db", db_dir);
 
         let client = Arc::new(KeychatClient::new(db_path, db_key)?);
 
