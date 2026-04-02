@@ -951,7 +951,7 @@ fn draw_status_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
 fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
     let pw = 62u16.min(area.width.saturating_sub(4));
-    let ph = 38u16.min(area.height.saturating_sub(4));
+    let ph = 44u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(pw)) / 2;
     let y = (area.height.saturating_sub(ph)) / 2;
     let popup = Rect::new(x, y, pw, ph);
@@ -996,6 +996,15 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
         Line::from(Span::styled("  /add <pk> [greeting]  /accept <id>  /reject <id>  /contacts", Style::default().fg(Color::Green))),
         Line::from(Span::styled("  /history [n]       /retry         /read", Style::default().fg(Color::Green))),
         Line::from("  (type text without / to send a message)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            " File Transfer",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("  /upload <path>              — Upload file without sending", Style::default().fg(Color::Green))),
+        Line::from(Span::styled("  /sendfile <path> [more...]  — Send file message to current room", Style::default().fg(Color::Green))),
+        Line::from(Span::styled("  /files [room_id]            — List files in room", Style::default().fg(Color::Green))),
+        Line::from(Span::styled("  /download <index|url>       — Download file by index or URL", Style::default().fg(Color::Green))),
         Line::from(""),
         Line::from(Span::styled(
             " Signal Groups",
