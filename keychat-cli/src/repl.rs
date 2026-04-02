@@ -1017,20 +1017,19 @@ async fn cmd_files(
             let item = &parsed.items[0];
             let icon = crate::commands::file_category_icon(&item.category);
             let size = crate::commands::format_file_size(item.size);
-            let name = item.display_name();
 
-            // Check download status
-            let status = if client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await.is_some() {
-                "✓".green().to_string()
+            // Check download status and get local path
+            let (status, display_name) = if let Some(path) = client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await {
+                ("✓".green().to_string(), path.dimmed().to_string())
             } else {
-                "○".dimmed().to_string()
+                ("○".dimmed().to_string(), item.display_name().bold().to_string())
             };
 
             println!("  {} {:>3} {} {} {} {} {}",
                 status,
                 format!("[{}]", idx).dimmed(),
                 icon,
-                name.bold(),
+                display_name,
                 format!("({})", size).dimmed(),
                 format!("from {}", sender.cyan()).dimmed(),
                 time.dimmed()
@@ -1048,19 +1047,19 @@ async fn cmd_files(
             for item in &parsed.items {
                 let icon = crate::commands::file_category_icon(&item.category);
                 let size = crate::commands::format_file_size(item.size);
-                let name = item.display_name();
 
-                let status = if client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await.is_some() {
-                    "✓".green().to_string()
+                // Check download status and get local path
+                let (status, display_name) = if let Some(path) = client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await {
+                    ("✓".green().to_string(), path.dimmed().to_string())
                 } else {
-                    "○".dimmed().to_string()
+                    ("○".dimmed().to_string(), item.display_name().to_string())
                 };
 
                 println!("  {} {:>3} {} {} {}",
                     status,
                     format!("[{}]", idx).dimmed(),
                     icon,
-                    name,
+                    display_name,
                     format!("({})", size).dimmed()
                 );
                 idx += 1;
