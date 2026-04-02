@@ -58,6 +58,19 @@ struct MessageEntry {
     status: MessageStatus,
     timestamp: u64,
     reply_to_content: Option<String>,
+    payload_json: Option<String>,
+    msgid: String,
+    file_info: Option<FileDisplayInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct FileDisplayInfo {
+    icon: String,
+    name: String,
+    size: String,
+    is_downloaded: bool,
+    local_path: Option<String>,
+    caption: Option<String>,
 }
 
 /// Flat display row for the room list (may be a section header or a room)
@@ -651,13 +664,53 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     ]));
                 }
 
-                let msg_with_status = format!("{} {status_icon}", msg.content);
-                let rpad = inner_width.saturating_sub(msg_with_status.len() + 2);
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(rpad.max(2))),
-                    Span::raw(&msg.content),
-                    Span::styled(format!(" {status_icon}"), Style::default().fg(status_color)),
-                ]));
+                // Check if it's a file message
+                if let Some(ref file_info) = msg.file_info {
+                    // File message - display file info
+                    let file_line = format!("{} {} ({})", file_info.icon, file_info.name, file_info.size);
+
+                    // Check download status
+                    let download_status = if let Some(ref path) = file_info.local_path {
+                        format!("✓ Saved to: {}", path)
+                    } else {
+                        "○ Not downloaded".to_string()
+                    };
+
+                    let msg_with_status = format!("{} {status_icon}", file_line);
+                    let rpad = inner_width.saturating_sub(msg_with_status.len() + 2);
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(rpad.max(2))),
+                        Span::styled(file_line, Style::default().fg(t.accent)),
+                        Span::styled(format!(" {status_icon}"), Style::default().fg(status_color)),
+                    ]));
+
+                    // Show caption if exists
+                    if let Some(ref caption) = file_info.caption {
+                        if !caption.is_empty() {
+                            let rpad = inner_width.saturating_sub(caption.len() + 2);
+                            lines.push(Line::from(vec![
+                                Span::raw(" ".repeat(rpad.max(2))),
+                                Span::raw(caption.as_str()),
+                            ]));
+                        }
+                    }
+
+                    // Show download status
+                    let rpad = inner_width.saturating_sub(download_status.len() + 2);
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(rpad.max(2))),
+                        Span::styled(download_status, Style::default().fg(t.muted)),
+                    ]));
+                } else {
+                    // Normal text message
+                    let msg_with_status = format!("{} {status_icon}", msg.content);
+                    let rpad = inner_width.saturating_sub(msg_with_status.len() + 2);
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(rpad.max(2))),
+                        Span::raw(&msg.content),
+                        Span::styled(format!(" {status_icon}"), Style::default().fg(status_color)),
+                    ]));
+                }
             } else {
                 // Left-aligned: [Sender] content
                 if !same_sender {
@@ -686,10 +739,45 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     ]));
                 }
 
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::raw(&msg.content),
-                ]));
+                // Check if it's a file message
+                if let Some(ref file_info) = msg.file_info {
+                    // File message - display file info
+                    let file_line = format!("{} {} ({})", file_info.icon, file_info.name, file_info.size);
+
+                    // Check download status
+                    let download_status = if let Some(ref path) = file_info.local_path {
+                        format!("✓ Saved to: {}", path)
+                    } else {
+                        "○ Not downloaded".to_string()
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(file_line, Style::default().fg(t.accent)),
+                    ]));
+
+                    // Show caption if exists
+                    if let Some(ref caption) = file_info.caption {
+                        if !caption.is_empty() {
+                            lines.push(Line::from(vec![
+                                Span::raw("    "),
+                                Span::raw(caption.as_str()),
+                            ]));
+                        }
+                    }
+
+                    // Show download status
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(download_status, Style::default().fg(t.muted)),
+                    ]));
+                } else {
+                    // Normal text message
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::raw(&msg.content),
+                    ]));
+                }
             }
 
             last_sender = Some((msg.is_me, msg.sender.clone()));
@@ -2220,9 +2308,33 @@ async fn load_messages(app: &mut App, room_id: &str) {
 async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32) {
     match app.client.get_messages(room_id.to_string(), count, 0).await {
         Ok(msgs) => {
-            app.messages = msgs
-                .into_iter()
-                .map(|m| MessageEntry {
+            let mut entries = Vec::new();
+            for m in msgs {
+                // Parse file info if it's a file message
+                let file_info = if let Some(ref payload_json) = m.payload_json {
+                    if let Some(parsed) = crate::commands::parse_file_message(payload_json) {
+                        let item = &parsed.items[0];
+                        let icon = crate::commands::file_category_icon(&item.category).to_string();
+                        let name = item.display_name();
+                        let size = item.size_string();
+                        let local_path = app.client.resolve_local_file(m.msgid.clone(), item.hash.clone()).await;
+                        let is_downloaded = local_path.is_some();
+                        Some(FileDisplayInfo {
+                            icon,
+                            name,
+                            size,
+                            is_downloaded,
+                            local_path,
+                            caption: parsed.message,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                entries.push(MessageEntry {
                     sender_name: app.contact_names.get(&m.sender_pubkey).cloned(),
                     sender: m.sender_pubkey,
                     content: m.content,
@@ -2230,8 +2342,12 @@ async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32) {
                     status: m.status,
                     timestamp: m.created_at,
                     reply_to_content: m.reply_to_content,
-                })
-                .collect();
+                    payload_json: m.payload_json,
+                    msgid: m.msgid,
+                    file_info,
+                });
+            }
+            app.messages = entries;
             app.command_output.clear();
             app.messages_scroll = 0;
         }
