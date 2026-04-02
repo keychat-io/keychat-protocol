@@ -278,6 +278,7 @@ fn mime_from_extension(ext: &str) -> Option<String> {
 // ─── File Message Parsing ───────────────────────────────────────
 
 /// Parsed file item from KCMessage payload.
+#[derive(Clone)]
 pub struct ParsedFileItem {
     pub category: FileCategory,
     pub url: String,

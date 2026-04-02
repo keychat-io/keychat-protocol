@@ -1804,6 +1804,164 @@ async fn process_command(app: &mut App, input: &str) {
                 refresh_rooms(app).await;
             }
         }
+        "/upload" => {
+            if args.is_empty() {
+                app.notify("Usage: /upload <path>".into());
+                return;
+            }
+            let path = std::path::Path::new(args);
+            if !path.exists() {
+                app.notify(format!("File not found: {args}"));
+                return;
+            }
+            let server = match app.client.get_active_media_server().await {
+                Ok(url) => url,
+                Err(_) => keychat_uniffi::default_blossom_server(),
+            };
+            app.notify(format!("Uploading to {}...", server));
+            match crate::commands::upload_and_prepare_file(path, &server).await {
+                Ok(payload) => {
+                    app.push_output(format!("✓ Uploaded: {}", payload.source_name.unwrap_or_else(|| "file".to_string())), Color::Green);
+                    app.push_output(format!("URL: {}", payload.url), Color::Cyan);
+                    app.push_output(format!("Key: {}...", &payload.key[..16.min(payload.key.len())]), Color::DarkGray);
+                }
+                Err(e) => app.notify(format!("Upload failed: {e}")),
+            }
+        }
+        "/sendfile" => {
+            if args.is_empty() {
+                app.notify("Usage: /sendfile <path> [more paths...]".into());
+                return;
+            }
+            let room_id = match app.selected_room_id() {
+                Some(id) => id,
+                None => {
+                    app.notify("Select a room first".into());
+                    return;
+                }
+            };
+            let paths: Vec<&str> = args.split_whitespace().collect();
+            let mut payloads = Vec::new();
+            let server = match app.client.get_active_media_server().await {
+                Ok(url) => url,
+                Err(_) => keychat_uniffi::default_blossom_server(),
+            };
+            for path_str in paths {
+                let path = std::path::Path::new(path_str);
+                if !path.exists() {
+                    app.notify(format!("File not found: {path_str}"));
+                    continue;
+                }
+                match crate::commands::upload_and_prepare_file(path, &server).await {
+                    Ok(payload) => payloads.push(payload),
+                    Err(e) => app.notify(format!("Upload failed for {path_str}: {e}")),
+                }
+            }
+            if !payloads.is_empty() {
+                let count = payloads.len();
+                match crate::commands::send_file_message(&app.client, &room_id, payloads, None).await {
+                    Ok(_) => app.push_output(format!("✓ Sent {} file(s)", count), Color::Green),
+                    Err(e) => app.notify(format!("Send failed: {e}")),
+                }
+            }
+        }
+        "/files" => {
+            let room_id = if args.is_empty() {
+                app.selected_room_id()
+            } else {
+                Some(args.to_string())
+            };
+            match room_id {
+                Some(id) => {
+                    match app.client.get_messages(id.clone(), 100, 0).await {
+                        Ok(msgs) => {
+                            let mut file_count = 0;
+                            for msg in msgs {
+                                if let Some(ref payload_json) = msg.payload_json {
+                                    if let Some(parsed) = crate::commands::parse_file_message(payload_json) {
+                                        file_count += 1;
+                                        for item in &parsed.items {
+                                            let icon = crate::commands::file_category_icon(&item.category);
+                                            let downloaded = if app.client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await.is_some() {
+                                                "✓"
+                                            } else {
+                                                "○"
+                                            };
+                                            app.push_output(format!("{} {} {} ({})", downloaded, icon, item.display_name(), item.size_string()), Color::Cyan);
+                                        }
+                                    }
+                                }
+                            }
+                            if file_count == 0 {
+                                app.push_output("No files in this room".into(), Color::Yellow);
+                            }
+                        }
+                        Err(e) => app.notify(format!("Failed to list files: {e}")),
+                    }
+                }
+                None => app.notify("Select a room first or specify room_id".into()),
+            }
+        }
+        "/download" => {
+            if args.is_empty() {
+                app.notify("Usage: /download <file_index>".into());
+                return;
+            }
+            let room_id = match app.selected_room_id() {
+                Some(id) => id,
+                None => {
+                    app.notify("Select a room first".into());
+                    return;
+                }
+            };
+            let index: usize = match args.parse::<usize>() {
+                Ok(n) if n >= 1 => n - 1,
+                _ => {
+                    app.notify(format!("Invalid index: {args}"));
+                    return;
+                }
+            };
+            // Find file by index
+            match app.client.get_messages(room_id.clone(), 100, 0).await {
+                Ok(msgs) => {
+                    let mut file_msgs: Vec<_> = Vec::new();
+                    for msg in msgs {
+                        if let Some(ref payload_json) = msg.payload_json {
+                            if let Some(parsed) = crate::commands::parse_file_message(payload_json) {
+                                for item in &parsed.items {
+                                    file_msgs.push((msg.msgid.clone(), item.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if index >= file_msgs.len() {
+                        app.notify(format!("Index {} out of range (found {} files)", index + 1, file_msgs.len()));
+                        return;
+                    }
+                    let (msgid, item) = &file_msgs[index];
+                    // Check if already downloaded
+                    if let Some(path) = app.client.resolve_local_file(msgid.clone(), item.hash.clone()).await {
+                        app.push_output(format!("Already downloaded: {}", path), Color::Green);
+                        return;
+                    }
+                    app.notify(format!("Downloading: {}...", item.display_name()));
+                    match app.client.download_and_save(
+                        item.url.clone(),
+                        item.key.clone(),
+                        item.iv.clone(),
+                        item.hash.clone(),
+                        item.source_name.clone(),
+                        item.suffix.clone(),
+                        room_id.clone(),
+                        Some(msgid.clone()),
+                    ).await {
+                        Ok(path) => app.push_output(format!("✓ Downloaded to: {}", path), Color::Green),
+                        Err(e) => app.notify(format!("Download failed: {e}")),
+                    }
+                }
+                Err(e) => app.notify(format!("Failed to get messages: {e}")),
+            }
+        }
         "/sg-create" => {
             let parts: Vec<&str> = args.split_whitespace().collect();
             if parts.len() < 2 {

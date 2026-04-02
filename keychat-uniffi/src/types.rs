@@ -117,7 +117,7 @@ pub struct GroupSentMessage {
 
 // ─── Enums ───────────────────────────────────────────────────────
 
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone)]
 pub enum FileCategory {
     Image,
     Video,
