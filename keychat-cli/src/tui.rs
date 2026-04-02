@@ -1809,9 +1809,15 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /upload <path>".into());
                 return;
             }
-            let path = std::path::Path::new(args);
+            // Trim quotes if present (for paths with spaces)
+            let path_str = args.trim().trim_matches('"').trim_matches('\'');
+            if path_str.is_empty() {
+                app.notify("Empty path".into());
+                return;
+            }
+            let path = std::path::Path::new(path_str);
             if !path.exists() {
-                app.notify(format!("File not found: {args}"));
+                app.notify(format!("File not found: {path_str}"));
                 return;
             }
             let server = match app.client.get_active_media_server().await {
@@ -1840,7 +1846,13 @@ async fn process_command(app: &mut App, input: &str) {
                     return;
                 }
             };
-            let paths: Vec<&str> = args.split_whitespace().collect();
+            // Support quoted paths with spaces
+            let paths: Vec<&str> = if args.contains('"') || args.contains('\'') {
+                // Simple quoted path support
+                vec![args.trim_matches('"').trim_matches('\'')]
+            } else {
+                args.split_whitespace().collect()
+            };
             let mut payloads = Vec::new();
             let server = match app.client.get_active_media_server().await {
                 Ok(url) => url,
