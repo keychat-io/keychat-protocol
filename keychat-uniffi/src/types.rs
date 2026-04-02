@@ -110,6 +110,9 @@ pub struct GroupSentMessage {
     pub msgid: String,
     pub group_id: String,
     pub event_ids: Vec<String>,
+    pub payload_json: Option<String>,
+    pub nostr_event_json: Option<String>,
+    pub relay_status_json: Option<String>,
 }
 
 // ─── Enums ───────────────────────────────────────────────────────

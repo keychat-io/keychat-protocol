@@ -177,6 +177,10 @@ pub fn build_router(
         .route("/events", get(sse_events))
         // Contacts
         .route("/contacts", get(list_contacts))
+        // File Transfer
+        .route("/upload", post(upload_file))
+        .route("/download", post(download_file))
+        .route("/files", get(list_files))
         .with_state(state)
 }
 
@@ -994,5 +998,139 @@ async fn list_contacts(
             ok_json(list)
         }
         Err(e) => internal_err(e),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// File Transfer
+// ═══════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+struct UploadFileReq {
+    /// Local file path to upload.
+    file_path: String,
+    /// Blossom server URL (optional, defaults to blossom.band).
+    #[serde(default)]
+    server: Option<String>,
+}
+
+async fn upload_file(
+    State(_state): State<AppState>,
+    Json(req): Json<UploadFileReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let path = std::path::Path::new(&req.file_path);
+    if !path.exists() {
+        return bad_request(format!("File not found: {}", req.file_path));
+    }
+
+    // Get server URL
+    let server = req.server.unwrap_or_else(|| {
+        keychat_uniffi::default_blossom_server()
+    });
+
+    // Upload file
+    match crate::commands::upload_and_prepare_file(path, &server).await {
+        Ok(payload) => {
+            ok_json(serde_json::json!({
+                "url": payload.url,
+                "key": payload.key,
+                "iv": payload.iv,
+                "hash": payload.hash,
+                "size": payload.size,
+                "category": file_category_str(&payload.category),
+                "mime_type": payload.mime_type,
+                "suffix": payload.suffix,
+                "source_name": payload.source_name,
+            }))
+        }
+        Err(e) => bad_request(format!("Upload failed: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct DownloadFileReq {
+    /// File URL to download.
+    url: String,
+    /// AES key (hex).
+    key: String,
+    /// IV (hex).
+    iv: String,
+    /// Hash (hex).
+    hash: String,
+    /// Room ID to save file to.
+    room_id: String,
+    /// Original source name (optional).
+    #[serde(default)]
+    source_name: Option<String>,
+    /// File suffix/extension (optional).
+    #[serde(default)]
+    suffix: Option<String>,
+    /// Event ID for tracking (optional).
+    #[serde(default)]
+    event_id: Option<String>,
+}
+
+async fn download_file(
+    State(state): State<AppState>,
+    Json(req): Json<DownloadFileReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.client.download_and_save(
+        req.url,
+        req.key,
+        req.iv,
+        req.hash,
+        req.source_name,
+        req.suffix,
+        req.room_id,
+        req.event_id,
+    ).await {
+        Ok(path) => ok_json(serde_json::json!({ "path": path })),
+        Err(e) => bad_request(format!("Download failed: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListFilesQuery {
+    room_id: String,
+}
+
+async fn list_files(
+    State(state): State<AppState>,
+    Query(query): Query<ListFilesQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Fetch messages and find file messages
+    match state.client.get_messages(query.room_id.clone(), 100, 0).await {
+        Ok(messages) => {
+            let mut files: Vec<serde_json::Value> = Vec::new();
+
+            for msg in messages {
+                if let Some(ref payload_json) = msg.payload_json {
+                    if let Some(parsed) = crate::commands::parse_file_message(payload_json) {
+                        for item in &parsed.items {
+                            // Check if downloaded
+                            let is_downloaded = state.client
+                                .resolve_local_file(msg.msgid.clone(), item.hash.clone())
+                                .await
+                                .is_some();
+
+                            files.push(serde_json::json!({
+                                "event_id": msg.msgid,
+                                "sender_pubkey": msg.sender_pubkey,
+                                "created_at": msg.created_at,
+                                "url": item.url,
+                                "hash": item.hash,
+                                "source_name": item.source_name,
+                                "category": file_category_str(&item.category),
+                                "size": item.size,
+                                "is_downloaded": is_downloaded,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            ok_json(files)
+        }
+        Err(e) => bad_request(format!("Failed to list files: {e}")),
     }
 }

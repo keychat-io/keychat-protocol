@@ -311,6 +311,147 @@ fn mime_from_extension(ext: &str) -> Option<String> {
     Some(mime.to_string())
 }
 
+// ─── File Message Parsing ───────────────────────────────────────
+
+/// Parsed file item from KCMessage payload.
+pub struct ParsedFileItem {
+    pub category: FileCategory,
+    pub url: String,
+    pub mime_type: Option<String>,
+    pub suffix: Option<String>,
+    pub size: u64,
+    pub key: String,
+    pub iv: String,
+    pub hash: String,
+    pub source_name: Option<String>,
+    pub audio_duration: Option<u32>,
+}
+
+/// Parsed file message from KCMessage payloadJson.
+pub struct ParsedFileMessage {
+    pub message: Option<String>,
+    pub items: Vec<ParsedFileItem>,
+}
+
+impl ParsedFileItem {
+    /// Check if this is an image file.
+    pub fn is_image(&self) -> bool {
+        matches!(self.category, FileCategory::Image)
+    }
+
+    /// Check if this is a video file.
+    pub fn is_video(&self) -> bool {
+        matches!(self.category, FileCategory::Video)
+    }
+
+    /// Check if this is an audio/voice file.
+    pub fn is_audio(&self) -> bool {
+        matches!(self.category, FileCategory::Audio | FileCategory::Voice)
+    }
+
+    /// Get display name for the file.
+    pub fn display_name(&self) -> String {
+        self.source_name.clone()
+            .unwrap_or_else(|| format!("{}.{}" , &self.hash[..12.min(self.hash.len())], self.suffix.as_deref().unwrap_or("bin")))
+    }
+
+    /// Format size as human-readable string.
+    pub fn size_string(&self) -> String {
+        format_file_size(self.size)
+    }
+}
+
+/// Parse file message from KCMessage payload JSON.
+/// Returns None if the message is not a file message.
+pub fn parse_file_message(payload_json: &str) -> Option<ParsedFileMessage> {
+    let json: serde_json::Value = serde_json::from_str(payload_json).ok()?;
+
+    // Check kind is "files"
+    let kind = json.get("kind")?.as_str()?;
+    if kind != "files" {
+        return None;
+    }
+
+    let files = json.get("files")?;
+    let message = files.get("message").and_then(|m| m.as_str()).map(|s| s.to_string());
+    let items_array = files.get("items")?.as_array()?;
+
+    let items: Vec<ParsedFileItem> = items_array.iter().filter_map(|item| {
+        let category = match item.get("category")?.as_str()? {
+            "image" => FileCategory::Image,
+            "video" => FileCategory::Video,
+            "voice" => FileCategory::Voice,
+            "audio" => FileCategory::Audio,
+            "document" => FileCategory::Document,
+            "text" => FileCategory::Text,
+            "archive" => FileCategory::Archive,
+            _ => FileCategory::Other,
+        };
+
+        Some(ParsedFileItem {
+            category,
+            url: item.get("url")?.as_str()?.to_string(),
+            mime_type: item.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()),
+            suffix: item.get("suffix").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            size: item.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+            key: item.get("key")?.as_str()?.to_string(),
+            iv: item.get("iv")?.as_str()?.to_string(),
+            hash: item.get("hash")?.as_str()?.to_string(),
+            source_name: item.get("sourceName").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            audio_duration: item.get("audioDuration").and_then(|a| a.as_u64()).map(|n| n as u32),
+        })
+    }).collect();
+
+    if items.is_empty() {
+        return None;
+    }
+
+    Some(ParsedFileMessage { message, items })
+}
+
+/// Format byte size to human-readable string.
+pub fn format_file_size(size: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut size = size as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    format!("{:.1} {}", size, UNITS[unit_idx])
+}
+
+/// File info for listing files in a room.
+pub struct FileInfo {
+    pub msgid: String,
+    pub event_id: Option<String>,
+    pub sender_pubkey: String,
+    pub created_at: u64,
+    pub file_hash: String,
+    pub source_name: String,
+    pub category: FileCategory,
+    pub size: u64,
+    pub url: String,
+    pub local_path: Option<String>,
+    pub is_downloaded: bool,
+}
+
+/// Get file category icon/emoji for display.
+pub fn file_category_icon(category: &FileCategory) -> &'static str {
+    match category {
+        FileCategory::Image => "🖼️",
+        FileCategory::Video => "🎬",
+        FileCategory::Voice => "🎤",
+        FileCategory::Audio => "🎵",
+        FileCategory::Document => "📄",
+        FileCategory::Text => "📝",
+        FileCategory::Archive => "📦",
+        FileCategory::Other => "📎",
+    }
+}
+
 /// Create identity with full persistence: save to app storage + save mnemonic.
 /// Returns (pubkey_hex, npub, mnemonic).
 pub async fn create_identity(

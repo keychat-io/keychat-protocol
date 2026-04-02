@@ -661,6 +661,9 @@ impl KeychatClient {
             msgid,
             group_id,
             event_ids,
+            payload_json,
+            nostr_event_json: Some(nostr_event_json),
+            relay_status_json: Some(initial_relay_json),
         })
     }
 }

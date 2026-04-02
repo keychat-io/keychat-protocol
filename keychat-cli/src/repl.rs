@@ -30,10 +30,10 @@ pub async fn run(
     // Mutable REPL state
     let mut active_room_id: Option<String> = None;
 
-    // Spawn background event printer
+    // Spawn background event printer with auto-download
     let event_rx = event_tx.subscribe();
     let data_rx = data_tx.subscribe();
-    spawn_event_printer(event_rx, data_rx);
+    spawn_event_printer(Arc::clone(&client), event_rx, data_rx);
 
     // Set up rustyline
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -141,6 +141,11 @@ async fn dispatch(
         "/read" => cmd_read(&client, active_room_id).await?,
         "/history" => cmd_history(&client, args, active_room_id).await?,
         "/sendfile" => cmd_sendfile(&client, args, active_room_id).await?,
+
+        // ── File Transfer ──
+        "/upload" => cmd_upload(&client, args).await?,
+        "/download" => cmd_download(&client, args, active_room_id).await?,
+        "/files" => cmd_files(&client, args, active_room_id).await?,
 
         // ── Signal Groups ──
         "/sg-create" => cmd_sg_create(&client, args).await?,
@@ -756,6 +761,320 @@ async fn cmd_sendfile(
     Ok(())
 }
 
+// ─── File Transfer Commands ─────────────────────────────────────
+
+/// Upload file without sending a message.
+async fn cmd_upload(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+    let path_str = args.trim();
+    if path_str.is_empty() {
+        print_err("Usage: /upload <path>");
+        return Ok(());
+    }
+
+    let path = std::path::Path::new(path_str);
+    if !path.exists() {
+        print_err(&format!("File not found: {path_str}"));
+        return Ok(());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path_str);
+
+    // Get active media server from settings or use default
+    let server = match client.get_active_media_server().await {
+        Ok(url) => url,
+        Err(_) => keychat_uniffi::default_blossom_server(),
+    };
+
+    print_sys(&format!("Uploading {} to {}...", file_name, server.dimmed()));
+
+    match crate::commands::upload_and_prepare_file(path, &server).await {
+        Ok(payload) => {
+            print_ok(&format!("Uploaded {}", file_name.green()));
+            println!("  {} {}", "URL:".dimmed(), payload.url.cyan());
+            println!("  {} {}", "Key:".dimmed(), crate::commands::short_key(&payload.key).cyan());
+            println!("  {} {}", "IV:".dimmed(), crate::commands::short_key(&payload.iv).cyan());
+            println!("  {} {}", "Hash:".dimmed(), crate::commands::short_key(&payload.hash).cyan());
+            println!("  {} {} bytes", "Size:".dimmed(), crate::commands::format_file_size(payload.size).cyan());
+        }
+        Err(e) => {
+            print_err(&format!("Upload failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Download file from message or URL.
+async fn cmd_download(
+    client: &KeychatClient,
+    args: &str,
+    active_room_id: &Option<String>,
+) -> anyhow::Result<()> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.is_empty() {
+        print_err("Usage: /download <file_index|url> [--key <key>] [--iv <iv>] [--hash <hash>] [--room <room_id>]");
+        return Ok(());
+    }
+
+    let target = parts[0];
+
+    // Check if target is a URL (starts with http)
+    if target.starts_with("http://") || target.starts_with("https://") {
+        // URL mode - requires key, iv, hash
+        let mut key: Option<String> = None;
+        let mut iv: Option<String> = None;
+        let mut hash: Option<String> = None;
+        let mut room_id: Option<String> = active_room_id.clone();
+        let mut source_name: Option<String> = None;
+
+        let mut i = 1;
+        while i < parts.len() {
+            match parts[i] {
+                "--key" => { i += 1; key = parts.get(i).map(|s| s.to_string()); }
+                "--iv" => { i += 1; iv = parts.get(i).map(|s| s.to_string()); }
+                "--hash" => { i += 1; hash = parts.get(i).map(|s| s.to_string()); }
+                "--room" => { i += 1; room_id = parts.get(i).map(|s| s.to_string()); }
+                "--name" => { i += 1; source_name = parts.get(i).map(|s| s.to_string()); }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        let room_id = match room_id {
+            Some(id) => id,
+            None => {
+                print_err("No room specified. Use /download <url> --room <room_id> or set active chat.");
+                return Ok(());
+            }
+        };
+
+        match (key, iv, hash) {
+            (Some(key), Some(iv), Some(hash)) => {
+                print_sys(&format!("Downloading from URL..."));
+                match client.download_and_save(
+                    target.to_string(),
+                    key,
+                    iv,
+                    hash,
+                    source_name,
+                    None, // suffix can be extracted from source_name
+                    room_id,
+                    None, // no msgid for direct URL download
+                ).await {
+                    Ok(path) => {
+                        print_ok(&format!("Downloaded to {}", path.green()));
+                    }
+                    Err(e) => {
+                        print_err(&format!("Download failed: {e}"));
+                    }
+                }
+            }
+            _ => {
+                print_err("URL download requires --key, --iv, and --hash arguments.");
+            }
+        }
+        return Ok(());
+    }
+
+    // Index mode - download from current room's file messages
+    let room_id = match active_room_id {
+        Some(id) => id.clone(),
+        None => {
+            print_err("No active chat. Use /chat <room_id> first or specify --room.");
+            return Ok(());
+        }
+    };
+
+    let index: usize = match target.parse() {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            print_err(&format!("Invalid file index: {target}. Use a number (1-based)."));
+            return Ok(());
+        }
+    };
+
+    // Fetch messages and find file messages
+    let messages = client.get_messages(room_id.clone(), 100, 0).await?;
+    let file_messages: Vec<_> = messages.iter().filter_map(|msg| {
+        msg.payload_json.as_ref().and_then(|json| {
+            crate::commands::parse_file_message(json).map(|parsed| (msg, parsed))
+        })
+    }).collect();
+
+    if file_messages.is_empty() {
+        print_err("No file messages found in this room.");
+        return Ok(());
+    }
+
+    // Flatten all file items with their message context
+    let mut all_files: Vec<(usize, &keychat_uniffi::MessageInfo, &crate::commands::ParsedFileItem)> = Vec::new();
+    let mut idx = 1;
+    for (msg, parsed) in &file_messages {
+        for item in &parsed.items {
+            all_files.push((idx, msg, item));
+            idx += 1;
+        }
+    }
+
+    if index > all_files.len() {
+        print_err(&format!("File index {index} out of range. Found {} file(s).", all_files.len()));
+        return Ok(());
+    }
+
+    // Download the selected file
+    let (_, msg, item) = &all_files[index - 1];
+    let file_name = item.display_name();
+
+    // Check if already downloaded
+    if let Some(path) = client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await {
+        print_ok(&format!("File already downloaded: {}", path.green()));
+        return Ok(());
+    }
+
+    print_sys(&format!("Downloading {} ({})", file_name, crate::commands::format_file_size(item.size)));
+
+    match client.download_and_save(
+        item.url.clone(),
+        item.key.clone(),
+        item.iv.clone(),
+        item.hash.clone(),
+        item.source_name.clone(),
+        item.suffix.clone(),
+        room_id.clone(),
+        Some(msg.msgid.clone()),
+    ).await {
+        Ok(path) => {
+            print_ok(&format!("Downloaded to {}", path.green()));
+        }
+        Err(e) => {
+            print_err(&format!("Download failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// List files in current room or all rooms.
+async fn cmd_files(
+    client: &KeychatClient,
+    args: &str,
+    active_room_id: &Option<String>,
+) -> anyhow::Result<()> {
+    let args = args.trim();
+
+    // Parse arguments
+    let mut room_id: Option<String> = None;
+
+    for part in args.split_whitespace() {
+        match part {
+            "--all" | "-a" => room_id = None,
+            _ if part.starts_with("--") => {
+                print_err(&format!("Unknown flag: {part}"));
+                return Ok(());
+            }
+            _ => room_id = Some(part.to_string()),
+        }
+    }
+
+    if room_id.is_none() {
+        room_id = active_room_id.clone();
+    }
+
+    let room_id = match room_id {
+        Some(id) => id,
+        None => {
+            print_err("No room specified. Use /files <room_id> or set active chat.");
+            return Ok(());
+        }
+    };
+
+    // Fetch messages and find file messages
+    let messages = client.get_messages(room_id.clone(), 100, 0).await?;
+    let mut file_entries: Vec<(keychat_uniffi::MessageInfo, crate::commands::ParsedFileMessage)> = Vec::new();
+
+    for msg in messages {
+        if let Some(ref json) = msg.payload_json {
+            if let Some(parsed) = crate::commands::parse_file_message(json) {
+                file_entries.push((msg, parsed));
+            }
+        }
+    }
+
+    if file_entries.is_empty() {
+        print_sys("No file messages found in this room.");
+        return Ok(());
+    }
+
+    // Display files
+    println!("  {}", "Files in room:".bold());
+    let mut idx = 1;
+    for (msg, parsed) in file_entries.iter().rev() {
+        let sender = crate::commands::short_key(&msg.sender_pubkey);
+        let time = crate::commands::format_timestamp(msg.created_at);
+
+        if parsed.items.len() == 1 {
+            let item = &parsed.items[0];
+            let icon = crate::commands::file_category_icon(&item.category);
+            let size = crate::commands::format_file_size(item.size);
+            let name = item.display_name();
+
+            // Check download status
+            let status = if client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await.is_some() {
+                "✓".green().to_string()
+            } else {
+                "○".dimmed().to_string()
+            };
+
+            println!("  {} {:>3} {} {} {} {} {}",
+                status,
+                format!("[{}]", idx).dimmed(),
+                icon,
+                name.bold(),
+                format!("({})", size).dimmed(),
+                format!("from {}", sender.cyan()).dimmed(),
+                time.dimmed()
+            );
+            idx += 1;
+        } else {
+            // Multiple files in one message
+            println!("  {} {} {} {} {}",
+                " ".to_string(),
+                format!("[{}-{}]", idx, idx + parsed.items.len() - 1).dimmed(),
+                format!("{} files", parsed.items.len()).yellow(),
+                format!("from {}", sender.cyan()).dimmed(),
+                time.dimmed()
+            );
+            for item in &parsed.items {
+                let icon = crate::commands::file_category_icon(&item.category);
+                let size = crate::commands::format_file_size(item.size);
+                let name = item.display_name();
+
+                let status = if client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await.is_some() {
+                    "✓".green().to_string()
+                } else {
+                    "○".dimmed().to_string()
+                };
+
+                println!("  {} {:>3} {} {} {}",
+                    status,
+                    format!("[{}]", idx).dimmed(),
+                    icon,
+                    name,
+                    format!("({})", size).dimmed()
+                );
+                idx += 1;
+            }
+        }
+    }
+
+    if idx > 1 {
+        println!("  {}", format!("\nUse /download <index> to download a file.").dimmed());
+    }
+
+    Ok(())
+}
+
 // ─── Signal Group commands ──────────────────────────────────────
 
 async fn cmd_sg_create(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
@@ -877,14 +1196,34 @@ async fn cmd_debug(client: &KeychatClient) -> anyhow::Result<()> {
 // ─── Background event printer ───────────────────────────────────
 
 fn spawn_event_printer(
+    client: Arc<KeychatClient>,
     mut event_rx: broadcast::Receiver<ClientEvent>,
     mut data_rx: broadcast::Receiver<DataChange>,
 ) {
-    // Event printer
+    // Event printer with auto-download for file messages
     tokio::spawn(async move {
         loop {
             match event_rx.recv().await {
-                Ok(event) => print_event(&event),
+                Ok(event) => {
+                    // Check if it's a file message for auto-download
+                    if let ClientEvent::MessageReceived {
+                        ref room_id,
+                        kind: MessageKind::Files,
+                        payload: Some(ref payload_json),
+                        ref event_id,
+                        ..
+                    } = event {
+                        // Spawn auto-download task
+                        let client_clone = Arc::clone(&client);
+                        let room_id = room_id.clone();
+                        let event_id = event_id.clone();
+                        let payload_json = payload_json.clone();
+                        tokio::spawn(async move {
+                            handle_file_message_auto_download(client_clone, room_id, event_id, payload_json).await;
+                        });
+                    }
+                    print_event(&event);
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     eprintln!(
                         "  {} {}",
@@ -907,6 +1246,61 @@ fn spawn_event_printer(
             }
         }
     });
+}
+
+/// Auto-download file message if enabled and file size is within limit.
+async fn handle_file_message_auto_download(
+    client: Arc<KeychatClient>,
+    room_id: String,
+    event_id: String,
+    payload_json: String,
+) {
+    // Parse file message
+    let parsed = match crate::commands::parse_file_message(&payload_json) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Process each file item
+    for item in &parsed.items {
+        // Check if already downloaded
+        if client.resolve_local_file(event_id.clone(), item.hash.clone()).await.is_some() {
+            continue;
+        }
+
+        // Check if should auto-download
+        match client.should_auto_download(item.size).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!("Skipping auto-download for {} (size {} exceeds limit)", item.display_name(), item.size);
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to check auto-download setting: {e}");
+                continue;
+            }
+        }
+
+        // Download the file
+        tracing::info!("Auto-downloading file: {}", item.display_name());
+        match client.download_and_save(
+            item.url.clone(),
+            item.key.clone(),
+            item.iv.clone(),
+            item.hash.clone(),
+            item.source_name.clone(),
+            item.suffix.clone(),
+            room_id.clone(),
+            Some(event_id.clone()),
+        ).await {
+            Ok(path) => {
+                tracing::info!("Auto-downloaded file to: {path}");
+            }
+            Err(e) => {
+                tracing::warn!("Auto-download failed for {}: {e}", item.display_name());
+            }
+        }
+    }
 }
 
 fn print_event(event: &ClientEvent) {
@@ -1158,9 +1552,23 @@ fn print_help() {
         "    {}  Send file(s) to active chat",
         "/sendfile <path> [path...]".green()
     );
+    println!();
+    println!("  {}", "File Transfer:".bold());
     println!(
-        "    {}",
-        "    (type text without / to send a message)".dimmed()
+        "    {}    Upload file (no message)",
+        "/upload <path>".green()
+    );
+    println!(
+        "    {}  Download file by index",
+        "/download <index>".green()
+    );
+    println!(
+        "    {}  Download from URL",
+        "/download <url> --key K --iv I --hash H --room R".green()
+    );
+    println!(
+        "    {}    List files in room",
+        "/files [room_id]".green()
     );
     println!();
     println!("  {}", "Signal Groups:".bold());

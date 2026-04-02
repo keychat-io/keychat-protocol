@@ -1191,6 +1191,77 @@ impl KeychatClient {
         Ok(())
     }
 
+    /// Remove a specific Signal session for a peer.
+    ///
+    /// Clears session, pending_outbound, peer mapping, and all related data from memory and DB.
+    /// This API is designed for situations where you want to clean up just one peer's session
+    /// without removing the entire room/contact.
+    pub async fn remove_session(&self, peer_pubkey: String) -> Result<(), KeychatUniError> {
+        let storage = self.inner.read().await.storage.clone();
+
+        {
+            let mut inner = self.inner.write().await;
+
+            // Remove signal session
+            if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&peer_pubkey) {
+                inner.sessions.remove(&signal_id);
+
+                // Remove any pending outbound FR for this peer
+                let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
+                for key in pending_keys {
+                    if let Some(state) = inner.pending_outbound.get(&key) {
+                        if state.peer_nostr_pubkey == peer_pubkey {
+                            inner.pending_outbound.remove(&key);
+                            break;
+                        }
+                    }
+                }
+
+                // Clean up in DB (no write lock held during DB operations)
+                drop(inner);
+
+                if let Ok(store) = storage.lock() {
+                    let _ = store.delete_peer_data(&signal_id, &peer_pubkey);
+                }
+
+                tracing::info!(
+                    "remove_session: removed session for peer {}",
+                    &peer_pubkey[..16.min(peer_pubkey.len())]
+                );
+            } else {
+                tracing::warn!(
+                    "remove_session: no session found for peer {}",
+                    &peer_pubkey[..16.min(peer_pubkey.len())]
+                );
+            }
+        }
+
+        // Clean up app_* tables (in app database)
+        let identity_pubkey = {
+            let inner = self.inner.read().await;
+            inner
+                .identity
+                .as_ref()
+                .map(|id| id.pubkey_hex())
+                .unwrap_or_default()
+        };
+
+        if !identity_pubkey.is_empty() {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            {
+                let store = crate::client::lock_app_storage(&app_storage);
+                // Only delete contact data, not the room as the room might still be needed
+                if let Err(e) = store.delete_app_contact(&peer_pubkey, &identity_pubkey) {
+                    tracing::warn!("remove_session: delete_app_contact: {e}");
+                }
+            }
+            // Notify that contact list has changed
+            self.emit_data_change(DataChange::ContactListChanged).await;
+        }
+
+        Ok(())
+    }
+
     /// Register an event listener for receiving async events from the event loop.
     pub async fn set_event_listener(&self, listener: Box<dyn EventListener>) {
         let mut inner = self.inner.write().await;
