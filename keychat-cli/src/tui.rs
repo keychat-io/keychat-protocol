@@ -70,6 +70,7 @@ struct FileDisplayInfo {
     size: String,
     is_downloaded: bool,
     local_path: Option<String>,
+    display_path: String,  // Full path for display
     caption: Option<String>,
 }
 
@@ -666,12 +667,17 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                 // Check if it's a file message
                 if let Some(ref file_info) = msg.file_info {
-                    // File message - display file info
-                    let file_line = format!("{} {} ({})", file_info.icon, file_info.name, file_info.size);
+                    // File message - display file info with full path
+                    let display_name = if file_info.is_downloaded {
+                        &file_info.display_path
+                    } else {
+                        &file_info.name
+                    };
+                    let file_line = format!("{} {} ({})", file_info.icon, display_name, file_info.size);
 
                     // Check download status
-                    let download_status = if let Some(ref path) = file_info.local_path {
-                        format!("✓ Saved to: {}", path)
+                    let download_status = if file_info.is_downloaded {
+                        "✓ Downloaded (click path to open)".to_string()
                     } else {
                         "○ Not downloaded".to_string()
                     };
@@ -741,12 +747,17 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
                 // Check if it's a file message
                 if let Some(ref file_info) = msg.file_info {
-                    // File message - display file info
-                    let file_line = format!("{} {} ({})", file_info.icon, file_info.name, file_info.size);
+                    // File message - display file info with full path
+                    let display_name = if file_info.is_downloaded {
+                        &file_info.display_path
+                    } else {
+                        &file_info.name
+                    };
+                    let file_line = format!("{} {} ({})", file_info.icon, display_name, file_info.size);
 
                     // Check download status
-                    let download_status = if let Some(ref path) = file_info.local_path {
-                        format!("✓ Saved to: {}", path)
+                    let download_status = if file_info.is_downloaded {
+                        "✓ Downloaded (click path to open)".to_string()
                     } else {
                         "○ Not downloaded".to_string()
                     };
@@ -1248,6 +1259,25 @@ fn handle_messages_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.messages_scroll = app.messages_scroll.saturating_sub(3);
+        }
+        KeyCode::Enter => {
+            // Try to open file if a message with file is selected
+            if let Some(msg) = app.messages.last() {
+                if let Some(ref file_info) = msg.file_info {
+                    if file_info.is_downloaded {
+                        if let Some(ref path) = file_info.local_path {
+                            // Open file with system default application
+                            if let Err(e) = open::that(path) {
+                                app.notify(format!("Failed to open file: {e}"));
+                            } else {
+                                app.notify(format!("Opening: {}", path));
+                            }
+                        }
+                    } else {
+                        app.notify("File not downloaded yet".to_string());
+                    }
+                }
+            }
         }
         KeyCode::Esc => {
             app.active_panel = Panel::Input;
@@ -2328,12 +2358,14 @@ async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32) {
                         let size = item.size_string();
                         let local_path = app.client.resolve_local_file(m.msgid.clone(), item.hash.clone()).await;
                         let is_downloaded = local_path.is_some();
+                        let display_path = local_path.clone().unwrap_or_else(|| item.source_name.clone().unwrap_or_else(|| name.clone()));
                         Some(FileDisplayInfo {
                             icon,
                             name,
                             size,
                             is_downloaded,
                             local_path,
+                            display_path,
                             caption: parsed.message,
                         })
                     } else {
