@@ -60,6 +60,7 @@ interface SseEvent {
   room_id?: string;
   sender_pubkey?: string;
   sender_name?: string;
+  sender_npub?: string;
   content?: string;
   kind?: string;
   group_id?: string;
@@ -449,7 +450,8 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
 
             // Non-owner → notify agent (agent forwards to owner on any channel)
             if (ownerData.owner) {
-              const notifyText = `${senderNm} wants to add this agent as a friend. Reply "approve ${reqId}" or "reject ${reqId}".`;
+              const senderNpub = data.sender_npub ?? senderPk;
+              const notifyText = `${senderNm} (${senderNpub}) wants to add this agent as a friend. Reply "approve ${reqId}" or "reject ${reqId}".`;
 
               // Try daemon direct message to owner (best effort)
               try {
