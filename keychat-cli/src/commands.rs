@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use chrono::TimeZone;
 use keychat_uniffi::{
-    ClientEvent, DataChange, DataListener, EventListener, FileCategory, FilePayload,
-    KeychatClient, KeychatUniError, RoomType,
+    ClientEvent, DataChange, DataListener, EventListener, FileCategory, FilePayload, KeychatClient,
+    KeychatUniError, RoomType,
 };
 use tokio::sync::broadcast;
 
@@ -36,7 +36,9 @@ pub fn get_or_create_db_key(_data_dir: &str) -> anyhow::Result<String> {
             tracing::info!("Generated new DB key, stored in system keychain");
         }
         _ => {
-            return Err(anyhow::anyhow!("System keychain not available — cannot store DB key securely"));
+            return Err(anyhow::anyhow!(
+                "System keychain not available — cannot store DB key securely"
+            ));
         }
     }
     Ok(key)
@@ -56,7 +58,9 @@ pub(crate) fn generate_hex_key() -> anyhow::Result<String> {
     #[cfg(not(unix))]
     {
         // On non-Unix platforms, compile error to signal that an RNG dep is needed.
-        compile_error!("keychat-cli requires Unix for /dev/urandom; add a rand crate for other platforms");
+        compile_error!(
+            "keychat-cli requires Unix for /dev/urandom; add a rand crate for other platforms"
+        );
     }
 
     Ok(bytes_to_hex(&buf))
@@ -80,7 +84,10 @@ pub async fn restore_identity(client: &Arc<KeychatClient>) -> Option<String> {
     if let Ok(Some(mnemonic)) = client.get_setting(SETTING_MNEMONIC.to_string()).await {
         match client.import_identity(mnemonic).await {
             Ok(pk) => {
-                tracing::info!("Identity restored from saved mnemonic: {}", &pk[..16.min(pk.len())]);
+                tracing::info!(
+                    "Identity restored from saved mnemonic: {}",
+                    &pk[..16.min(pk.len())]
+                );
             }
             Err(e) => {
                 tracing::warn!("Failed to restore identity from mnemonic: {e}");
@@ -92,7 +99,10 @@ pub async fn restore_identity(client: &Arc<KeychatClient>) -> Option<String> {
 
 /// Save mnemonic to DB so identity persists across restarts.
 pub async fn save_mnemonic(client: &KeychatClient, mnemonic: &str) {
-    if let Err(e) = client.set_setting(SETTING_MNEMONIC.to_string(), mnemonic.to_string()).await {
+    if let Err(e) = client
+        .set_setting(SETTING_MNEMONIC.to_string(), mnemonic.to_string())
+        .await
+    {
         tracing::warn!("Failed to save mnemonic: {e}");
     }
 }
@@ -109,7 +119,10 @@ pub async fn delete_mnemonic(client: &KeychatClient) {
 /// Result of sending a message to a room (DM or group).
 pub enum SendResult {
     /// DM sent successfully — event_id, relay count.
-    Dm { event_id: String, relay_count: usize },
+    Dm {
+        event_id: String,
+        relay_count: usize,
+    },
     /// Signal group sent — number of events.
     Group { event_count: usize },
     /// MLS not supported.
@@ -190,7 +203,8 @@ pub async fn send_file_message(
 }
 
 /// Upload a local file and return the FilePayload ready for sending.
-/// Reads the file, encrypts + uploads via Blossom, and builds the FilePayload.
+/// Reads the file, encrypts, routes upload by server type (Relay/Blossom),
+/// and builds the FilePayload.
 pub async fn upload_and_prepare_file(
     file_path: &Path,
     server_url: &str,
@@ -199,13 +213,19 @@ pub async fn upload_and_prepare_file(
         msg: format!("Failed to read file {}: {e}", file_path.display()),
     })?;
 
-    let result =
-        keychat_uniffi::encrypt_and_upload(data, server_url.to_string()).await?;
+    let route = if keychat_uniffi::is_relay_server(server_url.to_string()) {
+        "relay-presigned"
+    } else {
+        "blossom"
+    };
 
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let result = keychat_uniffi::encrypt_and_upload_routed(data, server_url.to_string())
+        .await
+        .map_err(|e| KeychatUniError::MediaTransfer {
+            msg: format!("upload route={route}, server={server_url}, error={e}"),
+        })?;
+
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let category = category_from_extension(ext);
     let mime_type = mime_from_extension(ext);
 
@@ -213,7 +233,11 @@ pub async fn upload_and_prepare_file(
         category,
         url: result.url,
         mime_type,
-        suffix: if ext.is_empty() { None } else { Some(ext.to_string()) },
+        suffix: if ext.is_empty() {
+            None
+        } else {
+            Some(ext.to_string())
+        },
         size: result.encrypted_size,
         key: result.key,
         iv: result.iv,
@@ -278,6 +302,7 @@ fn mime_from_extension(ext: &str) -> Option<String> {
 // ─── File Message Parsing ───────────────────────────────────────
 
 /// Parsed file item from KCMessage payload.
+#[derive(Clone)]
 pub struct ParsedFileItem {
     pub category: FileCategory,
     pub url: String,
@@ -315,8 +340,13 @@ impl ParsedFileItem {
 
     /// Get display name for the file.
     pub fn display_name(&self) -> String {
-        self.source_name.clone()
-            .unwrap_or_else(|| format!("{}.{}" , &self.hash[..12.min(self.hash.len())], self.suffix.as_deref().unwrap_or("bin")))
+        self.source_name.clone().unwrap_or_else(|| {
+            format!(
+                "{}.{}",
+                &self.hash[..12.min(self.hash.len())],
+                self.suffix.as_deref().unwrap_or("bin")
+            )
+        })
     }
 
     /// Format size as human-readable string.
@@ -330,41 +360,74 @@ impl ParsedFileItem {
 pub fn parse_file_message(payload_json: &str) -> Option<ParsedFileMessage> {
     let json: serde_json::Value = serde_json::from_str(payload_json).ok()?;
 
-    // Check kind is "files"
-    let kind = json.get("kind")?.as_str()?;
-    if kind != "files" {
+    // Accept both envelopes:
+    // 1) {"kind":"files","files":{...}}
+    // 2) {"files":{...}}
+    // 3) direct files object {"message":...,"items":[...]}
+    let files = if let Some(kind) = json.get("kind").and_then(|k| k.as_str()) {
+        if kind != "files" {
+            return None;
+        }
+        json.get("files")?
+    } else {
+        json.get("files").unwrap_or(&json)
+    };
+
+    // Must look like a file payload
+    if files.get("items").is_none() {
         return None;
     }
 
-    let files = json.get("files")?;
-    let message = files.get("message").and_then(|m| m.as_str()).map(|s| s.to_string());
+    let message = files
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
     let items_array = files.get("items")?.as_array()?;
 
-    let items: Vec<ParsedFileItem> = items_array.iter().filter_map(|item| {
-        let category = match item.get("category")?.as_str()? {
-            "image" => FileCategory::Image,
-            "video" => FileCategory::Video,
-            "voice" => FileCategory::Voice,
-            "audio" => FileCategory::Audio,
-            "document" => FileCategory::Document,
-            "text" => FileCategory::Text,
-            "archive" => FileCategory::Archive,
-            _ => FileCategory::Other,
-        };
+    let items: Vec<ParsedFileItem> = items_array
+        .iter()
+        .filter_map(|item| {
+            let category = match item.get("category")?.as_str()? {
+                "image" => FileCategory::Image,
+                "video" => FileCategory::Video,
+                "voice" => FileCategory::Voice,
+                "audio" => FileCategory::Audio,
+                "document" => FileCategory::Document,
+                "text" => FileCategory::Text,
+                "archive" => FileCategory::Archive,
+                _ => FileCategory::Other,
+            };
 
-        Some(ParsedFileItem {
-            category,
-            url: item.get("url")?.as_str()?.to_string(),
-            mime_type: item.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()),
-            suffix: item.get("suffix").and_then(|s| s.as_str()).map(|s| s.to_string()),
-            size: item.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
-            key: item.get("key")?.as_str()?.to_string(),
-            iv: item.get("iv")?.as_str()?.to_string(),
-            hash: item.get("hash")?.as_str()?.to_string(),
-            source_name: item.get("sourceName").and_then(|s| s.as_str()).map(|s| s.to_string()),
-            audio_duration: item.get("audioDuration").and_then(|a| a.as_u64()).map(|n| n as u32),
+            Some(ParsedFileItem {
+                category,
+                url: item.get("url")?.as_str()?.to_string(),
+                mime_type: item
+                    .get("type")
+                    .or_else(|| item.get("mimeType"))
+                    .or_else(|| item.get("mime_type"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string()),
+                suffix: item
+                    .get("suffix")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                size: item.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+                key: item.get("key")?.as_str()?.to_string(),
+                iv: item.get("iv")?.as_str()?.to_string(),
+                hash: item.get("hash")?.as_str()?.to_string(),
+                source_name: item
+                    .get("sourceName")
+                    .or_else(|| item.get("source_name"))
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                audio_duration: item
+                    .get("audioDuration")
+                    .or_else(|| item.get("audio_duration"))
+                    .and_then(|a| a.as_u64())
+                    .map(|n| n as u32),
+            })
         })
-    }).collect();
+        .collect();
 
     if items.is_empty() {
         return None;
@@ -504,7 +567,10 @@ pub fn connect_and_start(client: &Arc<KeychatClient>, relay_urls: Vec<String>) {
 /// Restore identity, restore sessions, connect to relays, and start event loop.
 /// Shared startup sequence for all modes.
 /// Returns the pubkey hex and session count if identity was found.
-pub async fn init_and_connect(client: &Arc<KeychatClient>, relay_urls: Vec<String>) -> Option<(String, u32)> {
+pub async fn init_and_connect(
+    client: &Arc<KeychatClient>,
+    relay_urls: Vec<String>,
+) -> Option<(String, u32)> {
     let pubkey = restore_identity(client).await?;
 
     let session_count = match client.restore_sessions().await {

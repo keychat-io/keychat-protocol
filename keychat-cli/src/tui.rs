@@ -18,12 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use keychat_uniffi::{
-    ClientEvent, DataChange, GroupMemberInput, KeychatClient, MessageStatus,
-    RoomStatus, RoomType,
+    ClientEvent, DataChange, GroupMemberInput, KeychatClient, MessageStatus, RoomStatus, RoomType,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -58,6 +59,20 @@ struct MessageEntry {
     status: MessageStatus,
     timestamp: u64,
     reply_to_content: Option<String>,
+    payload_json: Option<String>,
+    msgid: String,
+    file_info: Option<FileDisplayInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct FileDisplayInfo {
+    icon: String,
+    name: String,
+    size: String,
+    is_downloaded: bool,
+    local_path: Option<String>,
+    display_path: String, // Full path for display
+    caption: Option<String>,
 }
 
 /// Flat display row for the room list (may be a section header or a room)
@@ -141,6 +156,7 @@ impl Theme {
 struct App {
     client: Arc<KeychatClient>,
     data_dir: PathBuf,
+    data_tx: broadcast::Sender<DataChange>,
     // Room data
     rooms: Vec<RoomEntry>,
     display_rows: Vec<DisplayRow>,
@@ -175,12 +191,17 @@ struct App {
 }
 
 impl App {
-    fn new(client: Arc<KeychatClient>, data_dir: PathBuf) -> Self {
+    fn new(
+        client: Arc<KeychatClient>,
+        data_dir: PathBuf,
+        data_tx: broadcast::Sender<DataChange>,
+    ) -> Self {
         let mut room_state = ListState::default();
         room_state.select(Some(0));
         Self {
             client,
             data_dir,
+            data_tx,
             rooms: Vec::new(),
             display_rows: Vec::new(),
             room_state,
@@ -232,6 +253,18 @@ impl App {
         // Terminal bell
         eprint!("\x07");
         self.notification = Some((msg, std::time::Instant::now()));
+    }
+
+    /// Show error with full message in output area and short notification.
+    fn show_error(&mut self, msg: String) {
+        self.push_output(msg.clone(), Color::Red);
+        // Truncate for notification bar
+        let short = if msg.len() > 60 {
+            format!("{}...", &msg[..60])
+        } else {
+            msg
+        };
+        self.notify(short);
     }
 
     fn push_output(&mut self, msg: String, color: Color) {
@@ -308,11 +341,20 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        cursor::Hide
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(Arc::clone(&client), PathBuf::from(&data_dir));
+    let mut app = App::new(
+        Arc::clone(&client),
+        PathBuf::from(&data_dir),
+        data_tx.clone(),
+    );
 
     // Load settings from DB
     app.owner_pubkey = load_owner(&client).await;
@@ -320,7 +362,9 @@ pub async fn run(
 
     // Shared startup: restore identity → sessions → connect → event loop
     let relay_urls = keychat_uniffi::default_relays();
-    if let Some((pubkey, session_count)) = crate::commands::init_and_connect(&client, relay_urls).await {
+    if let Some((pubkey, session_count)) =
+        crate::commands::init_and_connect(&client, relay_urls).await
+    {
         app.identity_hex = Some(pubkey.clone());
         // Load identity display name from app storage
         if let Ok(identities) = client.get_identities().await {
@@ -338,6 +382,9 @@ pub async fn run(
     }
 
     refresh_rooms(&mut app).await;
+    if let Some(room_id) = app.selected_room_id() {
+        load_messages(&mut app, &room_id).await;
+    }
     refresh_relay_status(&mut app).await;
     refresh_contacts(&mut app).await;
 
@@ -349,8 +396,18 @@ pub async fn run(
         terminal.draw(|f| draw_ui(f, &mut app))?;
 
         if crossterm::event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                handle_key_event(&mut app, key).await;
+            match event::read()? {
+                Event::Key(key) => {
+                    handle_key_event(&mut app, key).await;
+                }
+                Event::Paste(text) => {
+                    // Handle pasted text (may contain newlines)
+                    for ch in text.chars() {
+                        app.input.insert(app.cursor_pos, ch);
+                        app.cursor_pos += ch.len_utf8();
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -380,7 +437,12 @@ pub async fn run(
     }
 
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        cursor::Show
+    )?;
     let _ = client.disconnect().await;
     Ok(())
 }
@@ -451,9 +513,7 @@ fn draw_rooms(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::styled("─ ", Style::default().fg(t.muted)),
                     Span::styled(
                         label.as_str(),
-                        Style::default()
-                            .fg(t.muted)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(" ─", Style::default().fg(t.muted)),
                 ]);
@@ -473,9 +533,7 @@ fn draw_rooms(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 let name_display = if name.chars().count() > (20 - indent.len()) {
                     format!(
                         "{}…",
-                        name.chars()
-                            .take(19 - indent.len())
-                            .collect::<String>()
+                        name.chars().take(19 - indent.len()).collect::<String>()
                     )
                 } else {
                     name.clone()
@@ -544,6 +602,67 @@ fn draw_rooms(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(rooms_list, area, &mut app.room_state);
 }
 
+// ─── Text wrapping utilities ────────────────────────────────
+/// Calculate the display width of a string using unicode-width
+fn calculate_display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Wrap text into lines with a maximum display width
+fn wrap_text_with_width(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 || text.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+
+    for ch in text.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+
+        if current_width + ch_width > max_width {
+            if current_line.is_empty() {
+                // Force insert a character that's too wide
+                current_line.push(ch);
+                result.push(current_line);
+                current_line = String::new();
+                current_width = 0;
+            } else {
+                // Move to next line
+                result.push(current_line);
+                current_line = String::new();
+                current_line.push(ch);
+                current_width = ch_width;
+            }
+        } else {
+            current_line.push(ch);
+            current_width += ch_width;
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push(current_line);
+    }
+
+    if result.is_empty() {
+        result.push(String::new());
+    }
+
+    result
+}
+
+/// Pad a string to the right with spaces to match target display width
+fn pad_right(s: &str, target_width: usize) -> String {
+    let current_width = calculate_display_width(s);
+    if current_width >= target_width {
+        s.to_string()
+    } else {
+        let spaces = target_width - current_width;
+        format!("{}{}", " ".repeat(spaces), s)
+    }
+}
+
 fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let t = &app.theme;
     let border_style = if app.active_panel == Panel::Messages {
@@ -609,9 +728,9 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
 
             let time = format_time(msg.timestamp);
-            let same_sender = last_sender
-                .as_ref()
-                .map_or(false, |(is_me, pk)| *is_me == msg.is_me && *pk == msg.sender);
+            let same_sender = last_sender.as_ref().map_or(false, |(is_me, pk)| {
+                *is_me == msg.is_me && *pk == msg.sender
+            });
 
             if msg.is_me {
                 // Right-aligned: content + status + [You]
@@ -631,12 +750,12 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let label = format!("{time}  You");
                     let rpad = inner_width.saturating_sub(label.len());
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            " ".repeat(rpad),
-                            Style::default(),
-                        ),
+                        Span::styled(" ".repeat(rpad), Style::default()),
                         Span::styled(time.clone(), Style::default().fg(t.muted)),
-                        Span::styled("  You", Style::default().fg(t.self_msg).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "  You",
+                            Style::default().fg(t.self_msg).add_modifier(Modifier::BOLD),
+                        ),
                     ]));
                 }
 
@@ -647,25 +766,118 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let rpad = inner_width.saturating_sub(quote.len() + 2);
                     lines.push(Line::from(vec![
                         Span::raw(" ".repeat(rpad.max(2))),
-                        Span::styled(quote, Style::default().fg(t.muted).add_modifier(Modifier::ITALIC)),
+                        Span::styled(
+                            quote,
+                            Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
+                        ),
                     ]));
                 }
 
-                let msg_with_status = format!("{} {status_icon}", msg.content);
-                let rpad = inner_width.saturating_sub(msg_with_status.len() + 2);
-                lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(rpad.max(2))),
-                    Span::raw(&msg.content),
-                    Span::styled(format!(" {status_icon}"), Style::default().fg(status_color)),
-                ]));
+                // Check if it's a file message
+                if let Some(ref file_info) = msg.file_info {
+                    // File message - display file info with full path
+                    let display_name = if file_info.is_downloaded {
+                        &file_info.display_path
+                    } else {
+                        &file_info.name
+                    };
+                    let file_line =
+                        format!("{} {} ({})", file_info.icon, display_name, file_info.size);
+
+                    // Check download status
+                    let download_status = if file_info.is_downloaded {
+                        "✓ Downloaded (click path to open)".to_string()
+                    } else {
+                        "○ Not downloaded".to_string()
+                    };
+
+                    let available_width = inner_width.saturating_sub(2); // 2 spaces for margin
+                    let wrapped_file_lines = wrap_text_with_width(&file_line, available_width);
+                    for (line_idx, wrapped_line) in wrapped_file_lines.into_iter().enumerate() {
+                        if line_idx == 0 {
+                            let with_status = format!("{} {status_icon}", wrapped_line);
+                            let display_width = calculate_display_width(&with_status);
+                            let rpad = available_width.saturating_sub(display_width);
+                            lines.push(Line::from(vec![
+                                Span::raw(" ".repeat(rpad.max(2))),
+                                Span::styled(wrapped_line, Style::default().fg(t.accent)),
+                                Span::styled(
+                                    format!(" {status_icon}"),
+                                    Style::default().fg(status_color),
+                                ),
+                            ]));
+                        } else {
+                            let display_width = calculate_display_width(&wrapped_line);
+                            let rpad = available_width.saturating_sub(display_width);
+                            lines.push(Line::from(vec![
+                                Span::raw(" ".repeat(rpad.max(2))),
+                                Span::styled(wrapped_line, Style::default().fg(t.accent)),
+                            ]));
+                        }
+                    }
+
+                    // Show caption if exists
+                    if let Some(ref caption) = file_info.caption {
+                        if !caption.is_empty() {
+                            let available_width = inner_width.saturating_sub(2);
+                            let wrapped_caption = wrap_text_with_width(caption, available_width);
+                            for cap_line in wrapped_caption {
+                                let display_width = calculate_display_width(&cap_line);
+                                let rpad = available_width.saturating_sub(display_width);
+                                lines.push(Line::from(vec![
+                                    Span::raw(" ".repeat(rpad.max(2))),
+                                    Span::raw(cap_line),
+                                ]));
+                            }
+                        }
+                    }
+
+                    // Show download status
+                    let available_width = inner_width.saturating_sub(2);
+                    let wrapped_status = wrap_text_with_width(&download_status, available_width);
+                    for status_line in wrapped_status {
+                        let display_width = calculate_display_width(&status_line);
+                        let rpad = available_width.saturating_sub(display_width);
+                        lines.push(Line::from(vec![
+                            Span::raw(" ".repeat(rpad.max(2))),
+                            Span::styled(status_line, Style::default().fg(t.muted)),
+                        ]));
+                    }
+                } else {
+                    // Normal text message - with wrapping support
+                    let available_width = inner_width.saturating_sub(2); // 2 spaces for margin
+                    let wrapped_lines = wrap_text_with_width(&msg.content, available_width);
+
+                    for (line_idx, wrapped_line) in wrapped_lines.into_iter().enumerate() {
+                        if line_idx == 0 {
+                            // First line: right-aligned with status icon
+                            let msg_with_status = format!("{} {status_icon}", wrapped_line);
+                            let display_width = calculate_display_width(&msg_with_status);
+                            let rpad = available_width.saturating_sub(display_width);
+                            lines.push(Line::from(vec![
+                                Span::raw(" ".repeat(rpad.max(2))),
+                                Span::raw(wrapped_line.clone()),
+                                Span::styled(
+                                    format!(" {status_icon}"),
+                                    Style::default().fg(status_color),
+                                ),
+                            ]));
+                        } else {
+                            // Subsequent lines: right-aligned without status icon
+                            let display_width = calculate_display_width(&wrapped_line);
+                            let rpad = available_width.saturating_sub(display_width);
+                            lines.push(Line::from(vec![
+                                Span::raw(" ".repeat(rpad.max(2))),
+                                Span::raw(wrapped_line),
+                            ]));
+                        }
+                    }
+                }
             } else {
                 // Left-aligned: [Sender] content
                 if !same_sender {
                     let fallback = app.contact_name(&msg.sender);
-                    let sender_name = msg
-                        .sender_name
-                        .as_deref()
-                        .unwrap_or(&fallback);
+                    let sender_name = msg.sender_name.as_deref().unwrap_or(&fallback);
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("  {sender_name}"),
@@ -682,14 +894,68 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     let truncated: String = reply_content.chars().take(30).collect();
                     lines.push(Line::from(vec![
                         Span::raw("    "),
-                        Span::styled(format!("↩ {truncated}"), Style::default().fg(t.muted).add_modifier(Modifier::ITALIC)),
+                        Span::styled(
+                            format!("↩ {truncated}"),
+                            Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
+                        ),
                     ]));
                 }
 
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::raw(&msg.content),
-                ]));
+                // Check if it's a file message
+                if let Some(ref file_info) = msg.file_info {
+                    // File message - display file info with full path
+                    let display_name = if file_info.is_downloaded {
+                        &file_info.display_path
+                    } else {
+                        &file_info.name
+                    };
+                    let file_line =
+                        format!("{} {} ({})", file_info.icon, display_name, file_info.size);
+
+                    // Check download status
+                    let download_status = if file_info.is_downloaded {
+                        "✓ Downloaded (click path to open)".to_string()
+                    } else {
+                        "○ Not downloaded".to_string()
+                    };
+
+                    let available_width = inner_width.saturating_sub(4); // 4 spaces for indent
+                    let wrapped_file_lines = wrap_text_with_width(&file_line, available_width);
+                    for wrapped_line in wrapped_file_lines {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(wrapped_line, Style::default().fg(t.accent)),
+                        ]));
+                    }
+
+                    // Show caption if exists
+                    if let Some(ref caption) = file_info.caption {
+                        if !caption.is_empty() {
+                            let wrapped_caption = wrap_text_with_width(caption, available_width);
+                            for cap_line in wrapped_caption {
+                                lines
+                                    .push(Line::from(vec![Span::raw("    "), Span::raw(cap_line)]));
+                            }
+                        }
+                    }
+
+                    // Show download status
+                    let wrapped_status = wrap_text_with_width(&download_status, available_width);
+                    for status_line in wrapped_status {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(status_line, Style::default().fg(t.muted)),
+                        ]));
+                    }
+                } else {
+                    // Normal text message - with wrapping support
+                    let available_width = inner_width.saturating_sub(4); // 4 spaces for indent
+                    let wrapped_lines = wrap_text_with_width(&msg.content, available_width);
+
+                    for wrapped_line in wrapped_lines {
+                        lines.push(Line::from(vec![Span::raw("    "), Span::raw(wrapped_line)]));
+                    }
+                }
             }
 
             last_sender = Some((msg.is_me, msg.sender.clone()));
@@ -705,7 +971,9 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         0
     };
 
-    let messages_widget = Paragraph::new(lines).block(block).scroll((scroll as u16, 0));
+    let messages_widget = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll as u16, 0));
     f.render_widget(messages_widget, area);
 }
 
@@ -716,9 +984,7 @@ fn draw_welcome(app: &App) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from(Span::styled(
                 "  Welcome to Keychat CLI",
-                Style::default()
-                    .fg(t.accent)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -773,7 +1039,7 @@ fn draw_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let title = if app.input.starts_with('/') {
         " Command "
     } else if app.selected_room_id().is_some() {
-        " Message (Alt+Enter: newline) "
+        " Message (Enter: send, Ctrl+J/Alt+Enter: newline) "
     } else {
         " Input (/ for commands) "
     };
@@ -844,7 +1110,10 @@ fn draw_status_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
     ];
 
     if let Some((msg, _)) = &app.notification {
-        spans.push(Span::styled(msg.as_str(), Style::default().fg(t.warning).bg(t.bar_bg)));
+        spans.push(Span::styled(
+            msg.as_str(),
+            Style::default().fg(t.warning).bg(t.bar_bg),
+        ));
     } else {
         spans.push(Span::styled(
             "Tab/j/k  F1:help  ^C:quit",
@@ -863,7 +1132,7 @@ fn draw_status_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
 fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
     let pw = 62u16.min(area.width.saturating_sub(4));
-    let ph = 38u16.min(area.height.saturating_sub(4));
+    let ph = 44u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(pw)) / 2;
     let y = (area.height.saturating_sub(ph)) / 2;
     let popup = Rect::new(x, y, pw, ph);
@@ -893,35 +1162,76 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
             " Identity",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled("  /create  /import  /whoami  /delete-identity", Style::default().fg(Color::Green))),
+        Line::from(Span::styled(
+            "  /create  /import  /whoami  /delete-identity",
+            Style::default().fg(Color::Green),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             " Connection",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled("  /connect  /disconnect  /relays  /add-relay  /reconnect  /status", Style::default().fg(Color::Green))),
+        Line::from(Span::styled(
+            "  /connect  /disconnect  /relays  /add-relay  /reconnect  /status",
+            Style::default().fg(Color::Green),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             " Friends & Messaging",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled("  /add <pk> [greeting]  /accept <id>  /reject <id>  /contacts", Style::default().fg(Color::Green))),
-        Line::from(Span::styled("  /history [n]       /retry         /read", Style::default().fg(Color::Green))),
+        Line::from(Span::styled(
+            "  /add <pk> [greeting]  /accept <id>  /reject <id>  /contacts",
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            "  /history [n]       /retry         /read",
+            Style::default().fg(Color::Green),
+        )),
         Line::from("  (type text without / to send a message)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            " File Transfer",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "  /sendfile <path> [more...]  — Send file message to current room",
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            "  /files [room_id]            — List files in room",
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            "  /download <index|url>       — Download file by index or URL",
+            Style::default().fg(Color::Green),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             " Signal Groups",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled("  /sg-create <name> <pk...>  /sg-leave  /sg-dissolve", Style::default().fg(Color::Green))),
-        Line::from(Span::styled("  /sg-rename <id> <name>     /sg-kick <id> <pk>", Style::default().fg(Color::Green))),
+        Line::from(Span::styled(
+            "  /sg-create <name> <pk...>  /sg-leave  /sg-dissolve",
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            "  /sg-rename <id> <name>     /sg-kick <id> <pk>",
+            Style::default().fg(Color::Green),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             " Settings",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled("  /theme dark|light  — Switch theme", Style::default().fg(Color::Green))),
-        Line::from(Span::styled("  /reset             — Delete all data and start fresh", Style::default().fg(Color::Red))),
+        Line::from(Span::styled(
+            "  /theme dark|light  — Switch theme",
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            "  /reset             — Delete all data and start fresh",
+            Style::default().fg(Color::Red),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             " Tips",
@@ -947,8 +1257,24 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
 }
 
 fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let pw = 62u16.min(area.width.saturating_sub(4));
-    let ph = 28u16.min(area.height.saturating_sub(4));
+    // Calculate QR code size first to determine popup width
+    let qr_lines = if let Some(ref pk) = app.identity_hex {
+        let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
+        render_qr_lines(&npub)
+    } else {
+        vec![]
+    };
+
+    // Calculate required width: max of QR code width, text lines, or minimum usable width
+    let qr_width = qr_lines.first().map(|l| l.len() as u16).unwrap_or(0);
+    let min_content_width = 54u16; // Minimum width for text content
+    let content_width = qr_width.max(min_content_width);
+
+    // Popup dimensions: add padding for borders (2) and margins (4)
+    let pw = (content_width + 6)
+        .min(area.width.saturating_sub(4))
+        .max(60);
+    let ph = (28u16).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(pw)) / 2;
     let y = (area.height.saturating_sub(ph)) / 2;
     let popup = Rect::new(x, y, pw, ph);
@@ -958,7 +1284,9 @@ fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let mut lines = vec![
         Line::from(Span::styled(
             " Identity",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ];
@@ -986,8 +1314,16 @@ fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
             ]));
         }
         lines.push(Line::from(""));
-        for qr_line in render_qr_lines(&npub) {
-            lines.push(Line::from(format!("  {qr_line}")));
+        // Center QR code in popup
+        let qr_display_width = qr_lines.first().map(|l| l.len()).unwrap_or(0) as u16;
+        let padding = ((pw.saturating_sub(2)) / 2).saturating_sub(qr_display_width / 2);
+        for qr_line in qr_lines {
+            lines.push(Line::from(format!(
+                "{:padding$}{}",
+                "",
+                qr_line,
+                padding = padding as usize
+            )));
         }
     } else {
         lines.push(Line::from(Span::styled(
@@ -1057,11 +1393,30 @@ async fn handle_key_event(app: &mut App, key: KeyEvent) {
 
 async fn handle_rooms_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => room_select_prev(app),
-        KeyCode::Down | KeyCode::Char('j') => room_select_next(app),
+        KeyCode::Up | KeyCode::Char('k') => {
+            let before = app.selected_room_id();
+            room_select_prev(app);
+            let after = app.selected_room_id();
+            if after.is_some() && after != before {
+                if let Some(room_id) = after {
+                    load_messages(app, &room_id).await;
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let before = app.selected_room_id();
+            room_select_next(app);
+            let after = app.selected_room_id();
+            if after.is_some() && after != before {
+                if let Some(room_id) = after {
+                    load_messages(app, &room_id).await;
+                }
+            }
+        }
         KeyCode::Enter | KeyCode::Char('l') => {
             if let Some(room_id) = app.selected_room_id() {
                 load_messages(app, &room_id).await;
+                app.messages_scroll = 0;
                 app.active_panel = Panel::Input;
                 let _ = app.client.mark_room_read(room_id).await;
                 refresh_rooms(app).await;
@@ -1135,6 +1490,25 @@ fn handle_messages_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => {
             app.messages_scroll = app.messages_scroll.saturating_sub(3);
         }
+        KeyCode::Enter => {
+            // Try to open file if a message with file is selected
+            if let Some(msg) = app.messages.last() {
+                if let Some(ref file_info) = msg.file_info {
+                    if file_info.is_downloaded {
+                        if let Some(ref path) = file_info.local_path {
+                            // Open file with system default application
+                            if let Err(e) = open::that(path) {
+                                app.notify(format!("Failed to open file: {e}"));
+                            } else {
+                                app.notify(format!("Opening: {}", path));
+                            }
+                        }
+                    } else {
+                        app.notify("File not downloaded yet".to_string());
+                    }
+                }
+            }
+        }
         KeyCode::Esc => {
             app.active_panel = Panel::Input;
         }
@@ -1145,13 +1519,12 @@ fn handle_messages_key(app: &mut App, key: KeyEvent) {
 async fn handle_input_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => {
-            // Alt+Enter or Shift+Enter inserts a newline for multi-line input
-            if key.modifiers.contains(KeyModifiers::ALT)
-                || key.modifiers.contains(KeyModifiers::SHIFT)
-            {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                // Alt+Enter inserts a newline for multi-line input
                 app.input.insert(app.cursor_pos, '\n');
                 app.cursor_pos += 1;
             } else if !app.input.is_empty() {
+                // Plain Enter sends the message
                 let input = app.input.clone();
                 app.input.clear();
                 app.cursor_pos = 0;
@@ -1160,8 +1533,17 @@ async fn handle_input_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char(c) => {
+            // Ctrl+J inserts newline (works in most terminals)
+            if (c == 'j' || c == 'J') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.input.insert(app.cursor_pos, '\n');
+                app.cursor_pos += 1;
+                return;
+            }
+
             // Tab completion for commands
-            if c == '\t' || (key.code == KeyCode::Char('i') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+            if c == '\t'
+                || (key.code == KeyCode::Char('i') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
                 try_tab_complete(app);
                 return;
             }
@@ -1314,19 +1696,26 @@ async fn send_message(app: &mut App, text: &str) {
             return;
         }
     };
-    tracing::info!("Sending message to room={}, len={}", &room_id[..16.min(room_id.len())], text.len());
+    tracing::info!(
+        "Sending message to room={}, len={}",
+        &room_id[..16.min(room_id.len())],
+        text.len()
+    );
 
     match crate::commands::send_message(&app.client, &room_id, text).await {
         Ok(crate::commands::SendResult::Dm { .. }) => {}
         Ok(crate::commands::SendResult::Group { event_count }) => {
-            app.push_output(format!("Sent to group ({event_count} event(s))"), Color::Green);
+            app.push_output(
+                format!("Sent to group ({event_count} event(s))"),
+                Color::Green,
+            );
         }
         Ok(crate::commands::SendResult::MlsNotSupported) => {
             app.notify("MLS groups not yet supported".into());
             return;
         }
         Err(e) => {
-            app.notify(format!("Send failed: {e}"));
+            app.show_error(format!("Send failed: {e}"));
             return;
         }
     }
@@ -1352,7 +1741,10 @@ async fn process_command(app: &mut App, input: &str) {
                     app.identity_hex = Some(pubkey_hex.clone());
                     app.identity_name = Some(display_name.clone());
 
-                    app.push_output(format!("Identity created! Name: {display_name}"), Color::Green);
+                    app.push_output(
+                        format!("Identity created! Name: {display_name}"),
+                        Color::Green,
+                    );
                     app.push_output(String::new(), Color::White);
                     app.push_output("Pubkey (hex):".into(), Color::DarkGray);
                     app.push_output(pubkey_hex, Color::Cyan);
@@ -1378,12 +1770,15 @@ async fn process_command(app: &mut App, input: &str) {
 
                     // Auto-connect to relays
                     if !app.event_loop_started {
-                        crate::commands::connect_and_start(&app.client, keychat_uniffi::default_relays());
+                        crate::commands::connect_and_start(
+                            &app.client,
+                            keychat_uniffi::default_relays(),
+                        );
                         app.event_loop_started = true;
                     }
                     app.notify("Identity created! Connecting to relays...".into());
                 }
-                Err(e) => app.notify(format!("Create failed: {e}")),
+                Err(e) => app.show_error(format!("Create failed: {e}")),
             }
         }
         "/import" => {
@@ -1400,16 +1795,22 @@ async fn process_command(app: &mut App, input: &str) {
                             app.identity_name = Some(id.name.clone());
                         }
                     }
-                    app.push_output(format!("Identity imported: {}", short_key(&pubkey)), Color::Green);
+                    app.push_output(
+                        format!("Identity imported: {}", short_key(&pubkey)),
+                        Color::Green,
+                    );
                     // Auto-connect to relays
                     if !app.event_loop_started {
-                        crate::commands::connect_and_start(&app.client, keychat_uniffi::default_relays());
+                        crate::commands::connect_and_start(
+                            &app.client,
+                            keychat_uniffi::default_relays(),
+                        );
                         app.event_loop_started = true;
                     }
                     refresh_rooms(app).await;
                     refresh_contacts(app).await;
                 }
-                Err(e) => app.notify(format!("Import failed: {e}")),
+                Err(e) => app.show_error(format!("Import failed: {e}")),
             }
         }
         "/whoami" => {
@@ -1432,17 +1833,14 @@ async fn process_command(app: &mut App, input: &str) {
                 app.messages.clear();
                 app.notify("Identity deleted".into());
             }
-            Err(e) => app.notify(format!("Delete failed: {e}")),
+            Err(e) => app.show_error(format!("Delete failed: {e}")),
         },
         "/reset" => {
             app.push_output(
                 "⚠ This will DELETE ALL DATA (identity, messages, contacts, sessions).".into(),
                 Color::Red,
             );
-            app.push_output(
-                "Type /confirm-reset to confirm.".into(),
-                Color::Yellow,
-            );
+            app.push_output("Type /confirm-reset to confirm.".into(), Color::Yellow);
         }
         "/confirm-reset" => {
             let data_dir = app.data_dir.clone();
@@ -1452,10 +1850,7 @@ async fn process_command(app: &mut App, input: &str) {
             match std::fs::remove_dir_all(&data_dir) {
                 Ok(_) => {
                     app.push_output("All data deleted.".into(), Color::Green);
-                    app.push_output(
-                        "Restart keychat to begin fresh.".into(),
-                        Color::Cyan,
-                    );
+                    app.push_output("Restart keychat to begin fresh.".into(), Color::Cyan);
                     app.identity_hex = None;
                     app.identity_name = None;
                     app.owner_pubkey = None;
@@ -1468,7 +1863,7 @@ async fn process_command(app: &mut App, input: &str) {
                     app.event_loop_started = false;
                     app.should_quit = true;
                 }
-                Err(e) => app.notify(format!("Reset failed: {e}")),
+                Err(e) => app.show_error(format!("Reset failed: {e}")),
             }
         }
         "/connect" => {
@@ -1477,7 +1872,10 @@ async fn process_command(app: &mut App, input: &str) {
             } else {
                 args.split_whitespace().map(|s| s.to_string()).collect()
             };
-            app.push_output(format!("Connecting to {} relay(s)...", relay_urls.len()), Color::Cyan);
+            app.push_output(
+                format!("Connecting to {} relay(s)...", relay_urls.len()),
+                Color::Cyan,
+            );
             crate::commands::connect_and_start(&app.client, relay_urls);
             app.event_loop_started = true;
         }
@@ -1501,7 +1899,7 @@ async fn process_command(app: &mut App, input: &str) {
                     }
                 }
             }
-            Err(e) => app.notify(format!("Error: {e}")),
+            Err(e) => app.show_error(format!("Error: {e}")),
         },
         "/add-relay" => {
             if args.is_empty() {
@@ -1513,7 +1911,7 @@ async fn process_command(app: &mut App, input: &str) {
                     app.push_output(format!("Relay added: {args}"), Color::Green);
                     refresh_relay_status(app).await;
                 }
-                Err(e) => app.notify(format!("Error: {e}")),
+                Err(e) => app.show_error(format!("Error: {e}")),
             }
         }
         "/remove-relay" => {
@@ -1526,7 +1924,7 @@ async fn process_command(app: &mut App, input: &str) {
                     app.push_output(format!("Relay removed: {args}"), Color::Green);
                     refresh_relay_status(app).await;
                 }
-                Err(e) => app.notify(format!("Error: {e}")),
+                Err(e) => app.show_error(format!("Error: {e}")),
             }
         }
         "/reconnect" => {
@@ -1540,7 +1938,11 @@ async fn process_command(app: &mut App, input: &str) {
             } else {
                 app.push_output("Identity: None".into(), Color::Red);
             }
-            let relay_color = if app.connected_relays > 0 { Color::Green } else { Color::Red };
+            let relay_color = if app.connected_relays > 0 {
+                Color::Green
+            } else {
+                Color::Red
+            };
             app.push_output(
                 format!("Relays: {}/{}", app.connected_relays, app.total_relays),
                 relay_color,
@@ -1564,7 +1966,10 @@ async fn process_command(app: &mut App, input: &str) {
                 }
             };
             // Use identity display name; greeting is optional second arg
-            let name = app.identity_name.clone().unwrap_or_else(|| "CLI User".to_string());
+            let name = app
+                .identity_name
+                .clone()
+                .unwrap_or_else(|| "CLI User".to_string());
             let greeting = if parts.len() > 1 { parts[1] } else { "" };
             if !greeting.is_empty() {
                 app.push_output(format!("Greeting: {greeting}"), app.theme.muted);
@@ -1578,14 +1983,18 @@ async fn process_command(app: &mut App, input: &str) {
                 Ok(pending) => {
                     tracing::info!("Friend request sent, id={}", &pending.request_id);
                     app.push_output(
-                        format!("Request sent to {}. ID: {}", short_key(&peer), short_key(&pending.request_id)),
+                        format!(
+                            "Request sent to {}. ID: {}",
+                            short_key(&peer),
+                            short_key(&pending.request_id)
+                        ),
                         Color::Green,
                     );
                     refresh_rooms(app).await;
                 }
                 Err(e) => {
                     tracing::error!("Friend request send failed: {e}");
-                    app.notify(format!("Send failed: {e}"));
+                    app.show_error(format!("Send failed: {e}"));
                 }
             }
         }
@@ -1595,9 +2004,17 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /accept <request_id> [my_name]".into());
                 return;
             }
-            let name = if parts.len() > 1 { parts[1].to_string() } else { "CLI User".to_string() };
+            let name = if parts.len() > 1 {
+                parts[1].to_string()
+            } else {
+                "CLI User".to_string()
+            };
             tracing::info!("Accepting friend request: {}", parts[0]);
-            match app.client.accept_friend_request(parts[0].to_string(), name).await {
+            match app
+                .client
+                .accept_friend_request(parts[0].to_string(), name)
+                .await
+            {
                 Ok(contact) => {
                     tracing::info!("Friend request accepted: {}", contact.display_name);
                     app.push_output(format!("Accepted: {}", contact.display_name), Color::Green);
@@ -1606,7 +2023,7 @@ async fn process_command(app: &mut App, input: &str) {
                 }
                 Err(e) => {
                     tracing::error!("Accept friend request failed: {e}");
-                    app.notify(format!("Accept failed: {e}"));
+                    app.show_error(format!("Accept failed: {e}"));
                 }
             }
         }
@@ -1615,9 +2032,13 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /reject <request_id>".into());
                 return;
             }
-            match app.client.reject_friend_request(args.to_string(), None).await {
+            match app
+                .client
+                .reject_friend_request(args.to_string(), None)
+                .await
+            {
                 Ok(_) => app.push_output("Friend request rejected".into(), Color::Yellow),
-                Err(e) => app.notify(format!("Reject failed: {e}")),
+                Err(e) => app.show_error(format!("Reject failed: {e}")),
             }
         }
         "/contacts" => {
@@ -1628,12 +2049,19 @@ async fn process_command(app: &mut App, input: &str) {
                             app.push_output("No contacts yet".into(), app.theme.muted);
                         } else {
                             for c in &contacts {
-                                let name = c.petname.as_deref().or(c.name.as_deref()).unwrap_or("(unnamed)");
-                                app.push_output(format!("{name}  {}", short_key(&c.pubkey)), Color::White);
+                                let name = c
+                                    .petname
+                                    .as_deref()
+                                    .or(c.name.as_deref())
+                                    .unwrap_or("(unnamed)");
+                                app.push_output(
+                                    format!("{name}  {}", short_key(&c.pubkey)),
+                                    Color::White,
+                                );
                             }
                         }
                     }
-                    Err(e) => app.notify(format!("Error: {e}")),
+                    Err(e) => app.show_error(format!("Error: {e}")),
                 }
             }
         }
@@ -1645,19 +2073,281 @@ async fn process_command(app: &mut App, input: &str) {
                     return;
                 }
             };
-            let count: i32 = args.parse().unwrap_or(50);
-            load_messages_with_count(app, &room_id, count).await;
+            let display_count: i32 = args.parse().unwrap_or(50);
+            // Load the latest N messages
+            match app.client.get_message_count(room_id.to_string()).await {
+                Ok(total_count) => {
+                    let offset = (total_count - display_count).max(0);
+                    load_messages_with_count(app, &room_id, display_count, offset).await;
+                }
+                Err(e) => {
+                    app.show_error(format!("Failed to count messages: {e}"));
+                }
+            }
         }
         "/retry" => match app.client.retry_failed_messages().await {
-            Ok(count) if count > 0 => app.push_output(format!("Retrying {count} message(s)"), Color::Green),
+            Ok(count) if count > 0 => {
+                app.push_output(format!("Retrying {count} message(s)"), Color::Green)
+            }
             Ok(_) => app.push_output("No failed messages".into(), app.theme.muted),
-            Err(e) => app.notify(format!("Retry failed: {e}")),
+            Err(e) => app.show_error(format!("Retry failed: {e}")),
         },
         "/read" => {
             if let Some(room_id) = app.selected_room_id() {
                 let _ = app.client.mark_room_read(room_id).await;
                 app.push_output("Marked as read".into(), Color::Green);
                 refresh_rooms(app).await;
+            }
+        }
+        "/upload" => {
+            if args.is_empty() {
+                app.notify("Usage: /upload <path>".into());
+                return;
+            }
+            // Trim quotes if present (for paths with spaces)
+            let path_str = args.trim().trim_matches('"').trim_matches('\'');
+            if path_str.is_empty() {
+                app.notify("Empty path".into());
+                return;
+            }
+            let path = std::path::Path::new(path_str);
+            if !path.exists() {
+                app.notify(format!("File not found: {path_str}"));
+                return;
+            }
+            let server = match app.client.get_active_media_server().await {
+                Ok(url) => url,
+                Err(_) => keychat_uniffi::default_blossom_server(),
+            };
+            app.notify(format!("Uploading to {}...", server));
+            match crate::commands::upload_and_prepare_file(path, &server).await {
+                Ok(payload) => {
+                    app.push_output(
+                        format!(
+                            "✓ Uploaded: {}",
+                            payload.source_name.unwrap_or_else(|| "file".to_string())
+                        ),
+                        Color::Green,
+                    );
+                    app.push_output(format!("URL: {}", payload.url), Color::Cyan);
+                    app.push_output(
+                        format!("Key: {}...", &payload.key[..16.min(payload.key.len())]),
+                        Color::DarkGray,
+                    );
+                }
+                Err(e) => {
+                    app.show_error(format!("Upload failed: {e}"));
+                }
+            }
+        }
+        "/sendfile" => {
+            if args.is_empty() {
+                app.notify("Usage: /sendfile <path> [more paths...]".into());
+                return;
+            }
+            let room_id = match app.selected_room_id() {
+                Some(id) => id,
+                None => {
+                    app.notify("Select a room first".into());
+                    return;
+                }
+            };
+            // Support quoted paths with spaces
+            let paths: Vec<&str> = if args.contains('"') || args.contains('\'') {
+                // Simple quoted path support
+                vec![args.trim_matches('"').trim_matches('\'')]
+            } else {
+                args.split_whitespace().collect()
+            };
+            let mut payloads = Vec::new();
+            let server = match app.client.get_active_media_server().await {
+                Ok(url) => url,
+                Err(_) => keychat_uniffi::default_blossom_server(),
+            };
+            for path_str in paths {
+                let path = std::path::Path::new(path_str);
+                if !path.exists() {
+                    app.notify(format!("File not found: {path_str}"));
+                    continue;
+                }
+                match crate::commands::upload_and_prepare_file(path, &server).await {
+                    Ok(payload) => payloads.push(payload),
+                    Err(e) => app.show_error(format!("Upload failed for {path_str}: {e}")),
+                }
+            }
+            if !payloads.is_empty() {
+                let count = payloads.len();
+                match crate::commands::send_file_message(&app.client, &room_id, payloads, None)
+                    .await
+                {
+                    Ok(_) => {
+                        app.push_output(format!("✓ Sent {} file(s)", count), Color::Green);
+                        tracing::info!("File message sent successfully, waiting for sync...");
+
+                        // Wait for message to sync back from relay (usually <500ms)
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                        // Get current count before reload for diagnostics
+                        let count_before = app
+                            .client
+                            .get_message_count(room_id.clone())
+                            .await
+                            .unwrap_or(0);
+                        tracing::info!("[FileSync] Message count before reload: {}", count_before);
+
+                        load_messages(app, &room_id).await;
+                        refresh_rooms(app).await;
+
+                        // Log count after reload
+                        let count_after = app
+                            .client
+                            .get_message_count(room_id.clone())
+                            .await
+                            .unwrap_or(0);
+                        tracing::info!("[FileSync] Message count after reload: {}", count_after);
+
+                        if count_after > count_before {
+                            tracing::info!(
+                                "[FileSync] ✓ New message(s) detected - sync successful"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "[FileSync] ✗ No new messages detected - possible sync issue!"
+                            );
+                        }
+                    }
+                    Err(e) => app.show_error(format!("Send failed: {e}")),
+                }
+            }
+        }
+        "/files" => {
+            let room_id = if args.is_empty() {
+                app.selected_room_id()
+            } else {
+                Some(args.to_string())
+            };
+            match room_id {
+                Some(id) => match app.client.get_messages(id.clone(), 100, 0).await {
+                    Ok(msgs) => {
+                        let mut file_count = 0;
+                        for msg in msgs {
+                            if let Some(ref payload_json) = msg.payload_json {
+                                if let Some(parsed) =
+                                    crate::commands::parse_file_message(payload_json)
+                                {
+                                    file_count += 1;
+                                    for item in &parsed.items {
+                                        let icon =
+                                            crate::commands::file_category_icon(&item.category);
+                                        let downloaded = if app
+                                            .client
+                                            .resolve_local_file(
+                                                msg.msgid.clone(),
+                                                item.hash.clone(),
+                                            )
+                                            .await
+                                            .is_some()
+                                        {
+                                            "✓"
+                                        } else {
+                                            "○"
+                                        };
+                                        app.push_output(
+                                            format!(
+                                                "{} {} {} ({})",
+                                                downloaded,
+                                                icon,
+                                                item.display_name(),
+                                                item.size_string()
+                                            ),
+                                            Color::Cyan,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if file_count == 0 {
+                            app.push_output("No files in this room".into(), Color::Yellow);
+                        }
+                    }
+                    Err(e) => app.show_error(format!("Failed to list files: {e}")),
+                },
+                None => app.notify("Select a room first or specify room_id".into()),
+            }
+        }
+        "/download" => {
+            if args.is_empty() {
+                app.notify("Usage: /download <file_index>".into());
+                return;
+            }
+            let room_id = match app.selected_room_id() {
+                Some(id) => id,
+                None => {
+                    app.notify("Select a room first".into());
+                    return;
+                }
+            };
+            let index: usize = match args.parse::<usize>() {
+                Ok(n) if n >= 1 => n - 1,
+                _ => {
+                    app.notify(format!("Invalid index: {args}"));
+                    return;
+                }
+            };
+            // Find file by index
+            match app.client.get_messages(room_id.clone(), 100, 0).await {
+                Ok(msgs) => {
+                    let mut file_msgs: Vec<_> = Vec::new();
+                    for msg in msgs {
+                        if let Some(ref payload_json) = msg.payload_json {
+                            if let Some(parsed) = crate::commands::parse_file_message(payload_json)
+                            {
+                                for item in &parsed.items {
+                                    file_msgs.push((msg.msgid.clone(), item.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if index >= file_msgs.len() {
+                        app.notify(format!(
+                            "Index {} out of range (found {} files)",
+                            index + 1,
+                            file_msgs.len()
+                        ));
+                        return;
+                    }
+                    let (msgid, item) = &file_msgs[index];
+                    // Check if already downloaded
+                    if let Some(path) = app
+                        .client
+                        .resolve_local_file(msgid.clone(), item.hash.clone())
+                        .await
+                    {
+                        app.push_output(format!("Already downloaded: {}", path), Color::Green);
+                        return;
+                    }
+                    app.notify(format!("Downloading: {}...", item.display_name()));
+                    match app
+                        .client
+                        .download_and_save(
+                            item.url.clone(),
+                            item.key.clone(),
+                            item.iv.clone(),
+                            item.hash.clone(),
+                            item.source_name.clone(),
+                            item.suffix.clone(),
+                            room_id.clone(),
+                            Some(msgid.clone()),
+                        )
+                        .await
+                    {
+                        Ok(path) => {
+                            app.push_output(format!("✓ Downloaded to: {}", path), Color::Green)
+                        }
+                        Err(e) => app.show_error(format!("Download failed: {e}")),
+                    }
+                }
+                Err(e) => app.notify(format!("Failed to get messages: {e}")),
             }
         }
         "/sg-create" => {
@@ -1672,18 +2362,24 @@ async fn process_command(app: &mut App, input: &str) {
                 .map(|pk| {
                     let n = keychat_uniffi::normalize_to_hex(pk.to_string())
                         .unwrap_or_else(|_| pk.to_string());
-                    GroupMemberInput { nostr_pubkey: n.clone(), name: short_key(&n) }
+                    GroupMemberInput {
+                        nostr_pubkey: n.clone(),
+                        name: short_key(&n),
+                    }
                 })
                 .collect();
             match app.client.create_signal_group(name, members).await {
                 Ok(info) => {
                     app.push_output(
-                        format!("Group created: {} ({} members)", info.name, info.member_count),
+                        format!(
+                            "Group created: {} ({} members)",
+                            info.name, info.member_count
+                        ),
                         Color::Green,
                     );
                     refresh_rooms(app).await;
                 }
-                Err(e) => app.notify(format!("Create failed: {e}")),
+                Err(e) => app.show_error(format!("Create failed: {e}")),
             }
         }
         "/sg-leave" => {
@@ -1691,8 +2387,11 @@ async fn process_command(app: &mut App, input: &str) {
             match gid {
                 None => app.notify("Select a group room first".into()),
                 Some(gid) => match app.client.leave_signal_group(gid).await {
-                    Ok(_) => { app.push_output("Left group".into(), Color::Yellow); refresh_rooms(app).await; }
-                    Err(e) => app.notify(format!("Leave failed: {e}")),
+                    Ok(_) => {
+                        app.push_output("Left group".into(), Color::Yellow);
+                        refresh_rooms(app).await;
+                    }
+                    Err(e) => app.show_error(format!("Leave failed: {e}")),
                 },
             }
         }
@@ -1701,31 +2400,44 @@ async fn process_command(app: &mut App, input: &str) {
             match gid {
                 None => app.notify("Select a group room first".into()),
                 Some(gid) => match app.client.dissolve_signal_group(gid).await {
-                    Ok(_) => { app.push_output("Group dissolved".into(), Color::Red); refresh_rooms(app).await; }
-                    Err(e) => app.notify(format!("Dissolve failed: {e}")),
+                    Ok(_) => {
+                        app.push_output("Group dissolved".into(), Color::Red);
+                        refresh_rooms(app).await;
+                    }
+                    Err(e) => app.show_error(format!("Dissolve failed: {e}")),
                 },
             }
         }
         "/sg-rename" => {
-            if args.is_empty() { app.notify("Usage: /sg-rename <new_name>".into()); return; }
+            if args.is_empty() {
+                app.notify("Usage: /sg-rename <new_name>".into());
+                return;
+            }
             let gid = resolve_selected_group_id(app).await;
             match gid {
                 None => app.notify("Select a group room first".into()),
                 Some(gid) => match app.client.rename_signal_group(gid, args.to_string()).await {
-                    Ok(_) => { app.push_output(format!("Renamed to: {args}"), Color::Green); refresh_rooms(app).await; }
-                    Err(e) => app.notify(format!("Rename failed: {e}")),
+                    Ok(_) => {
+                        app.push_output(format!("Renamed to: {args}"), Color::Green);
+                        refresh_rooms(app).await;
+                    }
+                    Err(e) => app.show_error(format!("Rename failed: {e}")),
                 },
             }
         }
         "/sg-kick" => {
-            if args.is_empty() { app.notify("Usage: /sg-kick <pubkey>".into()); return; }
+            if args.is_empty() {
+                app.notify("Usage: /sg-kick <pubkey>".into());
+                return;
+            }
             let gid = resolve_selected_group_id(app).await;
-            let pk = keychat_uniffi::normalize_to_hex(args.trim().to_string()).unwrap_or_else(|_| args.trim().to_string());
+            let pk = keychat_uniffi::normalize_to_hex(args.trim().to_string())
+                .unwrap_or_else(|_| args.trim().to_string());
             match gid {
                 None => app.notify("Select a group room first".into()),
                 Some(gid) => match app.client.remove_group_member(gid, pk).await {
                     Ok(_) => app.push_output("Member removed".into(), Color::Yellow),
-                    Err(e) => app.notify(format!("Kick failed: {e}")),
+                    Err(e) => app.show_error(format!("Kick failed: {e}")),
                 },
             }
         }
@@ -1735,12 +2447,27 @@ async fn process_command(app: &mut App, input: &str) {
         },
         "/theme" => {
             let new_theme = match args {
-                "light" => { save_theme_setting(&app.client, "light").await; Theme::light() }
-                "dark" | "" => { save_theme_setting(&app.client, "dark").await; Theme::dark() }
-                _ => { app.notify("Usage: /theme dark|light".into()); return; }
+                "light" => {
+                    save_theme_setting(&app.client, "light").await;
+                    Theme::light()
+                }
+                "dark" | "" => {
+                    save_theme_setting(&app.client, "dark").await;
+                    Theme::dark()
+                }
+                _ => {
+                    app.notify("Usage: /theme dark|light".into());
+                    return;
+                }
             };
             app.theme = new_theme;
-            app.push_output(format!("Theme set to: {}", if args.is_empty() { "dark" } else { args }), Color::Green);
+            app.push_output(
+                format!(
+                    "Theme set to: {}",
+                    if args.is_empty() { "dark" } else { args }
+                ),
+                Color::Green,
+            );
         }
         "/help" => app.show_help = true,
         "/quit" | "/exit" => app.should_quit = true,
@@ -1750,18 +2477,117 @@ async fn process_command(app: &mut App, input: &str) {
 
 // ─── Event handlers ─────────────────────────────────────────
 
+/// Handle auto-download for file messages.
+/// Spawns a background task to download files and refresh UI when complete.
+fn spawn_file_auto_download(
+    client: Arc<KeychatClient>,
+    data_tx: broadcast::Sender<DataChange>,
+    room_id: String,
+    event_id: String,
+    payload_json: String,
+) {
+    tokio::spawn(async move {
+        // Parse file message
+        let parsed = match crate::commands::parse_file_message(&payload_json) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Process each file item
+        for item in &parsed.items {
+            // Check if already downloaded
+            if client
+                .resolve_local_file(event_id.clone(), item.hash.clone())
+                .await
+                .is_some()
+            {
+                continue;
+            }
+
+            // Check if should auto-download
+            match client.should_auto_download(item.size).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        "Skipping auto-download for {} (size {} exceeds limit)",
+                        item.display_name(),
+                        item.size
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to check auto-download setting: {e}");
+                    continue;
+                }
+            }
+
+            // Download the file
+            tracing::info!("Auto-downloading file: {}", item.display_name());
+            match client
+                .download_and_save(
+                    item.url.clone(),
+                    item.key.clone(),
+                    item.iv.clone(),
+                    item.hash.clone(),
+                    item.source_name.clone(),
+                    item.suffix.clone(),
+                    room_id.clone(),
+                    Some(event_id.clone()),
+                )
+                .await
+            {
+                Ok(path) => {
+                    tracing::info!("Auto-downloaded file to: {path}");
+                    // Notify UI to refresh this message
+                    let _ = data_tx.send(DataChange::MessageUpdated {
+                        room_id: room_id.clone(),
+                        msgid: event_id.clone(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to auto-download file {}: {e}", item.display_name());
+                }
+            }
+        }
+    });
+}
+
 async fn handle_client_event(app: &mut App, event: &ClientEvent) {
     match event {
         ClientEvent::MessageReceived {
             sender_pubkey,
             content,
             room_id,
+            kind,
+            payload,
+            event_id,
             ..
         } => {
-            tracing::info!("Message received: room={}, sender={}, len={}", &room_id[..16.min(room_id.len())], &sender_pubkey[..16.min(sender_pubkey.len())], content.as_deref().map_or(0, |c| c.len()));
+            tracing::info!(
+                "Message received: room={}, sender={}, len={}",
+                &room_id[..16.min(room_id.len())],
+                &sender_pubkey[..16.min(sender_pubkey.len())],
+                content.as_deref().map_or(0, |c| c.len())
+            );
+
+            // Handle file message auto-download
+            if matches!(kind, keychat_uniffi::MessageKind::Files) {
+                if let Some(ref payload_json) = payload {
+                    spawn_file_auto_download(
+                        Arc::clone(&app.client),
+                        app.data_tx.clone(),
+                        room_id.clone(),
+                        event_id.clone(),
+                        payload_json.clone(),
+                    );
+                }
+            }
+
             refresh_rooms(app).await;
-            if app.selected_room_id().as_deref() == Some(room_id.as_str()) {
-                load_messages(app, room_id).await;
+            if let Some(selected_room_id) = app.selected_room_id() {
+                // Always refresh currently selected room to avoid missing updates when
+                // event room_id format differs across DM/group flows.
+                load_messages(app, &selected_room_id).await;
             }
             let sender = app.contact_name(sender_pubkey);
             let body = content.as_deref().unwrap_or("");
@@ -1778,17 +2604,26 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
             sender_name,
             ..
         } => {
-            tracing::info!("Friend request received: name={sender_name}, pubkey={}, request_id={request_id}", &sender_pubkey[..16.min(sender_pubkey.len())]);
+            tracing::info!(
+                "Friend request received: name={sender_name}, pubkey={}, request_id={request_id}",
+                &sender_pubkey[..16.min(sender_pubkey.len())]
+            );
             let is_owner = app.owner_pubkey.as_deref() == Some(sender_pubkey.as_str());
             let should_auto_approve = app.owner_pubkey.is_none() || is_owner;
             if should_auto_approve {
-                let reason = if is_owner { "owner request" } else { "first friend → owner" };
+                let reason = if is_owner {
+                    "owner request"
+                } else {
+                    "first friend → owner"
+                };
                 tracing::info!("Auto-approving ({reason}): {sender_name}");
                 app.push_output(format!("Auto-approving {sender_name}..."), Color::Green);
 
                 // Get display name for accept response
                 let my_name = if let Ok(ids) = app.client.get_identities().await {
-                    ids.first().map(|i| i.name.clone()).filter(|n| !n.is_empty())
+                    ids.first()
+                        .map(|i| i.name.clone())
+                        .filter(|n| !n.is_empty())
                         .unwrap_or_else(|| "CLI User".to_string())
                 } else {
                     "CLI User".to_string()
@@ -1797,14 +2632,26 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
                 // Retry up to 3 times — relay may still be connecting
                 let mut accepted = false;
                 for attempt in 0..3 {
-                    match app.client.accept_friend_request(request_id.clone(), my_name.clone()).await {
+                    match app
+                        .client
+                        .accept_friend_request(request_id.clone(), my_name.clone())
+                        .await
+                    {
                         Ok(contact) => {
                             if app.owner_pubkey.is_none() {
                                 save_owner(&app.client, sender_pubkey).await;
                                 app.owner_pubkey = Some(sender_pubkey.clone());
-                                tracing::info!("Owner set: {} ({})", contact.display_name, &sender_pubkey[..16.min(sender_pubkey.len())]);
+                                tracing::info!(
+                                    "Owner set: {} ({})",
+                                    contact.display_name,
+                                    &sender_pubkey[..16.min(sender_pubkey.len())]
+                                );
                                 app.push_output(
-                                    format!("Owner set: {} ({})", contact.display_name, short_key(sender_pubkey)),
+                                    format!(
+                                        "Owner set: {} ({})",
+                                        contact.display_name,
+                                        short_key(sender_pubkey)
+                                    ),
                                     Color::Green,
                                 );
                             } else {
@@ -1871,7 +2718,11 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
             ..
         } => {
             app.push_output(
-                format!("Group invite: '{}' from {}", group_name, short_key(inviter_pubkey)),
+                format!(
+                    "Group invite: '{}' from {}",
+                    group_name,
+                    short_key(inviter_pubkey)
+                ),
                 Color::Yellow,
             );
             app.notify(format!("Invited to group: {group_name}"));
@@ -1881,7 +2732,9 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
             app.notify(format!("Group dissolved: {}", short_key(room_id)));
             refresh_rooms(app).await;
         }
-        ClientEvent::GroupMemberChanged { kind, new_value, .. } => {
+        ClientEvent::GroupMemberChanged {
+            kind, new_value, ..
+        } => {
             let msg = match kind {
                 keychat_uniffi::GroupChangeKind::NameChanged => {
                     format!("Group renamed to: {}", new_value.as_deref().unwrap_or("?"))
@@ -1919,9 +2772,9 @@ async fn handle_data_change(app: &mut App, change: &DataChange) {
         | DataChange::RoomDeleted { .. } => {
             refresh_rooms(app).await;
         }
-        DataChange::MessageAdded { room_id, .. } | DataChange::MessageUpdated { room_id, .. } => {
-            if app.selected_room_id().as_deref() == Some(room_id.as_str()) {
-                load_messages(app, room_id).await;
+        DataChange::MessageAdded { .. } | DataChange::MessageUpdated { .. } => {
+            if let Some(selected_room_id) = app.selected_room_id() {
+                load_messages(app, &selected_room_id).await;
             }
         }
         DataChange::ContactUpdated { .. } | DataChange::ContactListChanged => {
@@ -1968,15 +2821,19 @@ async fn refresh_rooms(app: &mut App) {
 
     // Restore selection
     if let Some(ref sid) = selected_id {
-        if let Some(idx) = app.display_rows.iter().position(|row| {
-            matches!(&row.kind, DisplayRowKind::Room { room_id, .. } if room_id == sid)
-        }) {
+        if let Some(idx) = app.display_rows.iter().position(
+            |row| matches!(&row.kind, DisplayRowKind::Room { room_id, .. } if room_id == sid),
+        ) {
             app.room_state.select(Some(idx));
             return;
         }
     }
     // Default: select first room
-    if let Some(idx) = app.display_rows.iter().position(|r| matches!(r.kind, DisplayRowKind::Room { .. })) {
+    if let Some(idx) = app
+        .display_rows
+        .iter()
+        .position(|r| matches!(r.kind, DisplayRowKind::Room { .. }))
+    {
         app.room_state.select(Some(idx));
     } else {
         app.room_state.select(None);
@@ -2036,8 +2893,16 @@ fn build_display_rows(app: &mut App) {
         // Sort by last_message_at desc
         let mut sorted_pubkeys: Vec<(&String, &Vec<&RoomEntry>)> = pubkey_rooms.iter().collect();
         sorted_pubkeys.sort_by(|a, b| {
-            let a_time = a.1.iter().filter_map(|r| r.last_message_at).max().unwrap_or(0);
-            let b_time = b.1.iter().filter_map(|r| r.last_message_at).max().unwrap_or(0);
+            let a_time =
+                a.1.iter()
+                    .filter_map(|r| r.last_message_at)
+                    .max()
+                    .unwrap_or(0);
+            let b_time =
+                b.1.iter()
+                    .filter_map(|r| r.last_message_at)
+                    .max()
+                    .unwrap_or(0);
             b_time.cmp(&a_time)
         });
 
@@ -2187,25 +3052,70 @@ async fn refresh_contacts(app: &mut App) {
     if let Ok(contacts) = app.client.get_contacts(pubkey).await {
         app.contact_names.clear();
         for c in contacts {
-            let name = c
-                .petname
-                .or(c.name)
-                .unwrap_or_else(|| short_key(&c.pubkey));
+            let name = c.petname.or(c.name).unwrap_or_else(|| short_key(&c.pubkey));
             app.contact_names.insert(c.pubkey, name);
         }
     }
 }
 
 async fn load_messages(app: &mut App, room_id: &str) {
-    load_messages_with_count(app, room_id, 50).await;
+    // Display limit: 300 messages (~30-50 text lines with wrapping, plenty for one screen)
+    const DISPLAY_LIMIT: i32 = 300;
+
+    // Always load the latest messages, regardless of total message count
+    match app.client.get_message_count(room_id.to_string()).await {
+        Ok(total_count) => {
+            // Calculate offset to skip to the last N messages
+            let offset = (total_count - DISPLAY_LIMIT).max(0);
+            load_messages_with_count(app, room_id, DISPLAY_LIMIT, offset).await;
+        }
+        Err(e) => {
+            app.show_error(format!("Failed to count messages: {e}"));
+        }
+    }
 }
 
-async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32) {
-    match app.client.get_messages(room_id.to_string(), count, 0).await {
+async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32, offset: i32) {
+    match app
+        .client
+        .get_messages(room_id.to_string(), count, offset)
+        .await
+    {
         Ok(msgs) => {
-            app.messages = msgs
-                .into_iter()
-                .map(|m| MessageEntry {
+            let mut entries = Vec::new();
+            for m in msgs {
+                // Parse file info if it's a file message
+                let file_info = if let Some(ref payload_json) = m.payload_json {
+                    if let Some(parsed) = crate::commands::parse_file_message(payload_json) {
+                        let item = &parsed.items[0];
+                        let icon = crate::commands::file_category_icon(&item.category).to_string();
+                        let name = item.display_name();
+                        let size = item.size_string();
+                        let local_path = app
+                            .client
+                            .resolve_local_file(m.msgid.clone(), item.hash.clone())
+                            .await;
+                        let is_downloaded = local_path.is_some();
+                        let display_path = local_path.clone().unwrap_or_else(|| {
+                            item.source_name.clone().unwrap_or_else(|| name.clone())
+                        });
+                        Some(FileDisplayInfo {
+                            icon,
+                            name,
+                            size,
+                            is_downloaded,
+                            local_path,
+                            display_path,
+                            caption: parsed.message,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                entries.push(MessageEntry {
                     sender_name: app.contact_names.get(&m.sender_pubkey).cloned(),
                     sender: m.sender_pubkey,
                     content: m.content,
@@ -2213,12 +3123,16 @@ async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32) {
                     status: m.status,
                     timestamp: m.created_at,
                     reply_to_content: m.reply_to_content,
-                })
-                .collect();
+                    payload_json: m.payload_json,
+                    msgid: m.msgid,
+                    file_info,
+                });
+            }
+            app.messages = entries;
             app.command_output.clear();
             app.messages_scroll = 0;
         }
-        Err(e) => app.notify(format!("Load messages failed: {e}")),
+        Err(e) => app.show_error(format!("Load messages failed: {e}")),
     }
 }
 
@@ -2255,13 +3169,19 @@ fn format_date(ts: u64) -> String {
 const SETTING_OWNER: &str = "owner_pubkey";
 const SETTING_THEME: &str = "theme";
 
-
 async fn load_owner(client: &KeychatClient) -> Option<String> {
-    client.get_setting(SETTING_OWNER.to_string()).await.ok().flatten()
+    client
+        .get_setting(SETTING_OWNER.to_string())
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn save_owner(client: &KeychatClient, pubkey: &str) {
-    if let Err(e) = client.set_setting(SETTING_OWNER.to_string(), pubkey.to_string()).await {
+    if let Err(e) = client
+        .set_setting(SETTING_OWNER.to_string(), pubkey.to_string())
+        .await
+    {
         tracing::warn!("Failed to save owner setting: {e}");
     }
 }
@@ -2274,7 +3194,9 @@ async fn load_theme_setting(client: &KeychatClient) -> Theme {
 }
 
 async fn save_theme_setting(client: &KeychatClient, theme: &str) {
-    let _ = client.set_setting(SETTING_THEME.to_string(), theme.to_string()).await;
+    let _ = client
+        .set_setting(SETTING_THEME.to_string(), theme.to_string())
+        .await;
 }
 
 use crate::commands::delete_mnemonic;
@@ -2282,7 +3204,7 @@ use crate::commands::delete_mnemonic;
 // ─── QR code rendering ─────────────────────────────────────
 
 fn render_qr_lines(data: &str) -> Vec<String> {
-    use qrcode::{QrCode, EcLevel};
+    use qrcode::{EcLevel, QrCode};
 
     // Use low ECC for smaller QR (fewer modules)
     let code = match QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L) {

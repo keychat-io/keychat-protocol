@@ -74,55 +74,90 @@ fn default_data_dir() -> String {
         .unwrap_or_else(|| ".keychat".to_string())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let command = cli.command.clone().unwrap_or(Commands::Tui);
-
-    // TUI mode: log to file to avoid corrupting the terminal UI
-    // Other modes: log to stderr as usual
+/// Initialize logging: write to dated file under {data_dir}/logs/, keep last 7 days.
+/// Falls back to stderr if file creation fails.
+fn init_logging(data_dir: &str, mode: &str) {
     let default_filter = "keychat=info,keychat_uniffi=info,keychat_cli=info";
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_filter.into());
 
-    match &command {
-        Commands::Tui => {
-            let log_path = format!("{}/keychat.log", cli.data_dir);
-            std::fs::create_dir_all(&cli.data_dir)?;
-            // Truncate log file on each startup to avoid unbounded growth
-            let log_file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&log_path)?;
+    let logs_dir = format!("{data_dir}/logs");
+    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        // Fall back to stderr if we can't create the log directory
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        tracing::warn!("Cannot create log dir {logs_dir}: {e}, logging to stderr");
+        return;
+    }
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let log_path = format!("{logs_dir}/keychat-{today}.log");
+
+    // Clean up logs older than 7 days (best-effort)
+    let _ = cleanup_old_logs(&logs_dir, 7);
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(log_file) => {
             tracing_subscriber::fmt()
                 .with_env_filter(env_filter)
                 .with_writer(std::sync::Mutex::new(log_file))
                 .with_ansi(false)
                 .init();
-            tracing::info!("=== keychat-cli started (TUI mode) ===");
+            tracing::info!("=== keychat-cli started ({mode} mode) ===");
             tracing::info!("Log: {log_path}");
-            tracing::info!("Data: {}", cli.data_dir);
+            tracing::info!("Data: {data_dir}");
         }
-        Commands::Daemon { port, .. } => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
-            tracing::info!("=== keychat-cli started (daemon mode, port {port}) ===");
-        }
-        Commands::Agent { port, .. } => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
-            tracing::info!("=== keychat-cli started (agent mode, port {port}) ===");
-        }
-        _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
-            tracing::info!("=== keychat-cli started (interactive mode) ===");
+        Err(e) => {
+            // Fall back to stderr
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+            tracing::warn!("Cannot open log file {log_path}: {e}, logging to stderr");
+            tracing::info!("=== keychat-cli started ({mode} mode) ===");
         }
     }
+}
+
+/// Clean up log files older than N days from the logs directory.
+fn cleanup_old_logs(logs_dir: &str, days: i64) -> anyhow::Result<()> {
+    let cutoff = chrono::Local::now() - chrono::Duration::days(days);
+
+    if let Ok(entries) = std::fs::read_dir(logs_dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    let modified_chrono = chrono::DateTime::<chrono::Local>::from(modified);
+                    if modified_chrono < cutoff {
+                        if let Ok(filename) = entry.file_name().into_string() {
+                            if filename.starts_with("keychat-") && filename.ends_with(".log") {
+                                let path = entry.path();
+                                if let Err(e) = std::fs::remove_file(&path) {
+                                    eprintln!("Failed to delete old log {filename}: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let command = cli.command.clone().unwrap_or(Commands::Tui);
+
+    let mode = match &command {
+        Commands::Tui => "tui",
+        Commands::Daemon { .. } => "daemon",
+        Commands::Agent { .. } => "agent",
+        _ => "interactive",
+    };
+    init_logging(&cli.data_dir, mode);
 
     // Agent mode manages its own client lifecycle
     if let Commands::Agent {
@@ -138,10 +173,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Standard modes: shared client initialization
-    std::fs::create_dir_all(&cli.data_dir)?;
+    // Create subdirectories: db/, files/, logs/
+    let db_dir = format!("{}/db", cli.data_dir);
+    std::fs::create_dir_all(&db_dir)?;
 
-    let db_path = format!("{}/protocol.db", cli.data_dir);
-    let db_key = commands::get_or_create_db_key(&cli.data_dir)?;
+    let db_path = format!("{}/protocol.db", db_dir);
+    let db_key = commands::get_or_create_db_key(&db_dir)?;
 
     let client = Arc::new(KeychatClient::new(db_path, db_key)?);
 

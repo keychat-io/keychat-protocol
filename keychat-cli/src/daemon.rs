@@ -733,17 +733,91 @@ async fn kick_member(
 // SSE Events
 // ═══════════════════════════════════════════════════════════════
 
+/// Handle auto-download for file messages in daemon mode.
+fn spawn_file_auto_download_daemon(
+    client: Arc<KeychatClient>,
+    room_id: String,
+    event_id: String,
+    payload_json: String,
+) {
+    tokio::spawn(async move {
+        // Parse file message
+        let parsed = match crate::commands::parse_file_message(&payload_json) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Process each file item
+        for item in &parsed.items {
+            // Check if already downloaded
+            if client.resolve_local_file(event_id.clone(), item.hash.clone()).await.is_some() {
+                continue;
+            }
+
+            // Check if should auto-download
+            match client.should_auto_download(item.size).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!("[daemon] Skipping auto-download for {} (size {} exceeds limit)", item.display_name(), item.size);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("[daemon] Failed to check auto-download setting: {e}");
+                    continue;
+                }
+            }
+
+            // Download the file
+            tracing::info!("[daemon] Auto-downloading file: {}", item.display_name());
+            match client.download_and_save(
+                item.url.clone(),
+                item.key.clone(),
+                item.iv.clone(),
+                item.hash.clone(),
+                item.source_name.clone(),
+                item.suffix.clone(),
+                room_id.clone(),
+                Some(event_id.clone()),
+            ).await {
+                Ok(path) => {
+                    tracing::info!("[daemon] Auto-downloaded file to: {path}");
+                }
+                Err(e) => {
+                    tracing::warn!("[daemon] Failed to auto-download file {}: {e}", item.display_name());
+                }
+            }
+        }
+    });
+}
+
 async fn sse_events(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
     // Merge both broadcast channels into a single mpsc for the SSE stream
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(256);
 
-    // Forward ClientEvent
+    // Forward ClientEvent with auto-download for file messages
     let mut event_rx = state.event_tx.subscribe();
     let tx1 = tx.clone();
+    let client = Arc::clone(&state.client);
     tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
+            // Trigger auto-download for file messages
+            if let ClientEvent::MessageReceived {
+                ref room_id,
+                kind: MessageKind::Files,
+                payload: Some(ref payload_json),
+                ref event_id,
+                ..
+            } = event {
+                spawn_file_auto_download_daemon(
+                    Arc::clone(&client),
+                    room_id.clone(),
+                    event_id.clone(),
+                    payload_json.clone(),
+                );
+            }
+
             let event_type = client_event_type(&event);
             let json = serialize_client_event(&event);
             let sse = SseEvent::default().event(event_type).data(json);
