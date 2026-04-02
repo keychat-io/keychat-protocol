@@ -447,22 +447,30 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
               return;
             }
 
-            // Non-owner → notify owner
+            // Non-owner → notify agent (agent forwards to owner on any channel)
             if (ownerData.owner) {
-              const roomsPath = agentId ? `/agents/${agentId}/rooms` : "/rooms";
-              const rooms = await daemonJson<Array<{ id: string; to_main_pubkey: string; status: string }>>(account.url, roomsPath);
-              ctx.log?.info(`[${account.accountId}] Found ${(rooms ?? []).length} rooms, looking for owner ${ownerData.owner?.slice(0, 16)}`);
-              const ownerRoom = (rooms ?? []).find((r) => r.to_main_pubkey === ownerData.owner && r.status === "enabled");
-              ctx.log?.info(`[${account.accountId}] Owner room: ${ownerRoom ? ownerRoom.id.slice(0, 16) : 'NOT FOUND'}`);
-              const notifyText = `🔔 Friend request from ${senderNm} (pubkey: ${senderPk}). Request ID: ${reqId}`;
+              const notifyText = `🔔 Friend request from ${senderNm} (pubkey: ${senderPk}). Request ID: ${reqId}. Use keychat_approve_friend or keychat_reject_friend tool to respond.`;
 
-              if (ownerRoom) {
-                await daemonSend(account.url, ownerRoom.id, notifyText, agentId);
-                ctx.log?.info(`Notified owner about friend request from ${senderNm}`);
-              }
+              // Try daemon direct message to owner (best effort)
+              try {
+                const roomsPath = `/agents/${agentId}/rooms`;
+                const rooms = await daemonJson<Array<{ id: string; to_main_pubkey: string; status: string }>>(account.url, roomsPath);
+                const ownerRoom = (rooms ?? []).find((r) => r.to_main_pubkey === ownerData.owner && r.status === "enabled");
+                if (ownerRoom) {
+                  await daemonSend(account.url, ownerRoom.id, notifyText, agentId);
+                  ctx.log?.info(`[${account.accountId}] Notified owner via daemon`);
+                }
+              } catch { /* best effort */ }
 
-              // Also dispatch to agent session so agent has context
-              await dispatchToAgent(core, account, normalizePubkey(ownerData.owner), "system", notifyText, ownerRoom?.id, undefined, ctx, agentId);
+              // Always enqueue system event for agent (reliable path)
+              try {
+                const rt = getRuntime();
+                if (rt.enqueueSystemEvent) {
+                  rt.enqueueSystemEvent(notifyText, { sessionKey: `agent:main:main`, trusted: true });
+                  try { rt.requestHeartbeatNow?.(); } catch { /* best effort */ }
+                  ctx.log?.info(`[${account.accountId}] Friend request notification enqueued for agent`);
+                }
+              } catch { /* best effort */ }
             }
           } catch (err) {
             ctx.log?.error(`Friend request notification failed: ${err}`);
