@@ -451,7 +451,7 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
             // Non-owner → notify agent (agent forwards to owner on any channel)
             if (ownerData.owner) {
               const senderNpub = data.sender_npub ?? senderPk;
-              const notifyText = `${senderNm} (${senderNpub}) wants to add this agent as a friend. Reply "approve ${reqId}" or "reject ${reqId}".`;
+              const notifyText = `${senderNm} (${senderNpub}) wants to add this agent as a friend. Reply "approve" or "reject".`;
 
               // Try daemon direct message to owner (best effort)
               try {
