@@ -191,52 +191,44 @@ async fn handle_friend_request(
         .ok()
         .flatten();
 
-    if auto_accept {
-        match &owner {
-            // No owner yet — accept and set as owner
-            None => {
-                tracing::info!(
-                    "Auto-accepting first friend request from {} — setting as owner",
-                    sender_name
-                );
-                match client
-                    .accept_friend_request(request_id.clone(), agent_name.to_string())
-                    .await
-                {
-                    Ok(_) => {
-                        if let Err(e) = client
-                            .set_setting(SETTING_OWNER.to_string(), sender_pubkey.clone())
-                            .await
-                        {
-                            tracing::warn!("Failed to set owner: {e}");
-                        }
-                        tracing::info!("Owner set to {sender_name} ({sender_pubkey})");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Auto-accept failed for {sender_name}: {e}");
-                    }
-                }
-                return;
-            }
-            // Sender is owner — auto-accept
-            Some(o) if o == &sender_pubkey => {
-                tracing::info!("Auto-accepting friend request from owner {sender_name}");
+    // First person with no owner → auto-accept and set as owner.
+    // All subsequent requests → queue as pending for owner approval.
+    if owner.is_none() {
+        tracing::info!(
+            "First friend request from {} — auto-accepting and setting as owner",
+            sender_name
+        );
+        match client
+            .accept_friend_request(request_id.clone(), agent_name.to_string())
+            .await
+        {
+            Ok(_) => {
                 if let Err(e) = client
-                    .accept_friend_request(request_id, agent_name.to_string())
+                    .set_setting(SETTING_OWNER.to_string(), sender_pubkey.clone())
                     .await
                 {
-                    tracing::warn!("Auto-accept failed for owner: {e}");
+                    tracing::warn!("Failed to set owner: {e}");
                 }
-                return;
+                tracing::info!("Owner set to {sender_name} ({sender_pubkey})");
             }
-            // Not owner — queue
-            Some(_) => {}
+            Err(e) => {
+                tracing::warn!("Auto-accept failed for {sender_name}: {e}");
+            }
         }
+        // Notify SSE (plugin uses this to add owner to allowFrom)
+        let entry = PendingFriendRequest {
+            request_id,
+            sender_pubkey,
+            sender_name,
+            created_at,
+        };
+        let _ = pending_tx.send(entry);
+        return;
     }
 
-    // Queue as pending
+    // Has owner — queue as pending for owner approval via plugin
     tracing::info!(
-        "Friend request from {sender_name} queued for approval (auto_accept={auto_accept})"
+        "Friend request from {sender_name} queued for owner approval"
     );
     let entry = PendingFriendRequest {
         request_id,
@@ -244,9 +236,6 @@ async fn handle_friend_request(
         sender_name,
         created_at,
     };
-
-    // Notify SSE subscribers
     let _ = pending_tx.send(entry.clone());
-
     pending.write().await.push(entry);
 }

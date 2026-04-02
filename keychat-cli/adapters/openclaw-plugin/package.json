@@ -1,0 +1,23 @@
+{
+  "name": "@keychat-io/keychat-cli",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for keychat-cli — E2E encrypted messaging via Signal Protocol + Nostr",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "postinstall": "bash scripts/postinstall.sh"
+  },
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "channel": {
+      "id": "keychat-cli",
+      "label": "Keychat CLI",
+      "selectionLabel": "Keychat CLI",
+      "docsPath": "/channels/keychat-cli",
+      "docsLabel": "keychat-cli",
+      "blurb": "E2E encrypted messaging via keychat-cli daemon.",
+      "order": 57
+    }
+  }
+}

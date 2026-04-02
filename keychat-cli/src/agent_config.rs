@@ -15,12 +15,11 @@ const SECRETS_DIR: &str = "secrets";
 
 // ─── DB Encryption Key ─────────────────────────────────────────
 
-/// Resolve the database encryption key with agent-friendly fallback chain.
+/// Resolve the database encryption key.
 ///
 /// Priority:
-/// 1. `KEYCHAT_DB_KEY` env var
-/// 2. `{data_dir}/secrets/dbkey` file
-/// 3. `commands::get_or_create_db_key()` (OS keyring → file fallback)
+/// 1. `KEYCHAT_DB_KEY` env var (container/CI injection)
+/// 2. System keychain (via commands::get_or_create_db_key, which also handles legacy file migration)
 pub fn resolve_db_key(data_dir: &str) -> anyhow::Result<String> {
     // 1. Environment variable
     if let Ok(key) = std::env::var("KEYCHAT_DB_KEY") {
@@ -32,21 +31,36 @@ pub fn resolve_db_key(data_dir: &str) -> anyhow::Result<String> {
         tracing::warn!("KEYCHAT_DB_KEY env var invalid (expected 64 hex chars), trying next source");
     }
 
-    // 2. Secrets file
-    if let Some(key) = read_secret_file(data_dir, "dbkey")? {
-        if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
-            tracing::info!("DB key loaded from secrets/dbkey");
+    // 2. Keychain (handles legacy file migration internally)
+    commands::get_or_create_db_key(data_dir)
+}
+
+/// Resolve DB key for a specific agent. Uses keychain key `db-key-{agent_id}`.
+pub fn resolve_db_key_for_agent(agent_id: &str) -> anyhow::Result<String> {
+    let keychain_key = format!("db-key-{agent_id}");
+
+    // 1. Try system keychain
+    match crate::secrets::retrieve(&keychain_key) {
+        Ok(Some(key)) if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) => {
+            tracing::info!("DB key for agent {agent_id} loaded from keychain");
             return Ok(key);
         }
-        tracing::warn!("secrets/dbkey invalid, trying next source");
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Keychain read failed for agent {agent_id}: {e}"),
     }
 
-    // 3. Standard resolution (keyring → file fallback)
-    let key = commands::get_or_create_db_key(data_dir)?;
-
-    // Persist to secrets file for container restarts
-    write_secret_file(data_dir, "dbkey", &key)?;
-
+    // 2. Generate and store
+    let key = commands::generate_hex_key()?;
+    match crate::secrets::store(&keychain_key, &key) {
+        Ok(true) => {
+            tracing::info!("Generated new DB key for agent {agent_id}, stored in keychain");
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "System keychain not available — cannot store DB key for agent {agent_id}"
+            ));
+        }
+    }
     Ok(key)
 }
 
@@ -68,21 +82,87 @@ pub fn resolve_mnemonic(data_dir: &str) -> anyhow::Result<Option<String>> {
         }
     }
 
-    // 2. Secrets file
-    if let Some(mnemonic) = read_secret_file(data_dir, "mnemonic")? {
-        if !mnemonic.is_empty() {
-            tracing::info!("Mnemonic loaded from secrets/mnemonic");
+    // 2. System keychain (macOS Keychain / Linux keyring)
+    match crate::secrets::retrieve("mnemonic") {
+        Ok(Some(mnemonic)) if !mnemonic.is_empty() => {
+            tracing::info!("Mnemonic loaded from system keychain");
             return Ok(Some(mnemonic));
         }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Keychain mnemonic read failed: {e}"),
     }
 
     // 3. Not found — caller decides what to do
     Ok(None)
 }
 
-/// Persist mnemonic to secrets file (called after identity creation).
-pub fn save_mnemonic(data_dir: &str, mnemonic: &str) -> anyhow::Result<()> {
-    write_secret_file(data_dir, "mnemonic", mnemonic)
+/// Persist mnemonic to system keychain only (never to file).
+pub fn save_mnemonic(_data_dir: &str, mnemonic: &str) -> anyhow::Result<()> {
+    match crate::secrets::store("mnemonic", mnemonic) {
+        Ok(true) => {
+            tracing::info!("Mnemonic stored in system keychain");
+            Ok(())
+        }
+        Ok(false) => Err(anyhow::anyhow!("System keychain not available — cannot store mnemonic securely")),
+        Err(e) => Err(anyhow::anyhow!("Keychain store failed: {e}")),
+    }
+}
+
+/// Resolve mnemonic for a specific agent. Uses keychain key `mnemonic-{agent_id}`.
+pub fn resolve_mnemonic_for_agent(agent_id: &str) -> anyhow::Result<Option<String>> {
+    let keychain_key = format!("mnemonic-{agent_id}");
+    match crate::secrets::retrieve(&keychain_key) {
+        Ok(Some(mnemonic)) if !mnemonic.is_empty() => {
+            tracing::info!("Mnemonic for agent {agent_id} loaded from keychain");
+            Ok(Some(mnemonic))
+        }
+        Ok(_) => Ok(None),
+        Err(e) => {
+            tracing::warn!("Keychain mnemonic read failed for agent {agent_id}: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Persist mnemonic for a specific agent to system keychain.
+pub fn save_mnemonic_for_agent(agent_id: &str, mnemonic: &str) -> anyhow::Result<()> {
+    let keychain_key = format!("mnemonic-{agent_id}");
+    match crate::secrets::store(&keychain_key, mnemonic) {
+        Ok(true) => {
+            tracing::info!("Mnemonic for agent {agent_id} stored in keychain");
+            Ok(())
+        }
+        Ok(false) => Err(anyhow::anyhow!(
+            "System keychain not available — cannot store mnemonic for agent {agent_id}"
+        )),
+        Err(e) => Err(anyhow::anyhow!("Keychain store failed for agent {agent_id}: {e}")),
+    }
+}
+
+/// List agent IDs by scanning the `{data_dir}/agents/` directory.
+pub fn list_agent_ids(data_dir: &str) -> Vec<String> {
+    let agents_dir = Path::new(data_dir).join("agents");
+    if !agents_dir.exists() {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    if let Ok(entries) = fs::read_dir(&agents_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+    }
+    ids.sort();
+    ids
+}
+
+/// Get or create the data directory for a specific agent.
+pub fn agent_data_dir(data_dir: &str, agent_id: &str) -> String {
+    let dir = Path::new(data_dir).join("agents").join(agent_id);
+    dir.to_string_lossy().to_string()
 }
 
 // ─── API Token ─────────────────────────────────────────────────

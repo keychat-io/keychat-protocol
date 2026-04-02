@@ -10,71 +10,35 @@ use keychat_uniffi::{
 };
 use tokio::sync::broadcast;
 
-const KEYRING_SERVICE: &str = "keychat-cli";
-const KEYRING_ACCOUNT: &str = "db-key";
 const KEY_FILE_NAME: &str = "db.key";
+const KEYCHAIN_DB_KEY: &str = "db-key";
 
 /// Get or create the database encryption key.
 ///
 /// Strategy:
-/// 1. Try OS keyring (macOS Keychain / Linux secret-service).
-/// 2. If keyring unavailable or fails, fall back to a file at `{data_dir}/db.key`.
-pub fn get_or_create_db_key(data_dir: &str) -> anyhow::Result<String> {
-    // Try keyring first
-    match get_or_create_via_keyring() {
-        Ok(key) => {
-            tracing::info!("DB key loaded from OS keyring");
+/// 1. Try system keychain (macOS Keychain / Linux keyring).
+/// 2. Generate new key, store in keychain.
+pub fn get_or_create_db_key(_data_dir: &str) -> anyhow::Result<String> {
+    // 1. Try system keychain
+    match crate::secrets::retrieve(KEYCHAIN_DB_KEY) {
+        Ok(Some(key)) if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) => {
+            tracing::info!("DB key loaded from system keychain");
             return Ok(key);
         }
-        Err(e) => {
-            tracing::warn!("Keyring unavailable, falling back to file: {e}");
-        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Keychain read failed: {e}"),
     }
 
-    // Fallback: file-based key
-    get_or_create_via_file(data_dir)
-}
-
-fn get_or_create_via_keyring() -> anyhow::Result<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)?;
-    match entry.get_password() {
-        Ok(key) if !key.is_empty() => Ok(key),
-        Ok(_) | Err(keyring::Error::NoEntry) => {
-            let key = generate_hex_key()?;
-            entry.set_password(&key)?;
-            tracing::info!("Generated new DB key, stored in OS keyring");
-            Ok(key)
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn get_or_create_via_file(data_dir: &str) -> anyhow::Result<String> {
-    let key_path = Path::new(data_dir).join(KEY_FILE_NAME);
-
-    if key_path.exists() {
-        let key = fs::read_to_string(&key_path)?.trim().to_string();
-        if key.len() == 64 {
-            tracing::info!("DB key loaded from file: {}", key_path.display());
-            return Ok(key);
-        }
-        tracing::warn!("Invalid key in {}, regenerating", key_path.display());
-    }
-
+    // 2. Generate and store in keychain
     let key = generate_hex_key()?;
-    fs::write(&key_path, &key)?;
-
-    // Best-effort: restrict permissions on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = fs::set_permissions(&key_path, perms) {
-            tracing::warn!("failed to restrict db.key permissions: {e}");
+    match crate::secrets::store(KEYCHAIN_DB_KEY, &key) {
+        Ok(true) => {
+            tracing::info!("Generated new DB key, stored in system keychain");
+        }
+        _ => {
+            return Err(anyhow::anyhow!("System keychain not available — cannot store DB key securely"));
         }
     }
-
-    tracing::info!("Generated new DB key, saved to {}", key_path.display());
     Ok(key)
 }
 
