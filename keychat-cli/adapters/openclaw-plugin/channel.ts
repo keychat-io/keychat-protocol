@@ -454,7 +454,8 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
               // Try daemon direct message to owner (best effort)
               try {
                 const roomsPath = `/agents/${agentId}/rooms`;
-                const rooms = await daemonJson<Array<{ id: string; to_main_pubkey: string; status: string }>>(account.url, roomsPath);
+                const roomsResp = await daemonJson<{ rooms?: Array<{ id: string; to_main_pubkey: string; status: string }> }>(account.url, roomsPath);
+                const rooms = roomsResp?.rooms ?? (Array.isArray(roomsResp) ? roomsResp : []);
                 const ownerRoom = (rooms ?? []).find((r) => r.to_main_pubkey === ownerData.owner && r.status === "enabled");
                 if (ownerRoom) {
                   await daemonSend(account.url, ownerRoom.id, notifyText, agentId);
