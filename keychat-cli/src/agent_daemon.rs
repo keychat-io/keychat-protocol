@@ -888,6 +888,7 @@ async fn agent_sse_events(
                 "agent_id": aid2,
                 "request_id": pfr.request_id,
                 "sender_pubkey": pfr.sender_pubkey,
+                "sender_npub": keychat_uniffi::npub_from_hex(pfr.sender_pubkey.clone()).unwrap_or_default(),
                 "sender_name": pfr.sender_name,
                 "created_at": pfr.created_at,
             })
@@ -1019,6 +1020,7 @@ async fn legacy_agent_sse_events(
                 "type": "pending_friend_request",
                 "request_id": pfr.request_id,
                 "sender_pubkey": pfr.sender_pubkey,
+                "sender_npub": keychat_uniffi::npub_from_hex(pfr.sender_pubkey.clone()).unwrap_or_default(),
                 "sender_name": pfr.sender_name,
                 "created_at": pfr.created_at,
             })
