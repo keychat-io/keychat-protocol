@@ -947,8 +947,22 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
 }
 
 fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let pw = 62u16.min(area.width.saturating_sub(4));
-    let ph = 28u16.min(area.height.saturating_sub(4));
+    // Calculate QR code size first to determine popup width
+    let qr_lines = if let Some(ref pk) = app.identity_hex {
+        let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
+        render_qr_lines(&npub)
+    } else {
+        vec![]
+    };
+
+    // Calculate required width: max of QR code width, text lines, or minimum usable width
+    let qr_width = qr_lines.first().map(|l| l.len() as u16).unwrap_or(0);
+    let min_content_width = 54u16; // Minimum width for text content
+    let content_width = qr_width.max(min_content_width);
+
+    // Popup dimensions: add padding for borders (2) and margins (4)
+    let pw = (content_width + 6).min(area.width.saturating_sub(4)).max(60);
+    let ph = (28u16).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(pw)) / 2;
     let y = (area.height.saturating_sub(ph)) / 2;
     let popup = Rect::new(x, y, pw, ph);
@@ -986,8 +1000,11 @@ fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
             ]));
         }
         lines.push(Line::from(""));
-        for qr_line in render_qr_lines(&npub) {
-            lines.push(Line::from(format!("  {qr_line}")));
+        // Center QR code in popup
+        let qr_display_width = qr_lines.first().map(|l| l.len()).unwrap_or(0) as u16;
+        let padding = ((pw.saturating_sub(2)) / 2).saturating_sub(qr_display_width / 2);
+        for qr_line in qr_lines {
+            lines.push(Line::from(format!("{:padding$}{}", "", qr_line, padding = padding as usize)));
         }
     } else {
         lines.push(Line::from(Span::styled(
