@@ -2402,7 +2402,6 @@ dependencies = [
  "http",
  "http-body-util",
  "keychat-uniffi",
- "keyring",
  "qrcode",
  "ratatui",
  "rustyline",

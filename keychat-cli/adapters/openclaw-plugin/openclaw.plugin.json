@@ -1,0 +1,18 @@
+{
+  "id": "keychat-cli",
+  "channels": ["keychat-cli"],
+  "name": "Keychat CLI",
+  "description": "E2E encrypted messaging via keychat-cli daemon (Signal Protocol + Nostr).",
+  "version": "0.1.0",
+  "license": "MIT",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "url": { "type": "string", "description": "keychat-cli daemon URL (default: http://127.0.0.1:7800)" },
+      "dmPolicy": { "type": "string", "enum": ["pairing", "allowlist", "open", "disabled"] },
+      "allowFrom": { "type": "array", "items": { "type": ["string", "number"] } }
+    }
+  }
+}

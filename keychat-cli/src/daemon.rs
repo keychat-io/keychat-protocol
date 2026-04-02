@@ -770,6 +770,16 @@ async fn sse_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// Public accessor for agent_daemon to reuse event type strings.
+pub fn client_event_type_str(event: &ClientEvent) -> &'static str {
+    client_event_type(event)
+}
+
+/// Public accessor for agent_daemon to reuse event serialization.
+pub fn serialize_client_event_str(event: &ClientEvent) -> String {
+    serialize_client_event(event)
+}
+
 fn client_event_type(event: &ClientEvent) -> &'static str {
     match event {
         ClientEvent::FriendRequestReceived { .. } => "friend_request_received",
