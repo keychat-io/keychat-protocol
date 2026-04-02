@@ -424,7 +424,7 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
 
       const connection = connectSse(account.url, async (eventType, data) => {
         // ─── Friend request handling ───────────────────────
-        if (eventType === "friend_request_received" || eventType === "pending_friend_request") {
+        if (eventType === "pending_friend_request") {
           const senderPk = data.sender_pubkey ?? "";
           const senderNm = data.sender_name ?? senderPk.slice(0, 16);
           const reqId = data.request_id ?? "";
@@ -449,7 +449,7 @@ export const keychatCliPlugin: ChannelPlugin<ResolvedAccount> = {
 
             // Non-owner → notify agent (agent forwards to owner on any channel)
             if (ownerData.owner) {
-              const notifyText = `🔔 Friend request from ${senderNm} (pubkey: ${senderPk}). Request ID: ${reqId}. Use keychat_approve_friend or keychat_reject_friend tool to respond.`;
+              const notifyText = `${senderNm} wants to add this agent as a friend. Reply "approve ${reqId}" or "reject ${reqId}".`;
 
               // Try daemon direct message to owner (best effort)
               try {
