@@ -27,7 +27,6 @@ pub struct RelayStatusUpdate {
 
 #[derive(Clone)]
 struct RelayState {
-    url: String,
     status: String,      // "pending", "success", "failed", "timeout"
     error: Option<String>,
 }
@@ -36,7 +35,10 @@ struct TrackedEvent {
     msgid: String,
     room_id: String,
     member: Option<String>,
-    relays: Vec<RelayState>,
+    /// relay_url → state (O(1) lookup by URL)
+    relays: HashMap<String, RelayState>,
+    /// Insertion order for deterministic JSON output
+    relay_order: Vec<String>,
     started_at: Instant,
 }
 
@@ -63,13 +65,9 @@ impl RelaySendTracker {
         room_id: String,
         relay_urls: Vec<String>,
     ) -> String {
-        let relays: Vec<RelayState> = relay_urls
+        let relays: HashMap<String, RelayState> = relay_urls
             .iter()
-            .map(|url| RelayState {
-                url: url.clone(),
-                status: "pending".into(),
-                error: None,
-            })
+            .map(|url| (url.clone(), RelayState { status: "pending".into(), error: None }))
             .collect();
 
         self.events.insert(
@@ -79,6 +77,7 @@ impl RelaySendTracker {
                 room_id: room_id.clone(),
                 member: None,
                 relays,
+                relay_order: relay_urls,
                 started_at: Instant::now(),
             },
         );
@@ -100,13 +99,9 @@ impl RelaySendTracker {
         relay_urls: Vec<String>,
     ) -> String {
         for (event_id, member_name) in &members {
-            let relays: Vec<RelayState> = relay_urls
+            let relays: HashMap<String, RelayState> = relay_urls
                 .iter()
-                .map(|url| RelayState {
-                    url: url.clone(),
-                    status: "pending".into(),
-                    error: None,
-                })
+                .map(|url| (url.clone(), RelayState { status: "pending".into(), error: None }))
                 .collect();
             self.events.insert(
                 event_id.clone(),
@@ -115,6 +110,7 @@ impl RelaySendTracker {
                     room_id: room_id.clone(),
                     member: Some(member_name.clone()),
                     relays,
+                    relay_order: relay_urls.clone(),
                     started_at: Instant::now(),
                 },
             );
@@ -137,8 +133,8 @@ impl RelaySendTracker {
         let entry = self.events.get_mut(event_id)?;
         let msgid = entry.msgid.clone();
 
-        // Update the specific relay's status
-        if let Some(relay) = entry.relays.iter_mut().find(|r| r.url == relay_url) {
+        // O(1) lookup by relay URL
+        if let Some(relay) = entry.relays.get_mut(relay_url) {
             if success {
                 relay.status = "success".into();
                 relay.error = None;
@@ -159,7 +155,7 @@ impl RelaySendTracker {
 
         for entry in self.events.values_mut() {
             if entry.started_at.elapsed() >= timeout {
-                for relay in &mut entry.relays {
+                for relay in entry.relays.values_mut() {
                     if relay.status == "pending" {
                         relay.status = "timeout".into();
                     }
@@ -184,7 +180,7 @@ impl RelaySendTracker {
                 eids.iter().all(|eid| {
                     self.events
                         .get(eid)
-                        .map_or(true, |e| e.relays.iter().all(|r| r.status != "pending"))
+                        .map_or(true, |e| e.relays.values().all(|r| r.status != "pending"))
                 })
             })
             .map(|(msgid, _)| msgid.clone())
@@ -213,9 +209,9 @@ impl RelaySendTracker {
                 for eid in eids {
                     if let Some(entry) = self.events.get(eid) {
                         let event_has_success =
-                            entry.relays.iter().any(|r| r.status == "success");
+                            entry.relays.values().any(|r| r.status == "success");
                         let event_resolved =
-                            entry.relays.iter().all(|r| r.status != "pending");
+                            entry.relays.values().all(|r| r.status != "pending");
                         if !event_resolved {
                             all_resolved = false;
                         }
@@ -254,18 +250,20 @@ impl RelaySendTracker {
                 continue;
             };
 
+            // Use relay_order for deterministic JSON output
             let relays: Vec<serde_json::Value> = entry
-                .relays
+                .relay_order
                 .iter()
-                .map(|r| {
+                .filter_map(|url| {
+                    let r = entry.relays.get(url)?;
                     let mut obj = serde_json::json!({
-                        "url": r.url,
+                        "url": url,
                         "status": r.status,
                     });
                     if let Some(ref err) = r.error {
                         obj["error"] = serde_json::Value::String(err.clone());
                     }
-                    obj
+                    Some(obj)
                 })
                 .collect();
 

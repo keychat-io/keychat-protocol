@@ -76,9 +76,8 @@ impl SignalPreKeyMaterial {
     }
 }
 
-/// Generate fresh Signal pre-key material using libsignal-protocol native types.
-///
-/// Includes Kyber1024 prekey for PQXDH key agreement.
+/// Generate fresh Signal pre-key material with a new random identity.
+/// Each call produces a unique identity key pair (per-peer privacy).
 pub fn generate_prekey_material() -> Result<SignalPreKeyMaterial> {
     let mut rng = ::rand::rng();
     let identity_key_pair = IdentityKeyPair::generate(&mut rng);

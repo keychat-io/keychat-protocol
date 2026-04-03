@@ -257,50 +257,23 @@ impl libsignal_protocol::IdentityKeyStore for PersistentIdentityKeyStore {
 
     async fn save_identity(
         &mut self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
     ) -> Result<libsignal_protocol::IdentityChange> {
-        use libsignal_protocol::IdentityChange;
-
-        let db = lock_storage(&self.storage)?;
-        let existing = db
-            .load_peer_identity(address.name())
-            .map_err(to_signal_err)?;
-
-        let result = match existing {
-            None => IdentityChange::NewOrUnchanged,
-            Some(ref bytes) => {
-                let existing_key = IdentityKey::decode(bytes)?;
-                if &existing_key == identity {
-                    IdentityChange::NewOrUnchanged
-                } else {
-                    IdentityChange::ReplacedExisting
-                }
-            }
-        };
-
-        db.save_peer_identity(address.name(), &identity.serialize())
-            .map_err(to_signal_err)?;
-        Ok(result)
+        // No-op: Keychat uses per-peer identity (privacy) and always-trust policy.
+        // Peer identity verification happens at the Nostr layer, not Signal.
+        Ok(libsignal_protocol::IdentityChange::NewOrUnchanged)
     }
 
     async fn is_trusted_identity(
         &self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
         _direction: libsignal_protocol::Direction,
     ) -> Result<bool> {
-        let db = lock_storage(&self.storage)?;
-        let existing = db
-            .load_peer_identity(address.name())
-            .map_err(to_signal_err)?;
-        match existing {
-            None => Ok(true), // TOFU: trust on first use
-            Some(ref bytes) => {
-                let existing_key = IdentityKey::decode(bytes)?;
-                Ok(&existing_key == identity)
-            }
-        }
+        // Always trust: Keychat authenticates peers at the Nostr layer (GiftWrap signatures).
+        // Signal provides E2E encryption only, not authentication.
+        Ok(true)
     }
 
     async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {

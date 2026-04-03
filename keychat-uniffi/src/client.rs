@@ -46,6 +46,8 @@ pub(crate) struct ClientInner {
     pub app_storage: Arc<std::sync::Mutex<AppStorage>>,
     pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
     pub peer_nostr_to_signal: HashMap<String, String>,
+    /// Reverse index: signal_id → nostr_pubkey for O(1) reverse lookup.
+    pub peer_signal_to_nostr: HashMap<String, String>,
     /// Reverse index: receiving_address_hex → peer_signal_id for O(1) message routing.
     pub receiving_addr_to_peer: HashMap<String, String>,
     pub pending_outbound: HashMap<String, FriendRequestState>,
@@ -127,6 +129,7 @@ impl KeychatClient {
                 app_storage: Arc::new(std::sync::Mutex::new(app_storage)),
                 sessions: HashMap::new(),
                 peer_nostr_to_signal: HashMap::new(),
+                peer_signal_to_nostr: HashMap::new(),
                 receiving_addr_to_peer: HashMap::new(),
                 pending_outbound: HashMap::new(),
                 group_manager: GroupManager::new(),
@@ -483,11 +486,11 @@ impl KeychatClient {
 
         // ── Phase 1: Read all data from DB while holding the lock ──
 
-        // Participant identity data: (peer_signal_id, device_id, identity_public, identity_private, registration_id)
-        type ParticipantIdentity = (String, u32, Vec<u8>, Vec<u8>, u32);
-        let mut participant_rows: Vec<ParticipantIdentity> = Vec::new();
+        // Per-peer identity: (peer_signal_id, device_id, id_pub, id_priv, reg_id)
+        type ParticipantRow = (String, u32, Vec<u8>, Vec<u8>, u32);
+        let mut participant_rows: Vec<ParticipantRow> = Vec::new();
 
-        // Pending FR data (still needs full prekey material — handshake not complete)
+        // Pending FR data (needs full prekey material — handshake not complete)
         type FrRow = (
             String, u32, Vec<u8>, Vec<u8>, u32,
             u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>,
@@ -512,14 +515,13 @@ impl KeychatClient {
             KeychatUniError::Storage { msg: format!("list_pending_frs: {e}") }
         })?;
         tracing::info!(
-            "RESTORE-V3: peers={} participants={} addresses={} frs={}",
+            "RESTORE: peers={} participants={} addresses={} frs={}",
             peers.len(), peer_ids.len(), all_addresses.len(), fr_ids.len()
         );
 
-        // Load only identity key pair + registration_id per peer (no prekey material)
         for peer_signal_id in &peer_ids {
             match store.load_signal_participant(peer_signal_id) {
-                Ok(Some((device_id, id_pub, id_priv, reg_id, _spk_id, _spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec))) => {
+                Ok(Some((device_id, id_pub, id_priv, reg_id, _spk_id, _spk_rec))) => {
                     participant_rows.push((peer_signal_id.clone(), device_id, id_pub, id_priv, reg_id));
                 }
                 Ok(None) => {
@@ -531,7 +533,7 @@ impl KeychatClient {
             }
         }
 
-        // Pending FRs still need full prekey material (handshake not complete)
+        // Pending FRs need full prekey material (handshake not complete)
         for fr_id in &fr_ids {
             match store.load_pending_fr(fr_id) {
                 Ok(Some((device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey))) => {
@@ -554,12 +556,15 @@ impl KeychatClient {
             inner
                 .peer_nostr_to_signal
                 .insert(peer.nostr_pubkey.clone(), peer.signal_id.clone());
+            inner
+                .peer_signal_to_nostr
+                .insert(peer.signal_id.clone(), peer.nostr_pubkey.clone());
         }
         if !peers.is_empty() {
             tracing::info!("restored {} peer mappings", peers.len());
         }
 
-        // 2. Restore active sessions using restore_persistent (no prekey re-injection)
+        // 2. Restore active sessions with per-peer identity
         let addr_map: HashMap<String, _> = all_addresses.into_iter().collect();
 
         for (peer_signal_id, device_id, id_pub, id_priv, reg_id) in participant_rows {
@@ -567,11 +572,10 @@ impl KeychatClient {
                 max_device_id = device_id;
             }
 
-            // Reconstruct only the identity key pair (needed for the identity store)
             let identity_key = match libkeychat::IdentityKey::decode(&id_pub) {
                 Ok(k) => k,
                 Err(e) => {
-                    tracing::error!("restore session {}: decode identity key: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
+                    tracing::error!("restore session {}: decode identity: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
                     continue;
                 }
             };
@@ -584,8 +588,6 @@ impl KeychatClient {
             };
             let identity_key_pair = libkeychat::IdentityKeyPair::new(identity_key, private_key);
 
-            // restore_persistent: sets up persistent store bundle, no prekey injection.
-            // Session records load on demand from signal_sessions table.
             let signal = match SignalParticipant::restore_persistent(
                 identity.pubkey_hex(),
                 device_id,
@@ -619,7 +621,7 @@ impl KeychatClient {
             restored_count += 1;
         }
 
-        // 3. Restore pending outbound friend requests
+        // 3. Restore pending outbound friend requests (per-peer identity)
         for (
             fr_id,
             device_id,
@@ -1000,6 +1002,7 @@ impl KeychatClient {
             let mut inner = self.inner.write().await;
             inner.sessions.clear();
             inner.peer_nostr_to_signal.clear();
+            inner.peer_signal_to_nostr.clear();
             inner.receiving_addr_to_peer.clear();
             inner.pending_outbound.clear();
             inner.group_manager = libkeychat::GroupManager::new();
@@ -1044,19 +1047,10 @@ impl KeychatClient {
         {
             let mut inner = self.inner.write().await;
             if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&room_id) {
+                inner.peer_signal_to_nostr.remove(&signal_id);
                 inner.sessions.remove(&signal_id);
                 inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-
-                // Remove any pending outbound FR for this peer
-                let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
-                for key in pending_keys {
-                    if let Some(state) = inner.pending_outbound.get(&key) {
-                        if state.peer_nostr_pubkey == room_id {
-                            inner.pending_outbound.remove(&key);
-                            break;
-                        }
-                    }
-                }
+                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != room_id);
                 drop(inner);
 
                 // Delete from DB (no write lock held)
@@ -1105,7 +1099,7 @@ impl KeychatClient {
         // Clean up app_* tables (in app database)
         let identity_pubkey = self.cached_identity_pubkey();
         if !identity_pubkey.is_empty() {
-            let app_room_id = format!("{}:{}", room_id, identity_pubkey);
+            let app_room_id = crate::types::make_room_id(&room_id, &identity_pubkey);
             let app_storage = self.inner.read().await.app_storage.clone();
             {
                 let store = lock_app_storage(&app_storage);
@@ -1136,19 +1130,10 @@ impl KeychatClient {
 
             // Remove signal session
             if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&peer_pubkey) {
+                inner.peer_signal_to_nostr.remove(&signal_id);
                 inner.sessions.remove(&signal_id);
                 inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-
-                // Remove any pending outbound FR for this peer
-                let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
-                for key in pending_keys {
-                    if let Some(state) = inner.pending_outbound.get(&key) {
-                        if state.peer_nostr_pubkey == peer_pubkey {
-                            inner.pending_outbound.remove(&key);
-                            break;
-                        }
-                    }
-                }
+                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
 
                 // Clean up in DB (no write lock held during DB operations)
                 drop(inner);
@@ -1221,8 +1206,8 @@ impl KeychatClient {
         }
 
         // Read relay subscription cursor for identity key `since` parameter.
-        // Identity keys receive NIP-59 GiftWrap with ±2 day outer timestamp randomization,
-        // so we subtract 2 days from the cursor as a safety window.
+        // NIP-17 gift wrap randomizes outer timestamp by ±2 days. Use 3-day
+        // safety window to cover edge cases near the boundary.
         // Ratchet keys are newly derived addresses with no history — use now().
         let identity_since = {
             let inner = self.inner.read().await;
@@ -1232,10 +1217,10 @@ impl KeychatClient {
             drop(inner);
 
             if cursor > 0 {
-                let two_days_secs: u64 = 2 * 24 * 60 * 60;
-                let since_ts = cursor.saturating_sub(two_days_secs);
+                let safety_window_secs: u64 = 3 * 24 * 60 * 60;
+                let since_ts = cursor.saturating_sub(safety_window_secs);
                 tracing::info!(
-                    "event loop: identity since = cursor({}) - 2days = {}",
+                    "event loop: identity since = cursor({}) - 3days = {}",
                     cursor,
                     since_ts
                 );
@@ -1603,3 +1588,4 @@ impl KeychatClient {
         }
     }
 }
+

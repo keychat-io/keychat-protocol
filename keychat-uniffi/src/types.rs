@@ -1,3 +1,8 @@
+/// Build a composite room ID from peer pubkey and identity pubkey.
+pub(crate) fn make_room_id(peer_pubkey: &str, identity_pubkey: &str) -> String {
+    format!("{}:{}", peer_pubkey, identity_pubkey)
+}
+
 // ─── Records ─────────────────────────────────────────────────────
 
 #[derive(uniffi::Record)]

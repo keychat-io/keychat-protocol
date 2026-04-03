@@ -34,7 +34,7 @@ impl KeychatClient {
             (id, inner.storage.clone(), did, pubkey_hex)
         }; // lock dropped
 
-        // 2. Generate keys and send (async, no lock held)
+        // 2. Generate fresh per-peer keys and send (async, no lock held)
         let keys = generate_prekey_material()?;
         let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
             serialize_prekey_material(&keys)?;
@@ -54,7 +54,7 @@ impl KeychatClient {
         let first_inbox_secret = state.first_inbox_keys.secret_hex();
         let event_id_hex = event.id.to_hex();
 
-        // 2b. Persist pending FR to SQLCipher
+        // 2b. Persist pending FR to SQLCipher (per-peer identity included)
         {
             let store = storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
@@ -103,7 +103,7 @@ impl KeychatClient {
 
         // 6. Write to app_* tables: room (status=0 requesting) + contact + message
         let peer_npub = crate::npub_from_hex(peer_nostr_pubkey.clone()).unwrap_or_default();
-        let room_id = format!("{}:{}", peer_nostr_pubkey, identity_pubkey);
+        let room_id = crate::types::make_room_id(&peer_nostr_pubkey, &identity_pubkey);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -198,7 +198,7 @@ impl KeychatClient {
             (id, inner.storage.clone(), did, received)
         }; // lock dropped
 
-        // 2. Accept (async, no lock)
+        // 2. Accept (async, no lock) — fresh per-peer identity
         let keys = generate_prekey_material()?;
         let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
             serialize_prekey_material(&keys)?;
@@ -243,15 +243,11 @@ impl KeychatClient {
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = ChatSession::new(accepted.signal_participant, addresses, identity.clone());
 
-        // 4b. Persist to SQLCipher: signal participant, peer addresses, peer mapping
+        // 4b. Persist to SQLCipher: signal participant (per-peer identity, no one-time prekeys)
         {
             let store = storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
-            // Save session metadata but zero out one-time prekey material
-            // to preserve forward secrecy — prekeys are consumed after handshake
-            // and must not be persisted. libsignal's persistent stores handle
-            // session state automatically via store_session().
             store.save_signal_participant(
                 &peer_signal_hex,
                 signal_device_id,
@@ -260,10 +256,6 @@ impl KeychatClient {
                 reg_id,
                 spk_id,
                 &spk_rec,
-                0,    // prekey id: zeroed
-                &[],  // prekey: zeroed — consumed after handshake
-                0,    // kyber prekey id: zeroed
-                &[],  // kyber prekey: zeroed — consumed after handshake
             )?;
 
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
@@ -289,6 +281,9 @@ impl KeychatClient {
             inner
                 .peer_nostr_to_signal
                 .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
+            inner
+                .peer_signal_to_nostr
+                .insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
             // Update reverse index for O(1) message routing
             for addr in &recv_addrs {
                 inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
@@ -299,7 +294,7 @@ impl KeychatClient {
 
         // 5. Write to app_* tables: update room status to enabled, create acceptance message
         let identity_pubkey = identity.pubkey_hex();
-        let room_id = format!("{}:{}", peer_nostr_hex, identity_pubkey);
+        let room_id = crate::types::make_room_id(&peer_nostr_hex, &identity_pubkey);
         tracing::info!(
             "accept_friend_request: updating app tables room_id={}, peer={}",
             &room_id, &peer_nostr_hex[..16.min(peer_nostr_hex.len())]
@@ -312,14 +307,9 @@ impl KeychatClient {
         let accept_storage = self.inner.read().await.app_storage.clone();
         {
             let store = crate::client::lock_app_storage(&accept_storage);
-            store.transaction(|conn| {
+            store.transaction(|_| {
                 store.update_app_room(&room_id, Some(RoomStatus::Enabled.to_i32()), None, Some("[Friend Request Accepted]"), Some(now))?;
-                // Update contact name directly — don't call update_app_contact which wraps its own transaction
-                let contact_id = format!("{}:{}", peer_nostr_hex, identity_pubkey);
-                conn.execute(
-                    "UPDATE app_contacts SET name = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
-                    rusqlite::params![peer_name, contact_id],
-                ).map_err(|e| KeychatError::Storage(format!("update contact name: {e}")))?;
+                store.update_contact_name(&peer_nostr_hex, &identity_pubkey, &peer_name)?;
                 store.save_app_message(
                     &msgid, Some(&accept_event_id_hex), &room_id, &identity_pubkey,
                     &identity.pubkey_hex(), "[Friend Request Accepted]", true, MessageStatus::Success.to_i32(), now,
@@ -381,7 +371,7 @@ impl KeychatClient {
 
         // Update room status to rejected (-1)
         if !sender_pubkey_hex.is_empty() && !identity_pubkey.is_empty() {
-            let room_id = format!("{}:{}", sender_pubkey_hex, identity_pubkey);
+            let room_id = crate::types::make_room_id(&sender_pubkey_hex, &identity_pubkey);
             let rej_storage = self.inner.read().await.app_storage.clone();
             {
                 let store = crate::client::lock_app_storage(&rej_storage);

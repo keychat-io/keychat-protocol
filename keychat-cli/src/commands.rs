@@ -191,8 +191,24 @@ pub async fn send_file_message(
         });
     }
 
-    // For now, send_file only supports DM rooms.
-    // Signal group file sending can be added when the FFI supports it.
+    if let Some(room) = client.get_room(room_id.to_string()).await? {
+        match room.room_type {
+            RoomType::SignalGroup => {
+                let group_id = room.to_main_pubkey.clone();
+                let result = client
+                    .send_group_file(group_id, files, message, None)
+                    .await?;
+                return Ok(SendResult::Group {
+                    event_count: result.event_ids.len(),
+                });
+            }
+            RoomType::MlsGroup => {
+                return Ok(SendResult::MlsNotSupported);
+            }
+            RoomType::Dm => {}
+        }
+    }
+    // DM (or room not found — try anyway)
     let result = client
         .send_file(room_id.to_string(), files, message, None)
         .await?;

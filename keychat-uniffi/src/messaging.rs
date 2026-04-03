@@ -115,10 +115,15 @@ impl KeychatClient {
             });
         }
 
-        // 2. Get session and peer info
+        // 2. Get session and peer info (reject group rooms — use send_group_text/send_group_file)
         let (session_mutex, peer_signal_hex, identity_pubkey) = {
             let inner = self.inner.read().await;
             let peer_pubkey = room_id.split(':').next().unwrap_or(&room_id);
+            if inner.group_manager.get_group(peer_pubkey).is_some() {
+                return Err(KeychatUniError::InvalidArgument {
+                    msg: format!("room {} is a group — use send_group_text/send_group_file", &peer_pubkey[..16.min(peer_pubkey.len())]),
+                });
+            }
             let signal_hex = inner
                 .peer_nostr_to_signal
                 .get(peer_pubkey)
@@ -166,7 +171,7 @@ impl KeychatClient {
                 &event_id, Some(&event_id), &full_room_id, &identity_pubkey,
                 &my_pubkey, &display_text, true, MessageStatus::Sending.to_i32(), now,
             ) {
-                tracing::warn!("save_app_message (send): {e}");
+                tracing::error!("PERSIST FAILED: save_app_message (send): {e}");
             }
             if let Err(e) = store.update_app_message(
                 &event_id, None, None, None,
@@ -174,12 +179,12 @@ impl KeychatClient {
                 reply_to.as_ref().map(|r| r.target_event_id.as_str()),
                 reply_to.as_ref().and_then(|r| r.content.as_deref()),
             ) {
-                tracing::warn!("update_app_message (send metadata): {e}");
+                tracing::error!("PERSIST FAILED: update_app_message (send metadata): {e}");
             }
             if let Err(e) = store.update_app_room(
                 &full_room_id, None, None, Some(&display_text), Some(now),
             ) {
-                tracing::warn!("update_app_room (send): {e}");
+                tracing::error!("PERSIST FAILED: update_app_room (send): {e}");
             }
         }
         drop(send_storage);

@@ -1005,11 +1005,60 @@ impl AppStorage {
         })
     }
 
+    /// Update contact name without wrapping in a transaction.
+    /// Safe to call inside an existing transaction.
+    pub fn update_contact_name(&self, pubkey: &str, identity_pubkey: &str, name: &str) -> Result<()> {
+        let id = format!("{}:{}", pubkey, identity_pubkey);
+        self.conn
+            .execute(
+                "UPDATE app_contacts SET name = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
+                rusqlite::params![name, id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("update_contact_name: {e}")))?;
+        Ok(())
+    }
+
     pub fn delete_app_contact(&self, pubkey: &str, identity_pubkey: &str) -> Result<()> {
         let id = format!("{}:{}", pubkey, identity_pubkey);
         self.conn.execute("DELETE FROM app_contacts WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| KeychatError::Storage(format!("delete_app_contact: {e}")))?;
         Ok(())
+    }
+
+    // ─── Composite Operations ─────────────────────────────
+
+    /// Persist an incoming message atomically: ensure room exists, save message,
+    /// update room's last message, increment unread count.
+    /// Returns the msgid on success.
+    pub fn persist_incoming_message(
+        &self,
+        room_peer: &str,
+        identity_pubkey: &str,
+        room_status: i32,
+        room_type: i32,
+        room_name: Option<&str>,
+        signal_id: Option<&str>,
+        msgid: &str,
+        event_id: &str,
+        sender_pubkey: &str,
+        content: &str,
+        display_content: &str,
+        status: i32,
+        created_at: i64,
+    ) -> Result<String> {
+        self.transaction(|_| {
+            let room_id = self.save_app_room(
+                room_peer, identity_pubkey, room_status, room_type,
+                room_name, signal_id, None,
+            )?;
+            self.save_app_message(
+                msgid, Some(event_id), &room_id, identity_pubkey,
+                sender_pubkey, content, false, status, created_at,
+            )?;
+            self.update_app_room(&room_id, None, None, Some(display_content), Some(created_at))?;
+            self.increment_app_room_unread(&room_id)?;
+            Ok(room_id)
+        })
     }
 
     // ─── Bulk Deletion ───────────────────────────────────
