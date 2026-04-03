@@ -1206,8 +1206,8 @@ impl KeychatClient {
         }
 
         // Read relay subscription cursor for identity key `since` parameter.
-        // Identity keys receive NIP-59 GiftWrap with ±2 day outer timestamp randomization,
-        // so we subtract 2 days from the cursor as a safety window.
+        // NIP-17 gift wrap randomizes outer timestamp by ±2 days. Use 3-day
+        // safety window to cover edge cases near the boundary.
         // Ratchet keys are newly derived addresses with no history — use now().
         let identity_since = {
             let inner = self.inner.read().await;
@@ -1217,10 +1217,10 @@ impl KeychatClient {
             drop(inner);
 
             if cursor > 0 {
-                let two_days_secs: u64 = 2 * 24 * 60 * 60;
-                let since_ts = cursor.saturating_sub(two_days_secs);
+                let safety_window_secs: u64 = 3 * 24 * 60 * 60;
+                let since_ts = cursor.saturating_sub(safety_window_secs);
                 tracing::info!(
-                    "event loop: identity since = cursor({}) - 2days = {}",
+                    "event loop: identity since = cursor({}) - 3days = {}",
                     cursor,
                     since_ts
                 );
