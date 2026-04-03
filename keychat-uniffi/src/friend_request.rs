@@ -101,7 +101,7 @@ impl KeychatClient {
 
         // 6. Write to app_* tables: room (status=0 requesting) + contact + message
         let peer_npub = crate::npub_from_hex(peer_nostr_pubkey.clone()).unwrap_or_default();
-        let room_id = format!("{}:{}", peer_nostr_pubkey, identity_pubkey);
+        let room_id = crate::types::make_room_id(&peer_nostr_pubkey, &identity_pubkey);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -290,7 +290,7 @@ impl KeychatClient {
 
         // 5. Write to app_* tables: update room status to enabled, create acceptance message
         let identity_pubkey = identity.pubkey_hex();
-        let room_id = format!("{}:{}", peer_nostr_hex, identity_pubkey);
+        let room_id = crate::types::make_room_id(&peer_nostr_hex, &identity_pubkey);
         tracing::info!(
             "accept_friend_request: updating app tables room_id={}, peer={}",
             &room_id, &peer_nostr_hex[..16.min(peer_nostr_hex.len())]
@@ -303,14 +303,9 @@ impl KeychatClient {
         let accept_storage = self.inner.read().await.app_storage.clone();
         {
             let store = crate::client::lock_app_storage(&accept_storage);
-            store.transaction(|conn| {
+            store.transaction(|_| {
                 store.update_app_room(&room_id, Some(RoomStatus::Enabled.to_i32()), None, Some("[Friend Request Accepted]"), Some(now))?;
-                // Update contact name directly — don't call update_app_contact which wraps its own transaction
-                let contact_id = format!("{}:{}", peer_nostr_hex, identity_pubkey);
-                conn.execute(
-                    "UPDATE app_contacts SET name = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
-                    rusqlite::params![peer_name, contact_id],
-                ).map_err(|e| KeychatError::Storage(format!("update contact name: {e}")))?;
+                store.update_contact_name(&peer_nostr_hex, &identity_pubkey, &peer_name)?;
                 store.save_app_message(
                     &msgid, Some(&accept_event_id_hex), &room_id, &identity_pubkey,
                     &identity.pubkey_hex(), "[Friend Request Accepted]", true, MessageStatus::Success.to_i32(), now,
@@ -372,7 +367,7 @@ impl KeychatClient {
 
         // Update room status to rejected (-1)
         if !sender_pubkey_hex.is_empty() && !identity_pubkey.is_empty() {
-            let room_id = format!("{}:{}", sender_pubkey_hex, identity_pubkey);
+            let room_id = crate::types::make_room_id(&sender_pubkey_hex, &identity_pubkey);
             let rej_storage = self.inner.read().await.app_storage.clone();
             {
                 let store = crate::client::lock_app_storage(&rej_storage);

@@ -1091,7 +1091,7 @@ impl KeychatClient {
         // Clean up app_* tables (in app database)
         let identity_pubkey = self.cached_identity_pubkey();
         if !identity_pubkey.is_empty() {
-            let app_room_id = format!("{}:{}", room_id, identity_pubkey);
+            let app_room_id = crate::types::make_room_id(&room_id, &identity_pubkey);
             let app_storage = self.inner.read().await.app_storage.clone();
             {
                 let store = lock_app_storage(&app_storage);

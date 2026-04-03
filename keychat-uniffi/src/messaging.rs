@@ -166,7 +166,7 @@ impl KeychatClient {
                 &event_id, Some(&event_id), &full_room_id, &identity_pubkey,
                 &my_pubkey, &display_text, true, MessageStatus::Sending.to_i32(), now,
             ) {
-                tracing::warn!("save_app_message (send): {e}");
+                tracing::error!("PERSIST FAILED: save_app_message (send): {e}");
             }
             if let Err(e) = store.update_app_message(
                 &event_id, None, None, None,
@@ -174,12 +174,12 @@ impl KeychatClient {
                 reply_to.as_ref().map(|r| r.target_event_id.as_str()),
                 reply_to.as_ref().and_then(|r| r.content.as_deref()),
             ) {
-                tracing::warn!("update_app_message (send metadata): {e}");
+                tracing::error!("PERSIST FAILED: update_app_message (send metadata): {e}");
             }
             if let Err(e) = store.update_app_room(
                 &full_room_id, None, None, Some(&display_text), Some(now),
             ) {
-                tracing::warn!("update_app_room (send): {e}");
+                tracing::error!("PERSIST FAILED: update_app_room (send): {e}");
             }
         }
         drop(send_storage);

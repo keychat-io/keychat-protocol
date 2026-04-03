@@ -485,7 +485,7 @@ impl KeychatClient {
         msg.group_id = Some(group_id.clone());
         let payload_json = msg.to_json().ok();
 
-        let full_room_id = format!("{}:{}", group_id, identity_pubkey);
+        let full_room_id = crate::types::make_room_id(&group_id, &identity_pubkey);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
