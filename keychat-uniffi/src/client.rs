@@ -899,6 +899,8 @@ impl KeychatClient {
         let mut inner = self.inner.write().await;
         inner.transport = Some(transport);
         inner.last_relay_urls = urls;
+        // Clear any stale subscription IDs from a previous connect session
+        inner.subscription_ids.clear();
         Ok(())
     }
 
@@ -1015,12 +1017,26 @@ impl KeychatClient {
 
     pub async fn disconnect(&self) -> Result<(), KeychatUniError> {
         tracing::info!("disconnecting from relays");
-        // Take transport out, drop lock, then disconnect
-        let transport = {
+        // Stop event loop, reconnect loop, take transport — all under write lock
+        let (transport, event_loop_tx, reconnect_tx) = {
             let mut inner = self.inner.write().await;
-            inner.transport.take()
+            (
+                inner.transport.take(),
+                inner.event_loop_stop.take(),
+                inner.reconnect_stop.take(),
+            )
         };
-        // Lock dropped here
+        if let Some(tx) = event_loop_tx {
+            let _ = tx.send(true);
+        }
+        if let Some(tx) = reconnect_tx {
+            let _ = tx.send(true);
+        }
+        // Clear subscription IDs — they belong to the old transport
+        {
+            let mut inner = self.inner.write().await;
+            inner.subscription_ids.clear();
+        }
         if let Some(t) = transport {
             t.disconnect().await.map_err(|e| {
                 tracing::error!("disconnect failed: {e}");
@@ -1038,10 +1054,13 @@ impl KeychatClient {
     pub async fn remove_identity(&self) -> Result<(), KeychatUniError> {
         tracing::info!("remove_identity: clearing all data");
 
-        // 1. Stop event loop
+        // 1. Stop event loop and reconnect loop
         {
             let inner = self.inner.read().await;
             if let Some(ref stop_tx) = inner.event_loop_stop {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(ref stop_tx) = inner.reconnect_stop {
                 let _ = stop_tx.send(true);
             }
         }
@@ -1065,6 +1084,9 @@ impl KeychatClient {
             inner.identity = None;
             inner.next_signal_device_id = 1;
             inner.event_loop_stop = None;
+            inner.reconnect_stop = None;
+            inner.subscription_ids.clear();
+            inner.last_relay_urls.clear();
         }
         if let Ok(store) = storage.lock() {
             store
@@ -1342,16 +1364,13 @@ impl KeychatClient {
         );
 
         // Subscribe via Transport — separate subscriptions for identity and ratchet keys.
-        // Unsubscribe any previous IDs first to prevent duplicate REQ accumulation.
-        {
+        // Use resubscribe() to atomically unsubscribe old IDs and subscribe new ones,
+        // preventing duplicate REQ accumulation.
+        let old_ids: Vec<String> = {
             let inner = self.inner.read().await;
-            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
-            for old_id in &inner.subscription_ids {
-                transport.unsubscribe(libkeychat::SubscriptionId::new(old_id)).await;
-            }
-        }
+            inner.subscription_ids.clone()
+        };
+        let mut old_iter = old_ids.into_iter().map(|s| libkeychat::SubscriptionId::new(s));
 
         let mut new_sub_ids: Vec<String> = Vec::new();
 
@@ -1363,7 +1382,7 @@ impl KeychatClient {
 
             if !identity_pubkeys.is_empty() {
                 let id = transport
-                    .subscribe(identity_pubkeys, identity_since)
+                    .resubscribe(old_iter.next(), identity_pubkeys, identity_since)
                     .await
                     .map_err(|e| {
                         tracing::error!("event loop: identity subscribe failed: {e}");
@@ -1374,13 +1393,18 @@ impl KeychatClient {
 
             if !ratchet_pubkeys.is_empty() {
                 let id = transport
-                    .subscribe(ratchet_pubkeys, ratchet_since)
+                    .resubscribe(old_iter.next(), ratchet_pubkeys, ratchet_since)
                     .await
                     .map_err(|e| {
                         tracing::error!("event loop: ratchet subscribe failed: {e}");
                         e
                     })?;
                 new_sub_ids.push(id.to_string());
+            }
+
+            // Unsubscribe any remaining stale IDs (e.g. old session had more slots)
+            for leftover in old_iter {
+                transport.unsubscribe(leftover).await;
             }
         } // lock dropped
 

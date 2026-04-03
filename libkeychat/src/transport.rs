@@ -163,6 +163,21 @@ impl Transport {
         self.client.unsubscribe(id).await;
     }
 
+    /// Replace an existing subscription with a new one atomically:
+    /// unsubscribes the old ID, subscribes with the new filter, returns the new ID.
+    /// If `old_id` is None, just subscribes without unsubscribing.
+    pub async fn resubscribe(
+        &self,
+        old_id: Option<SubscriptionId>,
+        pubkeys: Vec<PublicKey>,
+        since: Option<Timestamp>,
+    ) -> Result<SubscriptionId> {
+        if let Some(id) = old_id {
+            self.client.unsubscribe(id).await;
+        }
+        self.subscribe(pubkeys, since).await
+    }
+
     /// Publish an event to ALL connected relays simultaneously.
     /// Succeeds if at least one relay accepts the event.
     ///
