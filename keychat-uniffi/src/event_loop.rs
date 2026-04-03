@@ -621,6 +621,9 @@ impl KeychatClient {
                         inner
                             .peer_nostr_to_signal
                             .insert(peer_nostr_id.clone(), peer_signal_hex.clone());
+                        inner
+                            .peer_signal_to_nostr
+                            .insert(peer_signal_hex.clone(), peer_nostr_id.clone());
                         // Update reverse index for O(1) message routing
                         for addr in &recv_addrs {
                             inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
@@ -1010,10 +1013,9 @@ impl KeychatClient {
                 let sender_nostr_pubkey = {
                     let inner = self.inner.read().await;
                     inner
-                        .peer_nostr_to_signal
-                        .iter()
-                        .find(|(_, sig)| sig.as_str() == peer_signal_hex.as_str())
-                        .map(|(nostr, _)| nostr.clone())
+                        .peer_signal_to_nostr
+                        .get(peer_signal_hex)
+                        .cloned()
                         .unwrap_or_else(|| peer_signal_hex.clone())
                 };
 

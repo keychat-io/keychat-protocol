@@ -277,6 +277,9 @@ impl KeychatClient {
             inner
                 .peer_nostr_to_signal
                 .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
+            inner
+                .peer_signal_to_nostr
+                .insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
             // Update reverse index for O(1) message routing
             for addr in &recv_addrs {
                 inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());

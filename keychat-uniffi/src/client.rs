@@ -46,6 +46,8 @@ pub(crate) struct ClientInner {
     pub app_storage: Arc<std::sync::Mutex<AppStorage>>,
     pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
     pub peer_nostr_to_signal: HashMap<String, String>,
+    /// Reverse index: signal_id → nostr_pubkey for O(1) reverse lookup.
+    pub peer_signal_to_nostr: HashMap<String, String>,
     /// Reverse index: receiving_address_hex → peer_signal_id for O(1) message routing.
     pub receiving_addr_to_peer: HashMap<String, String>,
     pub pending_outbound: HashMap<String, FriendRequestState>,
@@ -127,6 +129,7 @@ impl KeychatClient {
                 app_storage: Arc::new(std::sync::Mutex::new(app_storage)),
                 sessions: HashMap::new(),
                 peer_nostr_to_signal: HashMap::new(),
+                peer_signal_to_nostr: HashMap::new(),
                 receiving_addr_to_peer: HashMap::new(),
                 pending_outbound: HashMap::new(),
                 group_manager: GroupManager::new(),
@@ -564,6 +567,9 @@ impl KeychatClient {
             inner
                 .peer_nostr_to_signal
                 .insert(peer.nostr_pubkey.clone(), peer.signal_id.clone());
+            inner
+                .peer_signal_to_nostr
+                .insert(peer.signal_id.clone(), peer.nostr_pubkey.clone());
         }
         if !peers.is_empty() {
             tracing::info!("restored {} peer mappings", peers.len());
@@ -988,6 +994,7 @@ impl KeychatClient {
             let mut inner = self.inner.write().await;
             inner.sessions.clear();
             inner.peer_nostr_to_signal.clear();
+            inner.peer_signal_to_nostr.clear();
             inner.receiving_addr_to_peer.clear();
             inner.pending_outbound.clear();
             inner.group_manager = libkeychat::GroupManager::new();
@@ -1032,19 +1039,10 @@ impl KeychatClient {
         {
             let mut inner = self.inner.write().await;
             if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&room_id) {
+                inner.peer_signal_to_nostr.remove(&signal_id);
                 inner.sessions.remove(&signal_id);
                 inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-
-                // Remove any pending outbound FR for this peer
-                let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
-                for key in pending_keys {
-                    if let Some(state) = inner.pending_outbound.get(&key) {
-                        if state.peer_nostr_pubkey == room_id {
-                            inner.pending_outbound.remove(&key);
-                            break;
-                        }
-                    }
-                }
+                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != room_id);
                 drop(inner);
 
                 // Delete from DB (no write lock held)
@@ -1124,19 +1122,10 @@ impl KeychatClient {
 
             // Remove signal session
             if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&peer_pubkey) {
+                inner.peer_signal_to_nostr.remove(&signal_id);
                 inner.sessions.remove(&signal_id);
                 inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-
-                // Remove any pending outbound FR for this peer
-                let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
-                for key in pending_keys {
-                    if let Some(state) = inner.pending_outbound.get(&key) {
-                        if state.peer_nostr_pubkey == peer_pubkey {
-                            inner.pending_outbound.remove(&key);
-                            break;
-                        }
-                    }
-                }
+                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
 
                 // Clean up in DB (no write lock held during DB operations)
                 drop(inner);
