@@ -14,6 +14,18 @@ use tracing::warn;
 use crate::client::{default_device_id, KeychatClient};
 use crate::types::*;
 
+/// Context for dispatching a successfully decrypted message.
+struct DecryptedContext {
+    msg: libkeychat::KCMessage,
+    metadata: libkeychat::MessageMetadata,
+    sender_nostr_pubkey: String,
+    peer_signal_hex: String,
+    session_mutex: Arc<tokio::sync::Mutex<ChatSession>>,
+    event: Event,
+    relay_url: Option<String>,
+    nostr_event_json: Option<String>,
+}
+
 impl KeychatClient {
     /// Run the event loop, dispatching relay notifications to EventListener.
     /// Exits when stop_rx receives true or on fatal error.
@@ -970,10 +982,14 @@ impl KeychatClient {
                         .unwrap_or_else(|| peer_signal_hex.clone())
                 };
 
-                self.handle_decrypted_message(
-                    msg, metadata, &sender_nostr_pubkey, peer_signal_hex,
-                    session_mutex, event, relay_url, nostr_event_json,
-                ).await;
+                self.handle_decrypted_message(DecryptedContext {
+                    msg, metadata,
+                    sender_nostr_pubkey,
+                    peer_signal_hex: peer_signal_hex.to_string(),
+                    session_mutex: session_mutex.clone(),
+                    event: event.clone(),
+                    relay_url, nostr_event_json,
+                }).await;
                 return true;
             }
         }
@@ -1044,18 +1060,11 @@ impl KeychatClient {
     }
 
     /// Dispatch a decrypted message by kind: group events or regular chat messages.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_decrypted_message(
-        &self,
-        msg: libkeychat::KCMessage,
-        metadata: libkeychat::MessageMetadata,
-        sender_nostr_pubkey: &str,
-        peer_signal_hex: &str,
-        session_mutex: &Arc<tokio::sync::Mutex<ChatSession>>,
-        event: &Event,
-        relay_url: Option<String>,
-        nostr_event_json: Option<String>,
-    ) {
+    async fn handle_decrypted_message(&self, ctx: DecryptedContext) {
+        let DecryptedContext {
+            msg, metadata, sender_nostr_pubkey, peer_signal_hex,
+            session_mutex, event, relay_url, nostr_event_json,
+        } = ctx;
                 match msg.kind {
                     KCMessageKind::SignalGroupInvite => {
                         // Use our Signal identity key as my_signal_id.
