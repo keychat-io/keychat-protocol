@@ -1717,6 +1717,122 @@ async_test!(test_concurrent_bidirectional, {
     .unwrap();
 });
 
+// ─── Lifecycle: disconnect() stops event loop ────────────────────
+//
+// Regression test for bug where disconnect() did NOT cancel the event loop
+// task. After the fix, calling disconnect() without explicit stop_event_loop()
+// and then reconnecting should work correctly — no zombie event loops.
+
+async_test!(test_disconnect_without_stop_event_loop, {
+    let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
+        create_friends().await;
+
+    let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
+
+    // Phase 1: verify baseline works
+    alice
+        .send_text(alice_room_id.clone(), "phase1".into(), None, None, None)
+        .await
+        .unwrap();
+    wait_for_event(&mut bob_rx, 30, |e| {
+        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "phase1")
+    })
+    .await
+    .expect("Bob should receive phase1 message");
+
+    // Phase 2: Bob disconnects WITHOUT calling stop_event_loop() first.
+    // Before the fix this left a zombie event loop task running.
+    bob.disconnect().await.ok();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Bob reconnects and starts a fresh event loop.
+    let (bob_listener2, mut bob_rx2) = TestListener::new();
+    bob.set_event_listener(Box::new(bob_listener2)).await;
+    bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
+    let bob_clone = bob.clone();
+    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    assert!(
+        wait_for_relay_connection(&bob, 15).await,
+        "Bob should reconnect"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Phase 3: messages should arrive via the new event loop only.
+    alice
+        .send_text(alice_room_id.clone(), "phase2".into(), None, None, None)
+        .await
+        .unwrap();
+    wait_for_event(&mut bob_rx2, 30, |e| {
+        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "phase2")
+    })
+    .await
+    .expect("Bob should receive phase2 message after reconnect");
+
+    let _ = alice.stop_event_loop().await;
+    let _ = bob.stop_event_loop().await;
+    let _ = alice.disconnect().await;
+    let _ = bob.disconnect().await;
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
+});
+
+// ─── Lifecycle: start_event_loop twice — no duplicate events ─────
+//
+// Regression test for duplicate REQ accumulation: calling start_event_loop()
+// multiple times on the same connection used to add new subscriptions to the
+// nostr-sdk pool without removing the old ones, causing the relay to send
+// duplicate events. After the fix, old subscription IDs are unsubscribed
+// before a new subscription is created, so each message is delivered exactly
+// once even when start_event_loop() is called repeatedly.
+
+async_test!(test_start_event_loop_twice_no_duplicate_delivery, {
+    let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
+        create_friends().await;
+
+    let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
+
+    // Call start_event_loop() a second time on Bob (simulates internal restart
+    // after auto-reconnect). The new call should unsubscribe the old REQ first.
+    let bob_clone = bob.clone();
+    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Alice sends a single message.
+    alice
+        .send_text(alice_room_id.clone(), "dedup-check".into(), None, None, None)
+        .await
+        .unwrap();
+
+    // Collect ALL matching events received within 15 s.
+    let mut count = 0u32;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout_at(deadline, bob_rx.recv()).await {
+            Ok(Ok(ClientEvent::MessageReceived { content: Some(c), .. })) if c == "dedup-check" => {
+                count += 1;
+            }
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    assert_eq!(count, 1, "Message should be received exactly once, got {count}");
+
+    let _ = alice.stop_event_loop().await;
+    let _ = bob.stop_event_loop().await;
+    let _ = alice.disconnect().await;
+    let _ = bob.disconnect().await;
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
+});
+
 // ═══════════════════════════════════════════════════════════════
 // File Transfer Integration Tests
 // ═══════════════════════════════════════════════════════════════

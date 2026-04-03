@@ -60,13 +60,13 @@ Read both state files and give the user a complete picture:
    `curl -H "Authorization: Bearer <token>" http://127.0.0.1:10443/status`
 
 5. **What next** — end with a concrete next step based on state:
-   - No token set → *"Set the API token with: `/keychat:configure token <your-token>`"*
-   - No daemon running → *"Start the agent with: `keychat agent --name MyBot`"*
-   - Daemon running, open policy → *"Ready. Messages from any Keychat
+   - No token set → _"Set the API token with: `/keychat:configure token <your-token>`"_
+   - No daemon running → _"Start the agent with: `keychat agent --name MyBot`"_
+   - Daemon running, open policy → _"Ready. Messages from any Keychat
      contact will come through. To restrict, run `/keychat:access policy allowlist`
-     then add specific pubkeys."*
-   - Daemon running, allowlist set → *"Ready. Only allowed pubkeys can
-     reach you."*
+     then add specific pubkeys."_
+   - Daemon running, allowlist set → _"Ready. Only allowed pubkeys can
+     reach you."_
 
 ### `<url>` — save daemon URL
 
@@ -103,7 +103,7 @@ Read both state files and give the user a complete picture:
 - `access.json` is re-read on every inbound message — policy changes via
   `/keychat:access` take effect immediately, no restart needed.
 - The daemon itself handles all encryption (Signal PQXDH + NIP-17
-  gift-wrap). The channel plugin only does MCP ↔ HTTP translation. No
+  gift-wrap). The Claude MCP server only does MCP ↔ HTTP translation. No
   secrets or keys are stored in the channel config.
 - The API token is printed to stdout when `keychat agent` starts. The user
   needs to copy it from there.

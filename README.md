@@ -20,15 +20,15 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
 ### CLI & Tools
 
 - **[keychat-cli](keychat-cli/)** — Terminal client with 4 modes: TUI, REPL, HTTP daemon, and AI agent
-- **[keychat-channel-plugin](keychat-channel-plugin/)** — Claude Code MCP channel plugin for agent daemon
+- **[keychat-claude-mcp](keychat-claude-mcp/)** — Claude MCP server for keychat agent daemon
 - **[keychat-agent-skill](keychat-agent-skill/)** — OpenClaw skill + bridge for agent daemon
 
 ### [NIPs](nips/)
 
 Nostr Implementation Possibilities proposed by Keychat:
 
-| NIP | Title | Status |
-|-----|-------|--------|
-| [NIP-XX: Signal Protocol over Nostr](nips/nip-signal.md) | E2E encrypted 1:1 messaging using Signal Protocol (PQXDH + Double Ratchet) over Nostr relays | Draft |
-| [NIP-XX: MLS Protocol over Nostr](nips/nip-mls.md) | E2E encrypted group messaging using MLS (RFC 9420) over Nostr relays | Draft |
-| [NIP-XX: Ecash Token as Nostr Note Stamp](nips/nip-estamp.md) | Anonymous per-event micropayments to relays using Cashu ecash | Draft |
+| NIP                                                           | Title                                                                                        | Status |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------ |
+| [NIP-XX: Signal Protocol over Nostr](nips/nip-signal.md)      | E2E encrypted 1:1 messaging using Signal Protocol (PQXDH + Double Ratchet) over Nostr relays | Draft  |
+| [NIP-XX: MLS Protocol over Nostr](nips/nip-mls.md)            | E2E encrypted group messaging using MLS (RFC 9420) over Nostr relays                         | Draft  |
+| [NIP-XX: Ecash Token as Nostr Note Stamp](nips/nip-estamp.md) | Anonymous per-event micropayments to relays using Cashu ecash                                | Draft  |

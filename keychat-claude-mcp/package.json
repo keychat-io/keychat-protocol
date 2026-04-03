@@ -1,7 +1,7 @@
 {
-  "name": "keychat-channel-plugin",
+  "name": "keychat-claude-mcp",
   "version": "0.1.0",
-  "description": "Keychat channel plugin for Claude Code",
+  "description": "Keychat Claude MCP server for Claude Code",
   "private": true,
   "type": "module",
   "scripts": {

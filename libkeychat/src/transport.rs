@@ -121,6 +121,9 @@ impl Transport {
     /// ```json
     /// { "kinds": [1059], "#p": [<pubkeys>], "since": <timestamp> }
     /// ```
+    ///
+    /// Returns the generated SubscriptionId so callers can unsubscribe the old
+    /// subscription before re-subscribing (preventing duplicate REQ accumulation).
     pub async fn subscribe(
         &self,
         pubkeys: Vec<PublicKey>,
@@ -153,6 +156,26 @@ impl Transport {
         );
 
         Ok(output.val)
+    }
+
+    /// Unsubscribe from a previous subscription by ID.
+    pub async fn unsubscribe(&self, id: SubscriptionId) {
+        self.client.unsubscribe(id).await;
+    }
+
+    /// Replace an existing subscription with a new one atomically:
+    /// unsubscribes the old ID, subscribes with the new filter, returns the new ID.
+    /// If `old_id` is None, just subscribes without unsubscribing.
+    pub async fn resubscribe(
+        &self,
+        old_id: Option<SubscriptionId>,
+        pubkeys: Vec<PublicKey>,
+        since: Option<Timestamp>,
+    ) -> Result<SubscriptionId> {
+        if let Some(id) = old_id {
+            self.client.unsubscribe(id).await;
+        }
+        self.subscribe(pubkeys, since).await
     }
 
     /// Publish an event to ALL connected relays simultaneously.

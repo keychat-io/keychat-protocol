@@ -95,11 +95,10 @@ pub use friend_request::{
 };
 pub use giftwrap::{create_gift_wrap, unwrap_gift_wrap, UnwrappedMessage};
 pub use group::{
-    build_group_admin_message, create_signal_group, encrypt_for_group_member,
-    receive_group_invite, receive_group_message, send_group_dissolve, send_group_invite,
-    send_group_member_removed, send_group_message, send_group_name_changed,
-    send_group_self_leave, GroupManager, GroupMember, GroupMessageMetadata, RoomMember,
-    RoomProfile, SignalGroup,
+    build_group_admin_message, create_signal_group, encrypt_for_group_member, receive_group_invite,
+    receive_group_message, send_group_dissolve, send_group_invite, send_group_member_removed,
+    send_group_message, send_group_name_changed, send_group_self_leave, GroupManager, GroupMember,
+    GroupMessageMetadata, RoomMember, RoomProfile, SignalGroup,
 };
 pub use identity::{normalize_pubkey, EphemeralKeypair, Identity, IdentityWithMnemonic};
 pub use media::{
@@ -149,4 +148,4 @@ pub use transport::{PublishResult, RelayHealth, Transport, DEFAULT_RELAYS};
 // Re-export key nostr types for convenience
 pub use nostr::message::relay::RelayMessage;
 pub use nostr::{Event, EventId, Keys, Kind, PublicKey, SecretKey, Timestamp};
-pub use nostr_sdk::{RelayPoolNotification, RelayStatus};
+pub use nostr_sdk::{RelayPoolNotification, RelayStatus, SubscriptionId};
