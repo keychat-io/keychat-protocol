@@ -93,9 +93,10 @@ impl KeychatClient {
         } else {
             format!("{}_app", db_path)
         };
-        let app_storage = AppStorage::open(&app_db_path, &db_key).map_err(|e| {
-            KeychatUniError::Storage { msg: format!("open app database: {e}") }
-        })?;
+        let app_storage =
+            AppStorage::open(&app_db_path, &db_key).map_err(|e| KeychatUniError::Storage {
+                msg: format!("open app database: {e}"),
+            })?;
 
         // Derive files directory: db_path is {app_support}/libkeychat/libkeychat.db
         // files_dir becomes {app_support}/files/
@@ -170,7 +171,13 @@ impl KeychatClient {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
         store
-            .upsert_attachment(&msgid, &file_hash, &room_id, local_path.as_deref(), transfer_state as i32)
+            .upsert_attachment(
+                &msgid,
+                &file_hash,
+                &room_id,
+                local_path.as_deref(),
+                transfer_state as i32,
+            )
             .map_err(|e| KeychatUniError::Storage {
                 msg: format!("upsert_attachment: {e}"),
             })
@@ -184,9 +191,11 @@ impl KeychatClient {
     ) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.set_audio_played(&msgid, &file_hash).map_err(|e| KeychatUniError::Storage {
-            msg: format!("set_audio_played: {e}"),
-        })
+        store
+            .set_audio_played(&msgid, &file_hash)
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("set_audio_played: {e}"),
+            })
     }
 
     /// Check if a voice attachment has been played.
@@ -264,8 +273,7 @@ impl KeychatClient {
             }
         }
 
-        let file_name =
-            crate::media::local_file_name(source_name, hash.clone(), suffix);
+        let file_name = crate::media::local_file_name(source_name, hash.clone(), suffix);
         let room_dir = std::path::Path::new(&self.files_dir).join(&room_id);
         let file_path = room_dir.join(&file_name);
         let relative_path = format!("{room_id}/{file_name}");
@@ -274,7 +282,13 @@ impl KeychatClient {
         if file_path.exists() {
             if let Some(ref mid) = msgid {
                 let _ = self
-                    .upsert_attachment(mid.clone(), hash.clone(), room_id.clone(), Some(relative_path), 2)
+                    .upsert_attachment(
+                        mid.clone(),
+                        hash.clone(),
+                        room_id.clone(),
+                        Some(relative_path),
+                        2,
+                    )
                     .await;
             }
             return Ok(file_path.to_string_lossy().to_string());
@@ -286,8 +300,7 @@ impl KeychatClient {
         })?;
 
         // Download + decrypt
-        let plaintext =
-            crate::media::download_and_decrypt(url, key, iv, hash.clone()).await?;
+        let plaintext = crate::media::download_and_decrypt(url, key, iv, hash.clone()).await?;
 
         // Atomic write via temp file
         let tmp_path = room_dir.join(format!(".{file_name}.tmp"));
@@ -298,16 +311,18 @@ impl KeychatClient {
             msg: format!("rename temp file: {e}"),
         })?;
 
-        tracing::info!(
-            "Downloaded {} ({} bytes)",
-            file_name,
-            plaintext.len()
-        );
+        tracing::info!("Downloaded {} ({} bytes)", file_name, plaintext.len());
 
         // Record in file_attachments
         if let Some(ref mid) = msgid {
             let _ = self
-                .upsert_attachment(mid.clone(), hash.clone(), room_id.clone(), Some(relative_path), 2)
+                .upsert_attachment(
+                    mid.clone(),
+                    hash.clone(),
+                    room_id.clone(),
+                    Some(relative_path),
+                    2,
+                )
                 .await;
         }
 
@@ -887,12 +902,9 @@ impl KeychatClient {
     /// Add a relay at runtime, connect to it, and persist to DB.
     pub async fn add_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         transport.add_relay_and_connect(&url).await?;
 
         let storage = inner.storage.clone();
@@ -906,12 +918,9 @@ impl KeychatClient {
     /// Remove a relay at runtime and delete from DB.
     pub async fn remove_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         transport.remove_relay(&url).await?;
 
         let storage = inner.storage.clone();
@@ -925,36 +934,27 @@ impl KeychatClient {
     /// Get the current relay URL list.
     pub async fn get_relays(&self) -> Result<Vec<String>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         Ok(transport.get_relays().await)
     }
 
     /// Get only the currently connected relay URLs.
     pub async fn connected_relays(&self) -> Result<Vec<String>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         Ok(transport.connected_relays().await)
     }
 
     /// Get relay URLs with their connection status.
     pub async fn get_relay_statuses(&self) -> Result<Vec<RelayStatusInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         Ok(transport
             .get_relay_statuses()
             .await
@@ -966,12 +966,9 @@ impl KeychatClient {
     /// Reconnect to all relays (re-enables disabled ones).
     pub async fn reconnect_relays(&self) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         transport.reconnect().await?;
         tracing::info!("reconnected to all relays");
         Ok(())
@@ -980,12 +977,9 @@ impl KeychatClient {
     /// Reconnect a specific relay.
     pub async fn reconnect_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         transport.reconnect_relay(&url).await?;
         tracing::info!("reconnected relay: {url}");
         Ok(())
@@ -1001,12 +995,9 @@ impl KeychatClient {
                 msg: format!("invalid event JSON: {e}"),
             })?;
         let inner = self.inner.read().await;
-        let transport = inner
-            .transport
-            .as_ref()
-            .ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
+        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            msg: "Not connected to any relay. Please check your network.".into(),
+        })?;
         let result = transport.rebroadcast_event(event).await?;
         Ok(PublishResultInfo {
             event_id: result.event_id.to_hex(),
@@ -1318,22 +1309,41 @@ impl KeychatClient {
                 // First launch — no cursor yet. Subscribe without `since` to get
                 // initial history. The relay's own retention policy limits the result.
                 // After the first event is processed, the cursor will be set.
-                tracing::info!("event loop: no cursor yet, subscribing without since for initial sync");
+                tracing::info!(
+                    "event loop: no cursor yet, subscribing without since for initial sync"
+                );
                 None
             }
         };
 
         let ratchet_since = Some(libkeychat::Timestamp::now());
 
+        // Log all pubkeys being subscribed to — useful for debugging missing messages
+        tracing::info!(
+            "📡 SUBSCRIBE identity keys ({}): [{}]",
+            identity_pubkeys.len(),
+            identity_pubkeys
+                .iter()
+                .map(|pk| pk.to_hex()[..16].to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tracing::info!(
+            "📡 SUBSCRIBE ratchet keys ({}): [{}]",
+            ratchet_pubkeys.len(),
+            ratchet_pubkeys
+                .iter()
+                .map(|pk| pk.to_hex()[..16].to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
         // Subscribe via Transport — separate subscriptions for identity and ratchet keys
         {
             let inner = self.inner.read().await;
-            let transport = inner
-                .transport
-                .as_ref()
-                .ok_or(KeychatUniError::Transport {
-                    msg: "Not connected to any relay. Please check your network.".into(),
-                })?;
+            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
 
             if !identity_pubkeys.is_empty() {
                 transport
@@ -1433,14 +1443,17 @@ impl KeychatClient {
     pub async fn check_connection(self: Arc<Self>) -> ConnectionStatus {
         let connected = self.connected_relays().await.unwrap_or_default();
         if !connected.is_empty() {
-            self.notify_connection_status(ConnectionStatus::Connected, None).await;
+            self.notify_connection_status(ConnectionStatus::Connected, None)
+                .await;
             ConnectionStatus::Connected
         } else {
             // Trigger immediate reconnect attempt
-            self.notify_connection_status(ConnectionStatus::Reconnecting, None).await;
+            self.notify_connection_status(ConnectionStatus::Reconnecting, None)
+                .await;
             match self.try_reconnect().await {
                 Ok(_) => {
-                    self.notify_connection_status(ConnectionStatus::Connected, None).await;
+                    self.notify_connection_status(ConnectionStatus::Connected, None)
+                        .await;
                     // Auto-retry failed messages after reconnect (delayed to let relays stabilize)
                     let client = Arc::clone(&self);
                     tokio::spawn(async move {
@@ -1448,7 +1461,9 @@ impl KeychatClient {
                         match client.retry_failed_messages().await {
                             Ok(count) => {
                                 if count > 0 {
-                                    tracing::info!("auto-retry after reconnect: {count} messages retried");
+                                    tracing::info!(
+                                        "auto-retry after reconnect: {count} messages retried"
+                                    );
                                 }
                             }
                             Err(e) => tracing::warn!("auto-retry after reconnect failed: {e}"),
@@ -1458,13 +1473,13 @@ impl KeychatClient {
                 }
                 Err(e) => {
                     let msg = format!("{e}");
-                    self.notify_connection_status(ConnectionStatus::Failed, Some(msg)).await;
+                    self.notify_connection_status(ConnectionStatus::Failed, Some(msg))
+                        .await;
                     ConnectionStatus::Failed
                 }
             }
         }
     }
-
 }
 
 // ─── Private methods (not exported via UniFFI) ───────────────────
@@ -1509,15 +1524,13 @@ impl KeychatClient {
                 }
 
                 attempt += 1;
-                let delay_secs = std::cmp::min(
-                    2u64.saturating_pow(attempt),
-                    max_delay_secs,
-                );
+                let delay_secs = std::cmp::min(2u64.saturating_pow(attempt), max_delay_secs);
 
                 self.notify_connection_status(
                     ConnectionStatus::Reconnecting,
                     Some(format!("attempt {attempt}, retry in {delay_secs}s")),
-                ).await;
+                )
+                .await;
 
                 tracing::info!("reconnect attempt {attempt} in {delay_secs}s…");
 
@@ -1537,7 +1550,31 @@ impl KeychatClient {
                 match self.try_reconnect().await {
                     Ok(_) => {
                         tracing::info!("reconnected on attempt {attempt}");
-                        self.notify_connection_status(ConnectionStatus::Connected, None).await;
+                        self.notify_connection_status(ConnectionStatus::Connected, None)
+                            .await;
+
+                        // Check if the event loop is still alive; restart if it has exited.
+                        // The stop sender's receiver_count drops to 0 when the event loop task
+                        // has exited (all stop_rx handles dropped), indicating a dead loop.
+                        let event_loop_dead = {
+                            let inner = self.inner.read().await;
+                            inner
+                                .event_loop_stop
+                                .as_ref()
+                                .map(|tx| tx.receiver_count() == 0)
+                                .unwrap_or(true)
+                        };
+                        if event_loop_dead {
+                            tracing::warn!("reconnect: event loop is dead, restarting");
+                            let client = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                if let Err(e) = client.start_event_loop().await {
+                                    tracing::error!("reconnect: failed to restart event loop: {e}");
+                                } else {
+                                    tracing::info!("reconnect: event loop restarted successfully");
+                                }
+                            });
+                        }
 
                         // Auto-retry failed messages (delayed to let relay connections stabilize)
                         let client = Arc::clone(&self);
@@ -1546,7 +1583,9 @@ impl KeychatClient {
                             match client.retry_failed_messages().await {
                                 Ok(count) => {
                                     if count > 0 {
-                                        tracing::info!("auto-retry after reconnect: {count} messages retried");
+                                        tracing::info!(
+                                            "auto-retry after reconnect: {count} messages retried"
+                                        );
                                     }
                                 }
                                 Err(e) => tracing::warn!("auto-retry after reconnect failed: {e}"),
@@ -1560,7 +1599,8 @@ impl KeychatClient {
                         self.notify_connection_status(
                             ConnectionStatus::Failed,
                             Some(format!("attempt {attempt}: {e}")),
-                        ).await;
+                        )
+                        .await;
                     }
                 }
             }
@@ -1594,13 +1634,14 @@ impl KeychatClient {
     }
 
     /// Internal: notify DataListener of connection status change.
-    pub(crate) async fn notify_connection_status(&self, status: ConnectionStatus, message: Option<String>) {
+    pub(crate) async fn notify_connection_status(
+        &self,
+        status: ConnectionStatus,
+        message: Option<String>,
+    ) {
         let inner = self.inner.read().await;
         if let Some(ref listener) = inner.data_listener {
-            listener.on_data_change(DataChange::ConnectionStatusChanged {
-                status,
-                message,
-            });
+            listener.on_data_change(DataChange::ConnectionStatusChanged { status, message });
         }
     }
 }
