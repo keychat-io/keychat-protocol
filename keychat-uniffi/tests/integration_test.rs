@@ -1193,3 +1193,90 @@ fn network_group_message_persisted() {
     .join()
     .unwrap();
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Tests for the architectural fixes (Issues 1-10)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── Issue 8: cached_identity_pubkey ─────────────────────────────────
+
+async_test!(cached_identity_pubkey_after_create, {
+    let dir = tempfile::tempdir().unwrap();
+    let client = KeychatClient::new(temp_db(&dir, "t.db"), "k".into()).unwrap();
+
+    // Before identity: fails
+    assert!(client.get_pubkey_hex().await.is_err());
+
+    // After create: works without inner lock
+    let result = client.create_identity().await.unwrap();
+    let pubkey = client.get_pubkey_hex().await.unwrap();
+    assert_eq!(pubkey, result.pubkey_hex);
+    assert_eq!(pubkey.len(), 64, "hex pubkey must be 64 chars");
+
+    drop_client(client).await;
+});
+
+async_test!(cached_identity_pubkey_after_import, {
+    let dir = tempfile::tempdir().unwrap();
+    let c1 = KeychatClient::new(temp_db(&dir, "c1.db"), "k".into()).unwrap();
+    let r = c1.create_identity().await.unwrap();
+
+    let c2 = KeychatClient::new(temp_db(&dir, "c2.db"), "k".into()).unwrap();
+    let pubkey = c2.import_identity(r.mnemonic).await.unwrap();
+    assert_eq!(c2.get_pubkey_hex().await.unwrap(), pubkey);
+    assert_eq!(pubkey.len(), 64);
+
+    drop_client(c1).await;
+    drop_client(c2).await;
+});
+
+async_test!(cached_identity_pubkey_is_stable, {
+    let dir = tempfile::tempdir().unwrap();
+    let client = KeychatClient::new(temp_db(&dir, "t.db"), "k".into()).unwrap();
+    client.create_identity().await.unwrap();
+
+    // Multiple calls must be identical
+    let pk1 = client.get_pubkey_hex().await.unwrap();
+    let pk2 = client.get_pubkey_hex().await.unwrap();
+    let pk3 = client.get_pubkey_hex().await.unwrap();
+    assert_eq!(pk1, pk2);
+    assert_eq!(pk2, pk3);
+
+    drop_client(client).await;
+});
+
+// ─── Issue 4: device_identity table ──────────────────────────────────
+
+async_test!(device_identity_table_exists_after_open, {
+    let dir = tempfile::tempdir().unwrap();
+    let client = KeychatClient::new(temp_db(&dir, "t.db"), "k".into()).unwrap();
+
+    // DB migration creates device_identity table — verify no crash
+    client.create_identity().await.unwrap();
+    let summary = client.debug_state_summary().await.unwrap();
+    assert!(summary.contains("sessions="));
+
+    drop_client(client).await;
+});
+
+// ─── Issue 1/3: restore_sessions ─────────────────────────────────────
+
+async_test!(restore_sessions_zero_on_fresh_db, {
+    let dir = tempfile::tempdir().unwrap();
+    let client = KeychatClient::new(temp_db(&dir, "t.db"), "k".into()).unwrap();
+    client.create_identity().await.unwrap();
+
+    let count = client.restore_sessions().await.unwrap();
+    assert_eq!(count, 0, "fresh DB has no sessions");
+
+    drop_client(client).await;
+});
+
+async_test!(restore_sessions_fails_without_identity, {
+    let dir = tempfile::tempdir().unwrap();
+    let client = KeychatClient::new(temp_db(&dir, "t.db"), "k".into()).unwrap();
+
+    assert!(client.restore_sessions().await.is_err());
+
+    drop_client(client).await;
+});

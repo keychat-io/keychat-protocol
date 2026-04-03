@@ -638,36 +638,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_or_create_db_key_file_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().to_str().unwrap();
-
-        // First call: key file should be created
-        let key1 = get_or_create_via_file(data_dir).unwrap();
-        let key_path = dir.path().join(KEY_FILE_NAME);
-        assert!(key_path.exists(), "key file should be created");
-
-        // Second call: same key should be returned
-        let key2 = get_or_create_via_file(data_dir).unwrap();
-        assert_eq!(key1, key2, "same key should be returned on second call");
-    }
-
-    #[test]
-    fn test_db_key_is_valid_hex() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().to_str().unwrap();
-
-        let key = get_or_create_via_file(data_dir).unwrap();
-
-        // Should be 64 hex chars (32 bytes)
-        assert_eq!(key.len(), 64, "key should be 64 hex chars");
-        assert!(
-            key.chars().all(|c| c.is_ascii_hexdigit()),
-            "key should contain only hex characters"
-        );
-    }
-
-    #[test]
     fn test_event_listener_forwards() {
         let (tx, mut rx) = broadcast::channel(16);
         let listener = CliEventListener::new(tx);

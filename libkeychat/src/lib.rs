@@ -83,9 +83,9 @@ pub mod transport;
 
 pub use address::{AddressManager, AddressUpdate, DerivedAddress, PeerAddressState};
 pub use chat::{
-    create_signal_prekey_auth, handle_received_message, parse_and_route, receive_encrypted_message,
-    receive_encrypted_message_flexible, send_encrypted_message, verify_signal_prekey_auth,
-    MessageAction, MessageMetadata,
+    create_signal_prekey_auth, extract_p_tags, handle_received_message, parse_and_route,
+    receive_encrypted_message, receive_encrypted_message_flexible, send_encrypted_message,
+    verify_signal_prekey_auth, MessageAction, MessageMetadata,
 };
 pub use error::{KeychatError, Result};
 pub use friend_request::{

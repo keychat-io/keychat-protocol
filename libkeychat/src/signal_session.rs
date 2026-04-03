@@ -209,7 +209,12 @@ pub(crate) fn make_device_id(id: u32) -> DeviceId {
 pub struct SignalParticipant {
     address: ProtocolAddress,
     store: SignalProtocolStoreBundle,
-    keys: SignalPreKeyMaterial,
+    /// Pre-key material. Present during handshake (new sessions), absent after restore
+    /// (established sessions don't need prekeys — session state is in signal_sessions).
+    keys: Option<SignalPreKeyMaterial>,
+    /// Identity key pair + registration_id, always available (needed for encrypt/decrypt).
+    identity_key_pair: IdentityKeyPair,
+    registration_id: u32,
     tracked_peers: BTreeMap<String, ProtocolAddress>,
 }
 
@@ -260,10 +265,14 @@ impl SignalParticipant {
             Ok::<(), KeychatError>(())
         })?;
 
+        let identity_key_pair = keys.identity_key_pair;
+        let registration_id = keys.registration_id;
         Ok(Self {
             address: ProtocolAddress::new(name, make_device_id(device_id_val)),
             store,
-            keys,
+            keys: Some(keys),
+            identity_key_pair,
+            registration_id,
             tracked_peers: BTreeMap::new(),
         })
     }
@@ -307,10 +316,46 @@ impl SignalParticipant {
             "signal session created (persistent): name={}",
             &name[..16.min(name.len())]
         );
+        let identity_key_pair = keys.identity_key_pair;
+        let registration_id = keys.registration_id;
         Ok(Self {
             address: ProtocolAddress::new(name, make_device_id(device_id_val)),
             store,
-            keys,
+            keys: Some(keys),
+            identity_key_pair,
+            registration_id,
+            tracked_peers: BTreeMap::new(),
+        })
+    }
+
+    /// Restore a persistent participant from SQLCipher without prekey material.
+    ///
+    /// Used on restart for established sessions. Session state (ratchet keys, chain keys)
+    /// is loaded on demand from `signal_sessions` by `PersistentSessionStore::load_session()`.
+    /// No prekey injection needed — prekeys are only used during the initial handshake.
+    pub fn restore_persistent(
+        name: String,
+        device_id_val: u32,
+        identity_key_pair: IdentityKeyPair,
+        registration_id: u32,
+        storage: Arc<Mutex<SecureStorage>>,
+    ) -> Result<Self> {
+        let store = SignalProtocolStoreBundle::persistent(
+            storage,
+            identity_key_pair,
+            registration_id,
+        );
+
+        tracing::info!(
+            "signal session restored (persistent): name={}",
+            &name[..16.min(name.len())]
+        );
+        Ok(Self {
+            address: ProtocolAddress::new(name, make_device_id(device_id_val)),
+            store,
+            keys: None,
+            identity_key_pair,
+            registration_id,
             tracked_peers: BTreeMap::new(),
         })
     }
@@ -320,12 +365,16 @@ impl SignalParticipant {
     }
 
     /// Access to pre-key material for serialization/persistence.
-    pub fn keys(&self) -> &SignalPreKeyMaterial {
-        &self.keys
+    /// Returns None for restored sessions (prekeys are consumed after handshake).
+    pub fn keys(&self) -> Option<&SignalPreKeyMaterial> {
+        self.keys.as_ref()
     }
 
     pub fn prekey_bundle(&self) -> Result<PreKeyBundle> {
-        self.keys.build_prekey_bundle(self.address.device_id())
+        self.keys
+            .as_ref()
+            .ok_or_else(|| KeychatError::Signal("no prekey material (restored session)".into()))?
+            .build_prekey_bundle(self.address.device_id())
     }
 
     pub fn process_prekey_bundle(
@@ -512,7 +561,7 @@ impl SignalParticipant {
     }
 
     pub fn identity_public_key_hex(&self) -> String {
-        hex::encode(self.keys.identity_key_pair.identity_key().serialize())
+        hex::encode(self.identity_key_pair.identity_key().serialize())
     }
 
     /// Move a session record from one ProtocolAddress to another.
@@ -527,43 +576,49 @@ impl SignalParticipant {
     }
 
     pub fn registration_id(&self) -> u32 {
-        self.keys.registration_id
+        self.registration_id
     }
 
     pub fn signed_prekey_id(&self) -> u32 {
-        u32::from(self.keys.signed_prekey_id)
+        self.keys.as_ref().map(|k| u32::from(k.signed_prekey_id)).unwrap_or(0)
     }
 
     pub fn signed_prekey_public_hex(&self) -> Result<String> {
-        Ok(hex::encode(
-            self.keys.signed_prekey.public_key()?.serialize(),
-        ))
+        let keys = self.keys.as_ref()
+            .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
+        Ok(hex::encode(keys.signed_prekey.public_key()?.serialize()))
     }
 
     pub fn signed_prekey_signature_hex(&self) -> Result<String> {
-        Ok(hex::encode(self.keys.signed_prekey.signature()?))
+        let keys = self.keys.as_ref()
+            .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
+        Ok(hex::encode(keys.signed_prekey.signature()?))
     }
 
     pub fn prekey_id(&self) -> u32 {
-        u32::from(self.keys.prekey_id)
+        self.keys.as_ref().map(|k| u32::from(k.prekey_id)).unwrap_or(0)
     }
 
     pub fn prekey_public_hex(&self) -> Result<String> {
-        Ok(hex::encode(self.keys.prekey.public_key()?.serialize()))
+        let keys = self.keys.as_ref()
+            .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
+        Ok(hex::encode(keys.prekey.public_key()?.serialize()))
     }
 
     pub fn kyber_prekey_id(&self) -> u32 {
-        u32::from(self.keys.kyber_prekey_id)
+        self.keys.as_ref().map(|k| u32::from(k.kyber_prekey_id)).unwrap_or(0)
     }
 
     pub fn kyber_prekey_public_hex(&self) -> Result<String> {
-        Ok(hex::encode(
-            self.keys.kyber_prekey.public_key()?.serialize(),
-        ))
+        let keys = self.keys.as_ref()
+            .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
+        Ok(hex::encode(keys.kyber_prekey.public_key()?.serialize()))
     }
 
     pub fn kyber_prekey_signature_hex(&self) -> Result<String> {
-        Ok(hex::encode(self.keys.kyber_prekey.signature()?))
+        let keys = self.keys.as_ref()
+            .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
+        Ok(hex::encode(keys.kyber_prekey.signature()?))
     }
 
     pub fn bob_addresses(&self) -> BTreeMap<String, String> {
@@ -606,9 +661,12 @@ impl SignalParticipant {
         };
 
         // Get signed pre-key private key (was the initial sender chain)
+        let keys = match self.keys.as_ref() {
+            Some(k) => k,
+            None => return Ok(None), // Restored session: no prekey material available
+        };
         let mut signed_priv = hex::encode(
-            self.keys
-                .signed_prekey
+            keys.signed_prekey
                 .private_key()
                 .map_err(|e| KeychatError::Signal(format!("signed prekey private: {e}")))?
                 .serialize(),

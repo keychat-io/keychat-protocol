@@ -102,8 +102,8 @@ impl KeychatClient {
         name: String,
         members: Vec<GroupMemberInput>,
     ) -> Result<SignalGroupInfo, KeychatUniError> {
-        // I-15: Collect all data under read lock, then drop before async work
-        let (my_nostr_pubkey, my_signal_id, other_members, member_sessions) = {
+        // Collect data under read lock, clone session Arc, then drop lock before await
+        let (my_nostr_pubkey, first_session_arc, other_members, member_sessions) = {
             let inner = self.inner.read().await;
 
             let identity = inner
@@ -114,15 +114,8 @@ impl KeychatClient {
                 })?;
             let my_nostr_pubkey = identity.pubkey_hex();
 
-            let my_signal_id = if let Some(session_mutex) = inner.sessions.values().next() {
-                let session = session_mutex.lock().await;
-                session.signal.identity_public_key_hex()
-            } else {
-                tracing::warn!(
-                    "create_signal_group: no sessions available, using nostr pubkey as signal_id"
-                );
-                my_nostr_pubkey.clone()
-            };
+            // Clone the Arc so we can drop the read lock before awaiting the session mutex
+            let first_session_arc = inner.sessions.values().next().cloned();
 
             let mut other_members = Vec::new();
             let mut member_sessions = Vec::new();
@@ -151,11 +144,22 @@ impl KeychatClient {
 
             (
                 my_nostr_pubkey,
-                my_signal_id,
+                first_session_arc,
                 other_members,
                 member_sessions,
             )
         }; // read lock dropped
+
+        // Await session mutex outside the read lock to avoid holding it across await
+        let my_signal_id = if let Some(session_mutex) = first_session_arc {
+            let session = session_mutex.lock().await;
+            session.signal.identity_public_key_hex()
+        } else {
+            tracing::warn!(
+                "create_signal_group: no sessions available, using nostr pubkey as signal_id"
+            );
+            my_nostr_pubkey.clone()
+        };
 
         let group =
             create_signal_group(&name, &my_signal_id, &my_nostr_pubkey, "Me", other_members);
@@ -466,11 +470,7 @@ impl KeychatClient {
                 })?;
             let connected = transport.connected_relays().await;
 
-            let identity_pubkey = inner
-                .identity
-                .as_ref()
-                .map(|id| id.pubkey_hex())
-                .unwrap_or_default();
+            let identity_pubkey = self.cached_identity_pubkey();
 
             (group, identity_pubkey, connected)
         };

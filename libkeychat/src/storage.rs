@@ -106,7 +106,7 @@ impl SecureStorage {
     }
 
     /// Schema version. Increment when adding a new migration.
-    const SCHEMA_VERSION: u32 = 3;
+    const SCHEMA_VERSION: u32 = 4;
 
     /// Run all pending migrations sequentially.
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -127,6 +127,9 @@ impl SecureStorage {
         }
         if current < 3 {
             Self::migrate_v2_to_v3(conn)?;
+        }
+        if current < 4 {
+            Self::migrate_v3_to_v4(conn)?;
         }
         Ok(())
     }
@@ -294,6 +297,45 @@ impl SecureStorage {
         conn.pragma_update(None, "user_version", 3)
             .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
         tracing::info!("migration v2 → v3 complete");
+        Ok(())
+    }
+
+    /// V3 → V4: Create device_identity table (per-device, not per-peer).
+    /// Migrate identity data from the first signal_participants row if present.
+    fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+        tracing::info!("running migration v3 → v4: add device_identity table");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS device_identity (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                identity_public BLOB NOT NULL,
+                identity_private BLOB NOT NULL,
+                registration_id INTEGER NOT NULL
+            );",
+        )
+        .map_err(|e| KeychatError::Storage(format!("create device_identity: {e}")))?;
+
+        // Migrate from the first signal_participants row if the table has data.
+        let rows_inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO device_identity (id, identity_public, identity_private, registration_id)
+                 SELECT 1, identity_public, identity_private, registration_id
+                 FROM signal_participants LIMIT 1",
+                [],
+            )
+            .map_err(|e| KeychatError::Storage(format!("migrate device_identity: {e}")))?;
+        if rows_inserted > 0 {
+            tracing::info!("migrated device identity from signal_participants");
+        }
+
+        // Zero out one-time prekey material in existing rows to restore forward secrecy.
+        // These prekeys were already consumed by the handshake; keeping them is a security risk.
+        let _ = conn.execute_batch(
+            "UPDATE signal_participants SET prekey_record = X'', kyber_prekey_record = X'', prekey_id = 0, kyber_prekey_id = 0;"
+        );
+
+        conn.pragma_update(None, "user_version", 4)
+            .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
+        tracing::info!("migration v3 → v4 complete");
         Ok(())
     }
 
@@ -730,6 +772,48 @@ impl SecureStorage {
                 .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
         }
         Ok(results)
+    }
+
+    // ─── Device Identity (per-device, not per-peer) ───────
+
+    /// Save the device-level Signal identity key pair.
+    /// There is exactly one identity per device — this is NOT per-peer.
+    pub fn save_device_identity(
+        &self,
+        identity_public: &[u8],
+        identity_private: &[u8],
+        registration_id: u32,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO device_identity (id, identity_public, identity_private, registration_id) \
+                 VALUES (1, ?1, ?2, ?3)",
+                rusqlite::params![identity_public, identity_private, registration_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("save_device_identity: {e}")))?;
+        Ok(())
+    }
+
+    /// Load the device-level Signal identity key pair.
+    /// Returns (identity_public, identity_private, registration_id) or None if not yet saved.
+    pub fn load_device_identity(&self) -> Result<Option<(Vec<u8>, Vec<u8>, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT identity_public, identity_private, registration_id FROM device_identity WHERE id = 1")
+            .map_err(|e| KeychatError::Storage(format!("prepare load_device_identity: {e}")))?;
+
+        let result = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| KeychatError::Storage(format!("load_device_identity: {e}")))?;
+
+        Ok(result)
     }
 
     // ─── Signal Participant Key Material ────────────────────
@@ -1845,7 +1929,7 @@ mod tests {
             SignalParticipant::from_prekey_material("test-peer".to_string(), 1, keys).unwrap();
 
         // 2. Serialize and save to DB
-        let serialized = crate::signal_session::serialize_prekey_material(participant.keys());
+        let serialized = crate::signal_session::serialize_prekey_material(participant.keys().unwrap());
         let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
             serialized.unwrap();
 
@@ -2124,6 +2208,313 @@ mod tests {
         // Delete non-existent
         store.delete_inbound_fr("fr-999").unwrap();
         assert_eq!(store.list_inbound_frs().unwrap().len(), 1);
+    }
+
+    // ─── device_identity tests ───────────────────────────────────────
+
+    #[test]
+    fn test_device_identity_save_and_load() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Initially empty
+        let loaded = store.load_device_identity().unwrap();
+        assert!(loaded.is_none(), "device_identity should be empty on fresh DB");
+
+        // Save
+        let pub_key = b"test-public-key-bytes-32-chars!!";
+        let priv_key = b"test-private-key-bytes-32chars!!";
+        let reg_id = 42u32;
+        store.save_device_identity(pub_key, priv_key, reg_id).unwrap();
+
+        // Load back
+        let (loaded_pub, loaded_priv, loaded_reg) =
+            store.load_device_identity().unwrap().expect("should exist after save");
+        assert_eq!(loaded_pub, pub_key.to_vec());
+        assert_eq!(loaded_priv, priv_key.to_vec());
+        assert_eq!(loaded_reg, reg_id);
+    }
+
+    #[test]
+    fn test_device_identity_is_singleton() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Save first identity
+        store.save_device_identity(b"pub-1", b"priv-1", 100).unwrap();
+
+        // Overwrite with second
+        store.save_device_identity(b"pub-2", b"priv-2", 200).unwrap();
+
+        // Should only have the second
+        let (pub_key, priv_key, reg_id) =
+            store.load_device_identity().unwrap().expect("should exist");
+        assert_eq!(pub_key, b"pub-2".to_vec());
+        assert_eq!(priv_key, b"priv-2".to_vec());
+        assert_eq!(reg_id, 200);
+    }
+
+    #[test]
+    fn test_device_identity_migration_from_signal_participants() {
+        // Simulate a v3 database: create manually without running v3→v4 migration
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migrate_test.db");
+        let path_str = path.to_str().unwrap();
+
+        // Create a v3 DB with signal_participants data
+        {
+            let conn = rusqlite::Connection::open(path_str).unwrap();
+            conn.pragma_update(None, "key", TEST_KEY).unwrap();
+            conn.execute_batch("PRAGMA cipher_page_size = 4096; PRAGMA journal_mode = WAL;").unwrap();
+            // Run v0→v1 manually (creates signal_participants table)
+            SecureStorage::migrate_v0_to_v1(&conn).unwrap();
+            SecureStorage::migrate_v1_to_v2(&conn).unwrap();
+            SecureStorage::migrate_v2_to_v3(&conn).unwrap();
+            // Now at v3. Insert a signal_participant row.
+            conn.execute(
+                "INSERT INTO signal_participants (peer_signal_id, device_id, identity_public, identity_private, registration_id, signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record)
+                 VALUES ('peer-1', 1, X'AABB', X'CCDD', 999, 1, X'EE', 2, X'FF', 3, X'11')",
+                [],
+            ).unwrap();
+        }
+
+        // Reopen — this should run v3→v4 migration automatically
+        let store = SecureStorage::open(path_str, TEST_KEY).unwrap();
+
+        // device_identity should be populated from signal_participants
+        let (pub_key, priv_key, reg_id) =
+            store.load_device_identity().unwrap().expect("migration should populate device_identity");
+        assert_eq!(pub_key, vec![0xAA, 0xBB]);
+        assert_eq!(priv_key, vec![0xCC, 0xDD]);
+        assert_eq!(reg_id, 999);
+
+        // prekey_record and kyber_prekey_record should be zeroed
+        let (_, _, _, _, _, _, _, pk_rec, _, kpk_rec) =
+            store.load_signal_participant("peer-1").unwrap().expect("participant should exist");
+        assert!(pk_rec.is_empty(), "prekey_record should be zeroed after migration");
+        assert!(kpk_rec.is_empty(), "kyber_prekey_record should be zeroed after migration");
+    }
+
+    #[test]
+    fn test_device_identity_migration_empty_participants() {
+        // If signal_participants is empty, device_identity should remain empty
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migrate_empty.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = rusqlite::Connection::open(path_str).unwrap();
+            conn.pragma_update(None, "key", TEST_KEY).unwrap();
+            conn.execute_batch("PRAGMA cipher_page_size = 4096; PRAGMA journal_mode = WAL;").unwrap();
+            SecureStorage::migrate_v0_to_v1(&conn).unwrap();
+            SecureStorage::migrate_v1_to_v2(&conn).unwrap();
+            SecureStorage::migrate_v2_to_v3(&conn).unwrap();
+            // No participants inserted
+        }
+
+        let store = SecureStorage::open(path_str, TEST_KEY).unwrap();
+        let loaded = store.load_device_identity().unwrap();
+        assert!(loaded.is_none(), "device_identity should be empty when no participants exist");
+    }
+
+    // ─── prekey zeroing tests ────���───────────────────────────────────
+
+    #[test]
+    fn test_save_signal_participant_with_zeroed_prekeys() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Save with zeroed prekey and kyber_prekey
+        store.save_signal_participant(
+            "peer-zeroed",
+            1,
+            b"id-pub", b"id-priv",
+            42,
+            10, b"signed-prekey-record",
+            20, &[],  // prekey: zeroed
+            30, &[],  // kyber: zeroed
+        ).unwrap();
+
+        // Load back and verify prekeys are empty
+        let (device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+            store.load_signal_participant("peer-zeroed").unwrap().expect("should exist");
+
+        assert_eq!(device_id, 1);
+        assert_eq!(id_pub, b"id-pub".to_vec());
+        assert_eq!(id_priv, b"id-priv".to_vec());
+        assert_eq!(reg_id, 42);
+        assert_eq!(spk_id, 10);
+        assert_eq!(spk_rec, b"signed-prekey-record".to_vec());
+        assert_eq!(pk_id, 20);
+        assert!(pk_rec.is_empty(), "prekey_record must be empty");
+        assert_eq!(kpk_id, 30);
+        assert!(kpk_rec.is_empty(), "kyber_prekey_record must be empty");
+    }
+
+    // ─── restore_persistent tests ───────���────────────────────────────
+
+    #[test]
+    fn test_restore_persistent_no_prekey_injection() {
+        use crate::signal_session::{generate_prekey_material, SignalParticipant};
+        use std::sync::{Arc, Mutex};
+
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+        let storage = Arc::new(Mutex::new(store));
+
+        // 1. Create a fresh participant (simulating initial handshake)
+        let keys = generate_prekey_material().unwrap();
+        let identity_key_pair = keys.identity_key_pair;
+        let registration_id = keys.registration_id;
+        let participant = SignalParticipant::persistent(
+            "alice".into(), 1, keys, storage.clone(),
+        ).unwrap();
+
+        // Verify the new participant has prekey material
+        assert!(participant.keys().is_some(), "new participant should have prekey material");
+
+        // 2. Restore the same participant without prekey material
+        let restored = SignalParticipant::restore_persistent(
+            "alice".into(), 1,
+            identity_key_pair,
+            registration_id,
+            storage.clone(),
+        ).unwrap();
+
+        // Verify restored participant does NOT have prekey material
+        assert!(restored.keys().is_none(), "restored participant must not have prekey material");
+
+        // But should still have identity info
+        assert_eq!(
+            restored.identity_public_key_hex(),
+            participant.identity_public_key_hex(),
+            "identity key must match"
+        );
+        assert_eq!(
+            restored.registration_id(),
+            participant.registration_id(),
+            "registration_id must match"
+        );
+    }
+
+    #[test]
+    fn test_restore_persistent_encrypt_decrypt_roundtrip() {
+        use crate::signal_session::{generate_prekey_material, SignalParticipant};
+        use libsignal_protocol::{DeviceId, ProtocolAddress};
+        use std::sync::{Arc, Mutex};
+
+        let store_a = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+        let store_b = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+        let storage_a = Arc::new(Mutex::new(store_a));
+        let storage_b = Arc::new(Mutex::new(store_b));
+
+        // 1. Create Alice and Bob with persistent storage
+        let keys_a = generate_prekey_material().unwrap();
+        let keys_b = generate_prekey_material().unwrap();
+        let ikp_a = keys_a.identity_key_pair;
+        let reg_a = keys_a.registration_id;
+        let ikp_b = keys_b.identity_key_pair;
+        let reg_b = keys_b.registration_id;
+
+        let mut alice = SignalParticipant::persistent("alice".into(), 1, keys_a, storage_a.clone()).unwrap();
+        let mut bob = SignalParticipant::persistent("bob".into(), 1, keys_b, storage_b.clone()).unwrap();
+
+        let alice_id = alice.identity_public_key_hex();
+        let bob_id = bob.identity_public_key_hex();
+        let bob_addr = ProtocolAddress::new(bob_id.clone(), DeviceId::new(1).unwrap());
+        let alice_addr = ProtocolAddress::new(alice_id.clone(), DeviceId::new(1).unwrap());
+
+        // 2. Establish session: Alice → Bob
+        let bob_bundle = bob.prekey_bundle().unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
+        let ct1 = alice.encrypt_bytes(&bob_addr, b"hello bob").unwrap();
+        let pt1 = bob.decrypt_bytes(&alice_addr, &ct1).unwrap();
+        assert_eq!(pt1, b"hello bob");
+
+        // Bob → Alice (complete ratchet)
+        let ct2 = bob.encrypt_bytes(&alice_addr, b"hello alice").unwrap();
+        let pt2 = alice.decrypt_bytes(&bob_addr, &ct2).unwrap();
+        assert_eq!(pt2, b"hello alice");
+
+        // 3. Now "restart": restore Alice and Bob using restore_persistent (no prekeys)
+        let mut alice_restored = SignalParticipant::restore_persistent(
+            "alice".into(), 1, ikp_a, reg_a, storage_a.clone(),
+        ).unwrap();
+        let mut bob_restored = SignalParticipant::restore_persistent(
+            "bob".into(), 1, ikp_b, reg_b, storage_b.clone(),
+        ).unwrap();
+
+        // 4. Verify they can still communicate
+        let ct3 = alice_restored.encrypt_bytes(&bob_addr, b"after restart").unwrap();
+        let pt3 = bob_restored.decrypt_bytes(&alice_addr, &ct3).unwrap();
+        assert_eq!(pt3, b"after restart", "decrypt must work after restore_persistent");
+
+        let ct4 = bob_restored.encrypt_bytes(&alice_addr, b"also works").unwrap();
+        let pt4 = alice_restored.decrypt_bytes(&bob_addr, &ct4).unwrap();
+        assert_eq!(pt4, b"also works", "bidirectional decrypt must work after restore");
+
+        // 5. Verify prekey_bundle fails on restored participant (no prekeys)
+        assert!(
+            alice_restored.prekey_bundle().is_err(),
+            "restored participant must not be able to produce prekey bundles"
+        );
+    }
+
+    #[test]
+    fn test_restore_persistent_multi_ratchet_roundtrip() {
+        use crate::signal_session::{generate_prekey_material, SignalParticipant};
+        use libsignal_protocol::{DeviceId, ProtocolAddress};
+        use std::sync::{Arc, Mutex};
+
+        let store_a = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+        let store_b = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+        let storage_a = Arc::new(Mutex::new(store_a));
+        let storage_b = Arc::new(Mutex::new(store_b));
+
+        let keys_a = generate_prekey_material().unwrap();
+        let keys_b = generate_prekey_material().unwrap();
+        let ikp_a = keys_a.identity_key_pair;
+        let reg_a = keys_a.registration_id;
+        let ikp_b = keys_b.identity_key_pair;
+        let reg_b = keys_b.registration_id;
+
+        let mut alice = SignalParticipant::persistent("alice".into(), 1, keys_a, storage_a.clone()).unwrap();
+        let mut bob = SignalParticipant::persistent("bob".into(), 1, keys_b, storage_b.clone()).unwrap();
+
+        let alice_id = alice.identity_public_key_hex();
+        let bob_id = bob.identity_public_key_hex();
+        let bob_addr = ProtocolAddress::new(bob_id.clone(), DeviceId::new(1).unwrap());
+        let alice_addr = ProtocolAddress::new(alice_id.clone(), DeviceId::new(1).unwrap());
+
+        // Establish session
+        let bob_bundle = bob.prekey_bundle().unwrap();
+        alice.process_prekey_bundle(&bob_addr, &bob_bundle).unwrap();
+
+        // Advance ratchet multiple times (alternating senders)
+        for i in 0..10 {
+            let msg = format!("msg-{i}-a2b");
+            let ct = alice.encrypt_bytes(&bob_addr, msg.as_bytes()).unwrap();
+            let pt = bob.decrypt_bytes(&alice_addr, &ct).unwrap();
+            assert_eq!(pt, msg.as_bytes());
+
+            let msg = format!("msg-{i}-b2a");
+            let ct = bob.encrypt_bytes(&alice_addr, msg.as_bytes()).unwrap();
+            let pt = alice.decrypt_bytes(&bob_addr, &ct).unwrap();
+            assert_eq!(pt, msg.as_bytes());
+        }
+
+        // Restart both
+        let mut alice2 = SignalParticipant::restore_persistent(
+            "alice".into(), 1, ikp_a, reg_a, storage_a.clone(),
+        ).unwrap();
+        let mut bob2 = SignalParticipant::restore_persistent(
+            "bob".into(), 1, ikp_b, reg_b, storage_b.clone(),
+        ).unwrap();
+
+        // Continue communication after 10 ratchet advances + restart
+        let ct = alice2.encrypt_bytes(&bob_addr, b"post-restart-multi").unwrap();
+        let pt = bob2.decrypt_bytes(&alice_addr, &ct).unwrap();
+        assert_eq!(pt, b"post-restart-multi");
+
+        let ct = bob2.encrypt_bytes(&alice_addr, b"reply-post-restart").unwrap();
+        let pt = alice2.decrypt_bytes(&bob_addr, &ct).unwrap();
+        assert_eq!(pt, b"reply-post-restart");
     }
 
 }

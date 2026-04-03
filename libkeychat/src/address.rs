@@ -1091,4 +1091,126 @@ mod tests {
         let result = mgr.on_decrypt("unknown", None, None);
         assert!(result.is_err());
     }
+
+    // ─── Reverse index rebuild from serialized state ─────────────────
+
+    #[test]
+    fn receiving_addresses_survive_serialize_roundtrip() {
+        // This tests the exact code path used by restore_sessions():
+        // 1. Build AddressManager with addresses
+        // 2. Serialize to PeerAddressStateSerialized
+        // 3. Rebuild from serialized state
+        // 4. Verify receiving addresses are the same
+        let mut mgr = AddressManager::new();
+        mgr.add_peer("peer-A", Some("inbox-A".into()), None);
+
+        let (mut alice, mut bob, alice_addr, bob_addr) = setup_session();
+        let r1 = alice.encrypt(&bob_addr, b"setup").unwrap();
+        bob.decrypt(&alice_addr, &r1.bytes).unwrap();
+
+        if let Some(ref sa) = r1.sender_address {
+            mgr.on_encrypt("peer-A", Some(sa)).unwrap();
+        }
+
+        let addrs_before = mgr.get_all_receiving_address_strings();
+        assert!(!addrs_before.is_empty(), "should have receiving addresses");
+
+        // Serialize and rebuild
+        let serialized = mgr.to_serialized("peer-A").expect("serialization should succeed");
+        let mgr2 = AddressManager::from_serialized("peer-A", serialized);
+        let addrs_after = mgr2.get_all_receiving_address_strings();
+
+        assert_eq!(
+            addrs_before, addrs_after,
+            "receiving addresses must survive serialize/deserialize roundtrip"
+        );
+    }
+
+    #[test]
+    fn reverse_index_build_from_addresses() {
+        // Simulate what restore_sessions does: build a HashMap from address strings
+        use std::collections::HashMap;
+
+        let mut mgr = AddressManager::new();
+        mgr.add_peer("peer-X", Some("inbox-X".into()), None);
+        mgr.add_peer("peer-Y", Some("inbox-Y".into()), None);
+
+        let (mut alice, mut bob, alice_addr, bob_addr) = setup_session();
+        let r1 = alice.encrypt(&bob_addr, b"m1").unwrap();
+        bob.decrypt(&alice_addr, &r1.bytes).unwrap();
+
+        if let Some(ref sa) = r1.sender_address {
+            mgr.on_encrypt("peer-X", Some(sa)).unwrap();
+        }
+
+        // Build reverse index (same as restore_sessions does)
+        let mut reverse_index: HashMap<String, String> = HashMap::new();
+        for addr in mgr.get_all_receiving_address_strings() {
+            reverse_index.insert(addr, "peer-X".into());
+        }
+
+        // Verify each address maps to the correct peer
+        for addr in mgr.get_all_receiving_address_strings() {
+            assert_eq!(
+                reverse_index.get(&addr).map(|s| s.as_str()),
+                Some("peer-X"),
+                "reverse index should map address to correct peer"
+            );
+        }
+
+        // Verify an unknown address doesn't match
+        assert!(
+            reverse_index.get("unknown-address-hex").is_none(),
+            "unknown address should not be in reverse index"
+        );
+    }
+
+    #[test]
+    fn reverse_index_updates_after_address_rotation() {
+        // Test that after on_encrypt/on_decrypt, the addr_update contains
+        // the new addresses that need to be added to the reverse index
+        use std::collections::HashMap;
+
+        let mut mgr = AddressManager::new();
+        mgr.add_peer("peer-Z", None, None);
+
+        let (mut alice, mut bob, alice_addr, bob_addr) = setup_session();
+
+        // First encrypt: generates initial receiving address
+        let r1 = alice.encrypt(&bob_addr, b"m1").unwrap();
+        bob.decrypt(&alice_addr, &r1.bytes).unwrap();
+        let update1 = mgr.on_encrypt("peer-Z", r1.sender_address.as_deref()).unwrap();
+
+        let mut reverse_index: HashMap<String, String> = HashMap::new();
+        for addr in &update1.new_receiving {
+            reverse_index.insert(addr.clone(), "peer-Z".into());
+        }
+        assert!(!reverse_index.is_empty(), "first encrypt should produce new receiving addresses");
+
+        // Second round: bob replies, alice on_decrypt
+        let r2 = bob.encrypt(&alice_addr, b"m2").unwrap();
+        let d2 = alice.decrypt(&bob_addr, &r2.bytes).unwrap();
+        let update2 = mgr.on_decrypt(
+            "peer-Z",
+            d2.bob_derived_address.as_deref(),
+            d2.alice_addrs.as_deref(),
+        ).unwrap();
+
+        // Apply update to reverse index
+        for addr in &update2.new_receiving {
+            reverse_index.insert(addr.clone(), "peer-Z".into());
+        }
+        for addr in &update2.dropped_receiving {
+            reverse_index.remove(addr);
+        }
+
+        // All current addresses should be in the index
+        let current_addrs = mgr.get_all_receiving_address_strings();
+        for addr in &current_addrs {
+            assert!(
+                reverse_index.contains_key(addr),
+                "current address {addr} should be in reverse index after rotation"
+            );
+        }
+    }
 }

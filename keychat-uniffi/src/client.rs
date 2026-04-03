@@ -46,6 +46,8 @@ pub(crate) struct ClientInner {
     pub app_storage: Arc<std::sync::Mutex<AppStorage>>,
     pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
     pub peer_nostr_to_signal: HashMap<String, String>,
+    /// Reverse index: receiving_address_hex → peer_signal_id for O(1) message routing.
+    pub receiving_addr_to_peer: HashMap<String, String>,
     pub pending_outbound: HashMap<String, FriendRequestState>,
     pub group_manager: GroupManager,
     pub next_signal_device_id: u32,
@@ -66,6 +68,8 @@ pub struct KeychatClient {
     /// Base directory for file storage: {app_support}/files/
     pub(crate) files_dir: String,
     pub(crate) relay_tracker: std::sync::Mutex<RelaySendTracker>,
+    /// Cached identity pubkey hex — set once in import_identity(), never changes.
+    pub(crate) identity_pubkey_hex: tokio::sync::OnceCell<String>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -123,6 +127,7 @@ impl KeychatClient {
                 app_storage: Arc::new(std::sync::Mutex::new(app_storage)),
                 sessions: HashMap::new(),
                 peer_nostr_to_signal: HashMap::new(),
+                receiving_addr_to_peer: HashMap::new(),
                 pending_outbound: HashMap::new(),
                 group_manager: GroupManager::new(),
                 next_signal_device_id: 1,
@@ -137,6 +142,7 @@ impl KeychatClient {
             db_path,
             files_dir,
             relay_tracker: std::sync::Mutex::new(RelaySendTracker::new()),
+            identity_pubkey_hex: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -210,10 +216,12 @@ impl KeychatClient {
 
     /// Get the files directory for a specific room.
     pub fn get_room_files_dir(&self, room_id: String) -> String {
-        std::path::Path::new(&self.files_dir)
-            .join(&room_id)
-            .to_string_lossy()
-            .to_string()
+        // Sanitize room_id to prevent path traversal
+        let sanitized: String = room_id
+            .replace(['/', '\\'], "_")
+            .replace("..", "__");
+        let path = std::path::Path::new(&self.files_dir).join(&sanitized);
+        path.to_string_lossy().to_string()
     }
 
     // ─── Media Upload/Download (delegates to free functions, runs in client's runtime) ──
@@ -373,6 +381,8 @@ impl KeychatClient {
         inner.identity = Some(result.identity);
         tracing::info!("identity created: {}", &pubkey_hex[..16]);
 
+        let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
+
         Ok(CreateIdentityResult {
             pubkey_hex,
             mnemonic,
@@ -390,7 +400,18 @@ impl KeychatClient {
         inner.identity = Some(identity);
         tracing::info!("identity imported: {}", &pubkey_hex[..16]);
 
+        // Cache identity pubkey — immutable after import.
+        let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
+
         Ok(pubkey_hex)
+    }
+
+    /// Return the cached identity pubkey hex, or empty string if not yet imported.
+    pub(crate) fn cached_identity_pubkey(&self) -> String {
+        self.identity_pubkey_hex
+            .get()
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Debug: return a summary of stored state in the database + in-memory.
@@ -438,6 +459,11 @@ impl KeychatClient {
 
     /// Restore all persisted sessions and pending friend requests from SQLCipher.
     /// Must be called after import_identity() and before connect().
+    ///
+    /// Sessions are restored using `SignalParticipant::restore_persistent()` which
+    /// only sets up the persistent store bundle pointing to the DB. Session records
+    /// (ratchet state, chain keys) are loaded on demand by libsignal's
+    /// `PersistentSessionStore::load_session()` — no prekey re-injection needed.
     pub async fn restore_sessions(&self) -> Result<u32, KeychatUniError> {
         let mut inner = self.inner.write().await;
         let identity = inner
@@ -456,164 +482,69 @@ impl KeychatClient {
         let mut max_device_id: u32 = 0;
 
         // ── Phase 1: Read all data from DB while holding the lock ──
-        let peers;
-        let peer_ids;
-        let all_addresses;
-        let fr_ids;
 
-        // Loaded participant data: (peer_signal_id, device_id, serialized fields...)
-        type ParticipantRow = (
-            String,
-            u32,
-            Vec<u8>,
-            Vec<u8>,
-            u32,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-        );
-        let mut participant_rows: Vec<ParticipantRow> = Vec::new();
+        // Participant identity data: (peer_signal_id, device_id, identity_public, identity_private, registration_id)
+        type ParticipantIdentity = (String, u32, Vec<u8>, Vec<u8>, u32);
+        let mut participant_rows: Vec<ParticipantIdentity> = Vec::new();
 
-        // Loaded pending FR data
+        // Pending FR data (still needs full prekey material — handshake not complete)
         type FrRow = (
-            String,
-            u32,
-            Vec<u8>,
-            Vec<u8>,
-            u32,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-            String,
-            String,
+            String, u32, Vec<u8>, Vec<u8>, u32,
+            u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>,
+            String, String,
         );
         let mut fr_rows: Vec<FrRow> = Vec::new();
 
-        {
-            peers = store.list_peers().map_err(|e| {
-                tracing::error!("restore: list_peers failed: {e}");
-                KeychatUniError::Storage {
-                    msg: format!("list_peers: {e}"),
-                }
-            })?;
-            peer_ids = store.list_signal_participants().map_err(|e| {
-                tracing::error!("restore: list_signal_participants failed: {e}");
-                KeychatUniError::Storage {
-                    msg: format!("list_signal_participants: {e}"),
-                }
-            })?;
-            all_addresses = store.load_all_peer_addresses().map_err(|e| {
-                tracing::error!("restore: load_all_peer_addresses failed: {e}");
-                KeychatUniError::Storage {
-                    msg: format!("load_all_peer_addresses: {e}"),
-                }
-            })?;
-            fr_ids = store.list_pending_frs().map_err(|e| {
-                tracing::error!("restore: list_pending_frs failed: {e}");
-                KeychatUniError::Storage {
-                    msg: format!("list_pending_frs: {e}"),
-                }
-            })?;
-            tracing::info!(
-                "RESTORE-V2: peers={} participants={} addresses={} frs={}",
-                peers.len(),
-                peer_ids.len(),
-                all_addresses.len(),
-                fr_ids.len()
-            );
+        let peers = store.list_peers().map_err(|e| {
+            tracing::error!("restore: list_peers failed: {e}");
+            KeychatUniError::Storage { msg: format!("list_peers: {e}") }
+        })?;
+        let peer_ids = store.list_signal_participants().map_err(|e| {
+            tracing::error!("restore: list_signal_participants failed: {e}");
+            KeychatUniError::Storage { msg: format!("list_signal_participants: {e}") }
+        })?;
+        let all_addresses = store.load_all_peer_addresses().map_err(|e| {
+            tracing::error!("restore: load_all_peer_addresses failed: {e}");
+            KeychatUniError::Storage { msg: format!("load_all_peer_addresses: {e}") }
+        })?;
+        let fr_ids = store.list_pending_frs().map_err(|e| {
+            tracing::error!("restore: list_pending_frs failed: {e}");
+            KeychatUniError::Storage { msg: format!("list_pending_frs: {e}") }
+        })?;
+        tracing::info!(
+            "RESTORE-V3: peers={} participants={} addresses={} frs={}",
+            peers.len(), peer_ids.len(), all_addresses.len(), fr_ids.len()
+        );
 
-            for peer_signal_id in &peer_ids {
-                match store.load_signal_participant(peer_signal_id) {
-                    Ok(Some((
-                        device_id,
-                        id_pub,
-                        id_priv,
-                        reg_id,
-                        spk_id,
-                        spk_rec,
-                        pk_id,
-                        pk_rec,
-                        kpk_id,
-                        kpk_rec,
-                    ))) => {
-                        participant_rows.push((
-                            peer_signal_id.clone(),
-                            device_id,
-                            id_pub,
-                            id_priv,
-                            reg_id,
-                            spk_id,
-                            spk_rec,
-                            pk_id,
-                            pk_rec,
-                            kpk_id,
-                            kpk_rec,
-                        ));
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            "restore: no data for participant {}",
-                            &peer_signal_id[..16.min(peer_signal_id.len())]
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "restore: load participant {} failed: {e}",
-                            &peer_signal_id[..16.min(peer_signal_id.len())]
-                        );
-                    }
+        // Load only identity key pair + registration_id per peer (no prekey material)
+        for peer_signal_id in &peer_ids {
+            match store.load_signal_participant(peer_signal_id) {
+                Ok(Some((device_id, id_pub, id_priv, reg_id, _spk_id, _spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec))) => {
+                    participant_rows.push((peer_signal_id.clone(), device_id, id_pub, id_priv, reg_id));
                 }
-            }
-
-            for fr_id in &fr_ids {
-                match store.load_pending_fr(fr_id) {
-                    Ok(Some((
-                        device_id,
-                        id_pub,
-                        id_priv,
-                        reg_id,
-                        spk_id,
-                        spk_rec,
-                        pk_id,
-                        pk_rec,
-                        kpk_id,
-                        kpk_rec,
-                        first_inbox_secret,
-                        peer_nostr_pubkey,
-                    ))) => {
-                        fr_rows.push((
-                            fr_id.clone(),
-                            device_id,
-                            id_pub,
-                            id_priv,
-                            reg_id,
-                            spk_id,
-                            spk_rec,
-                            pk_id,
-                            pk_rec,
-                            kpk_id,
-                            kpk_rec,
-                            first_inbox_secret,
-                            peer_nostr_pubkey,
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            "restore pending FR {} failed: {e}",
-                            &fr_id[..16.min(fr_id.len())]
-                        );
-                    }
+                Ok(None) => {
+                    tracing::warn!("restore: no data for participant {}", &peer_signal_id[..16.min(peer_signal_id.len())]);
+                }
+                Err(e) => {
+                    tracing::error!("restore: load participant {} failed: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
                 }
             }
         }
-        // ── Drop the Mutex guard so SignalParticipant::persistent can lock it ──
+
+        // Pending FRs still need full prekey material (handshake not complete)
+        for fr_id in &fr_ids {
+            match store.load_pending_fr(fr_id) {
+                Ok(Some((device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey))) => {
+                    fr_rows.push((fr_id.clone(), device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("restore pending FR {} failed: {e}", &fr_id[..16.min(fr_id.len())]);
+                }
+            }
+        }
+
+        // ── Drop the Mutex guard so restore_persistent can lock it ──
         drop(store);
 
         // ── Phase 2: Reconstruct objects (may lock storage internally) ──
@@ -628,53 +559,43 @@ impl KeychatClient {
             tracing::info!("restored {} peer mappings", peers.len());
         }
 
-        // 2. Restore active sessions
+        // 2. Restore active sessions using restore_persistent (no prekey re-injection)
         let addr_map: HashMap<String, _> = all_addresses.into_iter().collect();
 
-        for (
-            peer_signal_id,
-            device_id,
-            id_pub,
-            id_priv,
-            reg_id,
-            spk_id,
-            spk_rec,
-            pk_id,
-            pk_rec,
-            kpk_id,
-            kpk_rec,
-        ) in participant_rows
-        {
+        for (peer_signal_id, device_id, id_pub, id_priv, reg_id) in participant_rows {
             if device_id > max_device_id {
                 max_device_id = device_id;
             }
 
-            let keys = match reconstruct_prekey_material(
-                &id_pub, &id_priv, reg_id, spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
-            ) {
+            // Reconstruct only the identity key pair (needed for the identity store)
+            let identity_key = match libkeychat::IdentityKey::decode(&id_pub) {
                 Ok(k) => k,
                 Err(e) => {
-                    tracing::error!(
-                        "restore session {}: reconstruct keys failed: {e}",
-                        &peer_signal_id[..16.min(peer_signal_id.len())]
-                    );
+                    tracing::error!("restore session {}: decode identity key: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
                     continue;
                 }
             };
+            let private_key = match libkeychat::SignalPrivateKey::deserialize(&id_priv) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!("restore session {}: decode private key: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
+                    continue;
+                }
+            };
+            let identity_key_pair = libkeychat::IdentityKeyPair::new(identity_key, private_key);
 
-            // SignalParticipant::persistent locks storage internally — safe now
-            let signal = match SignalParticipant::persistent(
+            // restore_persistent: sets up persistent store bundle, no prekey injection.
+            // Session records load on demand from signal_sessions table.
+            let signal = match SignalParticipant::restore_persistent(
                 identity.pubkey_hex(),
                 device_id,
-                keys,
+                identity_key_pair,
+                reg_id,
                 storage.clone(),
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!(
-                        "restore session {}: create participant failed: {e}",
-                        &peer_signal_id[..16.min(peer_signal_id.len())]
-                    );
+                    tracing::error!("restore session {}: create participant failed: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
                     continue;
                 }
             };
@@ -684,6 +605,11 @@ impl KeychatClient {
             } else {
                 AddressManager::new()
             };
+
+            // Build reverse index: receiving_address → peer_signal_id
+            for addr in addresses.get_all_receiving_address_strings() {
+                inner.receiving_addr_to_peer.insert(addr, peer_signal_id.clone());
+            }
 
             let session = ChatSession::new(signal, addresses, identity.clone());
             inner.sessions.insert(
@@ -818,11 +744,9 @@ impl KeychatClient {
     }
 
     pub async fn get_pubkey_hex(&self) -> Result<String, KeychatUniError> {
-        let inner = self.inner.read().await;
-        inner
-            .identity
-            .as_ref()
-            .map(|id| id.pubkey_hex())
+        self.identity_pubkey_hex
+            .get()
+            .cloned()
             .ok_or(KeychatUniError::NotInitialized {
                 msg: "no identity set".into(),
             })
@@ -1017,9 +941,11 @@ impl KeychatClient {
 
     pub async fn disconnect(&self) -> Result<(), KeychatUniError> {
         tracing::info!("disconnecting from relays");
-        // Stop event loop, reconnect loop, take transport — all under write lock
+        // Stop event loop, reconnect loop, take transport — all under single write lock
         let (transport, event_loop_tx, reconnect_tx) = {
             let mut inner = self.inner.write().await;
+            // Clear subscription IDs — they belong to the old transport
+            inner.subscription_ids.clear();
             (
                 inner.transport.take(),
                 inner.event_loop_stop.take(),
@@ -1031,11 +957,6 @@ impl KeychatClient {
         }
         if let Some(tx) = reconnect_tx {
             let _ = tx.send(true);
-        }
-        // Clear subscription IDs — they belong to the old transport
-        {
-            let mut inner = self.inner.write().await;
-            inner.subscription_ids.clear();
         }
         if let Some(t) = transport {
             t.disconnect().await.map_err(|e| {
@@ -1079,6 +1000,7 @@ impl KeychatClient {
             let mut inner = self.inner.write().await;
             inner.sessions.clear();
             inner.peer_nostr_to_signal.clear();
+            inner.receiving_addr_to_peer.clear();
             inner.pending_outbound.clear();
             inner.group_manager = libkeychat::GroupManager::new();
             inner.identity = None;
@@ -1123,6 +1045,7 @@ impl KeychatClient {
             let mut inner = self.inner.write().await;
             if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&room_id) {
                 inner.sessions.remove(&signal_id);
+                inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
 
                 // Remove any pending outbound FR for this peer
                 let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
@@ -1180,14 +1103,7 @@ impl KeychatClient {
         }
 
         // Clean up app_* tables (in app database)
-        let identity_pubkey = {
-            let inner = self.inner.read().await;
-            inner
-                .identity
-                .as_ref()
-                .map(|id| id.pubkey_hex())
-                .unwrap_or_default()
-        };
+        let identity_pubkey = self.cached_identity_pubkey();
         if !identity_pubkey.is_empty() {
             let app_room_id = format!("{}:{}", room_id, identity_pubkey);
             let app_storage = self.inner.read().await.app_storage.clone();
@@ -1221,6 +1137,7 @@ impl KeychatClient {
             // Remove signal session
             if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&peer_pubkey) {
                 inner.sessions.remove(&signal_id);
+                inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
 
                 // Remove any pending outbound FR for this peer
                 let pending_keys: Vec<String> = inner.pending_outbound.keys().cloned().collect();
@@ -1253,14 +1170,7 @@ impl KeychatClient {
         }
 
         // Clean up app_* tables (in app database)
-        let identity_pubkey = {
-            let inner = self.inner.read().await;
-            inner
-                .identity
-                .as_ref()
-                .map(|id| id.pubkey_hex())
-                .unwrap_or_default()
-        };
+        let identity_pubkey = self.cached_identity_pubkey();
 
         if !identity_pubkey.is_empty() {
             let app_storage = self.inner.read().await.app_storage.clone();

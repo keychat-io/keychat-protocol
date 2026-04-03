@@ -1,3 +1,5 @@
+#![deny(clippy::await_holding_lock)]
+
 mod address;
 pub(crate) mod app_storage;
 mod client;

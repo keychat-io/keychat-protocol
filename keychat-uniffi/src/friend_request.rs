@@ -112,11 +112,11 @@ impl KeychatClient {
         {
             let store = crate::client::lock_app_storage(&fr_storage);
             if let Err(e) = store.transaction(|_| {
-                store.save_app_room(&peer_nostr_pubkey, &identity_pubkey, 0, 0, None, None, None)?;
+                store.save_app_room(&peer_nostr_pubkey, &identity_pubkey, RoomStatus::Requesting.to_i32(), RoomType::Dm.to_i32(), None, None, None)?;
                 store.save_app_contact(&peer_nostr_pubkey, &peer_npub, &identity_pubkey, None)?;
                 store.save_app_message(
                     &request_id, Some(&event_id_hex), &room_id, &identity_pubkey,
-                    &identity.pubkey_hex(), "[Friend Request Sent]", true, 1, now,
+                    &identity.pubkey_hex(), "[Friend Request Sent]", true, MessageStatus::Success.to_i32(), now,
                 )?;
                 store.update_app_room(&room_id, None, None, Some("[Friend Request Sent]"), Some(now))?;
                 Ok(())
@@ -200,7 +200,7 @@ impl KeychatClient {
 
         // 2. Accept (async, no lock)
         let keys = generate_prekey_material()?;
-        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
             serialize_prekey_material(&keys)?;
 
         let accepted = accept_friend_request_persistent(
@@ -240,6 +240,7 @@ impl KeychatClient {
         if accepted.sender_address.is_some() {
             let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
         }
+        let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = ChatSession::new(accepted.signal_participant, addresses, identity.clone());
 
         // 4b. Persist to SQLCipher: signal participant, peer addresses, peer mapping
@@ -247,6 +248,10 @@ impl KeychatClient {
             let store = storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
+            // Save session metadata but zero out one-time prekey material
+            // to preserve forward secrecy — prekeys are consumed after handshake
+            // and must not be persisted. libsignal's persistent stores handle
+            // session state automatically via store_session().
             store.save_signal_participant(
                 &peer_signal_hex,
                 signal_device_id,
@@ -255,10 +260,10 @@ impl KeychatClient {
                 reg_id,
                 spk_id,
                 &spk_rec,
-                pk_id,
-                &pk_rec,
-                kpk_id,
-                &kpk_rec,
+                0,    // prekey id: zeroed
+                &[],  // prekey: zeroed — consumed after handshake
+                0,    // kyber prekey id: zeroed
+                &[],  // kyber prekey: zeroed — consumed after handshake
             )?;
 
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
@@ -284,6 +289,10 @@ impl KeychatClient {
             inner
                 .peer_nostr_to_signal
                 .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
+            // Update reverse index for O(1) message routing
+            for addr in &recv_addrs {
+                inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+            }
         }
 
         let _ = self.refresh_subscriptions().await;
@@ -304,7 +313,7 @@ impl KeychatClient {
         {
             let store = crate::client::lock_app_storage(&accept_storage);
             store.transaction(|conn| {
-                store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now))?;
+                store.update_app_room(&room_id, Some(RoomStatus::Enabled.to_i32()), None, Some("[Friend Request Accepted]"), Some(now))?;
                 // Update contact name directly — don't call update_app_contact which wraps its own transaction
                 let contact_id = format!("{}:{}", peer_nostr_hex, identity_pubkey);
                 conn.execute(
@@ -313,7 +322,7 @@ impl KeychatClient {
                 ).map_err(|e| KeychatError::Storage(format!("update contact name: {e}")))?;
                 store.save_app_message(
                     &msgid, Some(&accept_event_id_hex), &room_id, &identity_pubkey,
-                    &identity.pubkey_hex(), "[Friend Request Accepted]", true, 1, now,
+                    &identity.pubkey_hex(), "[Friend Request Accepted]", true, MessageStatus::Success.to_i32(), now,
                 )?;
                 Ok(())
             }).map_err(|e| {
@@ -357,11 +366,7 @@ impl KeychatClient {
                 .map_err(|e| KeychatUniError::Storage {
                     msg: format!("load_inbound_fr: {e}"),
                 })?;
-            let pubkey_hex = inner
-                .identity
-                .as_ref()
-                .map(|id| id.pubkey_hex())
-                .unwrap_or_default();
+            let pubkey_hex = self.cached_identity_pubkey();
             let sender = fr.map(|(pubkey, _, _)| pubkey).unwrap_or_default();
 
             // Delete from DB
@@ -381,7 +386,7 @@ impl KeychatClient {
             {
                 let store = crate::client::lock_app_storage(&rej_storage);
                 if let Err(e) = store.update_app_room(
-                    &room_id, Some(-1), None, Some("[Friend Request Rejected]"), None,
+                    &room_id, Some(RoomStatus::Rejected.to_i32()), None, Some("[Friend Request Rejected]"), None,
                 ) {
                     tracing::warn!("reject_friend_request update_app_room: {e}");
                 }
