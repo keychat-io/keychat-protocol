@@ -1245,13 +1245,12 @@ async_test!(cached_identity_pubkey_is_stable, {
     drop_client(client).await;
 });
 
-// ─── Issue 4: device_identity table ──────────────────────────────────
+// ─── Schema sanity ──────────────────────────────────────────────────
 
-async_test!(device_identity_table_exists_after_open, {
+async_test!(schema_created_on_open, {
     let dir = tempfile::tempdir().unwrap();
     let client = KeychatClient::new(temp_db(&dir, "t.db"), "k".into()).unwrap();
 
-    // DB migration creates device_identity table — verify no crash
     client.create_identity().await.unwrap();
     let summary = client.debug_state_summary().await.unwrap();
     assert!(summary.contains("sessions="));

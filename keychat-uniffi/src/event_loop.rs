@@ -658,9 +658,9 @@ impl KeychatClient {
                                 ) {
                                     tracing::error!("persist peer_mapping failed: {e}");
                                 }
-                                // Save signal participant session metadata
+                                // Save signal participant (per-peer identity, no one-time prekeys)
                                 if let Some((
-                                    _id_pub, _id_priv, _reg_id,
+                                    id_pub, id_priv, reg_id,
                                     spk_id, spk_rec,
                                     _pk_id, _pk_rec, _kpk_id, _kpk_rec,
                                 )) = &serialized_keys
@@ -668,6 +668,9 @@ impl KeychatClient {
                                     if let Err(e) = store.save_signal_participant(
                                         &peer_signal_hex,
                                         signal_device_id,
+                                        id_pub,
+                                        id_priv,
+                                        *reg_id,
                                         *spk_id,
                                         spk_rec,
                                     ) {

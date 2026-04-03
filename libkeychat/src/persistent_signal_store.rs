@@ -286,21 +286,14 @@ impl libsignal_protocol::IdentityKeyStore for PersistentIdentityKeyStore {
 
     async fn is_trusted_identity(
         &self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
         _direction: libsignal_protocol::Direction,
     ) -> Result<bool> {
-        let db = lock_storage(&self.storage)?;
-        let existing = db
-            .load_peer_identity(address.name())
-            .map_err(to_signal_err)?;
-        match existing {
-            None => Ok(true), // TOFU: trust on first use
-            Some(ref bytes) => {
-                let existing_key = IdentityKey::decode(bytes)?;
-                Ok(&existing_key == identity)
-            }
-        }
+        // Always trust: Keychat authenticates peers at the Nostr layer (GiftWrap signatures).
+        // Signal provides E2E encryption only, not authentication.
+        // TOFU would break multi-peer sessions since all peers share one identity store.
+        Ok(true)
     }
 
     async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {
