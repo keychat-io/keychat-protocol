@@ -1,9 +1,3 @@
 [workspace]
-members = [
-    "libkeychat",
-    "keychat-cli-human",
-    "keychat-cli-agent",
-    "keychat-uniffi",
-    "keychat-cli",
-]
+members = ["libkeychat", "keychat-uniffi"]
 resolver = "2"
