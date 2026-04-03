@@ -697,19 +697,33 @@ impl KeychatClient {
                         }
                         drop(inner); // C-SEC1: drop write lock BEFORE async subscribe
 
-                        // Re-subscribe with the full current ratchet key set under the fixed ID
-                        // to avoid accumulating duplicate subscriptions.
+                        // Re-subscribe with the full current ratchet key set.
+                        // Unsubscribe the previous ratchet subscription first to avoid duplicates.
                         let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
                         if !all_ratchet_pubkeys.is_empty() {
+                            let old_ratchet_id = {
+                                let inner = self.inner.read().await;
+                                // ratchet sub is the last entry (index 1 if identity also exists)
+                                inner.subscription_ids.last().cloned()
+                            };
                             let inner = self.inner.read().await;
                             if let Some(transport) = inner.transport.as_ref() {
-                                let _ = transport
-                                    .subscribe(
-                                        "keychat-ratchet",
-                                        all_ratchet_pubkeys,
-                                        Some(Timestamp::now()),
-                                    )
-                                    .await;
+                                if let Some(old_id) = old_ratchet_id {
+                                    transport.unsubscribe(libkeychat::SubscriptionId::new(&old_id)).await;
+                                }
+                                if let Ok(new_id) = transport
+                                    .subscribe(all_ratchet_pubkeys, Some(Timestamp::now()))
+                                    .await
+                                {
+                                    drop(inner);
+                                    let mut inner = self.inner.write().await;
+                                    // Replace the last sub ID (ratchet slot)
+                                    if let Some(last) = inner.subscription_ids.last_mut() {
+                                        *last = new_id.to_string();
+                                    } else {
+                                        inner.subscription_ids.push(new_id.to_string());
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -912,15 +926,31 @@ impl KeychatClient {
                 // Refresh relay subscriptions if new receiving addresses were derived
                 // C-SEC1: collect pubkeys first, drop lock, then subscribe
                 if !addr_update.new_receiving.is_empty() {
-                    // Re-subscribe with the full current ratchet key set under the fixed ID
-                    // to avoid accumulating duplicate subscriptions.
+                    // Re-subscribe with the full current ratchet key set.
+                    // Unsubscribe the previous ratchet subscription first to avoid duplicates.
                     let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
                     if !all_ratchet_pubkeys.is_empty() {
+                        let old_ratchet_id = {
+                            let inner = self.inner.read().await;
+                            inner.subscription_ids.last().cloned()
+                        };
                         let inner = self.inner.read().await;
                         if let Some(transport) = inner.transport.as_ref() {
-                            let _ = transport
-                                .subscribe("keychat-ratchet", all_ratchet_pubkeys, Some(Timestamp::now()))
-                                .await;
+                            if let Some(old_id) = old_ratchet_id {
+                                transport.unsubscribe(libkeychat::SubscriptionId::new(&old_id)).await;
+                            }
+                            if let Ok(new_id) = transport
+                                .subscribe(all_ratchet_pubkeys, Some(Timestamp::now()))
+                                .await
+                            {
+                                drop(inner);
+                                let mut inner = self.inner.write().await;
+                                if let Some(last) = inner.subscription_ids.last_mut() {
+                                    *last = new_id.to_string();
+                                } else {
+                                    inner.subscription_ids.push(new_id.to_string());
+                                }
+                            }
                         }
                     }
                 }

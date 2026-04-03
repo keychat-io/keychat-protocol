@@ -54,6 +54,8 @@ pub(crate) struct ClientInner {
     pub event_loop_stop: Option<tokio::sync::watch::Sender<bool>>,
     pub reconnect_stop: Option<tokio::sync::watch::Sender<bool>>,
     pub last_relay_urls: Vec<String>,
+    /// Active subscription IDs — cleared and replaced on each start_event_loop().
+    pub subscription_ids: Vec<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -129,6 +131,7 @@ impl KeychatClient {
                 event_loop_stop: None,
                 reconnect_stop: None,
                 last_relay_urls: Vec::new(),
+                subscription_ids: Vec::new(),
             }),
             runtime: Arc::new(runtime),
             db_path,
@@ -1338,7 +1341,20 @@ impl KeychatClient {
                 .join(", ")
         );
 
-        // Subscribe via Transport — separate subscriptions for identity and ratchet keys
+        // Subscribe via Transport — separate subscriptions for identity and ratchet keys.
+        // Unsubscribe any previous IDs first to prevent duplicate REQ accumulation.
+        {
+            let inner = self.inner.read().await;
+            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
+            for old_id in &inner.subscription_ids {
+                transport.unsubscribe(libkeychat::SubscriptionId::new(old_id)).await;
+            }
+        }
+
+        let mut new_sub_ids: Vec<String> = Vec::new();
+
         {
             let inner = self.inner.read().await;
             let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
@@ -1346,25 +1362,33 @@ impl KeychatClient {
             })?;
 
             if !identity_pubkeys.is_empty() {
-                transport
-                    .subscribe("keychat-identity", identity_pubkeys, identity_since)
+                let id = transport
+                    .subscribe(identity_pubkeys, identity_since)
                     .await
                     .map_err(|e| {
                         tracing::error!("event loop: identity subscribe failed: {e}");
                         e
                     })?;
+                new_sub_ids.push(id.to_string());
             }
 
             if !ratchet_pubkeys.is_empty() {
-                transport
-                    .subscribe("keychat-ratchet", ratchet_pubkeys, ratchet_since)
+                let id = transport
+                    .subscribe(ratchet_pubkeys, ratchet_since)
                     .await
                     .map_err(|e| {
                         tracing::error!("event loop: ratchet subscribe failed: {e}");
                         e
                     })?;
+                new_sub_ids.push(id.to_string());
             }
         } // lock dropped
+
+        // Persist new subscription IDs
+        {
+            let mut inner = self.inner.write().await;
+            inner.subscription_ids = new_sub_ids;
+        }
 
         // Create stop channel
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);

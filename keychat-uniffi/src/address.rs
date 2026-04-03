@@ -55,12 +55,12 @@ impl KeychatClient {
 
         if !identity_pubkeys.is_empty() {
             transport
-                .subscribe("keychat-identity", identity_pubkeys, identity_since)
+                .subscribe(identity_pubkeys, identity_since)
                 .await?;
         }
         if !ratchet_pubkeys.is_empty() {
             transport
-                .subscribe("keychat-ratchet", ratchet_pubkeys, ratchet_since)
+                .subscribe(ratchet_pubkeys, ratchet_since)
                 .await?;
         }
         Ok(())
