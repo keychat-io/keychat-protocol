@@ -8,7 +8,7 @@
 #
 # What this does:
 #   1. Downloads keychat binary (if not installed)
-#   2. Downloads channel plugin source
+#   2. Downloads Claude MCP server source
 #   3. Installs npm dependencies
 #   4. Writes Claude Code MCP config
 #   5. Starts agent daemon
@@ -20,7 +20,7 @@ set -euo pipefail
 # ─── Config ──────────────────────────────────────────────────
 GITHUB_REPO="keychat-io/keychat-protocol"
 INSTALL_DIR="$HOME/.keychat"
-PLUGIN_DIR="$INSTALL_DIR/channel-plugin"
+PLUGIN_DIR="$INSTALL_DIR/claude-mcp"
 BIN_DIR="$INSTALL_DIR/bin"
 AGENT_NAME="Keychat Agent"
 AGENT_PORT=10443
@@ -119,10 +119,10 @@ else
   info "Installed: $(keychat --version 2>/dev/null || echo 'keychat')"
 fi
 
-# ─── Step 3: Download and install channel plugin ─────────────
-info "Setting up Claude Code channel plugin..."
+# ─── Step 3: Download and install Claude MCP server ──────────
+info "Setting up Keychat Claude MCP server..."
 
-RAW_BASE="https://raw.githubusercontent.com/$GITHUB_REPO/main/keychat-channel-plugin"
+RAW_BASE="https://raw.githubusercontent.com/$GITHUB_REPO/main/keychat-claude-mcp"
 
 # Download plugin files
 curl -fsSL "$RAW_BASE/server.ts"    -o "$PLUGIN_DIR/server.ts"
@@ -131,7 +131,7 @@ curl -fsSL "$RAW_BASE/package.json" -o "$PLUGIN_DIR/package.json"
 # Install npm dependencies
 cd "$PLUGIN_DIR"
 npm install --silent 2>/dev/null
-info "Plugin installed at $PLUGIN_DIR"
+info "Claude MCP server installed at $PLUGIN_DIR"
 
 # ─── Step 4: Configure Claude Code MCP ───────────────────────
 MCP_FILE="$HOME/.claude/mcp.json"

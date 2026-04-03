@@ -1,14 +1,14 @@
-# Keychat Channel Plugin for Claude Code
+# Keychat Claude MCP Server for Claude Code
 
 E2E encrypted messaging channel that bridges Claude Code to a [keychat-cli](../keychat-cli/) agent daemon via HTTP API.
 
 ## Architecture
 
 ```
-Claude Code ←stdio MCP→ this plugin ←HTTP→ keychat agent daemon ←Nostr→ Relay
+Claude Code ←stdio MCP→ this MCP server ←HTTP→ keychat agent daemon ←Nostr→ Relay
 ```
 
-The daemon handles all encryption (Signal PQXDH + NIP-17 gift-wrap). This plugin only does MCP ↔ HTTP translation. All API calls use Bearer token authentication.
+The daemon handles all encryption (Signal PQXDH + NIP-17 gift-wrap). This MCP server only does MCP ↔ HTTP translation. All API calls use Bearer token authentication.
 
 ## Setup
 
@@ -22,7 +22,7 @@ keychat agent --name "MyBot"
 #   Listening on http://0.0.0.0:10443
 ```
 
-### 2. Install the plugin
+### 2. Install the MCP server
 
 Add to your Claude Code MCP config (`~/.claude/mcp.json` or project `.mcp.json`):
 
@@ -31,7 +31,7 @@ Add to your Claude Code MCP config (`~/.claude/mcp.json` or project `.mcp.json`)
   "mcpServers": {
     "keychat": {
       "command": "npx",
-      "args": ["tsx", "/path/to/keychat-channel-plugin/server.ts"]
+      "args": ["tsx", "/path/to/keychat-claude-mcp/server.ts"]
     }
   }
 }
@@ -69,38 +69,38 @@ Configuration is stored in `~/.claude/channels/keychat/config.json`:
 
 ### Messaging
 
-| Tool | Description |
-|------|-------------|
-| `reply` | Send a message to a Keychat room |
+| Tool             | Description                       |
+| ---------------- | --------------------------------- |
+| `reply`          | Send a message to a Keychat room  |
 | `fetch_messages` | Fetch recent messages from a room |
-| `list_rooms` | List all rooms/conversations |
-| `list_contacts` | List all contacts |
+| `list_rooms`     | List all rooms/conversations      |
+| `list_contacts`  | List all contacts                 |
 
 ### Agent Management
 
-| Tool | Description |
-|------|-------------|
-| `get_identity` | Get agent identity (pubkey, npub, name) |
-| `get_status` | Get daemon status (connection, relays) |
+| Tool                  | Description                             |
+| --------------------- | --------------------------------------- |
+| `get_identity`        | Get agent identity (pubkey, npub, name) |
+| `get_status`          | Get daemon status (connection, relays)  |
 | `send_friend_request` | Send a friend request to a Nostr pubkey |
-| `pending_friends` | List pending friend requests |
-| `approve_friend` | Approve a pending friend request |
-| `reject_friend` | Reject a pending friend request |
+| `pending_friends`     | List pending friend requests            |
+| `approve_friend`      | Approve a pending friend request        |
+| `reject_friend`       | Reject a pending friend request         |
 
 ## How It Works
 
-1. Plugin connects to daemon's SSE `/events` endpoint for real-time messages (with Bearer token)
+1. MCP server connects to daemon's SSE `/events` endpoint for real-time messages (with Bearer token)
 2. Incoming messages are forwarded as MCP `notifications/claude/channel` notifications
 3. Claude Code can reply using the `reply` tool, which POSTs to the daemon's `/send` endpoint
 4. Access control filters messages by sender pubkey before forwarding
 
 ## SSE Events Forwarded
 
-| Event | Forwarded As |
-|-------|-------------|
-| `message_received` | Channel notification with room_id, sender, content |
-| `friend_request_received` | System notification with request details |
-| `friend_request_accepted` | System notification |
+| Event                     | Forwarded As                                       |
+| ------------------------- | -------------------------------------------------- |
+| `message_received`        | Channel notification with room_id, sender, content |
+| `friend_request_received` | System notification with request details           |
+| `friend_request_accepted` | System notification                                |
 
 ## Configuration Files
 
