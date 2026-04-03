@@ -115,10 +115,15 @@ impl KeychatClient {
             });
         }
 
-        // 2. Get session and peer info
+        // 2. Get session and peer info (reject group rooms — use send_group_text/send_group_file)
         let (session_mutex, peer_signal_hex, identity_pubkey) = {
             let inner = self.inner.read().await;
             let peer_pubkey = room_id.split(':').next().unwrap_or(&room_id);
+            if inner.group_manager.get_group(peer_pubkey).is_some() {
+                return Err(KeychatUniError::InvalidArgument {
+                    msg: format!("room {} is a group — use send_group_text/send_group_file", &peer_pubkey[..16.min(peer_pubkey.len())]),
+                });
+            }
             let signal_hex = inner
                 .peer_nostr_to_signal
                 .get(peer_pubkey)
