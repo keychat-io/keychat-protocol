@@ -884,7 +884,7 @@ impl KeychatClient {
     ///
     /// Uses O(1) p-tag routing: the GiftWrap event's first p-tag is the ratchet-derived
     /// receiving address, which maps to the correct peer session via `receiving_addr_to_peer`.
-    /// Falls back to O(n) brute-force iteration if p-tag lookup fails.
+    /// If no p-tag match, the message is dropped (not for us or index bug — check logs).
     async fn try_handle_session_message(
         &self,
         event: &Event,
@@ -893,34 +893,46 @@ impl KeychatClient {
     ) -> bool {
         // ── O(1) p-tag routing ──
         let p_tags = libkeychat::extract_p_tags(event);
-        let routed_peer = if let Some(first_p) = p_tags.first() {
-            let inner = self.inner.read().await;
-            inner.receiving_addr_to_peer.get(first_p).cloned()
-        } else {
-            None
+        let first_p = match p_tags.first() {
+            Some(p) => p.clone(),
+            None => {
+                tracing::warn!("Step3: event {} has no p-tag, dropping", &event.id.to_hex()[..16]);
+                return false;
+            }
         };
 
-        // Build session list: if p-tag matched, try that session first (then skip loop).
-        // If not matched, fall back to iterating all sessions.
-        let session_entries: Vec<(String, Arc<tokio::sync::Mutex<ChatSession>>)> = {
+        let (peer_id, session_arc) = {
             let inner = self.inner.read().await;
-            if let Some(ref peer_id) = routed_peer {
-                // O(1): direct lookup
-                if let Some(session) = inner.sessions.get(peer_id) {
-                    tracing::debug!("Step3: O(1) route via p-tag → peer={}", &peer_id[..16.min(peer_id.len())]);
-                    vec![(peer_id.clone(), session.clone())]
-                } else {
-                    tracing::warn!("Step3: p-tag matched peer={} but no session found, falling back", &peer_id[..16.min(peer_id.len())]);
-                    inner.sessions.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            let peer_id = match inner.receiving_addr_to_peer.get(&first_p) {
+                Some(id) => id.clone(),
+                None => {
+                    tracing::warn!(
+                        "Step3: p-tag {} not in reverse index, dropping event {}",
+                        &first_p[..16.min(first_p.len())],
+                        &event.id.to_hex()[..16]
+                    );
+                    return false;
                 }
-            } else {
-                // Fallback: iterate all sessions
-                tracing::debug!("Step3: no p-tag match, trying all {} sessions", inner.sessions.len());
-                inner.sessions.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-            }
+            };
+            let session = match inner.sessions.get(&peer_id) {
+                Some(s) => s.clone(),
+                None => {
+                    tracing::warn!(
+                        "Step3: peer {} found in index but no session, dropping event {}",
+                        &peer_id[..16.min(peer_id.len())],
+                        &event.id.to_hex()[..16]
+                    );
+                    return false;
+                }
+            };
+            (peer_id, session)
         }; // RwLock dropped
 
-        for (peer_signal_hex, session_mutex) in &session_entries {
+        tracing::debug!("Step3: O(1) route via p-tag → peer={}", &peer_id[..16.min(peer_id.len())]);
+
+        let peer_signal_hex = &peer_id;
+        let session_mutex = &session_arc;
+        {
             let remote_address = ProtocolAddress::new(peer_signal_hex.clone(), default_device_id());
 
             // Lock only this peer's session
@@ -932,18 +944,18 @@ impl KeychatClient {
             match &result {
                 Ok((msg, metadata, _)) => {
                     tracing::info!(
-                        "[event] Step3 decrypt OK: kind={:?} eventId={} peer={}{}",
+                        "[event] Step3 decrypt OK: kind={:?} eventId={} peer={}",
                         msg.kind,
                         &metadata.event_id.to_hex()[..16],
-                        &peer_signal_hex[..16.min(peer_signal_hex.len())],
-                        if routed_peer.is_some() { " (routed)" } else { "" }
+                        &peer_signal_hex[..16.min(peer_signal_hex.len())]
                     );
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "Step3: decrypt failed for peer={}: {e}",
+                    tracing::warn!(
+                        "Step3: decrypt failed for routed peer={}: {e}",
                         &peer_signal_hex[..16.min(peer_signal_hex.len())]
                     );
+                    return false;
                 }
             }
 
