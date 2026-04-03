@@ -76,13 +76,29 @@ impl SignalPreKeyMaterial {
     }
 }
 
-/// Generate fresh Signal pre-key material using libsignal-protocol native types.
+/// Generate fresh Signal pre-key material with a new random identity.
 ///
-/// Includes Kyber1024 prekey for PQXDH key agreement.
+/// Use `generate_prekey_material_for` when a device identity already exists.
 pub fn generate_prekey_material() -> Result<SignalPreKeyMaterial> {
     let mut rng = ::rand::rng();
     let identity_key_pair = IdentityKeyPair::generate(&mut rng);
     let registration_id: u32 = ::rand::random_range(1..=u32::MAX);
+    generate_prekey_material_inner(identity_key_pair, registration_id)
+}
+
+/// Generate pre-key material reusing an existing device identity key pair.
+pub fn generate_prekey_material_for(
+    identity_key_pair: IdentityKeyPair,
+    registration_id: u32,
+) -> Result<SignalPreKeyMaterial> {
+    generate_prekey_material_inner(identity_key_pair, registration_id)
+}
+
+fn generate_prekey_material_inner(
+    identity_key_pair: IdentityKeyPair,
+    registration_id: u32,
+) -> Result<SignalPreKeyMaterial> {
+    let mut rng = ::rand::rng();
 
     let signed_prekey_id = SignedPreKeyId::from(::rand::random_range(1..=u32::MAX));
     let signed_prekey_key_pair = KeyPair::generate(&mut rng);

@@ -126,7 +126,8 @@ pub use signal_keys::{
     FriendRequestSecrets, KyberPrekey, OneTimePrekey, SignalIdentity, SignedPrekey,
 };
 pub use signal_session::{
-    derive_nostr_address_from_ratchet, generate_prekey_material, reconstruct_prekey_material,
+    derive_nostr_address_from_ratchet, generate_prekey_material, generate_prekey_material_for,
+    reconstruct_prekey_material,
     serialize_prekey_material, SignalCiphertext, SignalDecryptResult, SignalParticipant,
     SignalPreKeyMaterial,
 };

@@ -105,40 +105,33 @@ impl SecureStorage {
         Ok(result)
     }
 
-    /// Schema version. Increment when adding a new migration.
-    const SCHEMA_VERSION: u32 = 4;
+    /// Schema version.
+    const SCHEMA_VERSION: u32 = 1;
 
-    /// Run all pending migrations sequentially.
+    /// Create schema if database is fresh.
     fn run_migrations(conn: &Connection) -> Result<()> {
         let current: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| KeychatError::Storage(format!("Failed to read user_version: {e}")))?;
 
-        tracing::info!(
-            "database schema version: {current}, target: {}",
-            Self::SCHEMA_VERSION
-        );
-
-        if current < 1 {
-            Self::migrate_v0_to_v1(conn)?;
-        }
-        if current < 2 {
-            Self::migrate_v1_to_v2(conn)?;
-        }
-        if current < 3 {
-            Self::migrate_v2_to_v3(conn)?;
-        }
-        if current < 4 {
-            Self::migrate_v3_to_v4(conn)?;
+        if current == 0 {
+            Self::create_schema(conn)?;
         }
         Ok(())
     }
 
-    /// V0 → V1: Create all base tables (initial schema).
-    fn migrate_v0_to_v1(conn: &Connection) -> Result<()> {
-        tracing::info!("running migration v0 → v1: create base schema");
+    /// Create all tables (clean install, no migration from older versions).
+    fn create_schema(conn: &Connection) -> Result<()> {
+        tracing::info!("creating database schema v{}", Self::SCHEMA_VERSION);
         conn.execute_batch(
             "BEGIN;
+
+            CREATE TABLE IF NOT EXISTS device_identity (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                identity_public BLOB NOT NULL,
+                identity_private BLOB NOT NULL,
+                registration_id INTEGER NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS signal_sessions (
                 address TEXT NOT NULL,
@@ -193,24 +186,14 @@ impl SecureStorage {
             CREATE TABLE IF NOT EXISTS signal_participants (
                 peer_signal_id TEXT PRIMARY KEY,
                 device_id INTEGER NOT NULL,
-                identity_public BLOB NOT NULL,
-                identity_private BLOB NOT NULL,
-                registration_id INTEGER NOT NULL,
                 signed_prekey_id INTEGER NOT NULL,
                 signed_prekey_record BLOB NOT NULL,
-                prekey_id INTEGER NOT NULL,
-                prekey_record BLOB NOT NULL,
-                kyber_prekey_id INTEGER NOT NULL,
-                kyber_prekey_record BLOB NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
             CREATE TABLE IF NOT EXISTS pending_friend_requests (
                 request_id TEXT PRIMARY KEY,
                 device_id INTEGER NOT NULL,
-                identity_public BLOB NOT NULL,
-                identity_private BLOB NOT NULL,
-                registration_id INTEGER NOT NULL,
                 signed_prekey_id INTEGER NOT NULL,
                 signed_prekey_record BLOB NOT NULL,
                 prekey_id INTEGER NOT NULL,
@@ -254,88 +237,9 @@ impl SecureStorage {
 
             COMMIT;",
         )
-        .map_err(|e| KeychatError::Storage(format!("migration v0→v1 failed: {e}")))?;
+        .map_err(|e| KeychatError::Storage(format!("create schema failed: {e}")))?;
 
-        tracing::info!("migration v0 → v1 complete");
-        Ok(())
-    }
-
-    /// V1 → V2: Add peer_nostr_pubkey to pending_friend_requests, create inbound_friend_requests.
-    /// This migration handles databases created before the versioning system was added.
-    fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
-        tracing::info!("running migration v1 → v2: friend request columns");
-
-        // For databases that were v0 but now v1 (which already includes peer_nostr_pubkey
-        // and inbound_friend_requests in the base schema), these will be no-ops.
-        // For databases upgraded from the old ad-hoc system, these apply the changes.
-        let _ = conn.execute_batch(
-            "ALTER TABLE pending_friend_requests ADD COLUMN peer_nostr_pubkey TEXT NOT NULL DEFAULT '';"
-        );
-        let _ = conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS inbound_friend_requests (
-                request_id TEXT PRIMARY KEY,
-                sender_pubkey_hex TEXT NOT NULL,
-                message_json TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            );"
-        );
-
-        conn.pragma_update(None, "user_version", 2)
-            .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
-
-        tracing::info!("migration v1 → v2 complete");
-        Ok(())
-    }
-
-    /// V2 → V3: Add last_event_ts to relays table for subscription cursor tracking.
-    fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
-        tracing::info!("running migration v2 → v3: add relay subscription cursor");
-        let _ = conn.execute_batch(
-            "ALTER TABLE relays ADD COLUMN last_event_ts INTEGER NOT NULL DEFAULT 0;",
-        );
-        conn.pragma_update(None, "user_version", 3)
-            .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
-        tracing::info!("migration v2 → v3 complete");
-        Ok(())
-    }
-
-    /// V3 → V4: Create device_identity table (per-device, not per-peer).
-    /// Migrate identity data from the first signal_participants row if present.
-    fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
-        tracing::info!("running migration v3 → v4: add device_identity table");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS device_identity (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                identity_public BLOB NOT NULL,
-                identity_private BLOB NOT NULL,
-                registration_id INTEGER NOT NULL
-            );",
-        )
-        .map_err(|e| KeychatError::Storage(format!("create device_identity: {e}")))?;
-
-        // Migrate from the first signal_participants row if the table has data.
-        let rows_inserted = conn
-            .execute(
-                "INSERT OR IGNORE INTO device_identity (id, identity_public, identity_private, registration_id)
-                 SELECT 1, identity_public, identity_private, registration_id
-                 FROM signal_participants LIMIT 1",
-                [],
-            )
-            .map_err(|e| KeychatError::Storage(format!("migrate device_identity: {e}")))?;
-        if rows_inserted > 0 {
-            tracing::info!("migrated device identity from signal_participants");
-        }
-
-        // Zero out one-time prekey material in existing rows to restore forward secrecy.
-        // These prekeys were already consumed by the handshake; keeping them is a security risk.
-        let _ = conn.execute_batch(
-            "UPDATE signal_participants SET prekey_record = X'', kyber_prekey_record = X'', prekey_id = 0, kyber_prekey_id = 0;"
-        );
-
-        conn.pragma_update(None, "user_version", 4)
-            .map_err(|e| KeychatError::Storage(format!("Failed to update user_version: {e}")))?;
-        tracing::info!("migration v3 → v4 complete");
+        tracing::info!("database schema v{} created", Self::SCHEMA_VERSION);
         Ok(())
     }
 
@@ -794,6 +698,23 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// Get-or-create the device Signal identity.
+    /// Generates and saves a new identity if none exists.
+    /// Returns (identity_public, identity_private, registration_id).
+    pub fn get_or_create_device_identity(&self) -> Result<(Vec<u8>, Vec<u8>, u32)> {
+        if let Some(existing) = self.load_device_identity()? {
+            return Ok(existing);
+        }
+        let mut rng = ::rand::rng();
+        let ikp = libsignal_protocol::IdentityKeyPair::generate(&mut rng);
+        let reg_id: u32 = ::rand::random_range(1..=u32::MAX);
+        let pub_bytes = ikp.identity_key().serialize().to_vec();
+        let priv_bytes = ikp.private_key().serialize().to_vec();
+        self.save_device_identity(&pub_bytes, &priv_bytes, reg_id)?;
+        tracing::info!("generated new device Signal identity");
+        Ok((pub_bytes, priv_bytes, reg_id))
+    }
+
     /// Load the device-level Signal identity key pair.
     /// Returns (identity_public, identity_private, registration_id) or None if not yet saved.
     pub fn load_device_identity(&self) -> Result<Option<(Vec<u8>, Vec<u8>, u32)>> {
@@ -816,44 +737,26 @@ impl SecureStorage {
         Ok(result)
     }
 
-    // ─── Signal Participant Key Material ────────────────────
+    // ─── Signal Participant ─────────────────────────────────
 
-    /// Serialized Signal pre-key material for persistence.
-    /// Used to reconstruct `SignalParticipant::persistent()` on restart.
-    #[allow(clippy::too_many_arguments)]
+    /// Save per-peer session metadata. Identity is stored in device_identity (singleton).
     pub fn save_signal_participant(
         &self,
         peer_signal_id: &str,
         device_id: u32,
-        identity_public: &[u8],
-        identity_private: &[u8],
-        registration_id: u32,
         signed_prekey_id: u32,
         signed_prekey_record: &[u8],
-        prekey_id: u32,
-        prekey_record: &[u8],
-        kyber_prekey_id: u32,
-        kyber_prekey_record: &[u8],
     ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO signal_participants \
-                 (peer_signal_id, device_id, identity_public, identity_private, \
-                  registration_id, signed_prekey_id, signed_prekey_record, \
-                  prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%s','now'))",
+                 (peer_signal_id, device_id, signed_prekey_id, signed_prekey_record, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
                 rusqlite::params![
                     peer_signal_id,
                     device_id,
-                    identity_public,
-                    identity_private,
-                    registration_id,
                     signed_prekey_id,
                     signed_prekey_record,
-                    prekey_id,
-                    prekey_record,
-                    kyber_prekey_id,
-                    kyber_prekey_record,
                 ],
             )
             .map_err(|e| {
@@ -862,34 +765,15 @@ impl SecureStorage {
         Ok(())
     }
 
-    /// Load signal participant key material.
-    /// Returns (device_id, identity_public, identity_private, registration_id,
-    ///          signed_prekey_id, signed_prekey_record, prekey_id, prekey_record,
-    ///          kyber_prekey_id, kyber_prekey_record).
-    #[allow(clippy::type_complexity)]
+    /// Load signal participant. Returns (device_id, signed_prekey_id, signed_prekey_record).
     pub fn load_signal_participant(
         &self,
         peer_signal_id: &str,
-    ) -> Result<
-        Option<(
-            u32,
-            Vec<u8>,
-            Vec<u8>,
-            u32,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-        )>,
-    > {
+    ) -> Result<Option<(u32, u32, Vec<u8>)>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT device_id, identity_public, identity_private, registration_id, \
-                 signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, \
-                 kyber_prekey_id, kyber_prekey_record \
+                "SELECT device_id, signed_prekey_id, signed_prekey_record \
                  FROM signal_participants WHERE peer_signal_id = ?1",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
@@ -898,15 +782,8 @@ impl SecureStorage {
             .query_row(rusqlite::params![peer_signal_id], |row: &rusqlite::Row| {
                 Ok((
                     row.get::<_, u32>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u32>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, u32>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, u32>(6)?,
-                    row.get::<_, Vec<u8>>(7)?,
-                    row.get::<_, u32>(8)?,
-                    row.get::<_, Vec<u8>>(9)?,
                 ))
             })
             .optional()
@@ -953,15 +830,12 @@ impl SecureStorage {
 
     // ─── Pending Friend Requests ──────────────────────────
 
-    /// Save a pending friend request's key material.
+    /// Save a pending friend request's prekey material (identity is in device_identity).
     #[allow(clippy::too_many_arguments)]
     pub fn save_pending_fr(
         &self,
         request_id: &str,
         device_id: u32,
-        identity_public: &[u8],
-        identity_private: &[u8],
-        registration_id: u32,
         signed_prekey_id: u32,
         signed_prekey_record: &[u8],
         prekey_id: u32,
@@ -974,17 +848,13 @@ impl SecureStorage {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO pending_friend_requests \
-                 (request_id, device_id, identity_public, identity_private, \
-                  registration_id, signed_prekey_id, signed_prekey_record, \
+                 (request_id, device_id, signed_prekey_id, signed_prekey_record, \
                   prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record, \
                   first_inbox_secret, peer_nostr_pubkey, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s','now'))",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, strftime('%s','now'))",
                 rusqlite::params![
                     request_id,
                     device_id,
-                    identity_public,
-                    identity_private,
-                    registration_id,
                     signed_prekey_id,
                     signed_prekey_record,
                     prekey_id,
@@ -1002,35 +872,21 @@ impl SecureStorage {
     }
 
     /// Load a pending friend request.
-    /// Returns (device_id, identity_public, identity_private, registration_id,
-    ///          signed_prekey_id, signed_prekey_record, prekey_id, prekey_record,
+    /// Returns (device_id, signed_prekey_id, signed_prekey_record, prekey_id, prekey_record,
     ///          kyber_prekey_id, kyber_prekey_record, first_inbox_secret, peer_nostr_pubkey).
     #[allow(clippy::type_complexity)]
     pub fn load_pending_fr(
         &self,
         request_id: &str,
     ) -> Result<
-        Option<(
-            u32,
-            Vec<u8>,
-            Vec<u8>,
-            u32,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-            u32,
-            Vec<u8>,
-            String,
-            String,
-        )>,
+        Option<(u32, u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>, String, String)>,
     > {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT device_id, identity_public, identity_private, registration_id, \
-                 signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, \
-                 kyber_prekey_id, kyber_prekey_record, first_inbox_secret, peer_nostr_pubkey \
+                "SELECT device_id, signed_prekey_id, signed_prekey_record, \
+                 prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record, \
+                 first_inbox_secret, peer_nostr_pubkey \
                  FROM pending_friend_requests WHERE request_id = ?1",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
@@ -1039,17 +895,14 @@ impl SecureStorage {
             .query_row(rusqlite::params![request_id], |row: &rusqlite::Row| {
                 Ok((
                     row.get::<_, u32>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u32>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, u32>(3)?,
-                    row.get::<_, u32>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, u32>(6)?,
-                    row.get::<_, Vec<u8>>(7)?,
-                    row.get::<_, u32>(8)?,
-                    row.get::<_, Vec<u8>>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, u32>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             })
             .optional()
@@ -1070,36 +923,10 @@ impl SecureStorage {
     }
 
     /// Promote a pending friend request to an active signal participant.
-    /// Loads the pending FR key material, saves it as a participant, then deletes the pending FR.
+    /// Copies session metadata (device_id, signed prekey) and deletes the pending FR.
     pub fn promote_pending_fr(&self, request_id: &str, peer_signal_id: &str) -> Result<()> {
-        if let Some((
-            device_id,
-            id_pub,
-            id_priv,
-            reg_id,
-            spk_id,
-            spk_rec,
-            pk_id,
-            pk_rec,
-            kpk_id,
-            kpk_rec,
-            _first_inbox,
-            _peer_nostr,
-        )) = self.load_pending_fr(request_id)?
-        {
-            self.save_signal_participant(
-                peer_signal_id,
-                device_id,
-                &id_pub,
-                &id_priv,
-                reg_id,
-                spk_id,
-                &spk_rec,
-                pk_id,
-                &pk_rec,
-                kpk_id,
-                &kpk_rec,
-            )?;
+        if let Some((device_id, spk_id, spk_rec, ..)) = self.load_pending_fr(request_id)? {
+            self.save_signal_participant(peer_signal_id, device_id, spk_id, &spk_rec)?;
             self.delete_pending_fr(request_id)?;
         }
         Ok(())
@@ -1418,7 +1245,8 @@ impl SecureStorage {
     pub fn delete_all_data(&self) -> Result<()> {
         self.transaction(|conn| {
             conn.execute_batch(
-                "DELETE FROM signal_sessions;
+                "DELETE FROM device_identity;
+                 DELETE FROM signal_sessions;
                  DELETE FROM pre_keys;
                  DELETE FROM signed_pre_keys;
                  DELETE FROM kyber_pre_keys;
@@ -1799,10 +1627,7 @@ mod tests {
             .save_pending_fr(
                 "fr-test-123",
                 42, // device_id
-                b"id_pub",
-                b"id_priv",
-                1001, // reg_id
-                10,   // spk_id
+                10, // spk_id
                 b"spk_rec",
                 20, // pk_id
                 b"pk_rec",
@@ -1830,15 +1655,12 @@ mod tests {
         assert_eq!(participants[0], "peer_signal_id_hex");
 
         // Verify data is correct
-        let (device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
-            store
-                .load_signal_participant("peer_signal_id_hex")
-                .unwrap()
-                .unwrap();
+        let (device_id, spk_id, _spk_rec) = store
+            .load_signal_participant("peer_signal_id_hex")
+            .unwrap()
+            .unwrap();
         assert_eq!(device_id, 42);
-        assert_eq!(id_pub, b"id_pub");
-        assert_eq!(id_priv, b"id_priv");
-        assert_eq!(reg_id, 1001);
+        assert_eq!(spk_id, 10);
     }
 
     #[test]
@@ -1923,65 +1745,28 @@ mod tests {
         // 1. Generate keys and create a participant
         let keys = generate_prekey_material().unwrap();
         let original_identity = hex::encode(keys.identity_key_pair.identity_key().serialize());
-        let original_reg_id = keys.registration_id;
 
         let participant =
             SignalParticipant::from_prekey_material("test-peer".to_string(), 1, keys).unwrap();
 
-        // 2. Serialize and save to DB
+        // 2. Serialize and save to DB (only signed prekey — no identity or one-time prekeys)
         let serialized = crate::signal_session::serialize_prekey_material(participant.keys().unwrap());
-        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+        let (_id_pub, _id_priv, _reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
             serialized.unwrap();
 
-        store
-            .save_signal_participant(
-                "test-peer",
-                1,
-                &id_pub,
-                &id_priv,
-                reg_id,
-                spk_id,
-                &spk_rec,
-                pk_id,
-                &pk_rec,
-                kpk_id,
-                &kpk_rec,
-            )
-            .unwrap();
+        store.save_signal_participant("test-peer", 1, spk_id, &spk_rec).unwrap();
 
-        // 3. Load from DB and reconstruct
-        let (d_id, l_pub, l_priv, l_reg, l_spk_id, l_spk, l_pk_id, l_pk, l_kpk_id, l_kpk) =
-            store.load_signal_participant("test-peer").unwrap().unwrap();
+        // 3. Load from DB
+        let (d_id, l_spk_id, _l_spk) = store.load_signal_participant("test-peer").unwrap().unwrap();
 
         assert_eq!(d_id, 1);
-        assert_eq!(l_reg, original_reg_id);
+        assert_eq!(l_spk_id, spk_id);
 
-        let restored_keys = crate::signal_session::reconstruct_prekey_material(
-            &l_pub, &l_priv, l_reg, l_spk_id, &l_spk, l_pk_id, &l_pk, l_kpk_id, &l_kpk,
-        )
-        .unwrap();
-
-        let restored =
-            SignalParticipant::from_prekey_material("test-peer".to_string(), d_id, restored_keys)
-                .unwrap();
-
-        // 4. Verify identity is the same
+        // 4. Verify identity matches
         assert_eq!(
-            restored.identity_public_key_hex(),
+            participant.identity_public_key_hex(),
             original_identity,
-            "restored participant must have the same identity key"
-        );
-        assert_eq!(
-            restored.registration_id(),
-            original_reg_id,
-            "restored participant must have the same registration ID"
-        );
-
-        // 5. Verify the restored participant can produce a valid prekey bundle
-        let bundle = restored.prekey_bundle();
-        assert!(
-            bundle.is_ok(),
-            "restored participant must produce a valid prekey bundle"
+            "participant must have the same identity key"
         );
     }
 
@@ -2253,99 +2038,32 @@ mod tests {
     }
 
     #[test]
-    fn test_device_identity_migration_from_signal_participants() {
-        // Simulate a v3 database: create manually without running v3→v4 migration
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("migrate_test.db");
-        let path_str = path.to_str().unwrap();
-
-        // Create a v3 DB with signal_participants data
-        {
-            let conn = rusqlite::Connection::open(path_str).unwrap();
-            conn.pragma_update(None, "key", TEST_KEY).unwrap();
-            conn.execute_batch("PRAGMA cipher_page_size = 4096; PRAGMA journal_mode = WAL;").unwrap();
-            // Run v0→v1 manually (creates signal_participants table)
-            SecureStorage::migrate_v0_to_v1(&conn).unwrap();
-            SecureStorage::migrate_v1_to_v2(&conn).unwrap();
-            SecureStorage::migrate_v2_to_v3(&conn).unwrap();
-            // Now at v3. Insert a signal_participant row.
-            conn.execute(
-                "INSERT INTO signal_participants (peer_signal_id, device_id, identity_public, identity_private, registration_id, signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record)
-                 VALUES ('peer-1', 1, X'AABB', X'CCDD', 999, 1, X'EE', 2, X'FF', 3, X'11')",
-                [],
-            ).unwrap();
-        }
-
-        // Reopen — this should run v3→v4 migration automatically
-        let store = SecureStorage::open(path_str, TEST_KEY).unwrap();
-
-        // device_identity should be populated from signal_participants
-        let (pub_key, priv_key, reg_id) =
-            store.load_device_identity().unwrap().expect("migration should populate device_identity");
-        assert_eq!(pub_key, vec![0xAA, 0xBB]);
-        assert_eq!(priv_key, vec![0xCC, 0xDD]);
-        assert_eq!(reg_id, 999);
-
-        // prekey_record and kyber_prekey_record should be zeroed
-        let (_, _, _, _, _, _, _, pk_rec, _, kpk_rec) =
-            store.load_signal_participant("peer-1").unwrap().expect("participant should exist");
-        assert!(pk_rec.is_empty(), "prekey_record should be zeroed after migration");
-        assert!(kpk_rec.is_empty(), "kyber_prekey_record should be zeroed after migration");
-    }
-
-    #[test]
-    fn test_device_identity_migration_empty_participants() {
-        // If signal_participants is empty, device_identity should remain empty
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("migrate_empty.db");
-        let path_str = path.to_str().unwrap();
-
-        {
-            let conn = rusqlite::Connection::open(path_str).unwrap();
-            conn.pragma_update(None, "key", TEST_KEY).unwrap();
-            conn.execute_batch("PRAGMA cipher_page_size = 4096; PRAGMA journal_mode = WAL;").unwrap();
-            SecureStorage::migrate_v0_to_v1(&conn).unwrap();
-            SecureStorage::migrate_v1_to_v2(&conn).unwrap();
-            SecureStorage::migrate_v2_to_v3(&conn).unwrap();
-            // No participants inserted
-        }
-
-        let store = SecureStorage::open(path_str, TEST_KEY).unwrap();
-        let loaded = store.load_device_identity().unwrap();
-        assert!(loaded.is_none(), "device_identity should be empty when no participants exist");
-    }
-
-    // ─── prekey zeroing tests ────���───────────────────────────────────
-
-    #[test]
-    fn test_save_signal_participant_with_zeroed_prekeys() {
+    fn test_get_or_create_device_identity() {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
 
-        // Save with zeroed prekey and kyber_prekey
-        store.save_signal_participant(
-            "peer-zeroed",
-            1,
-            b"id-pub", b"id-priv",
-            42,
-            10, b"signed-prekey-record",
-            20, &[],  // prekey: zeroed
-            30, &[],  // kyber: zeroed
-        ).unwrap();
+        // Initially empty — get_or_create generates one
+        let (pub1, priv1, reg1) = store.get_or_create_device_identity().unwrap();
+        assert!(!pub1.is_empty());
+        assert!(!priv1.is_empty());
 
-        // Load back and verify prekeys are empty
-        let (device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
-            store.load_signal_participant("peer-zeroed").unwrap().expect("should exist");
+        // Second call returns the same identity
+        let (pub2, priv2, reg2) = store.get_or_create_device_identity().unwrap();
+        assert_eq!(pub1, pub2);
+        assert_eq!(priv1, priv2);
+        assert_eq!(reg1, reg2);
+    }
 
+    #[test]
+    fn test_signal_participant_no_identity_columns() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store.save_signal_participant("peer-1", 1, 10, b"spk-record").unwrap();
+
+        let (device_id, spk_id, spk_rec) =
+            store.load_signal_participant("peer-1").unwrap().expect("should exist");
         assert_eq!(device_id, 1);
-        assert_eq!(id_pub, b"id-pub".to_vec());
-        assert_eq!(id_priv, b"id-priv".to_vec());
-        assert_eq!(reg_id, 42);
         assert_eq!(spk_id, 10);
-        assert_eq!(spk_rec, b"signed-prekey-record".to_vec());
-        assert_eq!(pk_id, 20);
-        assert!(pk_rec.is_empty(), "prekey_record must be empty");
-        assert_eq!(kpk_id, 30);
-        assert!(kpk_rec.is_empty(), "kyber_prekey_record must be empty");
+        assert_eq!(spk_rec, b"spk-record".to_vec());
     }
 
     // ─── restore_persistent tests ───────���────────────────────────────

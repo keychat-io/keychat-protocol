@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use libkeychat::{
-    accept_friend_request_persistent, generate_prekey_material, send_friend_request_persistent,
+    accept_friend_request_persistent, generate_prekey_material_for, send_friend_request_persistent,
     serialize_prekey_material, AddressManager, ChatSession, FriendRequestReceived,
     KCFriendRequestPayload, KCMessage, KeychatError,
 };
@@ -34,9 +34,10 @@ impl KeychatClient {
             (id, inner.storage.clone(), did, pubkey_hex)
         }; // lock dropped
 
-        // 2. Generate keys and send (async, no lock held)
-        let keys = generate_prekey_material()?;
-        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+        // 2. Generate keys using device identity, then send (async, no lock held)
+        let (device_ikp, device_reg_id) = self.get_or_create_device_identity(&storage)?;
+        let keys = generate_prekey_material_for(device_ikp, device_reg_id)?;
+        let (_id_pub, _id_priv, _reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
             serialize_prekey_material(&keys)?;
 
         let (event, state) = send_friend_request_persistent(
@@ -54,7 +55,7 @@ impl KeychatClient {
         let first_inbox_secret = state.first_inbox_keys.secret_hex();
         let event_id_hex = event.id.to_hex();
 
-        // 2b. Persist pending FR to SQLCipher
+        // 2b. Persist pending FR to SQLCipher (identity is in device_identity table)
         {
             let store = storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
@@ -62,9 +63,6 @@ impl KeychatClient {
             store.save_pending_fr(
                 &request_id,
                 signal_device_id,
-                &id_pub,
-                &id_priv,
-                reg_id,
                 spk_id,
                 &spk_rec,
                 pk_id,
@@ -198,9 +196,10 @@ impl KeychatClient {
             (id, inner.storage.clone(), did, received)
         }; // lock dropped
 
-        // 2. Accept (async, no lock)
-        let keys = generate_prekey_material()?;
-        let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
+        // 2. Accept (async, no lock) — use device identity for prekey generation
+        let (device_ikp, device_reg_id) = self.get_or_create_device_identity(&storage)?;
+        let keys = generate_prekey_material_for(device_ikp, device_reg_id)?;
+        let (_id_pub, _id_priv, _reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
             serialize_prekey_material(&keys)?;
 
         let accepted = accept_friend_request_persistent(
@@ -243,27 +242,16 @@ impl KeychatClient {
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = ChatSession::new(accepted.signal_participant, addresses, identity.clone());
 
-        // 4b. Persist to SQLCipher: signal participant, peer addresses, peer mapping
+        // 4b. Persist to SQLCipher: signal participant + peer data
         {
             let store = storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
-            // Save session metadata but zero out one-time prekey material
-            // to preserve forward secrecy — prekeys are consumed after handshake
-            // and must not be persisted. libsignal's persistent stores handle
-            // session state automatically via store_session().
             store.save_signal_participant(
                 &peer_signal_hex,
                 signal_device_id,
-                &id_pub,
-                &id_priv,
-                reg_id,
                 spk_id,
                 &spk_rec,
-                0,    // prekey id: zeroed
-                &[],  // prekey: zeroed — consumed after handshake
-                0,    // kyber prekey id: zeroed
-                &[],  // kyber prekey: zeroed — consumed after handshake
             )?;
 
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {

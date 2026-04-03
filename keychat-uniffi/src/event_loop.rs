@@ -649,33 +649,18 @@ impl KeychatClient {
                                 ) {
                                     tracing::error!("persist peer_mapping failed: {e}");
                                 }
-                                // Save signal participant keys for session restore
+                                // Save signal participant session metadata
                                 if let Some((
-                                    id_pub,
-                                    id_priv,
-                                    reg_id,
-                                    spk_id,
-                                    spk_rec,
-                                    _pk_id,
-                                    _pk_rec,
-                                    _kpk_id,
-                                    _kpk_rec,
+                                    _id_pub, _id_priv, _reg_id,
+                                    spk_id, spk_rec,
+                                    _pk_id, _pk_rec, _kpk_id, _kpk_rec,
                                 )) = &serialized_keys
                                 {
-                                    // Zero out one-time prekey material to preserve
-                                    // forward secrecy — prekeys consumed after handshake.
                                     if let Err(e) = store.save_signal_participant(
                                         &peer_signal_hex,
                                         signal_device_id,
-                                        id_pub,
-                                        id_priv,
-                                        *reg_id,
                                         *spk_id,
                                         spk_rec,
-                                        0,
-                                        &[],  // prekey: zeroed
-                                        0,
-                                        &[],  // kyber prekey: zeroed
                                     ) {
                                         tracing::error!("persist signal_participant failed: {e}");
                                     }
