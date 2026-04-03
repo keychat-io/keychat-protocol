@@ -1347,7 +1347,7 @@ impl KeychatClient {
 
             if !identity_pubkeys.is_empty() {
                 transport
-                    .subscribe(identity_pubkeys, identity_since)
+                    .subscribe("keychat-identity", identity_pubkeys, identity_since)
                     .await
                     .map_err(|e| {
                         tracing::error!("event loop: identity subscribe failed: {e}");
@@ -1357,7 +1357,7 @@ impl KeychatClient {
 
             if !ratchet_pubkeys.is_empty() {
                 transport
-                    .subscribe(ratchet_pubkeys, ratchet_since)
+                    .subscribe("keychat-ratchet", ratchet_pubkeys, ratchet_since)
                     .await
                     .map_err(|e| {
                         tracing::error!("event loop: ratchet subscribe failed: {e}");

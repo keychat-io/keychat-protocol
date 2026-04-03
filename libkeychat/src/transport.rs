@@ -121,8 +121,13 @@ impl Transport {
     /// ```json
     /// { "kinds": [1059], "#p": [<pubkeys>], "since": <timestamp> }
     /// ```
+    ///
+    /// Uses a fixed `sub_id` so repeated calls (e.g. after event-loop restart) overwrite
+    /// the same entry in nostr-sdk's pool subscription HashMap rather than accumulating
+    /// duplicate subscriptions with fresh generated IDs.
     pub async fn subscribe(
         &self,
+        sub_id: &str,
         pubkeys: Vec<PublicKey>,
         since: Option<Timestamp>,
     ) -> Result<SubscriptionId> {
@@ -134,25 +139,27 @@ impl Transport {
 
         let connected = self.connected_relays().await;
         tracing::info!(
-            "📡 SUB: filter → {} connected relay(s): [{}]",
+            "📡 SUB [{}]: filter → {} connected relay(s): [{}]",
+            sub_id,
             connected.len(),
             connected.join(", ")
         );
 
+        let id = SubscriptionId::new(sub_id);
         let output = self
             .client
-            .subscribe(vec![filter], None)
+            .subscribe_with_id(id.clone(), vec![filter], None)
             .await
             .map_err(|e| KeychatError::Transport(format!("subscribe failed: {e}")))?;
 
         tracing::info!(
-            "📡 SUB: ok subId={} success={} failed={}",
-            output.val,
+            "📡 SUB [{}]: ok success={} failed={}",
+            sub_id,
             output.success.len(),
             output.failed.len()
         );
 
-        Ok(output.val)
+        Ok(id)
     }
 
     /// Publish an event to ALL connected relays simultaneously.

@@ -313,7 +313,11 @@ impl KeychatClient {
                 let app_storage = self.inner.read().await.app_storage.clone();
                 let store = crate::client::lock_app_storage(&app_storage);
                 let room_id = format!("{}:{}", sender_pubkey, identity_pubkey);
-                store.get_app_room(&room_id).ok().flatten().map(|r| r.status)
+                store
+                    .get_app_room(&room_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.status)
             };
             let is_existing_friend = existing_room_status == Some(1); // 1 = Enabled
 
@@ -322,22 +326,57 @@ impl KeychatClient {
                 let app_storage = self.inner.read().await.app_storage.clone();
                 let store = crate::client::lock_app_storage(&app_storage);
                 // Dedup: skip if this event was already persisted
-                if store.is_app_message_duplicate(&event_id_hex).unwrap_or(false) {
-                    tracing::info!("friend request event already persisted, skipping: {}", &event_id_hex[..16.min(event_id_hex.len())]);
+                if store
+                    .is_app_message_duplicate(&event_id_hex)
+                    .unwrap_or(false)
+                {
+                    tracing::info!(
+                        "friend request event already persisted, skipping: {}",
+                        &event_id_hex[..16.min(event_id_hex.len())]
+                    );
                     None
                 } else {
                     // If already a friend, keep status=Enabled (1); otherwise set Approving (2)
                     let room_status = if is_existing_friend { 1 } else { 2 };
-                    store.transaction(|_| {
-                        let room_id = store.save_app_room(
-                            &sender_pubkey, &identity_pubkey, room_status, 0, Some(&sender_name), None, None,
-                        )?;
-                        store.save_app_contact(&sender_pubkey, &sender_npub, &identity_pubkey, Some(&sender_name))?;
-                        store.save_app_message(&msgid, Some(&event_id_hex), &room_id, &identity_pubkey, &sender_pubkey, fr_content, false, 1, created_at as i64)?;
-                        store.update_app_room(&room_id, None, None, Some(fr_content), Some(created_at as i64))?;
-                        store.increment_app_room_unread(&room_id)?;
-                        Ok(room_id)
-                    }).ok()
+                    store
+                        .transaction(|_| {
+                            let room_id = store.save_app_room(
+                                &sender_pubkey,
+                                &identity_pubkey,
+                                room_status,
+                                0,
+                                Some(&sender_name),
+                                None,
+                                None,
+                            )?;
+                            store.save_app_contact(
+                                &sender_pubkey,
+                                &sender_npub,
+                                &identity_pubkey,
+                                Some(&sender_name),
+                            )?;
+                            store.save_app_message(
+                                &msgid,
+                                Some(&event_id_hex),
+                                &room_id,
+                                &identity_pubkey,
+                                &sender_pubkey,
+                                fr_content,
+                                false,
+                                1,
+                                created_at as i64,
+                            )?;
+                            store.update_app_room(
+                                &room_id,
+                                None,
+                                None,
+                                Some(fr_content),
+                                Some(created_at as i64),
+                            )?;
+                            store.increment_app_room_unread(&room_id)?;
+                            Ok(room_id)
+                        })
+                        .ok()
                 }
             }; // app_storage + MutexGuard dropped
 
@@ -350,9 +389,15 @@ impl KeychatClient {
                 let my_name = {
                     let app_storage = self.inner.read().await.app_storage.clone();
                     let store = crate::client::lock_app_storage(&app_storage);
-                    store.get_setting("owner_name").unwrap_or(None).unwrap_or_default()
+                    store
+                        .get_setting("owner_name")
+                        .unwrap_or(None)
+                        .unwrap_or_default()
                 };
-                match self.accept_friend_request(request_id.clone(), my_name).await {
+                match self
+                    .accept_friend_request(request_id.clone(), my_name)
+                    .await
+                {
                     Ok(_) => tracing::info!("auto-approved friend request from existing friend"),
                     Err(e) => tracing::warn!("auto-approve failed: {e}"),
                 }
@@ -361,7 +406,8 @@ impl KeychatClient {
             if let Some(room_id) = saved_room_id {
                 self.emit_data_change(DataChange::RoomListChanged).await;
                 self.emit_data_change(DataChange::ContactListChanged).await;
-                self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+                self.emit_data_change(DataChange::MessageAdded { room_id, msgid })
+                    .await;
             }
         }
 
@@ -618,7 +664,9 @@ impl KeychatClient {
                                     }
                                 }
                                 // Delete the pending FR (now an active session)
-                                if let Err(e) = store.delete_pending_fr(request_id) { warn!("delete_pending_fr: {e}"); }
+                                if let Err(e) = store.delete_pending_fr(request_id) {
+                                    warn!("delete_pending_fr: {e}");
+                                }
                                 tracing::info!("[Step2]: persisted session to SQLCipher");
                             }
                         } // store MutexGuard dropped here
@@ -649,12 +697,18 @@ impl KeychatClient {
                         }
                         drop(inner); // C-SEC1: drop write lock BEFORE async subscribe
 
-                        // Subscribe after lock is released
-                        if !sub_pubkeys.is_empty() {
+                        // Re-subscribe with the full current ratchet key set under the fixed ID
+                        // to avoid accumulating duplicate subscriptions.
+                        let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+                        if !all_ratchet_pubkeys.is_empty() {
                             let inner = self.inner.read().await;
                             if let Some(transport) = inner.transport.as_ref() {
                                 let _ = transport
-                                    .subscribe(sub_pubkeys, Some(Timestamp::now()))
+                                    .subscribe(
+                                        "keychat-ratchet",
+                                        all_ratchet_pubkeys,
+                                        Some(Timestamp::now()),
+                                    )
                                     .await;
                             }
                         }
@@ -684,33 +738,72 @@ impl KeychatClient {
                                 {
                                     let store = crate::client::lock_app_storage(&app_storage);
                                     // Dedup: skip if this event was already persisted
-                                    if store.is_app_message_duplicate(&event_id_hex).unwrap_or(false) {
-                                        tracing::info!("friend accept event already persisted, skipping: {}", &event_id_hex[..16.min(event_id_hex.len())]);
+                                    if store
+                                        .is_app_message_duplicate(&event_id_hex)
+                                        .unwrap_or(false)
+                                    {
+                                        tracing::info!(
+                                            "friend accept event already persisted, skipping: {}",
+                                            &event_id_hex[..16.min(event_id_hex.len())]
+                                        );
                                         None
                                     } else {
                                         let now = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
-                                            .as_secs() as i64;
-                                        store.transaction(|_| {
-                                            let room_id = store.save_app_room(
-                                                &peer_nostr_id, &identity_pubkey, 1, 0,
-                                                Some(&peer_name), Some(signal_id_hex), None,
-                                            )?;
-                                            store.save_app_contact(&peer_nostr_id, &peer_npub, &identity_pubkey, Some(&peer_name))?;
-                                            store.save_app_message(&msgid, Some(&event_id_hex), &room_id, &identity_pubkey, &peer_nostr_id, "[Friend Request Accepted]", false, 1, now)?;
-                                            store.update_app_room(&room_id, Some(1), None, Some("[Friend Request Accepted]"), Some(now))?;
-                                            store.increment_app_room_unread(&room_id)?;
-                                            Ok(room_id)
-                                        }).ok()
+                                            .as_secs()
+                                            as i64;
+                                        store
+                                            .transaction(|_| {
+                                                let room_id = store.save_app_room(
+                                                    &peer_nostr_id,
+                                                    &identity_pubkey,
+                                                    1,
+                                                    0,
+                                                    Some(&peer_name),
+                                                    Some(signal_id_hex),
+                                                    None,
+                                                )?;
+                                                store.save_app_contact(
+                                                    &peer_nostr_id,
+                                                    &peer_npub,
+                                                    &identity_pubkey,
+                                                    Some(&peer_name),
+                                                )?;
+                                                store.save_app_message(
+                                                    &msgid,
+                                                    Some(&event_id_hex),
+                                                    &room_id,
+                                                    &identity_pubkey,
+                                                    &peer_nostr_id,
+                                                    "[Friend Request Accepted]",
+                                                    false,
+                                                    1,
+                                                    now,
+                                                )?;
+                                                store.update_app_room(
+                                                    &room_id,
+                                                    Some(1),
+                                                    None,
+                                                    Some("[Friend Request Accepted]"),
+                                                    Some(now),
+                                                )?;
+                                                store.increment_app_room_unread(&room_id)?;
+                                                Ok(room_id)
+                                            })
+                                            .ok()
                                     }
                                 }
                             }; // app_storage + MutexGuard dropped
 
                             if let Some(room_id) = saved_room_id {
-                                self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
+                                self.emit_data_change(DataChange::RoomUpdated {
+                                    room_id: room_id.clone(),
+                                })
+                                .await;
                                 self.emit_data_change(DataChange::ContactListChanged).await;
-                                self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+                                self.emit_data_change(DataChange::MessageAdded { room_id, msgid })
+                                    .await;
                             }
                         }
                     }
@@ -744,10 +837,19 @@ impl KeychatClient {
                         let room_id = format!("{}:{}", peer_pubkey, identity_pubkey);
                         {
                             let store = crate::client::lock_app_storage(&inner.app_storage);
-                            if let Err(e) = store.update_app_room(&room_id, Some(-1), None, Some("[Friend Request Rejected]"), None) { warn!("update_app_room reject: {e}"); }
+                            if let Err(e) = store.update_app_room(
+                                &room_id,
+                                Some(-1),
+                                None,
+                                Some("[Friend Request Rejected]"),
+                                None,
+                            ) {
+                                warn!("update_app_room reject: {e}");
+                            }
                         }
                         drop(inner);
-                        self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+                        self.emit_data_change(DataChange::RoomUpdated { room_id })
+                            .await;
                     } else {
                         drop(inner);
                     }
@@ -810,16 +912,14 @@ impl KeychatClient {
                 // Refresh relay subscriptions if new receiving addresses were derived
                 // C-SEC1: collect pubkeys first, drop lock, then subscribe
                 if !addr_update.new_receiving.is_empty() {
-                    let new_pubkeys: Vec<PublicKey> = addr_update
-                        .new_receiving
-                        .iter()
-                        .filter_map(|addr| PublicKey::from_hex(addr).ok())
-                        .collect();
-                    if !new_pubkeys.is_empty() {
+                    // Re-subscribe with the full current ratchet key set under the fixed ID
+                    // to avoid accumulating duplicate subscriptions.
+                    let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+                    if !all_ratchet_pubkeys.is_empty() {
                         let inner = self.inner.read().await;
                         if let Some(transport) = inner.transport.as_ref() {
                             let _ = transport
-                                .subscribe(new_pubkeys, Some(Timestamp::now()))
+                                .subscribe("keychat-ratchet", all_ratchet_pubkeys, Some(Timestamp::now()))
                                 .await;
                         }
                     }
@@ -903,12 +1003,25 @@ impl KeychatClient {
                                     };
                                     if !identity_pubkey.is_empty() {
                                         let saved = {
-                                            let app_storage = self.inner.read().await.app_storage.clone();
-                                            let store = crate::client::lock_app_storage(&app_storage);
-                                            store.save_app_room(&group_id, &identity_pubkey, 1, 1, Some(&group_name), None, None).ok()
+                                            let app_storage =
+                                                self.inner.read().await.app_storage.clone();
+                                            let store =
+                                                crate::client::lock_app_storage(&app_storage);
+                                            store
+                                                .save_app_room(
+                                                    &group_id,
+                                                    &identity_pubkey,
+                                                    1,
+                                                    1,
+                                                    Some(&group_name),
+                                                    None,
+                                                    None,
+                                                )
+                                                .ok()
                                         };
                                         if saved.is_some() {
-                                            self.emit_data_change(DataChange::RoomListChanged).await;
+                                            self.emit_data_change(DataChange::RoomListChanged)
+                                                .await;
                                         }
                                     }
                                 }
@@ -1049,7 +1162,12 @@ impl KeychatClient {
                         let app_storage_clone = {
                             let mut inner = self.inner.write().await;
                             if let Ok(store) = inner.storage.clone().lock() {
-                                if let Err(e) = inner.group_manager.remove_group_persistent(&group_id, &store) { warn!("remove_group_persistent: {e}"); }
+                                if let Err(e) = inner
+                                    .group_manager
+                                    .remove_group_persistent(&group_id, &store)
+                                {
+                                    warn!("remove_group_persistent: {e}");
+                                }
                             } else {
                                 inner.group_manager.remove_group(&group_id);
                             }
@@ -1057,10 +1175,11 @@ impl KeychatClient {
                         };
                         // Delete app room (separate DB)
                         {
-                            let full_room_id =
-                                format!("{}:{}", group_id, identity_pubkey);
+                            let full_room_id = format!("{}:{}", group_id, identity_pubkey);
                             let app_store = crate::client::lock_app_storage(&app_storage_clone);
-                            if let Err(e) = app_store.delete_app_room(&full_room_id) { warn!("delete_app_room: {e}"); }
+                            if let Err(e) = app_store.delete_app_room(&full_room_id) {
+                                warn!("delete_app_room: {e}");
+                            }
                         }
 
                         self.emit_data_change(DataChange::RoomDeleted {
@@ -1105,13 +1224,16 @@ impl KeychatClient {
                                     g.name = name.clone();
                                 }
                                 if let Ok(store) = inner.storage.clone().lock() {
-                                    if let Err(e) = inner.group_manager.save_group(&group_id, &store) { warn!("save_group: {e}"); }
+                                    if let Err(e) =
+                                        inner.group_manager.save_group(&group_id, &store)
+                                    {
+                                        warn!("save_group: {e}");
+                                    }
                                 }
                                 app_storage_clone = inner.app_storage.clone();
                             }
                             // Update app room name (separate DB)
-                            let full_room_id =
-                                format!("{}:{}", group_id, identity_pubkey);
+                            let full_room_id = format!("{}:{}", group_id, identity_pubkey);
                             {
                                 let app_store = crate::client::lock_app_storage(&app_storage_clone);
                                 if let Err(e) = app_store.update_app_room(
@@ -1120,7 +1242,9 @@ impl KeychatClient {
                                     Some(name),
                                     None,
                                     None,
-                                ) { warn!("update_app_room name: {e}"); }
+                                ) {
+                                    warn!("update_app_room name: {e}");
+                                }
                             }
                         }
 
@@ -1196,32 +1320,68 @@ impl KeychatClient {
                                         format!(r#"[{{"url":"{}","status":"received"}}]"#, url)
                                     });
 
-                                    store.transaction(|_| {
-                                        store.save_app_room(
-                                            &room_id, &identity_pubkey, 1,
-                                            if group_id.is_some() { 1 } else { 0 }, None, None, None,
-                                        )?;
-                                        store.save_app_message(
-                                            &msgid, Some(&event_id), &full_room_id, &identity_pubkey,
-                                            &sender_pubkey, content_str, false, 1, created_at,
-                                        )?;
-                                        store.update_app_message(
-                                            &msgid, None, None, relay_status.as_deref(),
-                                            payload.as_deref(), nostr_event_json.as_deref(),
-                                            reply_to_event_id.as_deref(), None,
-                                        )?;
+                                    store
+                                        .transaction(|_| {
+                                            store.save_app_room(
+                                                &room_id,
+                                                &identity_pubkey,
+                                                1,
+                                                if group_id.is_some() { 1 } else { 0 },
+                                                None,
+                                                None,
+                                                None,
+                                            )?;
+                                            store.save_app_message(
+                                                &msgid,
+                                                Some(&event_id),
+                                                &full_room_id,
+                                                &identity_pubkey,
+                                                &sender_pubkey,
+                                                content_str,
+                                                false,
+                                                1,
+                                                created_at,
+                                            )?;
+                                            store.update_app_message(
+                                                &msgid,
+                                                None,
+                                                None,
+                                                relay_status.as_deref(),
+                                                payload.as_deref(),
+                                                nostr_event_json.as_deref(),
+                                                reply_to_event_id.as_deref(),
+                                                None,
+                                            )?;
 
-                                        // Resolve reply-to content
-                                        if let Some(ref reply_eid) = reply_to_event_id {
-                                            if let Ok(Some(reply_msg)) = store.get_app_message_by_event_id(reply_eid) {
-                                                store.update_app_message(&msgid, None, None, None, None, None, None, Some(&reply_msg.content))?;
+                                            // Resolve reply-to content
+                                            if let Some(ref reply_eid) = reply_to_event_id {
+                                                if let Ok(Some(reply_msg)) =
+                                                    store.get_app_message_by_event_id(reply_eid)
+                                                {
+                                                    store.update_app_message(
+                                                        &msgid,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        Some(&reply_msg.content),
+                                                    )?;
+                                                }
                                             }
-                                        }
 
-                                        store.update_app_room(&full_room_id, None, None, Some(display_content), Some(created_at))?;
-                                        store.increment_app_room_unread(&full_room_id)?;
-                                        Ok(msgid)
-                                    }).ok()
+                                            store.update_app_room(
+                                                &full_room_id,
+                                                None,
+                                                None,
+                                                Some(display_content),
+                                                Some(created_at),
+                                            )?;
+                                            store.increment_app_room_unread(&full_room_id)?;
+                                            Ok(msgid)
+                                        })
+                                        .ok()
                                 }
                             }
                         } else {
@@ -1231,11 +1391,14 @@ impl KeychatClient {
                         // Emit data changes after lock released
                         if let Some(msgid) = saved_msgid {
                             self.emit_data_change(DataChange::MessageAdded {
-                                room_id: full_room_id.clone(), msgid,
-                            }).await;
+                                room_id: full_room_id.clone(),
+                                msgid,
+                            })
+                            .await;
                             self.emit_data_change(DataChange::RoomUpdated {
                                 room_id: full_room_id.clone(),
-                            }).await;
+                            })
+                            .await;
                         }
 
                         self.emit_event(ClientEvent::MessageReceived {
@@ -1307,10 +1470,7 @@ impl KeychatClient {
 
         // Clean up resolved entries from tracker memory
         if update.all_resolved {
-            let mut tracker = self
-                .relay_tracker
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
             tracker.cleanup_resolved();
         }
     }
@@ -1336,9 +1496,7 @@ impl KeychatClient {
     /// so they need `since = cursor - 2 days`. Ratchet keys are newly derived
     /// and have no historical messages, so they use `since = now()`.
     /// C-FFI1: uses .lock().await instead of try_lock() to avoid silently skipping busy sessions.
-    pub(crate) async fn collect_subscribe_pubkeys(
-        &self,
-    ) -> (Vec<PublicKey>, Vec<PublicKey>) {
+    pub(crate) async fn collect_subscribe_pubkeys(&self) -> (Vec<PublicKey>, Vec<PublicKey>) {
         // Collect session Arcs under read lock, then drop the lock before awaiting session mutexes
         let (identity_pk, session_arcs, pending_pks) = {
             let inner = self.inner.read().await;
