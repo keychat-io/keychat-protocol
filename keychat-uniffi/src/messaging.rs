@@ -267,6 +267,108 @@ impl KeychatClient {
         })
     }
 
+    /// Send a standard NIP-17 DM (no Signal encryption, NIP-44 only).
+    /// Used for communicating with non-keychat Nostr apps.
+    pub async fn send_nip17_dm(
+        &self,
+        peer_pubkey: String,
+        text: String,
+    ) -> Result<SentMessage, KeychatUniError> {
+        // Check relay connection
+        let connected = {
+            let inner = self.inner.read().await;
+            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay.".into(),
+            })?;
+            transport.connected_relays().await
+        };
+        if connected.is_empty() {
+            return Err(KeychatUniError::Transport {
+                msg: "Not connected to any relay.".into(),
+            });
+        }
+
+        // Get identity keys
+        let identity = {
+            let inner = self.inner.read().await;
+            inner.identity.clone().ok_or(KeychatUniError::NotInitialized {
+                msg: "no identity set".into(),
+            })?
+        };
+        let identity_pubkey = identity.pubkey_hex();
+
+        // Create NIP-17 gift wrap
+        let receiver_pk = libkeychat::PublicKey::from_hex(&peer_pubkey)
+            .map_err(|e| KeychatUniError::Transport { msg: format!("invalid pubkey: {e}") })?;
+
+        let gift_wrap = libkeychat::giftwrap::create_gift_wrap(
+            identity.keys(), &receiver_pk, &text,
+        )
+        .await
+        .map_err(|e| KeychatUniError::Transport {
+            msg: format!("failed to create gift wrap: {e}"),
+        })?;
+
+        let event_id = gift_wrap.id.to_hex();
+        let nostr_event_json = serde_json::to_string(&gift_wrap).ok();
+
+        // Save message to DB before publishing
+        let room_id = crate::types::make_room_id(&peer_pubkey, &identity_pubkey);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = crate::client::lock_app_storage(&app_storage);
+            if let Err(e) = store.save_app_message(
+                &event_id, Some(&event_id), &room_id, &identity_pubkey,
+                &identity_pubkey, &text, true, 0, now,
+            ) {
+                tracing::warn!("send_nip17_dm: save_app_message failed: {e}");
+            }
+            let display = if text.len() > 50 { &text[..50] } else { &text };
+            if let Err(e) = store.update_app_room(&room_id, None, None, Some(display), Some(now)) {
+                tracing::warn!("send_nip17_dm: update_app_room failed: {e}");
+            }
+        }
+
+        // Emit optimistic UI update
+        self.emit_data_change(DataChange::MessageAdded {
+            room_id: room_id.clone(),
+            msgid: event_id.clone(),
+        }).await;
+        self.emit_data_change(DataChange::RoomUpdated {
+            room_id: room_id.clone(),
+        }).await;
+
+        // Publish to relays
+        {
+            let inner = self.inner.read().await;
+            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay.".into(),
+            })?;
+            transport.publish_event_async(gift_wrap).await?;
+        }
+
+        tracing::info!(
+            "⬆️ SENT NIP-17 DM eventId={} to peer={}",
+            &event_id[..16.min(event_id.len())],
+            &peer_pubkey[..16.min(peer_pubkey.len())]
+        );
+
+        Ok(SentMessage {
+            event_id: event_id.clone(),
+            payload_json: None,
+            nostr_event_json,
+            connected_relays: connected.iter().map(|u| u.to_string()).collect(),
+            new_receiving_addresses: vec![],
+            dropped_receiving_addresses: vec![],
+            new_sending_address: None,
+        })
+    }
+
     pub async fn retry_failed_messages(&self) -> Result<u32, KeychatUniError> {
         // 1. Query failed messages from DB
         let failed_messages = {

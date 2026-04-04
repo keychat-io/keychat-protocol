@@ -1279,3 +1279,113 @@ async_test!(restore_sessions_fails_without_identity, {
 
     drop_client(client).await;
 });
+
+// ─── NIP-17 DM Fallback ──────────────────────────────────────
+
+/// Alice sends a standard NIP-17 DM (no keychat protocol) to Bob.
+/// Bob's event loop should receive it via Step 4 fallback and persist
+/// it as a Nip17Dm room.
+async_test!(nip17_dm_receive_creates_room_and_message, {
+    let dir = tempfile::tempdir().unwrap();
+    let alice = Arc::new(make_client(&dir, "alice.db"));
+    let bob = Arc::new(make_client(&dir, "bob.db"));
+
+    alice.create_identity().await.unwrap();
+    bob.create_identity().await.unwrap();
+
+    let alice_pubkey = alice.get_pubkey_hex().await.unwrap();
+    let bob_pubkey = bob.get_pubkey_hex().await.unwrap();
+
+    alice.connect(vec![TEST_RELAY.into()]).await.unwrap();
+    bob.connect(vec![TEST_RELAY.into()]).await.unwrap();
+
+    // Bob starts event loop to receive messages
+    let bob_notify = Arc::new(tokio::sync::Notify::new());
+    let (bob_listener, bob_events) = CapturingEventListener::new(bob_notify.clone());
+    bob.set_event_listener(Box::new(bob_listener)).await;
+    Arc::clone(&bob).start_event_loop().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Alice sends NIP-17 DM to Bob (not a keychat protocol message)
+    let sent = alice.send_nip17_dm(bob_pubkey.clone(), "Hello from standard Nostr!".into()).await.unwrap();
+    assert!(!sent.event_id.is_empty());
+
+    // Bob should receive the message
+    let received = wait_for_event(&bob_events, &bob_notify, 30, |e| {
+        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "Hello from standard Nostr!")
+    }).await;
+    assert!(received, "Bob should receive NIP-17 DM via Step 4 fallback");
+
+    // Verify room was created as Nip17Dm type
+    let bob_rooms = bob.get_rooms(bob_pubkey.clone()).await.unwrap();
+    let nip17_room = bob_rooms.iter().find(|r| r.to_main_pubkey == alice_pubkey);
+    assert!(nip17_room.is_some(), "Bob should have a NIP-17 DM room with Alice");
+    assert_eq!(nip17_room.unwrap().room_type, RoomType::Nip17Dm, "Room type should be Nip17Dm");
+
+    // Verify message was persisted
+    let room_id = format!("{}:{}", alice_pubkey, bob_pubkey);
+    let messages = bob.get_messages(room_id, 50, 0).await.unwrap();
+    let dm_msgs: Vec<_> = messages.iter().filter(|m| !m.is_me_send).collect();
+    assert!(!dm_msgs.is_empty(), "Bob should have received message in DB");
+    assert_eq!(dm_msgs[0].content, "Hello from standard Nostr!");
+
+    bob.stop_event_loop().await;
+    alice.disconnect().await.unwrap();
+    bob.disconnect().await.unwrap();
+    // Event loop holds an Arc clone internally; drop on a blocking thread
+    // to avoid Runtime-in-Runtime panic (same pattern as existing network tests).
+    tokio::task::spawn_blocking(move || { drop(alice); drop(bob); }).await.unwrap();
+});
+
+/// Alice sends NIP-17 DM, Bob replies with NIP-17 DM — full round-trip.
+async_test!(nip17_dm_send_and_receive_roundtrip, {
+    let dir = tempfile::tempdir().unwrap();
+    let alice = Arc::new(make_client(&dir, "alice.db"));
+    let bob = Arc::new(make_client(&dir, "bob.db"));
+
+    alice.create_identity().await.unwrap();
+    bob.create_identity().await.unwrap();
+
+    let alice_pubkey = alice.get_pubkey_hex().await.unwrap();
+    let bob_pubkey = bob.get_pubkey_hex().await.unwrap();
+
+    alice.connect(vec![TEST_RELAY.into()]).await.unwrap();
+    bob.connect(vec![TEST_RELAY.into()]).await.unwrap();
+
+    // Both start event loops
+    let alice_notify = Arc::new(tokio::sync::Notify::new());
+    let (alice_listener, alice_events) = CapturingEventListener::new(alice_notify.clone());
+    alice.set_event_listener(Box::new(alice_listener)).await;
+    Arc::clone(&alice).start_event_loop().await.unwrap();
+
+    let bob_notify = Arc::new(tokio::sync::Notify::new());
+    let (bob_listener, bob_events) = CapturingEventListener::new(bob_notify.clone());
+    bob.set_event_listener(Box::new(bob_listener)).await;
+    Arc::clone(&bob).start_event_loop().await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Alice → Bob
+    alice.send_nip17_dm(bob_pubkey.clone(), "Hey Bob, this is Alice!".into()).await.unwrap();
+
+    let bob_got = wait_for_event(&bob_events, &bob_notify, 30, |e| {
+        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "Hey Bob, this is Alice!")
+    }).await;
+    assert!(bob_got, "Bob should receive Alice's NIP-17 DM");
+
+    // Bob → Alice reply
+    bob.send_nip17_dm(alice_pubkey.clone(), "Hi Alice, Bob here!".into()).await.unwrap();
+
+    let alice_got = wait_for_event(&alice_events, &alice_notify, 30, |e| {
+        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "Hi Alice, Bob here!")
+    }).await;
+    assert!(alice_got, "Alice should receive Bob's NIP-17 DM reply");
+
+    alice.stop_event_loop().await;
+    bob.stop_event_loop().await;
+    alice.disconnect().await.unwrap();
+    bob.disconnect().await.unwrap();
+    // Event loop holds an Arc clone internally; drop on a blocking thread
+    // to avoid Runtime-in-Runtime panic (same pattern as existing network tests).
+    tokio::task::spawn_blocking(move || { drop(alice); drop(bob); }).await.unwrap();
+});

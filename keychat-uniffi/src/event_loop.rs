@@ -194,10 +194,10 @@ impl KeychatClient {
     /// Handle a single incoming kind:1059 GiftWrap event.
     ///
     /// Tries in order:
-    /// 1. Friend request (NIP-17 unwrap)
-    /// 2. Friend approve response (pending outbound states)
-    /// 3. Existing session message
-    /// Handle a single incoming kind:1059 GiftWrap event (I-6: refactored from single 700-line fn).
+    /// 1. Friend request (NIP-17 unwrap → KCMessage FriendRequest)
+    /// 2. Friend approve/reject response (pending outbound states)
+    /// 3. Existing Signal session message
+    /// 4. NIP-17 DM fallback (unwrap succeeds but not a keychat protocol message)
     async fn handle_incoming_event(
         &self,
         event: &Event,
@@ -222,7 +222,14 @@ impl KeychatClient {
         }
         // Step 3: Try decrypt with existing sessions
         else if self
-            .try_handle_session_message(event, relay_url.clone(), nostr_event_json)
+            .try_handle_session_message(event, relay_url.clone(), nostr_event_json.clone())
+            .await
+        {
+            handled = true;
+        }
+        // Step 4: NIP-17 DM fallback — standard NIP-17 message from non-keychat app
+        else if self
+            .try_handle_nip17_dm(event, relay_url.clone(), nostr_event_json)
             .await
         {
             handled = true;
@@ -994,6 +1001,141 @@ impl KeychatClient {
             }
         }
         false
+    }
+
+    /// Step 4: NIP-17 DM fallback — unwrap gift wrap and treat as plain DM.
+    /// Called after Steps 1-3 all fail, meaning this is not a keychat protocol message
+    /// but a standard NIP-17 DM from another Nostr app.
+    async fn try_handle_nip17_dm(
+        &self,
+        event: &Event,
+        relay_url: Option<String>,
+        nostr_event_json: Option<String>,
+    ) -> bool {
+        let identity = {
+            let inner = self.inner.read().await;
+            inner.identity.clone()
+        };
+        let Some(identity) = identity else {
+            return false;
+        };
+
+        // Try to unwrap the gift wrap
+        let unwrapped = match libkeychat::giftwrap::unwrap_gift_wrap(identity.keys(), event) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::debug!("Step4: gift wrap unwrap failed: {e}");
+                return false;
+            }
+        };
+
+        let sender_pubkey = unwrapped.sender_pubkey.to_hex();
+        let content = unwrapped.content.clone();
+        let event_id = event.id.to_hex();
+        let identity_pubkey = identity.pubkey_hex();
+        let created_at = unwrapped.created_at.as_u64() as i64;
+
+        tracing::info!(
+            "[Step4] NIP-17 DM from={} content_len={} event_id={}",
+            &sender_pubkey[..16.min(sender_pubkey.len())],
+            content.len(),
+            &event_id[..16.min(event_id.len())]
+        );
+
+        // Build room_id and persist room + message
+        let room_id = crate::types::make_room_id(&sender_pubkey, &identity_pubkey);
+        let msgid = event_id.clone();
+
+        // Build a display name from sender pubkey (npub short form)
+        let sender_npub = crate::npub_from_hex(sender_pubkey.clone())
+            .unwrap_or_else(|_| sender_pubkey.clone());
+        let short_name = if sender_npub.len() > 16 {
+            format!("{}…", &sender_npub[..16])
+        } else {
+            sender_npub.clone()
+        };
+
+        // Persist to app DB
+        {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = crate::client::lock_app_storage(&app_storage);
+
+            // Create or update room (type = Nip17Dm = 3)
+            if let Err(e) = store.save_app_room(
+                &sender_pubkey,
+                &identity_pubkey,
+                1,  // status = enabled
+                3,  // room_type = Nip17Dm
+                Some(&short_name),
+                None, // no signal identity key
+                None, // no parent room
+            ) {
+                tracing::error!("Step4: save_app_room failed: {e}");
+                return false;
+            }
+
+            // Save message
+            if let Err(e) = store.save_app_message(
+                &msgid,
+                Some(&event_id),
+                &room_id,
+                &identity_pubkey,
+                &sender_pubkey,
+                &content,
+                false, // is_me_send = false
+                1,     // status = success
+                created_at,
+            ) {
+                tracing::error!("Step4: save_app_message failed: {e}");
+                return false;
+            }
+
+            // Update room last message
+            if let Err(e) = store.update_app_room(
+                &room_id,
+                None,
+                None,
+                Some(if content.len() > 50 { &content[..50] } else { &content }),
+                Some(created_at),
+            ) {
+                tracing::warn!("Step4: update_app_room failed: {e}");
+            }
+
+            // Increment unread count
+            if let Err(e) = store.increment_app_room_unread(&room_id) {
+                tracing::warn!("Step4: increment_unread failed: {e}");
+            }
+        }
+
+        // Emit data changes
+        self.emit_data_change(crate::types::DataChange::MessageAdded {
+            room_id: room_id.clone(),
+            msgid: msgid.clone(),
+        })
+        .await;
+        self.emit_data_change(crate::types::DataChange::RoomUpdated {
+            room_id: room_id.clone(),
+        })
+        .await;
+
+        // Emit event to Swift
+        self.emit_event(crate::types::ClientEvent::MessageReceived {
+            room_id,
+            sender_pubkey: sender_pubkey.clone(),
+            kind: crate::types::MessageKind::Text,
+            content: Some(content),
+            payload: None,
+            event_id,
+            fallback: None,
+            reply_to_event_id: None,
+            group_id: None,
+            thread_id: None,
+            nostr_event_json,
+            relay_url,
+        })
+        .await;
+
+        true
     }
 
     /// Update address state, reverse index, and relay subscriptions after a successful decrypt.
