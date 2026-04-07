@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use keychat_cli::{agent_daemon, commands, daemon, repl, tui};
-use keychat_uniffi::KeychatClient;
+use keychat_app_core::AppClient;
 
 #[derive(Parser)]
 #[command(
@@ -77,7 +77,7 @@ fn default_data_dir() -> String {
 /// Initialize logging: write to dated file under {data_dir}/logs/, keep last 7 days.
 /// Falls back to stderr if file creation fails.
 fn init_logging(data_dir: &str, mode: &str) {
-    let default_filter = "keychat=info,keychat_uniffi=info,keychat_cli=info";
+    let default_filter = "keychat=info,keychat_app_core=info,keychat_cli=info";
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_filter.into());
 
@@ -180,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
     let db_path = format!("{}/protocol.db", db_dir);
     let db_key = commands::get_or_create_db_key(&db_dir)?;
 
-    let client = Arc::new(KeychatClient::new(db_path, db_key)?);
+    let client = Arc::new(AppClient::new(db_path, db_key)?);
 
     // Set up event and data listeners
     let (event_tx, _) = tokio::sync::broadcast::channel(256);

@@ -109,6 +109,57 @@ pub fn default_device_id() -> DeviceId {
 
 static TRACING_INIT: Once = Once::new();
 
+/// Generate a local file name from source name or hash.
+pub fn local_file_name(source_name: Option<String>, hash: String, suffix: Option<String>) -> String {
+    if let Some(name) = source_name {
+        // Use the original file name if provided
+        name
+    } else if let Some(ext) = suffix {
+        format!("{}.{}", &hash[..16.min(hash.len())], ext)
+    } else {
+        hash[..16.min(hash.len())].to_string()
+    }
+}
+
+/// Download ciphertext from URL, verify hash, decrypt.
+pub async fn download_and_decrypt(
+    url: String,
+    key: String,
+    iv: String,
+    hash: String,
+) -> AppResult<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| AppError::MediaTransfer(format!("HTTP client: {e}")))?;
+
+    let resp = client.get(&url).send().await
+        .map_err(|e| AppError::MediaTransfer(format!("download failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::MediaTransfer(format!("HTTP {} from {}", resp.status().as_u16(), url)));
+    }
+
+    let ciphertext = resp.bytes().await
+        .map_err(|e| AppError::MediaTransfer(format!("read error: {e}")))?;
+
+    let key_bytes: [u8; 32] = hex::decode(&key)
+        .map_err(|e| AppError::MediaCrypto(format!("invalid key hex: {e}")))?
+        .try_into()
+        .map_err(|_| AppError::MediaCrypto("key must be 32 bytes".into()))?;
+    let iv_bytes: [u8; 16] = hex::decode(&iv)
+        .map_err(|e| AppError::MediaCrypto(format!("invalid iv hex: {e}")))?
+        .try_into()
+        .map_err(|_| AppError::MediaCrypto("iv must be 16 bytes".into()))?;
+    let hash_bytes: [u8; 32] = hex::decode(&hash)
+        .map_err(|e| AppError::MediaCrypto(format!("invalid hash hex: {e}")))?
+        .try_into()
+        .map_err(|_| AppError::MediaCrypto("hash must be 32 bytes".into()))?;
+
+    libkeychat::decrypt_file(&ciphertext, &key_bytes, &iv_bytes, &hash_bytes)
+        .map_err(|e| AppError::MediaCrypto(format!("decrypt: {e}")))
+}
+
 /// Convert a hex public key to npub (bech32) format.
 pub fn npub_from_hex(hex: String) -> AppResult<String> {
     let pk = libkeychat::PublicKey::from_hex(&hex)
@@ -819,6 +870,64 @@ impl AppClient {
     }
 
     /// Get the protocol-level inbound request ID for a sender.
+    /// Download, decrypt, save to disk, record in file_attachments.
+    pub async fn download_and_save(
+        &self,
+        url: String,
+        key: String,
+        iv: String,
+        hash: String,
+        source_name: Option<String>,
+        suffix: Option<String>,
+        room_id: String,
+        msgid: Option<String>,
+    ) -> AppResult<String> {
+        // Idempotent check
+        if let Some(ref mid) = msgid {
+            if let Some(abs) = self.resolve_local_file(mid.clone(), hash.clone()).await {
+                return Ok(abs);
+            }
+        }
+
+        let file_name = local_file_name(source_name, hash.clone(), suffix);
+        let room_dir = std::path::Path::new(&self.files_dir).join(&room_id);
+        let file_path = room_dir.join(&file_name);
+        let relative_path = format!("{room_id}/{file_name}");
+
+        if file_path.exists() {
+            if let Some(ref mid) = msgid {
+                let _ = self.upsert_attachment(mid.clone(), hash.clone(), room_id.clone(), Some(relative_path), 2).await;
+            }
+            return Ok(file_path.to_string_lossy().to_string());
+        }
+
+        std::fs::create_dir_all(&room_dir).map_err(|e| AppError::MediaTransfer(format!("create dir: {e}")))?;
+
+        let plaintext = download_and_decrypt(url, key, iv, hash.clone()).await?;
+
+        let tmp_path = room_dir.join(format!(".{file_name}.tmp"));
+        std::fs::write(&tmp_path, &plaintext).map_err(|e| AppError::MediaTransfer(format!("write: {e}")))?;
+        std::fs::rename(&tmp_path, &file_path).map_err(|e| AppError::MediaTransfer(format!("rename: {e}")))?;
+
+        tracing::info!("Downloaded {} ({} bytes)", file_name, plaintext.len());
+
+        if let Some(ref mid) = msgid {
+            let _ = self.upsert_attachment(mid.clone(), hash, room_id, Some(relative_path), 2).await;
+        }
+
+        Ok(file_path.to_string_lossy().to_string())
+    }
+
+    /// Save an app identity record.
+    pub async fn save_app_identity(
+        &self, pubkey_hex: String, npub: String, name: String, index: i32, is_default: bool,
+    ) -> AppResult<()> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        store.save_app_identity(&pubkey_hex, &npub, &name, index, is_default)
+            .map_err(|e| AppError::Storage(format!("save_app_identity: {e}")))
+    }
+
     pub async fn get_inbound_request_id(&self, sender_pubkey: String) -> AppResult<Option<String>> {
         let inner = self.inner.read().await;
         let store = inner.protocol.storage.lock()

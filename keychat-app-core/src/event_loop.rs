@@ -26,6 +26,92 @@ struct DecryptedContext {
 }
 
 impl AppClient {
+    /// Start the event loop: subscribe to relay notifications and dispatch
+    /// incoming events to the registered EventListener.
+    pub async fn start_event_loop(self: Arc<Self>) -> AppResult<()> {
+        let (identity_pubkeys, ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+        let total = identity_pubkeys.len() + ratchet_pubkeys.len();
+        tracing::info!(
+            "event loop: subscribing to {} pubkeys ({} identity, {} ratchet)",
+            total, identity_pubkeys.len(), ratchet_pubkeys.len()
+        );
+        if identity_pubkeys.is_empty() && ratchet_pubkeys.is_empty() {
+            return Err(AppError::NotInitialized("no pubkeys to subscribe to — set identity first".into()));
+        }
+
+        let identity_since = {
+            let inner = self.inner.read().await;
+            let storage = inner.protocol.storage.lock().unwrap_or_else(|e| e.into_inner());
+            let cursor = storage.get_min_relay_cursor().unwrap_or(0);
+            drop(storage);
+            drop(inner);
+
+            if cursor > 0 {
+                let safety_window_secs: u64 = 3 * 24 * 60 * 60;
+                let since_ts = cursor.saturating_sub(safety_window_secs);
+                tracing::info!("event loop: identity since = cursor({}) - 3days = {}", cursor, since_ts);
+                Some(Timestamp::from(since_ts))
+            } else {
+                tracing::info!("event loop: no cursor yet, subscribing without since for initial sync");
+                None
+            }
+        };
+
+        let ratchet_since = Some(Timestamp::now());
+
+        tracing::info!("📡 SUBSCRIBE identity keys ({}): [{}]",
+            identity_pubkeys.len(),
+            identity_pubkeys.iter().map(|pk| pk.to_hex()[..16].to_string()).collect::<Vec<_>>().join(", ")
+        );
+        tracing::info!("📡 SUBSCRIBE ratchet keys ({}): [{}]",
+            ratchet_pubkeys.len(),
+            ratchet_pubkeys.iter().map(|pk| pk.to_hex()[..16].to_string()).collect::<Vec<_>>().join(", ")
+        );
+
+        let old_ids: Vec<String> = {
+            let inner = self.inner.read().await;
+            inner.protocol.subscription_ids.clone()
+        };
+        let mut old_iter = old_ids.into_iter().map(|s| SubscriptionId::new(s));
+        let mut new_sub_ids: Vec<String> = Vec::new();
+
+        {
+            let inner = self.inner.read().await;
+            let transport = inner.protocol.transport.as_ref()
+                .ok_or(AppError::Transport("Not connected to any relay.".into()))?;
+
+            if !identity_pubkeys.is_empty() {
+                let id = transport.resubscribe(old_iter.next(), identity_pubkeys, identity_since).await?;
+                new_sub_ids.push(id.to_string());
+            }
+            if !ratchet_pubkeys.is_empty() {
+                let id = transport.resubscribe(old_iter.next(), ratchet_pubkeys, ratchet_since).await?;
+                new_sub_ids.push(id.to_string());
+            }
+            for leftover in old_iter {
+                transport.unsubscribe(leftover).await;
+            }
+        }
+
+        {
+            let mut inner = self.inner.write().await;
+            inner.protocol.subscription_ids = new_sub_ids;
+        }
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut inner = self.inner.write().await;
+            inner.event_loop_stop = Some(stop_tx);
+        }
+
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            self_clone.run_event_loop(stop_rx).await;
+        });
+
+        Ok(())
+    }
+
     /// Run the event loop, dispatching relay notifications to EventListener.
     /// Exits when stop_rx receives true or on fatal error.
     pub(crate) async fn run_event_loop(

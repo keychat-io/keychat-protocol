@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use colored::Colorize;
-use keychat_uniffi::{
-    ClientEvent, DataChange, GroupMemberInput, KeychatClient, MessageKind, RoomStatus, RoomType,
+use keychat_app_core::{
+    ClientEvent, DataChange, GroupMemberInput, AppClient, MessageKind, RoomStatus, RoomType,
 };
 use tokio::sync::broadcast;
 
@@ -20,7 +20,7 @@ const DEFAULT_HISTORY_COUNT: i32 = 20;
 // ─── Public entry point ─────────────────────────────────────────
 
 pub async fn run(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
     data_dir: String,
@@ -43,7 +43,7 @@ pub async fn run(
     let _ = rl.load_history(&hist_path);
 
     // Shared startup: restore identity → sessions → connect → event loop
-    let relay_urls = keychat_uniffi::default_relays();
+    let relay_urls = keychat_app_core::default_relays();
     if let Some((pubkey, session_count)) = crate::commands::init_and_connect(&client, relay_urls).await {
         print_sys(&format!("Identity loaded: {}", short_key(&pubkey).cyan()));
         if session_count > 0 {
@@ -97,7 +97,7 @@ pub async fn run(
 
 /// Returns Ok(true) to quit, Ok(false) to continue.
 async fn dispatch(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     line: &str,
     active_room_id: &mut Option<String>,
     data_dir: &str,
@@ -169,7 +169,7 @@ async fn dispatch(
 
 // ─── Identity commands ──────────────────────────────────────────
 
-async fn cmd_create(client: Arc<KeychatClient>, name: &str) -> anyhow::Result<()> {
+async fn cmd_create(client: Arc<AppClient>, name: &str) -> anyhow::Result<()> {
     let display_name = if name.is_empty() { "CLI User" } else { name };
     let (pubkey_hex, npub, mnemonic) = crate::commands::create_identity(&client, display_name).await?;
     print_ok(&format!("Identity created: {} ({})", display_name.green(), short_key(&pubkey_hex).cyan()));
@@ -177,12 +177,12 @@ async fn cmd_create(client: Arc<KeychatClient>, name: &str) -> anyhow::Result<()
     print_sys(&format!("Mnemonic (save this!): {}", mnemonic.yellow()));
 
     // Auto-connect to relays
-    crate::commands::connect_and_start(&client, keychat_uniffi::default_relays());
+    crate::commands::connect_and_start(&client, keychat_app_core::default_relays());
     print_sys("Connecting to relays...");
     Ok(())
 }
 
-async fn cmd_import(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()> {
+async fn cmd_import(client: Arc<AppClient>, args: &str) -> anyhow::Result<()> {
     if args.is_empty() {
         print_err("Usage: /import <mnemonic words>");
         return Ok(());
@@ -191,20 +191,20 @@ async fn cmd_import(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()
     print_ok(&format!("Identity imported: {}", pubkey.cyan()));
 
     // Auto-connect to relays
-    crate::commands::connect_and_start(&client, keychat_uniffi::default_relays());
+    crate::commands::connect_and_start(&client, keychat_app_core::default_relays());
     print_sys("Connecting to relays...");
     Ok(())
 }
 
-async fn cmd_whoami(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_whoami(client: &AppClient) -> anyhow::Result<()> {
     let pubkey = client.get_pubkey_hex().await?;
-    let npub = keychat_uniffi::npub_from_hex(pubkey.clone()).unwrap_or_default();
+    let npub = keychat_app_core::npub_from_hex(pubkey.clone()).unwrap_or_default();
     println!("  {} {}", "Pubkey:".dimmed(), pubkey.cyan());
     println!("  {} {}", "npub:  ".dimmed(), npub.cyan());
     Ok(())
 }
 
-async fn cmd_backup(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_backup(client: &AppClient) -> anyhow::Result<()> {
     // The mnemonic is only available at create time via CreateIdentityResult.
     // After that, it's not stored in the client. Inform the user.
     print_sys(
@@ -220,7 +220,7 @@ async fn cmd_backup(client: &KeychatClient) -> anyhow::Result<()> {
 }
 
 async fn cmd_delete_identity(
-    client: &KeychatClient,
+    client: &AppClient,
     active_room_id: &mut Option<String>,
 ) -> anyhow::Result<()> {
     print_sys("This will delete your identity and ALL data. Type 'yes' to confirm:");
@@ -260,9 +260,9 @@ async fn cmd_reset(data_dir: &str) -> anyhow::Result<bool> {
 
 // ─── Connection commands ────────────────────────────────────────
 
-async fn cmd_connect(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()> {
+async fn cmd_connect(client: Arc<AppClient>, args: &str) -> anyhow::Result<()> {
     let relay_urls: Vec<String> = if args.is_empty() {
-        keychat_uniffi::default_relays()
+        keychat_app_core::default_relays()
     } else {
         args.split_whitespace().map(|s| s.to_string()).collect()
     };
@@ -273,13 +273,13 @@ async fn cmd_connect(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<(
     Ok(())
 }
 
-async fn cmd_disconnect(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_disconnect(client: &AppClient) -> anyhow::Result<()> {
     client.disconnect().await?;
     print_ok("Disconnected from all relays");
     Ok(())
 }
 
-async fn cmd_relays(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_relays(client: &AppClient) -> anyhow::Result<()> {
     let statuses = client.get_relay_statuses().await?;
     if statuses.is_empty() {
         print_sys("No relays configured");
@@ -297,7 +297,7 @@ async fn cmd_relays(client: &KeychatClient) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_add_relay(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_add_relay(client: &AppClient, args: &str) -> anyhow::Result<()> {
     if args.is_empty() {
         print_err("Usage: /add-relay <url>");
         return Ok(());
@@ -307,7 +307,7 @@ async fn cmd_add_relay(client: &KeychatClient, args: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn cmd_remove_relay(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_remove_relay(client: &AppClient, args: &str) -> anyhow::Result<()> {
     if args.is_empty() {
         print_err("Usage: /remove-relay <url>");
         return Ok(());
@@ -317,13 +317,13 @@ async fn cmd_remove_relay(client: &KeychatClient, args: &str) -> anyhow::Result<
     Ok(())
 }
 
-async fn cmd_reconnect(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_reconnect(client: &AppClient) -> anyhow::Result<()> {
     client.reconnect_relays().await?;
     print_ok("Reconnecting to all relays...");
     Ok(())
 }
 
-async fn cmd_status(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_status(client: &AppClient) -> anyhow::Result<()> {
     println!("  {}", "─── Status ───".bold());
 
     // Identity
@@ -361,14 +361,14 @@ async fn cmd_status(client: &KeychatClient) -> anyhow::Result<()> {
 
 // ─── Friend commands ────────────────────────────────────────────
 
-async fn cmd_add_friend(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_add_friend(client: &AppClient, args: &str) -> anyhow::Result<()> {
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
     if parts.is_empty() || parts[0].is_empty() {
         print_err("Usage: /add <pubkey_hex_or_npub> [my_name]");
         return Ok(());
     }
 
-    let peer_pubkey = keychat_uniffi::normalize_to_hex(parts[0].to_string())
+    let peer_pubkey = keychat_app_core::normalize_to_hex(parts[0].to_string())
         .map_err(|e| anyhow::anyhow!("invalid pubkey: {e}"))?;
     let my_name = if parts.len() > 1 {
         parts[1].to_string()
@@ -390,7 +390,7 @@ async fn cmd_add_friend(client: &KeychatClient, args: &str) -> anyhow::Result<()
     Ok(())
 }
 
-async fn cmd_accept(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_accept(client: &AppClient, args: &str) -> anyhow::Result<()> {
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
     if parts.is_empty() || parts[0].is_empty() {
         print_err("Usage: /accept <request_id> [my_name]");
@@ -415,7 +415,7 @@ async fn cmd_accept(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_reject(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_reject(client: &AppClient, args: &str) -> anyhow::Result<()> {
     if args.is_empty() {
         print_err("Usage: /reject <request_id>");
         return Ok(());
@@ -427,7 +427,7 @@ async fn cmd_reject(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_contacts(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_contacts(client: &AppClient) -> anyhow::Result<()> {
     let pubkey = client.get_pubkey_hex().await?;
     let contacts = client.get_contacts(pubkey).await?;
     if contacts.is_empty() {
@@ -453,7 +453,7 @@ async fn cmd_contacts(client: &KeychatClient) -> anyhow::Result<()> {
 // ─── Messaging commands ─────────────────────────────────────────
 
 async fn cmd_chat(
-    client: &KeychatClient,
+    client: &AppClient,
     args: &str,
     active_room_id: &mut Option<String>,
 ) -> anyhow::Result<()> {
@@ -471,7 +471,7 @@ async fn cmd_chat(
     let rooms = client.get_rooms(pubkey).await?;
 
     // Helper to select a room
-    let select = |room: &keychat_uniffi::RoomInfo, active: &mut Option<String>| {
+    let select = |room: &keychat_app_core::RoomInfo, active: &mut Option<String>| {
         *active = Some(room.id.clone());
         let fallback = short_key(&room.to_main_pubkey);
         let name = room.name.as_deref().unwrap_or(&fallback);
@@ -530,7 +530,7 @@ async fn cmd_chat(
     }
 
     // 6. Try as contact pubkey (hex or npub)
-    let normalized = keychat_uniffi::normalize_to_hex(query.to_string()).unwrap_or(query.to_string());
+    let normalized = keychat_app_core::normalize_to_hex(query.to_string()).unwrap_or(query.to_string());
     if let Some(room) = rooms.iter().find(|r| r.to_main_pubkey == normalized) {
         select(room, active_room_id);
         return Ok(());
@@ -540,7 +540,7 @@ async fn cmd_chat(
     Ok(())
 }
 
-async fn cmd_rooms(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_rooms(client: &AppClient) -> anyhow::Result<()> {
     let pubkey = client.get_pubkey_hex().await?;
     let rooms = client.get_rooms(pubkey).await?;
     if rooms.is_empty() {
@@ -555,7 +555,7 @@ async fn cmd_rooms(client: &KeychatClient) -> anyhow::Result<()> {
         let room_type = match r.room_type {
             RoomType::Dm => "DM",
             RoomType::SignalGroup => "SG",
-            RoomType::MlsGroup => "MLS",
+            RoomType::MlsGroup | RoomType::Nip17Dm => "MLS",
         };
         let status = match r.status {
             RoomStatus::Enabled => "●".green(),
@@ -597,7 +597,7 @@ async fn cmd_rooms(client: &KeychatClient) -> anyhow::Result<()> {
 }
 
 async fn cmd_read(
-    client: &KeychatClient,
+    client: &AppClient,
     active_room_id: &Option<String>,
 ) -> anyhow::Result<()> {
     let room_id = match active_room_id {
@@ -613,7 +613,7 @@ async fn cmd_read(
 }
 
 async fn cmd_history(
-    client: &KeychatClient,
+    client: &AppClient,
     args: &str,
     active_room_id: &Option<String>,
 ) -> anyhow::Result<()> {
@@ -635,16 +635,16 @@ async fn cmd_history(
 
     println!("  {}", format!("─── Last {} messages ───", messages.len()).bold());
     for msg in &messages {
-        let time = format_timestamp(msg.created_at);
+        let time = format_timestamp(msg.created_at as u64);
         let sender = if msg.is_me_send {
             "You".green().to_string()
         } else {
             short_key(&msg.sender_pubkey).cyan().to_string()
         };
         let status_icon = match msg.status {
-            keychat_uniffi::MessageStatus::Sending => "⏳",
-            keychat_uniffi::MessageStatus::Success => "✓",
-            keychat_uniffi::MessageStatus::Failed => "✗",
+            keychat_app_core::MessageStatus::Sending => "⏳",
+            keychat_app_core::MessageStatus::Success => "✓",
+            keychat_app_core::MessageStatus::Failed => "✗",
         };
         println!(
             "  {} {} {} {}",
@@ -658,7 +658,7 @@ async fn cmd_history(
 }
 
 async fn send_chat_message(
-    client: &KeychatClient,
+    client: &AppClient,
     active_room_id: &Option<String>,
     text: &str,
 ) -> anyhow::Result<bool> {
@@ -691,7 +691,7 @@ async fn send_chat_message(
 // ─── File Transfer ──────────────────────────────────────────────
 
 async fn cmd_sendfile(
-    client: &KeychatClient,
+    client: &AppClient,
     args: &str,
     active_room_id: &Option<String>,
 ) -> anyhow::Result<()> {
@@ -764,7 +764,7 @@ async fn cmd_sendfile(
 // ─── File Transfer Commands ─────────────────────────────────────
 
 /// Upload file without sending a message.
-async fn cmd_upload(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_upload(client: &AppClient, args: &str) -> anyhow::Result<()> {
     let path_str = args.trim();
     if path_str.is_empty() {
         print_err("Usage: /upload <path>");
@@ -785,7 +785,7 @@ async fn cmd_upload(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
     // Get active media server from settings or use default
     let server = match client.get_active_media_server().await {
         Ok(url) => url,
-        Err(_) => keychat_uniffi::default_blossom_server(),
+        Err(_) => keychat_app_core::default_blossom_server(),
     };
 
     print_sys(&format!("Uploading {} to {}...", file_name, server.dimmed()));
@@ -808,7 +808,7 @@ async fn cmd_upload(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
 
 /// Download file from message or URL.
 async fn cmd_download(
-    client: &KeychatClient,
+    client: &AppClient,
     args: &str,
     active_room_id: &Option<String>,
 ) -> anyhow::Result<()> {
@@ -909,7 +909,7 @@ async fn cmd_download(
     }
 
     // Flatten all file items with their message context
-    let mut all_files: Vec<(usize, &keychat_uniffi::MessageInfo, &crate::commands::ParsedFileItem)> = Vec::new();
+    let mut all_files: Vec<(usize, &keychat_app_core::MessageInfo, &crate::commands::ParsedFileItem)> = Vec::new();
     let mut idx = 1;
     for (msg, parsed) in &file_messages {
         for item in &parsed.items {
@@ -957,7 +957,7 @@ async fn cmd_download(
 
 /// List files in current room or all rooms.
 async fn cmd_files(
-    client: &KeychatClient,
+    client: &AppClient,
     args: &str,
     active_room_id: &Option<String>,
 ) -> anyhow::Result<()> {
@@ -991,7 +991,7 @@ async fn cmd_files(
 
     // Fetch messages and find file messages
     let messages = client.get_messages(room_id.clone(), 100, 0).await?;
-    let mut file_entries: Vec<(keychat_uniffi::MessageInfo, crate::commands::ParsedFileMessage)> = Vec::new();
+    let mut file_entries: Vec<(keychat_app_core::MessageInfo, crate::commands::ParsedFileMessage)> = Vec::new();
 
     for msg in messages {
         if let Some(ref json) = msg.payload_json {
@@ -1011,7 +1011,7 @@ async fn cmd_files(
     let mut idx = 1;
     for (msg, parsed) in file_entries.iter().rev() {
         let sender = crate::commands::short_key(&msg.sender_pubkey);
-        let time = crate::commands::format_timestamp(msg.created_at);
+        let time = crate::commands::format_timestamp(msg.created_at as u64);
 
         if parsed.items.len() == 1 {
             let item = &parsed.items[0];
@@ -1076,7 +1076,7 @@ async fn cmd_files(
 
 // ─── Signal Group commands ──────────────────────────────────────
 
-async fn cmd_sg_create(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_sg_create(client: &AppClient, args: &str) -> anyhow::Result<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 2 {
         print_err("Usage: /sg-create <name> <member1_pubkey> [member2_pubkey...]");
@@ -1087,7 +1087,7 @@ async fn cmd_sg_create(client: &KeychatClient, args: &str) -> anyhow::Result<()>
         .iter()
         .map(|pk| {
             let normalized =
-                keychat_uniffi::normalize_to_hex(pk.to_string()).unwrap_or_else(|_| pk.to_string());
+                keychat_app_core::normalize_to_hex(pk.to_string()).unwrap_or_else(|_| pk.to_string());
             GroupMemberInput {
                 nostr_pubkey: normalized.clone(),
                 name: short_key(&normalized),
@@ -1123,7 +1123,7 @@ fn cmd_sg_chat(args: &str, active_room_id: &mut Option<String>) -> anyhow::Resul
     Ok(())
 }
 
-async fn cmd_sg_leave(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_sg_leave(client: &AppClient, args: &str) -> anyhow::Result<()> {
     if args.is_empty() {
         print_err("Usage: /sg-leave <group_id>");
         return Ok(());
@@ -1133,7 +1133,7 @@ async fn cmd_sg_leave(client: &KeychatClient, args: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-async fn cmd_sg_dissolve(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_sg_dissolve(client: &AppClient, args: &str) -> anyhow::Result<()> {
     if args.is_empty() {
         print_err("Usage: /sg-dissolve <group_id>");
         return Ok(());
@@ -1145,7 +1145,7 @@ async fn cmd_sg_dissolve(client: &KeychatClient, args: &str) -> anyhow::Result<(
     Ok(())
 }
 
-async fn cmd_sg_rename(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_sg_rename(client: &AppClient, args: &str) -> anyhow::Result<()> {
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
     if parts.len() < 2 {
         print_err("Usage: /sg-rename <group_id> <new_name>");
@@ -1158,14 +1158,14 @@ async fn cmd_sg_rename(client: &KeychatClient, args: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn cmd_sg_kick(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
+async fn cmd_sg_kick(client: &AppClient, args: &str) -> anyhow::Result<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 2 {
         print_err("Usage: /sg-kick <group_id> <member_pubkey>");
         return Ok(());
     }
     let member_pk =
-        keychat_uniffi::normalize_to_hex(parts[1].to_string()).unwrap_or_else(|_| parts[1].to_string());
+        keychat_app_core::normalize_to_hex(parts[1].to_string()).unwrap_or_else(|_| parts[1].to_string());
     client
         .remove_group_member(parts[0].to_string(), member_pk)
         .await?;
@@ -1175,7 +1175,7 @@ async fn cmd_sg_kick(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
 
 // ─── Utility commands ───────────────────────────────────────────
 
-async fn cmd_retry(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_retry(client: &AppClient) -> anyhow::Result<()> {
     let count = client.retry_failed_messages().await?;
     if count > 0 {
         print_ok(&format!("Retrying {} failed message(s)", count));
@@ -1185,7 +1185,7 @@ async fn cmd_retry(client: &KeychatClient) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_debug(client: &KeychatClient) -> anyhow::Result<()> {
+async fn cmd_debug(client: &AppClient) -> anyhow::Result<()> {
     let summary = client.debug_state_summary().await?;
     println!("  {}", "Debug State:".bold());
     println!("  {summary}");
@@ -1195,7 +1195,7 @@ async fn cmd_debug(client: &KeychatClient) -> anyhow::Result<()> {
 // ─── Background event printer ───────────────────────────────────
 
 fn spawn_event_printer(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     mut event_rx: broadcast::Receiver<ClientEvent>,
     mut data_rx: broadcast::Receiver<DataChange>,
 ) {
@@ -1249,7 +1249,7 @@ fn spawn_event_printer(
 
 /// Auto-download file message if enabled and file size is within limit.
 async fn handle_file_message_auto_download(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     room_id: String,
     event_id: String,
     payload_json: String,
@@ -1414,14 +1414,14 @@ fn print_event(event: &ClientEvent) {
             new_value,
         } => {
             let detail = match kind {
-                keychat_uniffi::GroupChangeKind::MemberRemoved => {
+                keychat_app_core::GroupChangeKind::MemberRemoved => {
                     format!(
                         "Member removed: {}",
                         member_pubkey.as_deref().unwrap_or("?")
                     )
                 }
-                keychat_uniffi::GroupChangeKind::SelfLeave => "A member left the group".to_string(),
-                keychat_uniffi::GroupChangeKind::NameChanged => {
+                keychat_app_core::GroupChangeKind::SelfLeave => "A member left the group".to_string(),
+                keychat_app_core::GroupChangeKind::NameChanged => {
                     format!(
                         "Group renamed to: {}",
                         new_value.as_deref().unwrap_or("?")
@@ -1466,9 +1466,9 @@ fn print_data_change(change: &DataChange) {
         DataChange::ConnectionStatusChanged { status, message } => {
             let status_str = format!("{:?}", status);
             let colored = match status {
-                keychat_uniffi::ConnectionStatus::Connected => status_str.green(),
-                keychat_uniffi::ConnectionStatus::Connecting
-                | keychat_uniffi::ConnectionStatus::Reconnecting => status_str.yellow(),
+                keychat_app_core::ConnectionStatus::Connected => status_str.green(),
+                keychat_app_core::ConnectionStatus::Connecting
+                | keychat_app_core::ConnectionStatus::Reconnecting => status_str.yellow(),
                 _ => status_str.red(),
             };
             let msg = message.as_deref().unwrap_or("");

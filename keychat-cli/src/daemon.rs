@@ -1,6 +1,6 @@
 //! HTTP daemon mode for keychat-cli.
 //!
-//! Provides a REST API + SSE event stream backed by `KeychatClient`.
+//! Provides a REST API + SSE event stream backed by `AppClient`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -15,9 +15,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use keychat_uniffi::{
+use keychat_app_core::{
     ClientEvent, ConnectionStatus, DataChange, FileCategory, GroupChangeKind, GroupMemberInput,
-    KeychatClient, MessageKind, MessageStatus, RoomStatus, RoomType,
+    AppClient, MessageKind, MessageStatus, RoomStatus, RoomType,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -27,7 +27,7 @@ use tokio_stream::StreamExt;
 
 #[derive(Clone)]
 struct AppState {
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
 }
@@ -67,7 +67,7 @@ fn room_type_str(t: &RoomType) -> &'static str {
     match t {
         RoomType::Dm => "dm",
         RoomType::SignalGroup => "signal_group",
-        RoomType::MlsGroup => "mls_group",
+        RoomType::MlsGroup | RoomType::Nip17Dm => "mls_group",
     }
 }
 
@@ -136,7 +136,7 @@ fn group_change_kind_str(k: &GroupChangeKind) -> &'static str {
 /// Build the axum Router with all routes. Extracted so tests can call it
 /// without starting a TCP listener.
 pub fn build_router(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
 ) -> Router {
@@ -187,13 +187,13 @@ pub fn build_router(
 // ─── Entry Point ────────────────────────────────────────────────
 
 pub async fn run(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
     port: u16,
 ) -> anyhow::Result<()> {
     // Shared startup: restore identity → sessions → connect → event loop
-    let relay_urls = keychat_uniffi::default_relays();
+    let relay_urls = keychat_app_core::default_relays();
     crate::commands::init_and_connect(&client, relay_urls).await;
 
     let router = build_router(client, event_tx, data_tx);
@@ -431,9 +431,7 @@ async fn send_message(
             }))
         }
         Ok(crate::commands::SendResult::MlsNotSupported) => {
-            bad_request(keychat_uniffi::KeychatUniError::InvalidArgument {
-                msg: "MLS groups not yet supported".into(),
-            })
+            bad_request(keychat_app_core::AppError::InvalidArgument("MLS groups not yet supported".into(),))
         }
         Err(e) => bad_request(e),
     }
@@ -735,7 +733,7 @@ async fn kick_member(
 
 /// Handle auto-download for file messages in daemon mode.
 fn spawn_file_auto_download_daemon(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     room_id: String,
     event_id: String,
     payload_json: String,
@@ -1109,7 +1107,7 @@ async fn upload_file(
 
     // Get server URL
     let server = req.server.unwrap_or_else(|| {
-        keychat_uniffi::default_blossom_server()
+        keychat_app_core::default_blossom_server()
     });
 
     // Upload file
