@@ -369,6 +369,22 @@ pub enum FileCategory {
     Other,
 }
 
+impl FileCategory {
+    /// Convert to libkeychat's FileCategory.
+    pub fn to_lib(&self) -> libkeychat::FileCategory {
+        match self {
+            FileCategory::Image => libkeychat::FileCategory::Image,
+            FileCategory::Video => libkeychat::FileCategory::Video,
+            FileCategory::Voice => libkeychat::FileCategory::Voice,
+            FileCategory::Audio => libkeychat::FileCategory::Audio,
+            FileCategory::Document => libkeychat::FileCategory::Document,
+            FileCategory::Text => libkeychat::FileCategory::Text,
+            FileCategory::Archive => libkeychat::FileCategory::Archive,
+            FileCategory::Other => libkeychat::FileCategory::Other,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FilePayload {
     pub category: FileCategory,

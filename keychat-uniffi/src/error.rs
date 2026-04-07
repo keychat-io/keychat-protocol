@@ -68,6 +68,26 @@ impl From<KeychatError> for KeychatUniError {
     }
 }
 
+impl From<keychat_app_core::AppError> for KeychatUniError {
+    fn from(err: keychat_app_core::AppError) -> Self {
+        use keychat_app_core::AppError::*;
+        match err {
+            Identity(msg) => KeychatUniError::Identity { msg },
+            Transport(msg) => KeychatUniError::Transport { msg },
+            Signal(msg) => KeychatUniError::Signal { msg },
+            Storage(msg) => KeychatUniError::Storage { msg },
+            Crypto(msg) => KeychatUniError::Crypto { msg },
+            Mls(msg) => KeychatUniError::Mls { msg },
+            Serialization(msg) => KeychatUniError::Serialization { msg },
+            MediaCrypto(msg) => KeychatUniError::MediaCrypto { msg },
+            MediaTransfer(msg) => KeychatUniError::MediaTransfer { msg },
+            PeerNotFound(msg) => KeychatUniError::PeerNotFound { peer_id: msg },
+            InvalidArgument(msg) => KeychatUniError::InvalidArgument { msg },
+            NotInitialized(msg) => KeychatUniError::NotInitialized { msg },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
