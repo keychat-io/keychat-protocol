@@ -1084,6 +1084,147 @@ impl ProtocolClient {
         })
     }
 
+    // ─── Friend Request Protocol ────────────────────────────────
+
+    /// Send a friend request: generate keys → build event → publish → persist → store in memory.
+    /// Returns (request_id, peer_nostr_pubkey, event_id_hex).
+    pub async fn send_friend_request_protocol(
+        &mut self,
+        peer_nostr_pubkey: &str,
+        my_name: &str,
+        device_id_str: &str,
+    ) -> Result<(String, String)> {
+        let identity = self.identity.clone()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+
+        let signal_device_id = self.next_signal_device_id;
+        self.next_signal_device_id += 1;
+
+        let keys = crate::generate_prekey_material()?;
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+            crate::serialize_prekey_material(&keys)?;
+
+        let (event, state) = crate::send_friend_request_persistent(
+            &identity, peer_nostr_pubkey, my_name, device_id_str,
+            keys, self.storage.clone(), signal_device_id,
+        ).await?;
+
+        let request_id = state.request_id.clone();
+        let first_inbox_secret = state.first_inbox_keys.secret_hex();
+
+        // Persist pending FR to SecureStorage
+        if let Ok(store) = self.storage.lock() {
+            store.save_pending_fr(
+                &request_id, signal_device_id,
+                &id_pub, &id_priv, reg_id, spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
+                &first_inbox_secret, peer_nostr_pubkey,
+            )?;
+        }
+
+        // Publish
+        let transport = self.transport.as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
+        transport.publish_event_async(event.clone()).await?;
+
+        let event_id_hex = event.id.to_hex();
+
+        // Store in memory
+        self.pending_outbound.insert(request_id.clone(), state);
+
+        Ok((request_id, event_id_hex))
+    }
+
+    /// Accept a friend request: load FR → generate keys → accept → create session → persist.
+    /// Returns (peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex).
+    pub async fn accept_friend_request_protocol(
+        &mut self,
+        request_id: &str,
+        my_name: &str,
+    ) -> Result<(String, String, String, String)> {
+        let identity = self.identity.clone()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+
+        // Load inbound FR
+        let (sender_pubkey_hex, message_json, payload_json) = {
+            let store = self.storage.lock()
+                .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
+            store.load_inbound_fr(request_id)?
+                .ok_or_else(|| KeychatError::FriendRequest(format!("no inbound FR: {request_id}")))?
+        };
+
+        let message: crate::KCMessage = serde_json::from_str(&message_json)?;
+        let payload: crate::KCFriendRequestPayload = serde_json::from_str(&payload_json)?;
+        let sender_pubkey = crate::PublicKey::from_hex(&sender_pubkey_hex)
+            .map_err(|e| KeychatError::FriendRequest(format!("invalid sender pubkey: {e}")))?;
+
+        let received = crate::FriendRequestReceived {
+            sender_pubkey, sender_pubkey_hex: sender_pubkey_hex.clone(),
+            message, payload: payload.clone(), created_at: 0,
+        };
+
+        let signal_device_id = self.next_signal_device_id;
+        self.next_signal_device_id += 1;
+
+        let keys = crate::generate_prekey_material()?;
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
+            crate::serialize_prekey_material(&keys)?;
+
+        let accepted = crate::accept_friend_request_persistent(
+            &identity, &received, my_name, keys, self.storage.clone(), signal_device_id,
+        ).await?;
+
+        let peer_signal_hex = payload.signal_identity_key.clone();
+        let peer_nostr_hex = sender_pubkey_hex;
+        let peer_name = payload.name.clone();
+
+        // Publish
+        let event_id_hex = accepted.event.id.to_hex();
+        let transport = self.transport.as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
+        transport.publish_event_async(accepted.event).await?;
+
+        // Create session
+        let mut addresses = crate::AddressManager::new();
+        addresses.add_peer(&peer_signal_hex, Some(payload.first_inbox.clone()), Some(peer_nostr_hex.clone()));
+        if accepted.sender_address.is_some() {
+            let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
+        }
+        let recv_addrs = addresses.get_all_receiving_address_strings();
+        let session = crate::ChatSession::new(accepted.signal_participant, addresses, identity);
+
+        // Persist to SecureStorage
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.save_signal_participant(
+                &peer_signal_hex, signal_device_id, &id_pub, &id_priv, reg_id, spk_id, &spk_rec,
+            );
+            if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
+                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+            }
+            let _ = store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name);
+            let _ = store.delete_inbound_fr(request_id);
+        }
+
+        // Update in-memory state
+        self.sessions.insert(peer_signal_hex.clone(), Arc::new(tokio::sync::Mutex::new(session)));
+        self.peer_nostr_to_signal.insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
+        self.peer_signal_to_nostr.insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
+        for addr in &recv_addrs {
+            self.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+        }
+
+        Ok((peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex))
+    }
+
+    /// Reject a friend request: delete from SecureStorage.
+    pub fn reject_friend_request_protocol(&self, request_id: &str) -> Result<String> {
+        let store = self.storage.lock()
+            .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
+        let sender = store.load_inbound_fr(request_id)?
+            .map(|(pubkey, _, _)| pubkey).unwrap_or_default();
+        store.delete_inbound_fr(request_id)?;
+        Ok(sender)
+    }
+
     // ─── Event Loop Core ────────────────────────────────────────
 
     /// Run the protocol event loop.

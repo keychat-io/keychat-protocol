@@ -1,24 +1,8 @@
-//! Friend request business logic (send, accept, reject).
+//! Friend request business logic — delegates protocol to ProtocolClient,
+//! handles app-layer persistence (rooms, contacts, messages, DataChange).
 
-use std::sync::Arc;
-
-use libkeychat::{
-    accept_friend_request_persistent, generate_prekey_material, send_friend_request_persistent,
-    serialize_prekey_material, AddressManager, ChatSession, FriendRequestReceived,
-    KCFriendRequestPayload, KCMessage,
-};
-use nostr::{PublicKey, ToBech32};
-
-use crate::app_client::{lock_app_storage, AppClient, AppError, AppResult};
+use crate::app_client::{lock_app_storage, npub_from_hex, AppClient, AppError, AppResult};
 use crate::types::*;
-
-/// Convert a hex public key to npub (bech32) format.
-fn npub_from_hex(hex: &str) -> Result<String, AppError> {
-    let pk = PublicKey::from_hex(hex)
-        .map_err(|e| AppError::Identity(format!("invalid hex pubkey: {e}")))?;
-    pk.to_bech32()
-        .map_err(|e| AppError::Identity(format!("bech32 encode failed: {e}")))
-}
 
 impl AppClient {
     pub async fn send_friend_request(
@@ -27,144 +11,43 @@ impl AppClient {
         my_name: String,
         device_id: String,
     ) -> AppResult<PendingFriendRequest> {
-        // 1. Extract needed data, drop lock before async
-        let (identity, storage, signal_device_id, identity_pubkey) = {
+        let identity_pubkey = self.cached_identity_pubkey();
+
+        // 1. Protocol: generate keys, publish, persist to SecureStorage, store in memory
+        let (request_id, event_id_hex) = {
             let mut inner = self.inner.write().await;
-            let id = inner
-                .protocol
-                .identity
-                .clone()
-                .ok_or(AppError::NotInitialized("no identity".into()))?;
-            let pubkey_hex = id.pubkey_hex();
-            let did = inner.protocol.next_signal_device_id;
-            inner.protocol.next_signal_device_id += 1;
-            (id, inner.protocol.storage.clone(), did, pubkey_hex)
-        }; // lock dropped
+            inner.protocol.send_friend_request_protocol(&peer_nostr_pubkey, &my_name, &device_id).await?
+        };
 
-        // 2. Generate fresh per-peer keys and send (async, no lock held)
-        let keys = generate_prekey_material()?;
-        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
-            serialize_prekey_material(&keys)?;
-
-        let (event, state) = send_friend_request_persistent(
-            &identity,
-            &peer_nostr_pubkey,
-            &my_name,
-            &device_id,
-            keys,
-            storage.clone(),
-            signal_device_id,
-        )
-        .await?;
-
-        let request_id = state.request_id.clone();
-        let first_inbox_secret = state.first_inbox_keys.secret_hex();
-        let event_id_hex = event.id.to_hex();
-
-        // 2b. Persist pending FR to SQLCipher (per-peer identity included)
-        {
-            let store = storage.lock().map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
-            store.save_pending_fr(
-                &request_id,
-                signal_device_id,
-                &id_pub,
-                &id_priv,
-                reg_id,
-                spk_id,
-                &spk_rec,
-                pk_id,
-                &pk_rec,
-                kpk_id,
-                &kpk_rec,
-                &first_inbox_secret,
-                &peer_nostr_pubkey,
-            )?;
-        }
-        tracing::info!(
-            "persisted pending FR reqId={}",
-            &request_id[..16.min(request_id.len())]
-        );
-
-        // 3. Publish async — don't block waiting for relay OK responses
-        {
-            let inner = self.inner.read().await;
-            let transport = inner
-                .protocol
-                .transport
-                .as_ref()
-                .ok_or(AppError::Transport(
-                    "Not connected to any relay. Please check your network.".into(),
-                ))?;
-            transport.publish_event_async(event).await?;
-        }
-
-        // 4. Store pending state in memory
-        {
-            let mut inner = self.inner.write().await;
-            inner
-                .protocol
-                .pending_outbound
-                .insert(request_id.clone(), state);
-        }
-
-        // 5. Write to app_* tables: room (status=0 requesting) + contact + message
-        let peer_npub = npub_from_hex(&peer_nostr_pubkey).unwrap_or_default();
+        // 2. App: persist to app_storage
+        let peer_npub = npub_from_hex(peer_nostr_pubkey.clone()).unwrap_or_default();
         let room_id = make_room_id(&peer_nostr_pubkey, &identity_pubkey);
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let fr_storage = self.inner.read().await.app_storage.clone();
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         {
-            let store = lock_app_storage(&fr_storage);
-            if let Err(e) = store.transaction(|_| {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let _ = store.transaction(|_| {
                 store.save_app_room(
-                    &peer_nostr_pubkey,
-                    &identity_pubkey,
-                    RoomStatus::Requesting.to_i32(),
-                    RoomType::Dm.to_i32(),
-                    None,
-                    None,
-                    None,
+                    &peer_nostr_pubkey, &identity_pubkey,
+                    RoomStatus::Requesting.to_i32(), RoomType::Dm.to_i32(), None, None, None,
                 )?;
                 store.save_app_contact(&peer_nostr_pubkey, &peer_npub, &identity_pubkey, None)?;
                 store.save_app_message(
-                    &request_id,
-                    Some(&event_id_hex),
-                    &room_id,
-                    &identity_pubkey,
-                    &identity.pubkey_hex(),
-                    "[Friend Request Sent]",
-                    true,
-                    MessageStatus::Success.to_i32(),
-                    now,
+                    &request_id, Some(&event_id_hex), &room_id, &identity_pubkey,
+                    &identity_pubkey, "[Friend Request Sent]", true,
+                    MessageStatus::Success.to_i32(), now,
                 )?;
-                store.update_app_room(
-                    &room_id,
-                    None,
-                    None,
-                    Some("[Friend Request Sent]"),
-                    Some(now),
-                )?;
+                store.update_app_room(&room_id, None, None, Some("[Friend Request Sent]"), Some(now))?;
                 Ok(())
-            }) {
-                tracing::warn!("send_friend_request app tables: {e}");
-            }
+            });
         }
-        drop(fr_storage);
 
         self.emit_data_change(DataChange::RoomListChanged).await;
         self.emit_data_change(DataChange::ContactListChanged).await;
-        self.emit_data_change(DataChange::MessageAdded {
-            room_id: room_id.clone(),
-            msgid: request_id.clone(),
-        })
-        .await;
+        self.emit_data_change(DataChange::MessageAdded { room_id, msgid: request_id.clone() }).await;
 
-        Ok(PendingFriendRequest {
-            request_id,
-            peer_nostr_pubkey,
-        })
+        Ok(PendingFriendRequest { request_id, peer_nostr_pubkey })
     }
 
     pub async fn accept_friend_request(
@@ -172,211 +55,41 @@ impl AppClient {
         request_id: String,
         my_name: String,
     ) -> AppResult<ContactInfo> {
-        // 1. Load inbound FR from DB, extract needed data
-        let (identity, storage, signal_device_id, received) = {
+        // 1. Protocol: load FR, generate keys, accept, create session, persist, publish
+        let (peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex) = {
             let mut inner = self.inner.write().await;
-            let id = inner
-                .protocol
-                .identity
-                .clone()
-                .ok_or(AppError::NotInitialized("no identity".into()))?;
+            inner.protocol.accept_friend_request_protocol(&request_id, &my_name).await?
+        };
 
-            let store = inner
-                .protocol
-                .storage
-                .lock()
-                .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
-            let (sender_pubkey_hex, message_json, payload_json) = store
-                .load_inbound_fr(&request_id)
-                .map_err(|e| AppError::Storage(format!("load_inbound_fr: {e}")))?
-                .ok_or(AppError::InvalidArgument(format!(
-                    "no pending inbound request: {request_id}"
-                )))?;
-            drop(store);
-
-            let message: KCMessage =
-                serde_json::from_str(&message_json).map_err(|e| {
-                    AppError::InvalidArgument(format!("deserialize message: {e}"))
-                })?;
-            let payload: KCFriendRequestPayload =
-                serde_json::from_str(&payload_json).map_err(|e| {
-                    AppError::InvalidArgument(format!("deserialize payload: {e}"))
-                })?;
-            let sender_pubkey = PublicKey::from_hex(&sender_pubkey_hex).map_err(|e| {
-                AppError::InvalidArgument(format!("parse sender pubkey: {e}"))
-            })?;
-
-            let received = FriendRequestReceived {
-                sender_pubkey,
-                sender_pubkey_hex,
-                message,
-                payload,
-                created_at: 0,
-            };
-
-            let did = inner.protocol.next_signal_device_id;
-            inner.protocol.next_signal_device_id += 1;
-            (id, inner.protocol.storage.clone(), did, received)
-        }; // lock dropped
-
-        // 2. Accept (async, no lock) — fresh per-peer identity
-        let keys = generate_prekey_material()?;
-        let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
-            serialize_prekey_material(&keys)?;
-
-        let accepted = accept_friend_request_persistent(
-            &identity,
-            &received,
-            &my_name,
-            keys,
-            storage.clone(),
-            signal_device_id,
-        )
-        .await?;
-
-        let peer_signal_hex = received.payload.signal_identity_key.clone();
-        let peer_nostr_hex = received.sender_pubkey_hex.clone();
-        let peer_name = received.payload.name.clone();
-
-        // 3. Publish approval event async
-        let accept_event_id_hex = accepted.event.id.to_hex();
-        {
-            let inner = self.inner.read().await;
-            let transport = inner
-                .protocol
-                .transport
-                .as_ref()
-                .ok_or(AppError::Transport(
-                    "Not connected to any relay. Please check your network.".into(),
-                ))?;
-            transport.publish_event_async(accepted.event).await?;
-        }
-
-        // 4. Create ChatSession and store
-        let mut addresses = AddressManager::new();
-        addresses.add_peer(
-            &peer_signal_hex,
-            Some(received.payload.first_inbox.clone()),
-            Some(peer_nostr_hex.clone()),
-        );
-        if accepted.sender_address.is_some() {
-            let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
-        }
-        let recv_addrs = addresses.get_all_receiving_address_strings();
-        let session =
-            ChatSession::new(accepted.signal_participant, addresses, identity.clone());
-
-        // 4b. Persist to SQLCipher: signal participant (per-peer identity, no one-time prekeys)
-        {
-            let store = storage
-                .lock()
-                .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
-            store.save_signal_participant(
-                &peer_signal_hex,
-                signal_device_id,
-                &id_pub,
-                &id_priv,
-                reg_id,
-                spk_id,
-                &spk_rec,
-            )?;
-
-            if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                store.save_peer_addresses(&peer_signal_hex, &addr_state)?;
-            }
-
-            store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
-
-            let _ = store.delete_inbound_fr(&request_id);
-        }
-        tracing::info!(
-            "persisted accepted session: signal={} nostr={}",
-            &peer_signal_hex[..16.min(peer_signal_hex.len())],
-            &peer_nostr_hex[..16.min(peer_nostr_hex.len())]
-        );
-
-        {
-            let mut inner = self.inner.write().await;
-            inner.protocol.sessions.insert(
-                peer_signal_hex.clone(),
-                Arc::new(tokio::sync::Mutex::new(session)),
-            );
-            inner
-                .protocol
-                .peer_nostr_to_signal
-                .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
-            inner
-                .protocol
-                .peer_signal_to_nostr
-                .insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
-            // Update reverse index for O(1) message routing
-            for addr in &recv_addrs {
-                inner
-                    .protocol
-                    .receiving_addr_to_peer
-                    .insert(addr.clone(), peer_signal_hex.clone());
-            }
-        }
-
-        // 5. Write to app_* tables: update room status to enabled, create acceptance message
-        let identity_pubkey = identity.pubkey_hex();
+        // 2. App: update room, create message
+        let identity_pubkey = self.cached_identity_pubkey();
         let room_id = make_room_id(&peer_nostr_hex, &identity_pubkey);
-        tracing::info!(
-            "accept_friend_request: updating app tables room_id={}, peer={}",
-            &room_id,
-            &peer_nostr_hex[..16.min(peer_nostr_hex.len())]
-        );
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         let msgid = format!("accept-{}", request_id);
-        let accept_storage = self.inner.read().await.app_storage.clone();
         {
-            let store = lock_app_storage(&accept_storage);
-            store
-                .transaction(|_| {
-                    store.update_app_room(
-                        &room_id,
-                        Some(RoomStatus::Enabled.to_i32()),
-                        None,
-                        Some("[Friend Request Accepted]"),
-                        Some(now),
-                    )?;
-                    store.update_contact_name(&peer_nostr_hex, &identity_pubkey, &peer_name)?;
-                    store.save_app_message(
-                        &msgid,
-                        Some(&accept_event_id_hex),
-                        &room_id,
-                        &identity_pubkey,
-                        &identity.pubkey_hex(),
-                        "[Friend Request Accepted]",
-                        true,
-                        MessageStatus::Success.to_i32(),
-                        now,
-                    )?;
-                    Ok(())
-                })
-                .map_err(|e| {
-                    tracing::error!("accept_friend_request app tables failed: {e}");
-                    AppError::Storage(format!("accept app tables: {e}"))
-                })?;
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let _ = store.transaction(|_| {
+                store.update_app_room(
+                    &room_id, Some(RoomStatus::Enabled.to_i32()), None,
+                    Some("[Friend Request Accepted]"), Some(now),
+                )?;
+                store.update_contact_name(&peer_nostr_hex, &identity_pubkey, &peer_name)?;
+                store.save_app_message(
+                    &msgid, Some(&event_id_hex), &room_id, &identity_pubkey,
+                    &identity_pubkey, "[Friend Request Accepted]", true,
+                    MessageStatus::Success.to_i32(), now,
+                )?;
+                Ok(())
+            });
         }
-        drop(accept_storage);
 
-        self.emit_data_change(DataChange::RoomUpdated {
-            room_id: room_id.clone(),
-        })
-        .await;
+        self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
         self.emit_data_change(DataChange::ContactListChanged).await;
-        self.emit_data_change(DataChange::MessageAdded { room_id, msgid })
-            .await;
+        self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
 
-        Ok(ContactInfo {
-            nostr_pubkey_hex: peer_nostr_hex,
-            signal_id_hex: peer_signal_hex,
-            display_name: peer_name,
-        })
+        Ok(ContactInfo { nostr_pubkey_hex: peer_nostr_hex, signal_id_hex: peer_signal_hex, display_name: peer_name })
     }
 
     pub async fn reject_friend_request(
@@ -384,45 +97,24 @@ impl AppClient {
         request_id: String,
         _message: Option<String>,
     ) -> AppResult<()> {
-        // Load sender info before deleting
-        let (sender_pubkey_hex, identity_pubkey) = {
+        // 1. Protocol: delete from SecureStorage
+        let sender_pubkey_hex = {
             let inner = self.inner.read().await;
-            let store = inner
-                .protocol
-                .storage
-                .lock()
-                .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
-            let fr = store
-                .load_inbound_fr(&request_id)
-                .map_err(|e| AppError::Storage(format!("load_inbound_fr: {e}")))?;
-            let pubkey_hex = self.cached_identity_pubkey();
-            let sender = fr.map(|(pubkey, _, _)| pubkey).unwrap_or_default();
-
-            // Delete from DB
-            store
-                .delete_inbound_fr(&request_id)
-                .map_err(|e| AppError::Storage(format!("delete_inbound_fr: {e}")))?;
-
-            (sender, pubkey_hex)
+            inner.protocol.reject_friend_request_protocol(&request_id)?
         };
 
-        // Update room status to rejected (-1)
+        // 2. App: update room status
+        let identity_pubkey = self.cached_identity_pubkey();
         if !sender_pubkey_hex.is_empty() && !identity_pubkey.is_empty() {
             let room_id = make_room_id(&sender_pubkey_hex, &identity_pubkey);
-            let rej_storage = self.inner.read().await.app_storage.clone();
             {
-                let store = lock_app_storage(&rej_storage);
-                if let Err(e) = store.update_app_room(
-                    &room_id,
-                    Some(RoomStatus::Rejected.to_i32()),
-                    None,
-                    Some("[Friend Request Rejected]"),
-                    None,
-                ) {
-                    tracing::warn!("reject_friend_request update_app_room: {e}");
-                }
+                let app_storage = self.inner.read().await.app_storage.clone();
+                let store = lock_app_storage(&app_storage);
+                let _ = store.update_app_room(
+                    &room_id, Some(RoomStatus::Rejected.to_i32()), None,
+                    Some("[Friend Request Rejected]"), None,
+                );
             }
-            drop(rej_storage);
             self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
         }
 
