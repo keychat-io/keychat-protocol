@@ -12,7 +12,7 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Client Apps                            │
+│                       Client Apps                           │
 ├──────────────┬──────────────┬───────────────┬───────────────┤
 │   iOS App    │ Android App  │  Desktop App  │  keychat-cli  │
 │   (Swift)    │  (Kotlin)    │ (Tauri/etc.)  │   (Rust)      │
@@ -28,18 +28,20 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
                ▼                     ▼               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                     keychat-app-sdk                          │
-│              (cross-platform business logic)                 │
+│                    (thin glue layer)                         │
 │                                                             │
-│  Messaging · Event Loop · Groups · Friend Requests          │
-│  App Storage (SQLCipher) · Relay Tracking · Media           │
-│  Callbacks (EventListener / DataListener)                   │
+│  App Storage (SQLCipher) · Relay Publish & Tracking         │
+│  UI Callbacks (EventListener / DataListener)                │
+│  HTTP File Upload/Download · Event Loop Infrastructure      │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                       libkeychat                            │
-│                  (protocol implementation)                   │
+│            (protocol + business logic)                       │
 │                                                             │
+│  KeychatContext · Message Routing · Send Orchestration       │
+│  Session Management · Group Fan-out · Friend Requests       │
 │  Identity (BIP-39/NIP-06) · Signal Protocol (PQXDH)        │
 │  MLS (RFC 9420) · NIP-17/44 Encryption · Nostr Transport   │
 │  Address Rotation · Cashu Stamps · Secure Storage           │
@@ -50,8 +52,8 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
 
 ### Core
 
-- **[libkeychat](libkeychat/)** — Rust implementation of the Keychat protocol
-- **[keychat-app-sdk](keychat-app-sdk/)** — Cross-platform app SDK with messaging, storage, and event handling
+- **[libkeychat](libkeychat/)** — Protocol implementation and business logic (encryption, routing, session management)
+- **[keychat-app-sdk](keychat-app-sdk/)** — Thin glue layer: app storage, relay publishing, UI callbacks, file I/O
 - **[keychat-uniffi](keychat-uniffi/)** — Thin UniFFI export layer for Swift/Kotlin bindings
 - **[Keychat Spec](SPEC.md)** — Authoritative protocol specification (v0.4.0-draft)
 - **[Client Guide](libkeychat/docs/client-guide.md)** — KeychatClient API guide and usage examples
