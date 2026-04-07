@@ -1267,6 +1267,149 @@ impl ProtocolClient {
         Ok((event_ids, connected_relays))
     }
 
+    /// Create a Signal group: create group struct, send invites, persist to GroupManager.
+    /// Returns (group_id, group_name, member_count).
+    pub async fn create_group_protocol(
+        &mut self,
+        name: &str,
+        members: Vec<(String, String)>, // (nostr_pubkey, display_name)
+    ) -> Result<(String, String, u32)> {
+        let identity = self.identity.as_ref()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+        let my_nostr = identity.pubkey_hex();
+
+        let my_signal_id = if let Some(s) = self.sessions.values().next() {
+            s.try_lock().map(|s| s.signal.identity_public_key_hex()).unwrap_or_else(|_| my_nostr.clone())
+        } else { my_nostr.clone() };
+
+        // Resolve members to (signal_id, nostr_pubkey, name)
+        let mut other_members = Vec::new();
+        let mut member_sessions = Vec::new();
+        for (nostr_pk, display_name) in &members {
+            let signal_id = self.peer_nostr_to_signal.get(nostr_pk)
+                .ok_or_else(|| KeychatError::SignalSession(format!("peer not found: {}", &nostr_pk[..16.min(nostr_pk.len())])))?
+                .clone();
+            let session = self.sessions.get(&signal_id)
+                .ok_or_else(|| KeychatError::SignalSession(format!("no session: {}", &signal_id[..16.min(signal_id.len())])))?
+                .clone();
+            other_members.push((signal_id.clone(), nostr_pk.clone(), display_name.clone()));
+            member_sessions.push((signal_id, session));
+        }
+
+        let group = crate::create_signal_group(name, &my_signal_id, &my_nostr, "Me", other_members);
+        let group_id = group.group_id.clone();
+        let group_name = group.name.clone();
+        let member_count = group.members.len() as u32;
+
+        // Send invite to each member
+        let transport = self.transport.as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
+        for (signal_id, session_arc) in &member_sessions {
+            let mut session = session_arc.lock().await;
+            let addr = session.addresses.clone();
+            let event = crate::send_group_invite(&mut session.signal, &group, signal_id, &addr).await?;
+            let _ = transport.publish_event_async(event).await;
+        }
+
+        // Store in GroupManager + persist
+        let gid = group.group_id.clone();
+        self.group_manager.add_group(group);
+        if let Ok(store) = self.storage.lock() {
+            let _ = self.group_manager.save_group(&gid, &store);
+        }
+
+        Ok((group_id, group_name, member_count))
+    }
+
+    /// Send an admin message to all other group members (encrypt + publish).
+    pub async fn send_admin_to_all_protocol(
+        &self,
+        group: &crate::SignalGroup,
+        msg: &crate::KCMessage,
+    ) -> Result<()> {
+        let transport = self.transport.as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
+
+        for member in group.other_members() {
+            let signal_id = match self.peer_nostr_to_signal.get(&member.nostr_pubkey) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let session_arc = match self.sessions.get(&signal_id) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let mut session = session_arc.lock().await;
+            let addr = session.addresses.clone();
+            match crate::encrypt_for_group_member(&mut session.signal, &signal_id, msg, &addr).await {
+                Ok(event) => { let _ = transport.publish_event_async(event).await; }
+                Err(e) => { tracing::warn!("admin send to {} failed: {e}", &signal_id[..16.min(signal_id.len())]); }
+            }
+        }
+        Ok(())
+    }
+
+    /// Leave a group: send self-leave msg + remove from manager.
+    pub async fn leave_group_protocol(&mut self, group_id: &str) -> Result<()> {
+        let group = self.group_manager.get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
+        let payload = serde_json::json!({ "action": "selfLeave", "memberId": group.my_signal_id });
+        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupSelfLeave, &group, payload);
+        self.send_admin_to_all_protocol(&group, &msg).await?;
+        if let Ok(store) = self.storage.lock() {
+            let _ = self.group_manager.remove_group_persistent(group_id, &store);
+        } else {
+            self.group_manager.remove_group(group_id);
+        }
+        Ok(())
+    }
+
+    /// Dissolve a group: send dissolve msg + remove from manager.
+    pub async fn dissolve_group_protocol(&mut self, group_id: &str) -> Result<()> {
+        let group = self.group_manager.get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
+        let payload = serde_json::json!({ "action": "dissolve" });
+        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupDissolve, &group, payload);
+        self.send_admin_to_all_protocol(&group, &msg).await?;
+        if let Ok(store) = self.storage.lock() {
+            let _ = self.group_manager.remove_group_persistent(group_id, &store);
+        } else {
+            self.group_manager.remove_group(group_id);
+        }
+        Ok(())
+    }
+
+    /// Remove a member from a group: send removal msg + update group.
+    pub async fn remove_member_protocol(&mut self, group_id: &str, member_nostr_pubkey: &str) -> Result<()> {
+        let group = self.group_manager.get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
+        let removed_signal_id = self.peer_nostr_to_signal.get(member_nostr_pubkey)
+            .ok_or_else(|| KeychatError::SignalSession(format!("peer not found: {member_nostr_pubkey}")))?.clone();
+        let payload = serde_json::json!({ "action": "memberRemoved", "memberId": removed_signal_id });
+        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupMemberRemoved, &group, payload);
+        self.send_admin_to_all_protocol(&group, &msg).await?;
+        if let Some(g) = self.group_manager.get_group_mut(group_id) {
+            g.remove_member(&removed_signal_id);
+        }
+        if let Ok(store) = self.storage.lock() {
+            let _ = self.group_manager.save_group(group_id, &store);
+        }
+        Ok(())
+    }
+
+    /// Rename a group: send name-changed msg + update group.
+    pub async fn rename_group_protocol(&mut self, group_id: &str, new_name: &str) -> Result<()> {
+        let group = self.group_manager.get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
+        let payload = serde_json::json!({ "action": "nameChanged", "newName": new_name });
+        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupNameChanged, &group, payload);
+        self.send_admin_to_all_protocol(&group, &msg).await?;
+        if let Some(g) = self.group_manager.get_group_mut(group_id) {
+            g.name = new_name.to_string();
+        }
+        Ok(())
+    }
+
     /// Reject a friend request: delete from SecureStorage.
     pub fn reject_friend_request_protocol(&self, request_id: &str) -> Result<String> {
         let store = self.storage.lock()

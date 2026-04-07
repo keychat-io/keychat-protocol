@@ -1,697 +1,177 @@
-//! Signal Group (sendAll) — shared business logic.
-//!
-//! Groups use per-member 1:1 Signal encryption — each message
-//! is encrypted individually for every member.
+//! Signal Group — delegates protocol to ProtocolClient, handles app persistence.
 
-use libkeychat::{
-    build_group_admin_message, build_multi_file_message, create_signal_group,
-    encrypt_for_group_member, send_group_invite, KCFilePayload, KCMessage, KCMessageKind,
-    SignalGroup,
-};
+use libkeychat::{build_multi_file_message, KCFilePayload, KCMessage};
 
 use crate::app_client::{lock_app_storage, AppClient, AppError, AppResult};
 use crate::types::*;
 
 impl AppClient {
-    /// Helper: send a list of (member_id, Event) tuples to relay (fire-and-forget).
-    pub(crate) async fn broadcast_group_events(
-        &self,
-        events: Vec<(String, nostr::Event)>,
-    ) -> AppResult<Vec<String>> {
-        let inner = self.inner.read().await;
-        let transport = inner
-            .protocol
-            .transport
-            .as_ref()
-            .ok_or(AppError::Transport(
-                "Not connected to any relay. Please check your network.".into(),
-            ))?;
-
-        let mut event_ids = Vec::with_capacity(events.len());
-        for (_member_id, event) in events {
-            event_ids.push(event.id.to_hex());
-            if let Err(e) = transport.publish_event_async(event).await {
-                tracing::warn!("broadcast_group_events: send failed: {e}");
-            }
-        }
-
-        Ok(event_ids)
-    }
-
-    /// Encrypt a KCMessage for each group member using their individual 1:1 session,
-    /// then broadcast all events to relay. Used by leave/dissolve/rename/kick.
-    pub(crate) async fn send_group_admin_to_all(
-        &self,
-        group: &SignalGroup,
-        msg: &KCMessage,
-    ) -> AppResult<()> {
-        let inner = self.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(AppError::Transport(
-            "Not connected to any relay. Please check your network.".into(),
-        ))?;
-
-        // Encrypt sequentially (needs mutable session locks), collect events
-        let mut events = Vec::new();
-        for member in group.other_members() {
-            let signal_id = match inner.protocol.peer_nostr_to_signal.get(&member.nostr_pubkey) {
-                Some(sid) => sid.clone(),
-                None => {
-                    continue;
-                }
-            };
-            let session_mutex = match inner.protocol.sessions.get(&signal_id) {
-                Some(s) => s.clone(),
-                None => {
-                    continue;
-                }
-            };
-
-            let event = {
-                let mut session = session_mutex.lock().await;
-                let addr = session.addresses.clone();
-                encrypt_for_group_member(&mut session.signal, &signal_id, msg, &addr)
-                    .await
-                    .map_err(|e| AppError::Signal(e.to_string()))?
-            };
-
-            events.push(event);
-        }
-
-        // Fire-and-forget: push to relay websocket without waiting for OK
-        for event in events {
-            if let Err(e) = transport.publish_event_async(event).await {
-                tracing::warn!("send group admin event failed: {e}");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Create a new Signal group.
-    ///
-    /// `members` is a list of (peer_nostr_pubkey, name) tuples.
-    /// Each peer must already have an established 1:1 Signal session.
-    /// Returns the group_id and sends invites to all members.
     pub async fn create_signal_group(
         &self,
         name: String,
         members: Vec<GroupMemberInput>,
     ) -> AppResult<SignalGroupInfo> {
-        // Collect data under read lock, clone session Arc, then drop lock before await
-        let (my_nostr_pubkey, first_session_arc, other_members, member_sessions) = {
-            let inner = self.inner.read().await;
-
-            let identity = inner
-                .protocol
-                .identity
-                .as_ref()
-                .ok_or(AppError::NotInitialized("no identity set".into()))?;
-            let my_nostr_pubkey = identity.pubkey_hex();
-
-            // Clone the Arc so we can drop the read lock before awaiting the session mutex
-            let first_session_arc = inner.protocol.sessions.values().next().cloned();
-
-            let mut other_members = Vec::new();
-            let mut member_sessions = Vec::new();
-            for member in &members {
-                let signal_id = inner
-                    .protocol
-                    .peer_nostr_to_signal
-                    .get(&member.nostr_pubkey)
-                    .ok_or(AppError::PeerNotFound(member.nostr_pubkey.clone()))?
-                    .clone();
-                let session_arc = inner
-                    .protocol
-                    .sessions
-                    .get(&signal_id)
-                    .ok_or(AppError::PeerNotFound(signal_id.clone()))?
-                    .clone();
-                other_members.push((
-                    signal_id.clone(),
-                    member.nostr_pubkey.clone(),
-                    member.name.clone(),
-                ));
-                member_sessions.push((signal_id, session_arc));
-            }
-
-            (
-                my_nostr_pubkey,
-                first_session_arc,
-                other_members,
-                member_sessions,
-            )
-        }; // read lock dropped
-
-        // Await session mutex outside the read lock to avoid holding it across await
-        let my_signal_id = if let Some(session_mutex) = first_session_arc {
-            let session = session_mutex.lock().await;
-            session.signal.identity_public_key_hex()
-        } else {
-            tracing::warn!(
-                "create_signal_group: no sessions available, using nostr pubkey as signal_id"
-            );
-            my_nostr_pubkey.clone()
-        };
-
-        let group =
-            create_signal_group(&name, &my_signal_id, &my_nostr_pubkey, "Me", other_members);
-
-        let group_id = group.group_id.clone();
-        let group_name = group.name.clone();
-        let member_count = group.members.len() as u32;
-
-        tracing::info!(
-            "created signal group: id={}, name={}, members={}",
-            &group_id[..16.min(group_id.len())],
-            name,
-            member_count
-        );
-
-        // Send invite to each member (no read lock held)
-        let mut all_events = Vec::new();
-        for (signal_id, session_arc) in &member_sessions {
-            let mut session = session_arc.lock().await;
-            let addr = session.addresses.clone();
-            let event = send_group_invite(&mut session.signal, &group, signal_id, &addr).await?;
-            tracing::info!(
-                "sent group invite to {}",
-                &signal_id[..16.min(signal_id.len())]
-            );
-            all_events.push((signal_id.clone(), event));
-        }
-        let _ = self.broadcast_group_events(all_events).await;
-
-        // Store group in manager + persist
-        let mut inner = self.inner.write().await;
-        let gid = group.group_id.clone();
-        inner.protocol.group_manager.add_group(group);
-        if let Ok(store) = inner.protocol.storage.clone().lock() {
-            let _ = inner.protocol.group_manager.save_group(&gid, &store);
-        }
-
-        // Create app_room for the group (same as receiver side in event_loop)
-        {
-            let app_storage = inner.app_storage.clone();
-            let store = lock_app_storage(&app_storage);
-            if let Err(e) =
-                store.save_app_room(&group_id, &my_nostr_pubkey, 1, 1, Some(&name), None, None)
-            {
-                tracing::warn!("save_app_room for group: {e}");
-            }
-        }
-        drop(inner);
-        self.emit_data_change(DataChange::RoomListChanged).await;
-
-        Ok(SignalGroupInfo {
-            group_id,
-            name: group_name,
-            member_count,
-        })
-    }
-
-    /// Get the member list for a Signal group.
-    pub async fn get_signal_group_members(
-        &self,
-        group_id: String,
-    ) -> AppResult<Vec<GroupMemberInfo>> {
-        let inner = self.inner.read().await;
-        let group = inner
-            .protocol
-            .group_manager
-            .get_group(&group_id)
-            .ok_or(AppError::PeerNotFound(group_id.clone()))?;
-
-        let members = group
-            .members
-            .values()
-            .map(|m| GroupMemberInfo {
-                nostr_pubkey: m.nostr_pubkey.clone(),
-                name: m.name.clone(),
-                is_admin: group.is_admin(&m.signal_id),
-                is_me: m.signal_id == group.my_signal_id,
-            })
+        let member_tuples: Vec<(String, String)> = members
+            .iter()
+            .map(|m| (m.nostr_pubkey.clone(), m.name.clone()))
             .collect();
 
-        Ok(members)
+        // 1. Protocol: create group, send invites, persist to GroupManager
+        let (group_id, group_name, member_count) = {
+            let mut inner = self.inner.write().await;
+            inner.protocol.create_group_protocol(&name, member_tuples).await?
+        };
+
+        // 2. App: save room
+        let identity_pubkey = self.cached_identity_pubkey();
+        {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let _ = store.save_app_room(&group_id, &identity_pubkey, 1, 1, Some(&name), None, None);
+        }
+        self.emit_data_change(DataChange::RoomListChanged).await;
+
+        Ok(SignalGroupInfo { group_id, name: group_name, member_count })
     }
 
-    /// Send a text message to a Signal group.
+    pub async fn get_signal_group_members(&self, group_id: String) -> AppResult<Vec<GroupMemberInfo>> {
+        let inner = self.inner.read().await;
+        let group = inner.protocol.group_manager.get_group(&group_id)
+            .ok_or(AppError::PeerNotFound(group_id))?;
+        Ok(group.members.values().map(|m| GroupMemberInfo {
+            nostr_pubkey: m.nostr_pubkey.clone(),
+            name: m.name.clone(),
+            is_admin: group.is_admin(&m.signal_id),
+            is_me: m.signal_id == group.my_signal_id,
+        }).collect())
+    }
+
     pub async fn send_group_text(
-        &self,
-        group_id: String,
-        text: String,
-        reply_to: Option<ReplyToPayload>,
+        &self, group_id: String, text: String, reply_to: Option<ReplyToPayload>,
     ) -> AppResult<GroupSentMessage> {
         let mut msg = KCMessage::text(&text);
         if let Some(ref rt) = reply_to {
             msg.reply_to = Some(libkeychat::ReplyTo {
-                target_id: None,
-                target_event_id: Some(rt.target_event_id.clone()),
-                content: rt.content.clone().unwrap_or_default(),
-                user_id: None,
-                user_name: None,
+                target_id: None, target_event_id: Some(rt.target_event_id.clone()),
+                content: rt.content.clone().unwrap_or_default(), user_id: None, user_name: None,
             });
         }
         let display = if text.is_empty() { "[Message]" } else { &text };
-        self.send_group_message_internal(group_id, msg, display, &reply_to)
-            .await
+        self.send_group_message_internal(group_id, msg, display, &reply_to).await
     }
 
-    /// Send file(s) to a Signal group.
     pub async fn send_group_file(
-        &self,
-        group_id: String,
-        files: Vec<FilePayload>,
-        message: Option<String>,
-        reply_to: Option<ReplyToPayload>,
+        &self, group_id: String, files: Vec<FilePayload>,
+        message: Option<String>, reply_to: Option<ReplyToPayload>,
     ) -> AppResult<GroupSentMessage> {
-        if files.is_empty() {
-            return Err(AppError::InvalidArgument(
-                "files list cannot be empty".into(),
-            ));
-        }
-
-        let kc_files: Vec<KCFilePayload> = files
-            .iter()
-            .map(|f| KCFilePayload {
-                category: f.category.to_lib(),
-                url: f.url.clone(),
-                type_: f.mime_type.clone(),
-                suffix: f.suffix.clone(),
-                size: Some(f.size),
-                key: Some(f.key.clone()),
-                iv: Some(f.iv.clone()),
-                hash: Some(f.hash.clone()),
-                source_name: f.source_name.clone(),
-                audio_duration: f.audio_duration.map(|d| d as f64),
-                amplitude_samples: f.amplitude_samples.clone(),
-                ecash_token: None,
-            })
-            .collect();
-
+        if files.is_empty() { return Err(AppError::InvalidArgument("files empty".into())); }
+        let kc_files: Vec<KCFilePayload> = files.iter().map(|f| KCFilePayload {
+            category: f.category.to_lib(), url: f.url.clone(), type_: f.mime_type.clone(),
+            suffix: f.suffix.clone(), size: Some(f.size), key: Some(f.key.clone()),
+            iv: Some(f.iv.clone()), hash: Some(f.hash.clone()), source_name: f.source_name.clone(),
+            audio_duration: f.audio_duration.map(|d| d as f64),
+            amplitude_samples: f.amplitude_samples.clone(), ecash_token: None,
+        }).collect();
         let mut msg = build_multi_file_message(kc_files);
         if let Some(ref m) = message {
-            if let Some(ref mut fs) = msg.files {
-                fs.message = Some(m.clone());
-            }
+            if let Some(ref mut fs) = msg.files { fs.message = Some(m.clone()); }
         }
         if let Some(ref rt) = reply_to {
             msg.reply_to = Some(libkeychat::ReplyTo {
-                target_id: None,
-                target_event_id: Some(rt.target_event_id.clone()),
-                content: rt.content.clone().unwrap_or_default(),
-                user_id: None,
-                user_name: None,
+                target_id: None, target_event_id: Some(rt.target_event_id.clone()),
+                content: rt.content.clone().unwrap_or_default(), user_id: None, user_name: None,
             });
         }
-
-        let display = match message.as_deref() {
-            Some(m) if !m.is_empty() => m,
-            _ => "[File]",
-        };
-        self.send_group_message_internal(group_id, msg, display, &reply_to)
-            .await
+        let display = match message.as_deref() { Some(m) if !m.is_empty() => m, _ => "[File]" };
+        self.send_group_message_internal(group_id, msg, display, &reply_to).await
     }
 
-    /// Leave a Signal group. Notifies all members.
     pub async fn leave_signal_group(&self, group_id: String) -> AppResult<()> {
-        let group = {
-            let inner = self.inner.read().await;
-            inner
-                .protocol
-                .group_manager
-                .get_group(&group_id)
-                .ok_or(AppError::PeerNotFound(group_id.clone()))?
-                .clone()
-        };
-
-        let payload =
-            serde_json::json!({ "action": "selfLeave", "memberId": group.my_signal_id });
-        let msg = build_group_admin_message(KCMessageKind::SignalGroupSelfLeave, &group, payload);
-        self.send_group_admin_to_all(&group, &msg).await?;
-
-        // Remove group from manager + storage
         let mut inner = self.inner.write().await;
-        if let Ok(store) = inner.protocol.storage.clone().lock() {
-            let _ = inner
-                .protocol
-                .group_manager
-                .remove_group_persistent(&group_id, &store);
-        } else {
-            inner.protocol.group_manager.remove_group(&group_id);
-        }
-
-        tracing::info!(
-            "left signal group {}",
-            &group_id[..16.min(group_id.len())]
-        );
+        inner.protocol.leave_group_protocol(&group_id).await?;
         Ok(())
     }
 
-    /// Dissolve a Signal group (admin only). Notifies all members.
     pub async fn dissolve_signal_group(&self, group_id: String) -> AppResult<()> {
-        let group = {
-            let inner = self.inner.read().await;
-            inner
-                .protocol
-                .group_manager
-                .get_group(&group_id)
-                .ok_or(AppError::PeerNotFound(group_id.clone()))?
-                .clone()
-        };
-
-        let payload = serde_json::json!({ "action": "dissolve" });
-        let msg = build_group_admin_message(KCMessageKind::SignalGroupDissolve, &group, payload);
-        self.send_group_admin_to_all(&group, &msg).await?;
-
         let mut inner = self.inner.write().await;
-        if let Ok(store) = inner.protocol.storage.clone().lock() {
-            let _ = inner
-                .protocol
-                .group_manager
-                .remove_group_persistent(&group_id, &store);
-        } else {
-            inner.protocol.group_manager.remove_group(&group_id);
-        }
-
-        tracing::info!(
-            "dissolved signal group {}",
-            &group_id[..16.min(group_id.len())]
-        );
+        inner.protocol.dissolve_group_protocol(&group_id).await?;
         Ok(())
     }
 
-    /// Remove a member from a Signal group (admin only).
-    pub async fn remove_group_member(
-        &self,
-        group_id: String,
-        member_nostr_pubkey: String,
-    ) -> AppResult<()> {
-        let (group, removed_signal_id) = {
-            let inner = self.inner.read().await;
-            let group = inner
-                .protocol
-                .group_manager
-                .get_group(&group_id)
-                .ok_or(AppError::PeerNotFound(group_id.clone()))?
-                .clone();
-            let removed_signal_id = inner
-                .protocol
-                .peer_nostr_to_signal
-                .get(&member_nostr_pubkey)
-                .ok_or(AppError::PeerNotFound(member_nostr_pubkey.clone()))?
-                .clone();
-            (group, removed_signal_id)
-        };
-
-        let payload =
-            serde_json::json!({ "action": "memberRemoved", "memberId": removed_signal_id });
-        let msg =
-            build_group_admin_message(KCMessageKind::SignalGroupMemberRemoved, &group, payload);
-        self.send_group_admin_to_all(&group, &msg).await?;
-
-        // Update group state + persist
+    pub async fn remove_group_member(&self, group_id: String, member_nostr_pubkey: String) -> AppResult<()> {
         let mut inner = self.inner.write().await;
-        if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
-            g.remove_member(&removed_signal_id);
-        }
-        if let Ok(store) = inner.protocol.storage.clone().lock() {
-            let _ = inner.protocol.group_manager.save_group(&group_id, &store);
-        }
-
-        tracing::info!(
-            "removed member {} from group {}",
-            &member_nostr_pubkey[..16.min(member_nostr_pubkey.len())],
-            &group_id[..16.min(group_id.len())]
-        );
+        inner.protocol.remove_member_protocol(&group_id, &member_nostr_pubkey).await?;
         Ok(())
     }
 
-    /// Rename a Signal group (admin only).
-    pub async fn rename_signal_group(
-        &self,
-        group_id: String,
-        new_name: String,
-    ) -> AppResult<()> {
-        let group = {
-            let inner = self.inner.read().await;
-            inner
-                .protocol
-                .group_manager
-                .get_group(&group_id)
-                .ok_or(AppError::PeerNotFound(group_id.clone()))?
-                .clone()
-        };
-
-        let payload = serde_json::json!({ "action": "nameChanged", "newName": new_name });
-        let msg =
-            build_group_admin_message(KCMessageKind::SignalGroupNameChanged, &group, payload);
-        self.send_group_admin_to_all(&group, &msg).await?;
-
+    pub async fn rename_signal_group(&self, group_id: String, new_name: String) -> AppResult<()> {
         let mut inner = self.inner.write().await;
-        if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
-            g.name = new_name.clone();
-        }
-
-        tracing::info!(
-            "renamed group {} to {}",
-            &group_id[..16.min(group_id.len())],
-            new_name
-        );
+        inner.protocol.rename_group_protocol(&group_id, &new_name).await?;
         Ok(())
     }
 
-    /// Shared fan-out logic for all group message types.
-    /// Encrypts the KCMessage for each member and publishes to relays.
+    /// Shared fan-out logic: protocol encrypt+publish, then app persistence.
     async fn send_group_message_internal(
-        &self,
-        group_id: String,
-        mut msg: KCMessage,
-        display_text: &str,
+        &self, group_id: String, mut msg: KCMessage, display_text: &str,
         reply_to: &Option<ReplyToPayload>,
     ) -> AppResult<GroupSentMessage> {
-        // 1. Gather group, identity, check connectivity
-        let (group, identity_pubkey, connected_relays) = {
-            let inner = self.inner.read().await;
-
-            let group = inner
-                .protocol
-                .group_manager
-                .get_group(&group_id)
-                .ok_or(AppError::PeerNotFound(group_id.clone()))?
-                .clone();
-
-            let transport = inner
-                .protocol
-                .transport
-                .as_ref()
-                .ok_or(AppError::Transport(
-                    "Not connected to any relay. Please check your network.".into(),
-                ))?;
-            let connected = transport.connected_relays().await;
-
-            let identity_pubkey = self.cached_identity_pubkey();
-
-            (group, identity_pubkey, connected)
-        };
-
-        if connected_relays.is_empty() {
-            return Err(AppError::Transport(
-                "Not connected to any relay. Please check your network.".into(),
-            ));
-        }
-
-        // 2. Stamp group_id onto the message
+        let identity_pubkey = self.cached_identity_pubkey();
         msg.group_id = Some(group_id.clone());
         let payload_json = msg.to_json().ok();
 
-        let full_room_id = crate::types::make_room_id(&group_id, &identity_pubkey);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let msgid = format!(
-            "gsend-{}-{}",
-            &group_id[..16.min(group_id.len())],
-            now
-        );
-
-        // 3. Save message to DB (status=0 sending) — UI shows it immediately
-        {
-            let send_storage = self.inner.read().await.app_storage.clone();
-            let store = lock_app_storage(&send_storage);
-            if let Err(e) = store.save_app_message(
-                &msgid,
-                Some(&msgid),
-                &full_room_id,
-                &identity_pubkey,
-                &identity_pubkey,
-                display_text,
-                true,
-                0,
-                now,
-            ) {
-                tracing::warn!("save_app_message (group send): {e}");
-            }
-            if let Err(e) = store.update_app_message(
-                &msgid,
-                None,
-                None,
-                None,
-                payload_json.as_deref(),
-                None,
-                reply_to.as_ref().map(|r| r.target_event_id.as_str()),
-                reply_to.as_ref().and_then(|r| r.content.as_deref()),
-            ) {
-                tracing::warn!("update_app_message (group send payload): {e}");
-            }
-            if let Err(e) =
-                store.update_app_room(&full_room_id, None, None, Some(display_text), Some(now))
-            {
-                tracing::warn!("update_app_room (group send): {e}");
-            }
-        }
-
-        // 4. Emit DataChange BEFORE relay publish
-        self.emit_data_change(DataChange::MessageAdded {
-            room_id: full_room_id.clone(),
-            msgid: msgid.clone(),
-        })
-        .await;
-        self.emit_data_change(DataChange::RoomUpdated {
-            room_id: full_room_id.clone(),
-        })
-        .await;
-
-        // 5. Encrypt for each member, collect events
-        struct PendingEvent {
-            event: nostr::Event,
-            eid: String,
-            member_name: String,
-        }
-        let mut event_ids = Vec::new();
-        let mut nostr_events_json = Vec::new();
-        let mut pending: Vec<PendingEvent> = Vec::new();
-
-        {
-            let inner = self.inner.read().await;
-            for member in group.other_members() {
-                let signal_id =
-                    match inner.protocol.peer_nostr_to_signal.get(&member.nostr_pubkey) {
-                        Some(sid) => sid.clone(),
-                        None => {
-                            tracing::warn!(
-                                "no signal_id for group member nostr={}",
-                                &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
-                            );
-                            continue;
-                        }
-                    };
-                let session_mutex = match inner.protocol.sessions.get(&signal_id) {
-                    Some(s) => s.clone(),
-                    None => {
-                        tracing::warn!(
-                            "no session for group member nostr={}",
-                            &member.nostr_pubkey[..16.min(member.nostr_pubkey.len())],
-                        );
-                        continue;
-                    }
-                };
-
-                let event = {
-                    let mut session = session_mutex.lock().await;
-                    let addr = session.addresses.clone();
-                    encrypt_for_group_member(&mut session.signal, &signal_id, &msg, &addr)
-                        .await
-                        .map_err(|e| AppError::Signal(e.to_string()))?
-                };
-
-                let eid = event.id.to_hex();
-                if let Ok(json) = serde_json::to_string(&event) {
-                    nostr_events_json.push(json);
-                }
-                event_ids.push(eid.clone());
-                pending.push(PendingEvent {
-                    event,
-                    eid,
-                    member_name: member.name.clone(),
-                });
-            }
-        }
-
-        // 5b. Publish events to relays
-        {
-            let inner = self.inner.read().await;
-            let transport = inner
-                .protocol
-                .transport
-                .as_ref()
-                .ok_or(AppError::Transport(
-                    "Not connected to any relay. Please check your network.".into(),
-                ))?;
-            for p in &pending {
-                if let Err(e) = transport.publish_event_async(p.event.clone()).await {
-                    tracing::warn!("group publish failed for member={}: {e}", p.member_name);
-                }
-            }
-        }
-
-        // 6. Register with relay tracker
-        let members: Vec<(String, String)> = pending
-            .iter()
-            .map(|p| (p.eid.clone(), p.member_name.clone()))
-            .collect();
-        let initial_relay_json = {
-            let mut tracker = self
-                .relay_tracker
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            tracker.track_group(
-                msgid.clone(),
-                full_room_id.clone(),
-                members,
-                connected_relays,
-            )
+        // 1. Protocol: fan-out encrypt + publish
+        let (event_ids, connected_relays) = {
+            let mut inner = self.inner.write().await;
+            inner.protocol.send_group_message_protocol(&group_id, &msg).await?
         };
 
-        let nostr_event_json = format!("[{}]", nostr_events_json.join(","));
+        // 2. App: persist message
+        let full_room_id = make_room_id(&group_id, &identity_pubkey);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let msgid = format!("gsend-{}-{}", &group_id[..16.min(group_id.len())], now);
+
         {
-            let send_storage = self.inner.read().await.app_storage.clone();
-            let store = lock_app_storage(&send_storage);
-            let event_id_ref = event_ids.first().map(|s| s.as_str());
-            if let Err(e) = store.update_app_message(
-                &msgid,
-                event_id_ref,
-                None,
-                Some(&initial_relay_json),
-                None,
-                Some(&nostr_event_json),
-                None,
-                None,
-            ) {
-                tracing::warn!("update_app_message (group send metadata): {e}");
-            }
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let _ = store.save_app_message(
+                &msgid, Some(&msgid), &full_room_id, &identity_pubkey,
+                &identity_pubkey, display_text, true, 0, now,
+            );
+            let _ = store.update_app_message(
+                &msgid, None, None, None, payload_json.as_deref(), None,
+                reply_to.as_ref().map(|r| r.target_event_id.as_str()),
+                reply_to.as_ref().and_then(|r| r.content.as_deref()),
+            );
+            let _ = store.update_app_room(&full_room_id, None, None, Some(display_text), Some(now));
         }
 
-        // 7. Emit MessageUpdated so UI sees initial relay status
-        self.emit_data_change(DataChange::MessageUpdated {
-            room_id: full_room_id,
-            msgid: msgid.clone(),
-        })
-        .await;
+        self.emit_data_change(DataChange::MessageAdded { room_id: full_room_id.clone(), msgid: msgid.clone() }).await;
+        self.emit_data_change(DataChange::RoomUpdated { room_id: full_room_id.clone() }).await;
 
-        tracing::info!(
-            "sent group message to {} members, group={}",
-            event_ids.len(),
-            &group_id[..16.min(group_id.len())]
-        );
+        // 3. Relay tracker
+        let members: Vec<(String, String)> = event_ids.iter()
+            .enumerate()
+            .map(|(i, eid)| (eid.clone(), format!("member_{i}")))
+            .collect();
+        let initial_relay_json = {
+            let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.track_group(msgid.clone(), full_room_id.clone(), members, connected_relays)
+        };
+        {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let event_id_ref = event_ids.first().map(|s| s.as_str());
+            let _ = store.update_app_message(
+                &msgid, event_id_ref, None, Some(&initial_relay_json), None, None, None, None,
+            );
+        }
+
+        self.emit_data_change(DataChange::MessageUpdated { room_id: full_room_id, msgid: msgid.clone() }).await;
 
         Ok(GroupSentMessage {
-            msgid,
-            group_id,
-            event_ids,
-            payload_json,
-            nostr_event_json: Some(nostr_event_json),
+            msgid, group_id, event_ids, payload_json,
+            nostr_event_json: None,
             relay_status_json: Some(initial_relay_json),
         })
     }
