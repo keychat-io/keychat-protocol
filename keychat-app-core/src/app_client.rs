@@ -15,6 +15,8 @@ use libkeychat::{
     Identity, IdentityWithMnemonic, ProtocolClient, SecureStorage, SignalParticipant, Transport,
 };
 
+use nostr::nips::nip19::{FromBech32, ToBech32};
+
 use crate::app_storage::AppStorage;
 use crate::relay_tracker::RelaySendTracker;
 use crate::types::*;
@@ -106,6 +108,30 @@ pub fn default_device_id() -> DeviceId {
 }
 
 static TRACING_INIT: Once = Once::new();
+
+/// Convert a hex public key to npub (bech32) format.
+pub fn npub_from_hex(hex: String) -> AppResult<String> {
+    let pk = libkeychat::PublicKey::from_hex(&hex)
+        .map_err(|e| AppError::Identity(format!("invalid hex pubkey: {e}")))?;
+    pk.to_bech32()
+        .map_err(|e| AppError::Identity(format!("bech32 encode failed: {e}")))
+}
+
+/// Convert an npub (bech32) string to hex public key.
+pub fn hex_from_npub(npub: String) -> AppResult<String> {
+    let pk = libkeychat::PublicKey::from_bech32(&npub)
+        .map_err(|e| AppError::Identity(format!("invalid npub: {e}")))?;
+    Ok(pk.to_hex())
+}
+
+/// Accept both npub1... and hex formats, normalize to hex.
+pub fn normalize_to_hex(input: String) -> AppResult<String> {
+    if input.starts_with("npub1") {
+        hex_from_npub(input)
+    } else {
+        Ok(input)
+    }
+}
 
 // ─── AppClient ──────────────────────────────────────────────────
 
