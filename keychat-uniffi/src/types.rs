@@ -326,9 +326,10 @@ impl RoomStatus {
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RoomType {
-    Dm,           // 0
+    Dm,           // 0 — Signal-encrypted 1:1 DM
     SignalGroup,  // 1
     MlsGroup,    // 2
+    Nip17Dm,     // 3 — Standard NIP-17 DM (no Signal session, NIP-44 only)
 }
 
 impl RoomType {
@@ -337,6 +338,7 @@ impl RoomType {
             0 => RoomType::Dm,
             1 => RoomType::SignalGroup,
             2 => RoomType::MlsGroup,
+            3 => RoomType::Nip17Dm,
             _ => RoomType::Dm,
         }
     }
@@ -346,6 +348,7 @@ impl RoomType {
             RoomType::Dm => 0,
             RoomType::SignalGroup => 1,
             RoomType::MlsGroup => 2,
+            RoomType::Nip17Dm => 3,
         }
     }
 }
