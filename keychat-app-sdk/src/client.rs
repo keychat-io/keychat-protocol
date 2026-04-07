@@ -62,7 +62,7 @@ pub(crate) struct ClientInner {
     pub subscription_ids: Vec<String>,
 }
 
-#[derive(uniffi::Object)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Object))]
 pub struct KeychatClient {
     pub(crate) inner: tokio::sync::RwLock<ClientInner>,
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
@@ -74,9 +74,9 @@ pub struct KeychatClient {
     pub(crate) identity_pubkey_hex: tokio::sync::OnceCell<String>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(async_runtime = "tokio"))]
 impl KeychatClient {
-    #[uniffi::constructor]
+    #[cfg_attr(feature = "uniffi-export", uniffi::constructor)]
     pub fn new(db_path: String, db_key: String) -> Result<Self, KeychatUniError> {
         // Initialize tracing subscriber once so Rust logs appear in Xcode console
         TRACING_INIT.call_once(|| {

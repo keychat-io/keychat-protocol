@@ -35,8 +35,8 @@ echo "==> Creating XCFramework..."
 
 cp "$TMP_DIR/swift/"*.h "$TMP_DIR/headers/" 2>/dev/null || true
 cat > "$TMP_DIR/headers/module.modulemap" << 'MODULEMAP'
-module keychat_uniffiFFI {
-    header "keychat_uniffiFFI.h"
+module keychat_app_sdkFFI {
+    header "keychat_app_sdkFFI.h"
     export *
 }
 MODULEMAP
@@ -53,7 +53,7 @@ xcodebuild -create-xcframework \
 echo "==> Deploying to $IOS_DIR ..."
 rm -rf "$IOS_DIR/KeychatFFI.xcframework"
 cp -R "$TMP_DIR/KeychatFFI.xcframework" "$IOS_DIR/KeychatFFI.xcframework"
-cp "$TMP_DIR/swift/KeychatFFI.swift" "$IOS_DIR/agentChat/Services/KeychatFFI.swift"
+cp "$TMP_DIR/swift/keychat_app_sdk.swift" "$IOS_DIR/agentChat/Services/KeychatFFI.swift"
 
 # Patch: UniFFI generates a function reference that Xcode 26 / Swift 6 rejects as
 # "a C function pointer can only be formed from a reference to a 'func' or a literal closure".

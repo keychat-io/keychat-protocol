@@ -90,7 +90,7 @@ impl KeychatClient {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(async_runtime = "tokio"))]
 impl KeychatClient {
     /// Create a new Signal group.
     ///

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use keychat_uniffi::*;
+use keychat_app_sdk::*;
 
 // ─── Network test helpers ────────────────────────────────────────
 

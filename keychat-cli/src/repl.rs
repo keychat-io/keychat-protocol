@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use colored::Colorize;
-use keychat_uniffi::{
+use keychat_app_sdk::{
     ClientEvent, DataChange, GroupMemberInput, KeychatClient, MessageKind, RoomStatus, RoomType,
 };
 use tokio::sync::broadcast;
@@ -43,7 +43,7 @@ pub async fn run(
     let _ = rl.load_history(&hist_path);
 
     // Shared startup: restore identity → sessions → connect → event loop
-    let relay_urls = keychat_uniffi::default_relays();
+    let relay_urls = keychat_app_sdk::default_relays();
     if let Some((pubkey, session_count)) = crate::commands::init_and_connect(&client, relay_urls).await {
         print_sys(&format!("Identity loaded: {}", short_key(&pubkey).cyan()));
         if session_count > 0 {
@@ -177,7 +177,7 @@ async fn cmd_create(client: Arc<KeychatClient>, name: &str) -> anyhow::Result<()
     print_sys(&format!("Mnemonic (save this!): {}", mnemonic.yellow()));
 
     // Auto-connect to relays
-    crate::commands::connect_and_start(&client, keychat_uniffi::default_relays());
+    crate::commands::connect_and_start(&client, keychat_app_sdk::default_relays());
     print_sys("Connecting to relays...");
     Ok(())
 }
@@ -191,14 +191,14 @@ async fn cmd_import(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()
     print_ok(&format!("Identity imported: {}", pubkey.cyan()));
 
     // Auto-connect to relays
-    crate::commands::connect_and_start(&client, keychat_uniffi::default_relays());
+    crate::commands::connect_and_start(&client, keychat_app_sdk::default_relays());
     print_sys("Connecting to relays...");
     Ok(())
 }
 
 async fn cmd_whoami(client: &KeychatClient) -> anyhow::Result<()> {
     let pubkey = client.get_pubkey_hex().await?;
-    let npub = keychat_uniffi::npub_from_hex(pubkey.clone()).unwrap_or_default();
+    let npub = keychat_app_sdk::npub_from_hex(pubkey.clone()).unwrap_or_default();
     println!("  {} {}", "Pubkey:".dimmed(), pubkey.cyan());
     println!("  {} {}", "npub:  ".dimmed(), npub.cyan());
     Ok(())
@@ -262,7 +262,7 @@ async fn cmd_reset(data_dir: &str) -> anyhow::Result<bool> {
 
 async fn cmd_connect(client: Arc<KeychatClient>, args: &str) -> anyhow::Result<()> {
     let relay_urls: Vec<String> = if args.is_empty() {
-        keychat_uniffi::default_relays()
+        keychat_app_sdk::default_relays()
     } else {
         args.split_whitespace().map(|s| s.to_string()).collect()
     };
@@ -368,7 +368,7 @@ async fn cmd_add_friend(client: &KeychatClient, args: &str) -> anyhow::Result<()
         return Ok(());
     }
 
-    let peer_pubkey = keychat_uniffi::normalize_to_hex(parts[0].to_string())
+    let peer_pubkey = keychat_app_sdk::normalize_to_hex(parts[0].to_string())
         .map_err(|e| anyhow::anyhow!("invalid pubkey: {e}"))?;
     let my_name = if parts.len() > 1 {
         parts[1].to_string()
@@ -471,7 +471,7 @@ async fn cmd_chat(
     let rooms = client.get_rooms(pubkey).await?;
 
     // Helper to select a room
-    let select = |room: &keychat_uniffi::RoomInfo, active: &mut Option<String>| {
+    let select = |room: &keychat_app_sdk::RoomInfo, active: &mut Option<String>| {
         *active = Some(room.id.clone());
         let fallback = short_key(&room.to_main_pubkey);
         let name = room.name.as_deref().unwrap_or(&fallback);
@@ -530,7 +530,7 @@ async fn cmd_chat(
     }
 
     // 6. Try as contact pubkey (hex or npub)
-    let normalized = keychat_uniffi::normalize_to_hex(query.to_string()).unwrap_or(query.to_string());
+    let normalized = keychat_app_sdk::normalize_to_hex(query.to_string()).unwrap_or(query.to_string());
     if let Some(room) = rooms.iter().find(|r| r.to_main_pubkey == normalized) {
         select(room, active_room_id);
         return Ok(());
@@ -642,9 +642,9 @@ async fn cmd_history(
             short_key(&msg.sender_pubkey).cyan().to_string()
         };
         let status_icon = match msg.status {
-            keychat_uniffi::MessageStatus::Sending => "⏳",
-            keychat_uniffi::MessageStatus::Success => "✓",
-            keychat_uniffi::MessageStatus::Failed => "✗",
+            keychat_app_sdk::MessageStatus::Sending => "⏳",
+            keychat_app_sdk::MessageStatus::Success => "✓",
+            keychat_app_sdk::MessageStatus::Failed => "✗",
         };
         println!(
             "  {} {} {} {}",
@@ -785,7 +785,7 @@ async fn cmd_upload(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
     // Get active media server from settings or use default
     let server = match client.get_active_media_server().await {
         Ok(url) => url,
-        Err(_) => keychat_uniffi::default_blossom_server(),
+        Err(_) => keychat_app_sdk::default_blossom_server(),
     };
 
     print_sys(&format!("Uploading {} to {}...", file_name, server.dimmed()));
@@ -909,7 +909,7 @@ async fn cmd_download(
     }
 
     // Flatten all file items with their message context
-    let mut all_files: Vec<(usize, &keychat_uniffi::MessageInfo, &crate::commands::ParsedFileItem)> = Vec::new();
+    let mut all_files: Vec<(usize, &keychat_app_sdk::MessageInfo, &crate::commands::ParsedFileItem)> = Vec::new();
     let mut idx = 1;
     for (msg, parsed) in &file_messages {
         for item in &parsed.items {
@@ -991,7 +991,7 @@ async fn cmd_files(
 
     // Fetch messages and find file messages
     let messages = client.get_messages(room_id.clone(), 100, 0).await?;
-    let mut file_entries: Vec<(keychat_uniffi::MessageInfo, crate::commands::ParsedFileMessage)> = Vec::new();
+    let mut file_entries: Vec<(keychat_app_sdk::MessageInfo, crate::commands::ParsedFileMessage)> = Vec::new();
 
     for msg in messages {
         if let Some(ref json) = msg.payload_json {
@@ -1087,7 +1087,7 @@ async fn cmd_sg_create(client: &KeychatClient, args: &str) -> anyhow::Result<()>
         .iter()
         .map(|pk| {
             let normalized =
-                keychat_uniffi::normalize_to_hex(pk.to_string()).unwrap_or_else(|_| pk.to_string());
+                keychat_app_sdk::normalize_to_hex(pk.to_string()).unwrap_or_else(|_| pk.to_string());
             GroupMemberInput {
                 nostr_pubkey: normalized.clone(),
                 name: short_key(&normalized),
@@ -1165,7 +1165,7 @@ async fn cmd_sg_kick(client: &KeychatClient, args: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let member_pk =
-        keychat_uniffi::normalize_to_hex(parts[1].to_string()).unwrap_or_else(|_| parts[1].to_string());
+        keychat_app_sdk::normalize_to_hex(parts[1].to_string()).unwrap_or_else(|_| parts[1].to_string());
     client
         .remove_group_member(parts[0].to_string(), member_pk)
         .await?;
@@ -1414,14 +1414,14 @@ fn print_event(event: &ClientEvent) {
             new_value,
         } => {
             let detail = match kind {
-                keychat_uniffi::GroupChangeKind::MemberRemoved => {
+                keychat_app_sdk::GroupChangeKind::MemberRemoved => {
                     format!(
                         "Member removed: {}",
                         member_pubkey.as_deref().unwrap_or("?")
                     )
                 }
-                keychat_uniffi::GroupChangeKind::SelfLeave => "A member left the group".to_string(),
-                keychat_uniffi::GroupChangeKind::NameChanged => {
+                keychat_app_sdk::GroupChangeKind::SelfLeave => "A member left the group".to_string(),
+                keychat_app_sdk::GroupChangeKind::NameChanged => {
                     format!(
                         "Group renamed to: {}",
                         new_value.as_deref().unwrap_or("?")
@@ -1466,9 +1466,9 @@ fn print_data_change(change: &DataChange) {
         DataChange::ConnectionStatusChanged { status, message } => {
             let status_str = format!("{:?}", status);
             let colored = match status {
-                keychat_uniffi::ConnectionStatus::Connected => status_str.green(),
-                keychat_uniffi::ConnectionStatus::Connecting
-                | keychat_uniffi::ConnectionStatus::Reconnecting => status_str.yellow(),
+                keychat_app_sdk::ConnectionStatus::Connected => status_str.green(),
+                keychat_app_sdk::ConnectionStatus::Connecting
+                | keychat_app_sdk::ConnectionStatus::Reconnecting => status_str.yellow(),
                 _ => status_str.red(),
             };
             let msg = message.as_deref().unwrap_or("");

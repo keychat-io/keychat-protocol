@@ -5,26 +5,26 @@ pub(crate) fn make_room_id(peer_pubkey: &str, identity_pubkey: &str) -> String {
 
 // ─── Records ─────────────────────────────────────────────────────
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct CreateIdentityResult {
     pub pubkey_hex: String,
     pub mnemonic: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct ContactInfo {
     pub nostr_pubkey_hex: String,
     pub signal_id_hex: String,
     pub display_name: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct PendingFriendRequest {
     pub request_id: String,
     pub peer_nostr_pubkey: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct ReceivedFriendRequest {
     pub request_id: String,
     pub sender_pubkey_hex: String,
@@ -33,7 +33,7 @@ pub struct ReceivedFriendRequest {
     pub message: Option<String>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct SentMessage {
     pub event_id: String,
     pub payload_json: Option<String>,
@@ -46,13 +46,13 @@ pub struct SentMessage {
     pub new_sending_address: Option<String>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct ReplyToPayload {
     pub target_event_id: String,
     pub content: Option<String>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct LocalFile {
     pub path: String,
     pub category: FileCategory,
@@ -62,7 +62,7 @@ pub struct LocalFile {
     pub amplitude_samples: Option<Vec<f64>>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct FilePayload {
     pub category: FileCategory,
     pub url: String,
@@ -77,7 +77,7 @@ pub struct FilePayload {
     pub amplitude_samples: Option<Vec<f64>>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct ProfilePayload {
     pub name: String,
     pub pubkey: String,
@@ -89,20 +89,20 @@ pub struct ProfilePayload {
 
 // ─── Signal Group Records ────────────────────────────────────────
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct GroupMemberInput {
     pub nostr_pubkey: String,
     pub name: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct SignalGroupInfo {
     pub group_id: String,
     pub name: String,
     pub member_count: u32,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct GroupMemberInfo {
     pub nostr_pubkey: String,
     pub name: String,
@@ -110,7 +110,7 @@ pub struct GroupMemberInfo {
     pub is_me: bool,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct GroupSentMessage {
     pub msgid: String,
     pub group_id: String,
@@ -122,7 +122,8 @@ pub struct GroupSentMessage {
 
 // ─── Enums ───────────────────────────────────────────────────────
 
-#[derive(uniffi::Enum, Clone)]
+#[derive(Clone)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum FileCategory {
     Image,
     Video,
@@ -134,7 +135,8 @@ pub enum FileCategory {
     Other,
 }
 
-#[derive(uniffi::Enum, Clone, Debug)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum MessageKind {
     // Common
     Text,
@@ -209,14 +211,16 @@ impl From<libkeychat::KCMessageKind> for MessageKind {
     }
 }
 
-#[derive(uniffi::Enum, Clone, Debug)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum GroupChangeKind {
     MemberRemoved,
     SelfLeave,
     NameChanged,
 }
 
-#[derive(uniffi::Enum, Clone, Debug)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum ClientEvent {
     FriendRequestReceived {
         request_id: String,
@@ -274,20 +278,20 @@ pub enum ClientEvent {
     },
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct PublishResultInfo {
     pub event_id: String,
     pub success_relays: Vec<String>,
     pub failed_relays: Vec<FailedRelayInfo>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct FailedRelayInfo {
     pub url: String,
     pub error: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct RelayStatusInfo {
     pub url: String,
     pub status: String,
@@ -295,7 +299,8 @@ pub struct RelayStatusInfo {
 
 // ─── Status Enums ───────────────────────────────────────────────
 
-#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum RoomStatus {
     Requesting,  // 0
     Enabled,     // 1
@@ -324,7 +329,8 @@ impl RoomStatus {
     }
 }
 
-#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum RoomType {
     Dm,           // 0 — Signal-encrypted 1:1 DM
     SignalGroup,  // 1
@@ -353,7 +359,8 @@ impl RoomType {
     }
 }
 
-#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum MessageStatus {
     Sending,   // 0
     Success,   // 1
@@ -379,7 +386,8 @@ impl MessageStatus {
     }
 }
 
-#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
@@ -390,7 +398,7 @@ pub enum ConnectionStatus {
 
 // ─── App Data Query Types ────────────────────────────────────────
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct IdentityInfo {
     pub npub: String,
     pub nostr_pubkey_hex: String,
@@ -401,7 +409,7 @@ pub struct IdentityInfo {
     pub created_at: u64,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct RoomInfo {
     pub id: String,
     pub to_main_pubkey: String,
@@ -417,7 +425,7 @@ pub struct RoomInfo {
     pub created_at: u64,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct MessageInfo {
     pub msgid: String,
     pub event_id: Option<String>,
@@ -437,7 +445,7 @@ pub struct MessageInfo {
     pub created_at: u64,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct ContactInfoFull {
     pub pubkey: String,
     pub npubkey: String,
@@ -447,7 +455,8 @@ pub struct ContactInfoFull {
     pub avatar: Option<String>,
 }
 
-#[derive(uniffi::Enum, Clone, Debug)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Enum))]
 pub enum DataChange {
     RoomUpdated { room_id: String },
     RoomDeleted { room_id: String },
@@ -462,12 +471,12 @@ pub enum DataChange {
 
 // ─── Callback Interfaces ────────────────────────────────────────
 
-#[uniffi::export(callback_interface)]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(callback_interface))]
 pub trait EventListener: Send + Sync {
     fn on_event(&self, event: ClientEvent);
 }
 
-#[uniffi::export(callback_interface)]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(callback_interface))]
 pub trait DataListener: Send + Sync {
     fn on_data_change(&self, change: DataChange);
 }

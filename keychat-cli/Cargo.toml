@@ -13,7 +13,7 @@ name = "keychat"
 path = "src/main.rs"
 
 [dependencies]
-keychat-uniffi = { path = "../keychat-uniffi" }
+keychat-app-sdk = { path = "../keychat-app-sdk" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 clap = { version = "4", features = ["derive"] }

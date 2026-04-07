@@ -11,7 +11,7 @@ use crate::client::KeychatClient;
 use crate::error::KeychatUniError;
 use crate::types::*;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(async_runtime = "tokio"))]
 impl KeychatClient {
     pub async fn send_friend_request(
         &self,

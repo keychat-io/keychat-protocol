@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::TimeZone;
-use keychat_uniffi::{
+use keychat_app_sdk::{
     ClientEvent, DataChange, DataListener, EventListener, FileCategory, FilePayload, KeychatClient,
     KeychatUniError, RoomType,
 };
@@ -229,13 +229,13 @@ pub async fn upload_and_prepare_file(
         msg: format!("Failed to read file {}: {e}", file_path.display()),
     })?;
 
-    let route = if keychat_uniffi::is_relay_server(server_url.to_string()) {
+    let route = if keychat_app_sdk::is_relay_server(server_url.to_string()) {
         "relay-presigned"
     } else {
         "blossom"
     };
 
-    let result = keychat_uniffi::encrypt_and_upload_routed(data, server_url.to_string())
+    let result = keychat_app_sdk::encrypt_and_upload_routed(data, server_url.to_string())
         .await
         .map_err(|e| KeychatUniError::MediaTransfer {
             msg: format!("upload route={route}, server={server_url}, error={e}"),
@@ -502,7 +502,7 @@ pub async fn create_identity(
     display_name: &str,
 ) -> Result<(String, String, String), KeychatUniError> {
     let result = client.create_identity().await?;
-    let npub = keychat_uniffi::npub_from_hex(result.pubkey_hex.clone()).unwrap_or_default();
+    let npub = keychat_app_sdk::npub_from_hex(result.pubkey_hex.clone()).unwrap_or_default();
 
     // Save identity with display name to app storage
     if let Err(e) = client

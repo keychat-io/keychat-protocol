@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use keychat_uniffi::{
+use keychat_app_sdk::{
     ClientEvent, ConnectionStatus, DataChange, FileCategory, GroupChangeKind, GroupMemberInput,
     KeychatClient, MessageKind, MessageStatus, RoomStatus, RoomType,
 };
@@ -193,7 +193,7 @@ pub async fn run(
     port: u16,
 ) -> anyhow::Result<()> {
     // Shared startup: restore identity → sessions → connect → event loop
-    let relay_urls = keychat_uniffi::default_relays();
+    let relay_urls = keychat_app_sdk::default_relays();
     crate::commands::init_and_connect(&client, relay_urls).await;
 
     let router = build_router(client, event_tx, data_tx);
@@ -431,7 +431,7 @@ async fn send_message(
             }))
         }
         Ok(crate::commands::SendResult::MlsNotSupported) => {
-            bad_request(keychat_uniffi::KeychatUniError::InvalidArgument {
+            bad_request(keychat_app_sdk::KeychatUniError::InvalidArgument {
                 msg: "MLS groups not yet supported".into(),
             })
         }
@@ -1109,7 +1109,7 @@ async fn upload_file(
 
     // Get server URL
     let server = req.server.unwrap_or_else(|| {
-        keychat_uniffi::default_blossom_server()
+        keychat_app_sdk::default_blossom_server()
     });
 
     // Upload file

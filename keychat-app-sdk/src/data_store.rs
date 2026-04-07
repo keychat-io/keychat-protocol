@@ -6,7 +6,7 @@ use crate::client::KeychatClient;
 use crate::error::KeychatUniError;
 use crate::types::*;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(async_runtime = "tokio"))]
 impl KeychatClient {
     // ─── Identity Queries ────────────────────────────────────
 

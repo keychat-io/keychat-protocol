@@ -1,4 +1,4 @@
 [bindings.swift]
 module_name = "KeychatFFI"
-ffi_module_name = "keychat_uniffiFFI"
+ffi_module_name = "keychat_app_sdkFFI"
 generate_immutable_records = true

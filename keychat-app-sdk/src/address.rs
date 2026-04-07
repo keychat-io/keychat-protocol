@@ -67,7 +67,7 @@ impl KeychatClient {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(async_runtime = "tokio"))]
 impl KeychatClient {
     /// Get all current receiving addresses (for debugging/monitoring).
     /// C-FFI1: uses .lock().await to avoid silently skipping busy sessions.

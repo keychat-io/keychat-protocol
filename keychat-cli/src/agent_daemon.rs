@@ -37,7 +37,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use keychat_uniffi::{ClientEvent, DataChange, KeychatClient};
+use keychat_app_sdk::{ClientEvent, DataChange, KeychatClient};
 use serde::Deserialize;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
@@ -160,7 +160,7 @@ impl AgentRegistry {
             }
         };
 
-        let npub = keychat_uniffi::npub_from_hex(pubkey.clone()).unwrap_or_default();
+        let npub = keychat_app_sdk::npub_from_hex(pubkey.clone()).unwrap_or_default();
 
         // 4. Connect to relays
         match client.restore_sessions().await {
@@ -262,7 +262,7 @@ pub async fn run(
 
     let relay_urls = match relay_override {
         Some(r) => r.split(',').map(|s| s.trim().to_string()).collect(),
-        None => keychat_uniffi::default_relays(),
+        None => keychat_app_sdk::default_relays(),
     };
 
     // Check if multi-agent mode: {data_dir}/agents/ exists with subdirs
@@ -333,7 +333,7 @@ pub async fn run(
             }
         };
 
-        let npub = keychat_uniffi::npub_from_hex(pubkey.clone()).unwrap_or_default();
+        let npub = keychat_app_sdk::npub_from_hex(pubkey.clone()).unwrap_or_default();
 
         match client.restore_sessions().await {
             Ok(n) if n > 0 => tracing::info!("Restored {n} session(s)"),
@@ -510,7 +510,7 @@ async fn get_agent_identity(
     }
     match agent.client.get_pubkey_hex().await {
         Ok(pubkey) => {
-            let npub = keychat_uniffi::npub_from_hex(pubkey.clone()).unwrap_or_default();
+            let npub = keychat_app_sdk::npub_from_hex(pubkey.clone()).unwrap_or_default();
             ok_json(serde_json::json!({
                 "agent_id": id,
                 "pubkey_hex": pubkey,
@@ -888,7 +888,7 @@ async fn agent_sse_events(
                 "agent_id": aid2,
                 "request_id": pfr.request_id,
                 "sender_pubkey": pfr.sender_pubkey,
-                "sender_npub": keychat_uniffi::npub_from_hex(pfr.sender_pubkey.clone()).unwrap_or_default(),
+                "sender_npub": keychat_app_sdk::npub_from_hex(pfr.sender_pubkey.clone()).unwrap_or_default(),
                 "sender_name": pfr.sender_name,
                 "created_at": pfr.created_at,
             })
@@ -1020,7 +1020,7 @@ async fn legacy_agent_sse_events(
                 "type": "pending_friend_request",
                 "request_id": pfr.request_id,
                 "sender_pubkey": pfr.sender_pubkey,
-                "sender_npub": keychat_uniffi::npub_from_hex(pfr.sender_pubkey.clone()).unwrap_or_default(),
+                "sender_npub": keychat_app_sdk::npub_from_hex(pfr.sender_pubkey.clone()).unwrap_or_default(),
                 "sender_name": pfr.sender_name,
                 "created_at": pfr.created_at,
             })

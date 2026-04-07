@@ -4,7 +4,7 @@ use crate::client::{default_device_id, KeychatClient};
 use crate::error::KeychatUniError;
 use crate::types::*;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg_attr(feature = "uniffi-export", uniffi::export(async_runtime = "tokio"))]
 impl KeychatClient {
     pub async fn send_text(
         &self,

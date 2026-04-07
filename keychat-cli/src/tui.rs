@@ -23,7 +23,7 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
-use keychat_uniffi::{
+use keychat_app_sdk::{
     ClientEvent, DataChange, GroupMemberInput, KeychatClient, MessageStatus, RoomStatus, RoomType,
 };
 use ratatui::backend::CrosstermBackend;
@@ -361,7 +361,7 @@ pub async fn run(
     app.theme = load_theme_setting(&client).await;
 
     // Shared startup: restore identity → sessions → connect → event loop
-    let relay_urls = keychat_uniffi::default_relays();
+    let relay_urls = keychat_app_sdk::default_relays();
     if let Some((pubkey, session_count)) =
         crate::commands::init_and_connect(&client, relay_urls).await
     {
@@ -1259,7 +1259,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
 fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
     // Calculate QR code size first to determine popup width
     let qr_lines = if let Some(ref pk) = app.identity_hex {
-        let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
+        let npub = keychat_app_sdk::npub_from_hex(pk.clone()).unwrap_or_default();
         render_qr_lines(&npub)
     } else {
         vec![]
@@ -1292,7 +1292,7 @@ fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
     ];
 
     if let Some(ref pk) = app.identity_hex {
-        let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
+        let npub = keychat_app_sdk::npub_from_hex(pk.clone()).unwrap_or_default();
         if let Some(ref name) = app.identity_name {
             lines.push(Line::from(vec![
                 Span::styled("  Name:   ", Style::default().fg(Color::DarkGray)),
@@ -1772,7 +1772,7 @@ async fn process_command(app: &mut App, input: &str) {
                     if !app.event_loop_started {
                         crate::commands::connect_and_start(
                             &app.client,
-                            keychat_uniffi::default_relays(),
+                            keychat_app_sdk::default_relays(),
                         );
                         app.event_loop_started = true;
                     }
@@ -1803,7 +1803,7 @@ async fn process_command(app: &mut App, input: &str) {
                     if !app.event_loop_started {
                         crate::commands::connect_and_start(
                             &app.client,
-                            keychat_uniffi::default_relays(),
+                            keychat_app_sdk::default_relays(),
                         );
                         app.event_loop_started = true;
                     }
@@ -1868,7 +1868,7 @@ async fn process_command(app: &mut App, input: &str) {
         }
         "/connect" => {
             let relay_urls: Vec<String> = if args.is_empty() {
-                keychat_uniffi::default_relays()
+                keychat_app_sdk::default_relays()
             } else {
                 args.split_whitespace().map(|s| s.to_string()).collect()
             };
@@ -1958,7 +1958,7 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /add <pubkey> [greeting]".into());
                 return;
             }
-            let peer = match keychat_uniffi::normalize_to_hex(parts[0].to_string()) {
+            let peer = match keychat_app_sdk::normalize_to_hex(parts[0].to_string()) {
                 Ok(p) => p,
                 Err(e) => {
                     app.notify(format!("Invalid pubkey: {e}"));
@@ -2117,7 +2117,7 @@ async fn process_command(app: &mut App, input: &str) {
             }
             let server = match app.client.get_active_media_server().await {
                 Ok(url) => url,
-                Err(_) => keychat_uniffi::default_blossom_server(),
+                Err(_) => keychat_app_sdk::default_blossom_server(),
             };
             app.notify(format!("Uploading to {}...", server));
             match crate::commands::upload_and_prepare_file(path, &server).await {
@@ -2162,7 +2162,7 @@ async fn process_command(app: &mut App, input: &str) {
             let mut payloads = Vec::new();
             let server = match app.client.get_active_media_server().await {
                 Ok(url) => url,
-                Err(_) => keychat_uniffi::default_blossom_server(),
+                Err(_) => keychat_app_sdk::default_blossom_server(),
             };
             for path_str in paths {
                 let path = std::path::Path::new(path_str);
@@ -2360,7 +2360,7 @@ async fn process_command(app: &mut App, input: &str) {
             let members: Vec<GroupMemberInput> = parts[1..]
                 .iter()
                 .map(|pk| {
-                    let n = keychat_uniffi::normalize_to_hex(pk.to_string())
+                    let n = keychat_app_sdk::normalize_to_hex(pk.to_string())
                         .unwrap_or_else(|_| pk.to_string());
                     GroupMemberInput {
                         nostr_pubkey: n.clone(),
@@ -2431,7 +2431,7 @@ async fn process_command(app: &mut App, input: &str) {
                 return;
             }
             let gid = resolve_selected_group_id(app).await;
-            let pk = keychat_uniffi::normalize_to_hex(args.trim().to_string())
+            let pk = keychat_app_sdk::normalize_to_hex(args.trim().to_string())
                 .unwrap_or_else(|_| args.trim().to_string());
             match gid {
                 None => app.notify("Select a group room first".into()),
@@ -2571,7 +2571,7 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
             );
 
             // Handle file message auto-download
-            if matches!(kind, keychat_uniffi::MessageKind::Files) {
+            if matches!(kind, keychat_app_sdk::MessageKind::Files) {
                 if let Some(ref payload_json) = payload {
                     spawn_file_auto_download(
                         Arc::clone(&app.client),
@@ -2736,11 +2736,11 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
             kind, new_value, ..
         } => {
             let msg = match kind {
-                keychat_uniffi::GroupChangeKind::NameChanged => {
+                keychat_app_sdk::GroupChangeKind::NameChanged => {
                     format!("Group renamed to: {}", new_value.as_deref().unwrap_or("?"))
                 }
-                keychat_uniffi::GroupChangeKind::MemberRemoved => "Member removed".to_string(),
-                keychat_uniffi::GroupChangeKind::SelfLeave => "A member left".to_string(),
+                keychat_app_sdk::GroupChangeKind::MemberRemoved => "Member removed".to_string(),
+                keychat_app_sdk::GroupChangeKind::SelfLeave => "A member left".to_string(),
             };
             app.notify(msg);
             refresh_rooms(app).await;

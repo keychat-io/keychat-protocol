@@ -17,7 +17,7 @@ pub const MAX_FILES_PER_MESSAGE: u32 = 10;
 // ─── Utility functions ──────────────────────────────────────────
 
 /// Check if a server URL uses the relay presigned-S3 protocol.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn is_relay_server(server_url: String) -> bool {
     // Simple host check without pulling in the `url` crate
     server_url
@@ -32,7 +32,7 @@ pub fn is_relay_server(server_url: String) -> bool {
 
 /// Deterministic local file name for a payload.
 /// Uses source_name if available, otherwise "{hash_prefix_12}.{suffix}".
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn local_file_name(
     source_name: Option<String>,
     _hash: String,
@@ -61,38 +61,38 @@ pub fn local_file_name(
 }
 
 /// Return the built-in media server URL.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn built_in_media_server() -> String {
     BUILT_IN_SERVER.to_string()
 }
 
 /// Return the default Blossom server URL.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn default_blossom_server() -> String {
     DEFAULT_BLOSSOM_SERVER.to_string()
 }
 
 /// Return the default auto-download limit in MB.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn default_auto_download_limit_mb() -> u64 {
     DEFAULT_AUTO_DOWNLOAD_LIMIT_MB
 }
 
 /// Return the max file size in bytes.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn max_file_size() -> u64 {
     MAX_FILE_SIZE
 }
 
 /// Return the max files per message.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn max_files_per_message() -> u32 {
     MAX_FILES_PER_MESSAGE
 }
 
 // ─── UniFFI Record for encryption result ────────────────────────
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct EncryptedFileResult {
     pub ciphertext: Vec<u8>,
     /// AES-256 key, hex-encoded.
@@ -107,7 +107,7 @@ pub struct EncryptedFileResult {
 
 /// Encrypt file data with AES-256-CTR + PKCS7 padding.
 /// Returns hex-encoded key, iv, hash for use in KCFilePayload.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn encrypt_file_data(plaintext: Vec<u8>) -> EncryptedFileResult {
     let enc = libkeychat::encrypt_file(&plaintext);
     EncryptedFileResult {
@@ -121,7 +121,7 @@ pub fn encrypt_file_data(plaintext: Vec<u8>) -> EncryptedFileResult {
 /// Decrypt file data encrypted with AES-256-CTR + PKCS7.
 /// key, iv, hash are hex-encoded strings (as stored in KCFilePayload).
 /// Verifies SHA-256 hash before decrypting.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn decrypt_file_data(
     ciphertext: Vec<u8>,
     key: String,
@@ -168,7 +168,7 @@ pub fn decrypt_file_data(
 /// Uses an ephemeral secp256k1 keypair — does not expose the user's identity.
 /// Returns a base64-encoded signed Nostr event JSON, ready for the
 /// `Authorization: Nostr <base64>` header.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub fn sign_blossom_upload_auth(hash: String) -> Result<String, KeychatUniError> {
     use nostr::prelude::*;
 
@@ -194,7 +194,7 @@ pub fn sign_blossom_upload_auth(hash: String) -> Result<String, KeychatUniError>
 // ─── Blossom upload (HTTP) ───────────────────────────────────────
 
 /// Result of a Blossom upload, with the download URL separate from crypto metadata.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Record))]
 pub struct FileUploadResult {
     /// Download URL from the Blossom server.
     pub url: String,
@@ -211,7 +211,7 @@ pub struct FileUploadResult {
 /// Encrypt and upload a file to a Blossom server in one call.
 ///
 /// Returns the download URL and all encryption metadata needed for KCFilePayload.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub async fn encrypt_and_upload(
     plaintext: Vec<u8>,
     server_url: String,
@@ -388,7 +388,7 @@ async fn upload_via_relay(
 // ─── Unified upload (routes to relay or Blossom) ────────────────
 
 /// Encrypt and upload, routing to relay or Blossom based on server URL.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub async fn encrypt_and_upload_routed(
     plaintext: Vec<u8>,
     server_url: String,
@@ -405,7 +405,7 @@ pub async fn encrypt_and_upload_routed(
 /// Download ciphertext from a URL, verify hash, decrypt, and return plaintext.
 ///
 /// Swift saves the returned bytes to local disk.
-#[uniffi::export]
+#[cfg_attr(feature = "uniffi-export", uniffi::export)]
 pub async fn download_and_decrypt(
     url: String,
     key: String,

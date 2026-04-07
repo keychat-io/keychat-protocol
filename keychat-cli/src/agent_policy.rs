@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use keychat_uniffi::{ClientEvent, KeychatClient};
+use keychat_app_sdk::{ClientEvent, KeychatClient};
 use tokio::sync::{broadcast, RwLock};
 
 const SETTING_OWNER: &str = "agent_owner";

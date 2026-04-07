@@ -1,6 +1,7 @@
 use libkeychat::KeychatError;
 
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[derive(Debug, thiserror::Error)]
+#[cfg_attr(feature = "uniffi-export", derive(uniffi::Error))]
 pub enum KeychatUniError {
     #[error("Identity error: {msg}")]
     Identity { msg: String },

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use keychat_cli::{agent_daemon, commands, daemon, repl, tui};
-use keychat_uniffi::KeychatClient;
+use keychat_app_sdk::KeychatClient;
 
 #[derive(Parser)]
 #[command(
@@ -77,7 +77,7 @@ fn default_data_dir() -> String {
 /// Initialize logging: write to dated file under {data_dir}/logs/, keep last 7 days.
 /// Falls back to stderr if file creation fails.
 fn init_logging(data_dir: &str, mode: &str) {
-    let default_filter = "keychat=info,keychat_uniffi=info,keychat_cli=info";
+    let default_filter = "keychat=info,keychat_app_sdk=info,keychat_cli=info";
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_filter.into());
 
