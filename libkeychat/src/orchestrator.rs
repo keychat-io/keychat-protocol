@@ -948,7 +948,7 @@ impl ProtocolClient {
     /// Returns `Some(FriendRequestContext)` if successful, `None` if not a friend request.
     /// Pure protocol: unwraps gift wrap, verifies globalSign, persists to SecureStorage.
     /// Does NOT write to app_storage.
-    pub async fn try_decrypt_friend_request(
+    pub fn try_decrypt_friend_request(
         &self,
         event: &crate::Event,
     ) -> Option<FriendRequestContext> {
@@ -1082,5 +1082,216 @@ impl ProtocolClient {
             nostr_event_json: None,
             relay_url: None,
         })
+    }
+
+    // ─── Event Loop Core ────────────────────────────────────────
+
+    /// Run the protocol event loop.
+    ///
+    /// Receives GiftWrap events from relay, deduplicates, attempts decryption
+    /// in priority order (friend request → approve → session → NIP-17 DM),
+    /// and notifies the delegate for app-layer persistence.
+    ///
+    /// Pure protocol: does NOT touch app_storage. All persistence happens
+    /// through the `OrchestratorDelegate` callbacks.
+    pub async fn run_event_loop(
+        client: Arc<tokio::sync::RwLock<Self>>,
+        delegate: Arc<dyn OrchestratorDelegate>,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        // Get nostr client handle
+        let nostr_client = {
+            let inner = client.read().await;
+            match inner.transport.as_ref() {
+                Some(t) => t.client().clone(),
+                None => {
+                    delegate.on_error("transport not initialized".into()).await;
+                    return;
+                }
+            }
+        };
+
+        let mut notifications = nostr_client.notifications();
+
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    tracing::info!("protocol event loop: stop signal received");
+                    break;
+                }
+                result = notifications.recv() => {
+                    match result {
+                        Ok(crate::RelayPoolNotification::Event { relay_url, event, .. }) => {
+                            let eid = event.id.to_hex();
+
+                            // Deduplicate
+                            let deduped = {
+                                let inner = client.read().await;
+                                match inner.transport.as_ref() {
+                                    Some(t) => t.deduplicate((*event).clone()).await,
+                                    None => None,
+                                }
+                            };
+
+                            if let Some(event) = deduped {
+                                if event.kind == crate::Kind::GiftWrap {
+                                    tracing::info!(
+                                        "⬇️ RECV kind={} id={} from={}",
+                                        event.kind.as_u16(),
+                                        &eid[..16.min(eid.len())],
+                                        relay_url
+                                    );
+                                    let relay = relay_url.to_string();
+                                    let nostr_event_json = serde_json::to_string(&event).ok();
+
+                                    // Update relay cursor
+                                    let event_ts = event.created_at.as_u64();
+                                    let cursor_storage = client.read().await.storage.clone();
+                                    if let Ok(store) = cursor_storage.lock() {
+                                        let _ = store.update_relay_cursor(&relay, event_ts);
+                                    }
+
+                                    // Step 1: Try friend request
+                                    {
+                                        let inner = client.read().await;
+                                        if let Some(ctx) = inner.try_decrypt_friend_request(&event) {
+                                            delegate.on_friend_request_received(ctx).await;
+                                            continue;
+                                        }
+                                    }
+
+                                    // Step 2: Try friend approve/reject
+                                    {
+                                        let mut inner = client.write().await;
+                                        if let Some((request_id, msg)) = inner.try_decrypt_pending_outbound(&event) {
+                                            if msg.kind == crate::KCMessageKind::FriendApprove {
+                                                // Full session creation happens here
+                                                // Extract peer info from signal_prekey_auth
+                                                let peer_name = msg.signal_prekey_auth.as_ref()
+                                                    .map(|a| a.name.clone()).unwrap_or_default();
+                                                let peer_signal_id = msg.signal_prekey_auth.as_ref()
+                                                    .map(|a| a.signal_id.clone()).unwrap_or_default();
+                                                let peer_nostr_id = msg.signal_prekey_auth.as_ref()
+                                                    .map(|a| a.nostr_id.clone())
+                                                    .unwrap_or_else(|| {
+                                                        inner.pending_outbound.get(&request_id)
+                                                            .map(|s| s.peer_nostr_pubkey.clone())
+                                                            .unwrap_or_default()
+                                                    });
+
+                                                let peer_signal_hex = if peer_signal_id.is_empty() {
+                                                    peer_nostr_id.clone()
+                                                } else {
+                                                    peer_signal_id
+                                                };
+
+                                                delegate.on_friend_approved(FriendApprovedContext {
+                                                    request_id,
+                                                    peer_nostr_pubkey: peer_nostr_id,
+                                                    peer_name,
+                                                    peer_signal_id_hex: peer_signal_hex,
+                                                    event_id: event.id.to_hex(),
+                                                }).await;
+                                            } else if msg.kind == crate::KCMessageKind::FriendReject {
+                                                let peer_pubkey = inner.pending_outbound.get(&request_id)
+                                                    .map(|s| s.peer_nostr_pubkey.clone())
+                                                    .unwrap_or_default();
+                                                inner.pending_outbound.remove(&request_id);
+                                                delegate.on_friend_rejected(FriendRejectedContext {
+                                                    request_id,
+                                                    peer_pubkey,
+                                                }).await;
+                                            }
+                                            continue;
+                                        }
+                                    }
+
+                                    // Step 3: Try session message
+                                    // Need to drop read lock before async session decrypt
+                                    let step3_result = {
+                                        let inner = client.read().await;
+                                        inner.try_decrypt_session_message(&event).await
+                                    };
+                                    if let Some((peer_signal_hex, msg, metadata, addr_update, session_mutex)) = step3_result
+                                    {
+                                        // Update addresses
+                                        {
+                                            let mut inner_w = client.write().await;
+                                            inner_w.update_addresses_after_decrypt(
+                                                &peer_signal_hex, &session_mutex, &addr_update,
+                                            ).await;
+                                        }
+
+                                            // Resolve sender nostr pubkey
+                                            let sender_nostr_pubkey = {
+                                                let inner = client.read().await;
+                                                inner.peer_signal_to_nostr
+                                                    .get(&peer_signal_hex)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| peer_signal_hex.clone())
+                                            };
+
+                                            let kind = msg.kind.clone();
+                                            let content = msg.text.as_ref().map(|t| t.content.clone());
+                                            let payload_json = msg.to_json().ok();
+                                            let group_id = msg.group_id.clone();
+                                            let thread_id = msg.thread_id.clone();
+                                            let fallback = msg.fallback.clone();
+                                            let reply_to_event_id = msg.reply_to.as_ref()
+                                                .and_then(|r| r.target_event_id.clone());
+
+                                            delegate.on_message_received(MessageReceivedContext {
+                                                event_id: metadata.event_id.to_hex(),
+                                                sender_pubkey: sender_nostr_pubkey,
+                                                kind,
+                                                content,
+                                                payload_json,
+                                                nostr_event_json: nostr_event_json.clone(),
+                                                fallback,
+                                                reply_to_event_id,
+                                                group_id,
+                                                thread_id,
+                                                relay_url: Some(relay.clone()),
+                                                created_at: event.created_at.as_u64(),
+                                            }).await;
+                                            continue;
+                                        }
+
+                                    // Step 4: Try NIP-17 DM fallback
+                                    {
+                                        let inner = client.read().await;
+                                        if let Some(mut ctx) = inner.try_decrypt_nip17_dm(&event) {
+                                            ctx.nostr_event_json = nostr_event_json;
+                                            ctx.relay_url = Some(relay);
+                                            delegate.on_nip17_dm_received(ctx).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            } else {
+                                tracing::debug!("⬇️ DUP id={}", &eid[..16.min(eid.len())]);
+                            }
+                        }
+                        Ok(crate::RelayPoolNotification::Message { relay_url, message }) => {
+                            if let crate::RelayMessage::Ok { event_id, status, message: msg } = message {
+                                delegate.on_relay_ok(
+                                    event_id.to_hex(),
+                                    relay_url.to_string(),
+                                    status,
+                                    msg,
+                                ).await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!("event loop notification error: {e}");
+                            delegate.on_error(format!("notification error: {e}")).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!("protocol event loop exited");
     }
 }
