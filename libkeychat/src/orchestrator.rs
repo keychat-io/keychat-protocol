@@ -1,0 +1,868 @@
+//! Protocol orchestration layer.
+//!
+//! Provides `ProtocolClient` for multi-session management and event routing,
+//! plus the `OrchestratorDelegate` trait for notifying upper layers (app persistence, UI)
+//! without depending on them.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::address::AddressManager;
+use crate::error::{KeychatError, Result};
+use crate::friend_request::FriendRequestState;
+use crate::group::GroupManager;
+use crate::identity::Identity;
+use crate::message::KCMessageKind;
+use crate::session::ChatSession;
+use crate::storage::SecureStorage;
+use crate::transport::Transport;
+
+// ─── Delegate Trait ─────────────────────────────────────────────
+
+/// Callback interface for the protocol orchestrator.
+///
+/// The orchestrator calls these methods after protocol-level processing is complete
+/// (decryption, session creation, address rotation, SecureStorage persistence).
+/// Implementations handle app-layer concerns: UI persistence, notifications, etc.
+///
+/// **Lock contract**: The orchestrator drops its own `RwLock` before calling any
+/// delegate method, so implementations may freely acquire their own locks.
+#[async_trait::async_trait]
+pub trait OrchestratorDelegate: Send + Sync {
+    /// An inbound friend request was received and protocol-persisted.
+    /// App should: create room (status=Approving), save contact, save message, notify UI.
+    async fn on_friend_request_received(&self, ctx: FriendRequestContext);
+
+    /// A pending outbound friend request was approved by the peer.
+    /// Session is created and protocol-persisted.
+    /// App should: update room (status=Enabled), save contact, save message, notify UI.
+    async fn on_friend_approved(&self, ctx: FriendApprovedContext);
+
+    /// A pending outbound friend request was rejected by the peer.
+    /// App should: update room (status=Rejected), notify UI.
+    async fn on_friend_rejected(&self, ctx: FriendRejectedContext);
+
+    /// A decrypted session message was received (Text, Files, Cashu, etc.).
+    /// App should: create/update room, save message, increment unread, notify UI.
+    async fn on_message_received(&self, ctx: MessageReceivedContext);
+
+    /// A Signal group invite was received and stored in GroupManager.
+    /// App should: create group room, notify UI.
+    async fn on_group_invite_received(&self, ctx: GroupInviteContext);
+
+    /// A group change event occurred (member removed, self-leave, dissolve, rename).
+    /// App should: update/delete room, notify UI.
+    async fn on_group_changed(&self, ctx: GroupChangedContext);
+
+    /// A NIP-17 DM (non-keychat) was received.
+    /// App should: create/update room (type=Nip17Dm), save message, notify UI.
+    async fn on_nip17_dm_received(&self, ctx: Nip17DmContext);
+
+    /// A relay responded OK to one of our published events (NIP-01).
+    /// App should: update relay status tracking, update message status.
+    async fn on_relay_ok(
+        &self,
+        event_id: String,
+        relay_url: String,
+        success: bool,
+        message: String,
+    );
+
+    /// The event loop encountered an error.
+    async fn on_error(&self, description: String);
+}
+
+// ─── Context Structs ────────────────────────────────────────────
+// Pure data — no app_storage, no UI types, no UniFFI annotations.
+
+/// Context for an inbound friend request.
+#[derive(Debug, Clone)]
+pub struct FriendRequestContext {
+    /// Unique ID of the friend request.
+    pub request_id: String,
+    /// Sender's Nostr pubkey (hex).
+    pub sender_pubkey: String,
+    /// Sender's display name.
+    pub sender_name: String,
+    /// Optional message from the sender.
+    pub message: Option<String>,
+    /// Rumor created_at timestamp (seconds since epoch).
+    pub created_at: u64,
+    /// Nostr event ID (hex) of the GiftWrap event.
+    pub event_id: String,
+    /// Serialized KCMessage JSON.
+    pub message_json: Option<String>,
+    /// Serialized KCFriendRequestPayload JSON.
+    pub payload_json: Option<String>,
+}
+
+/// Context for a friend request that was approved.
+#[derive(Debug, Clone)]
+pub struct FriendApprovedContext {
+    /// The original request ID.
+    pub request_id: String,
+    /// Peer's Nostr pubkey (hex).
+    pub peer_nostr_pubkey: String,
+    /// Peer's display name.
+    pub peer_name: String,
+    /// Peer's Signal identity key (hex) — used for room association.
+    pub peer_signal_id_hex: String,
+    /// Nostr event ID (hex) of the GiftWrap event.
+    pub event_id: String,
+}
+
+/// Context for a friend request that was rejected.
+#[derive(Debug, Clone)]
+pub struct FriendRejectedContext {
+    /// The original request ID.
+    pub request_id: String,
+    /// Peer's Nostr pubkey (hex).
+    pub peer_pubkey: String,
+}
+
+/// Context for a decrypted incoming message.
+#[derive(Debug, Clone)]
+pub struct MessageReceivedContext {
+    /// Nostr event ID (hex).
+    pub event_id: String,
+    /// Sender's Nostr pubkey (hex).
+    pub sender_pubkey: String,
+    /// KCMessage kind.
+    pub kind: KCMessageKind,
+    /// Text content (if text message).
+    pub content: Option<String>,
+    /// Serialized full KCMessage payload (JSON).
+    pub payload_json: Option<String>,
+    /// Serialized Nostr event JSON (for resend support).
+    pub nostr_event_json: Option<String>,
+    /// Fallback text for unknown kinds.
+    pub fallback: Option<String>,
+    /// Event ID of the message being replied to.
+    pub reply_to_event_id: Option<String>,
+    /// Group ID if this is a group message.
+    pub group_id: Option<String>,
+    /// Thread ID for threaded conversations.
+    pub thread_id: Option<String>,
+    /// Relay URL that delivered this event.
+    pub relay_url: Option<String>,
+    /// Event created_at timestamp.
+    pub created_at: u64,
+}
+
+/// Context for a group invite.
+#[derive(Debug, Clone)]
+pub struct GroupInviteContext {
+    /// The group ID (Nostr pubkey of the group).
+    pub group_id: String,
+    /// Group name.
+    pub group_name: String,
+    /// Group type identifier (e.g. "signal").
+    pub group_type: String,
+    /// Pubkey of the member who sent the invite.
+    pub inviter_pubkey: String,
+}
+
+/// The kind of group change event.
+#[derive(Debug, Clone)]
+pub enum GroupChangeKind {
+    MemberRemoved {
+        member_pubkey: Option<String>,
+    },
+    SelfLeave {
+        group_id: String,
+    },
+    Dissolve {
+        group_id: String,
+    },
+    NameChanged {
+        new_name: Option<String>,
+    },
+}
+
+/// Context for a group change event.
+#[derive(Debug, Clone)]
+pub struct GroupChangedContext {
+    /// The group ID.
+    pub group_id: String,
+    /// What changed.
+    pub change: GroupChangeKind,
+    /// Nostr event ID (hex) of the event.
+    pub event_id: String,
+}
+
+/// Context for a NIP-17 DM.
+#[derive(Debug, Clone)]
+pub struct Nip17DmContext {
+    /// Nostr event ID (hex).
+    pub event_id: String,
+    /// Sender's Nostr pubkey (hex).
+    pub sender_pubkey: String,
+    /// Message content.
+    pub content: String,
+    /// Event created_at timestamp.
+    pub created_at: u64,
+    /// Serialized Nostr event JSON.
+    pub nostr_event_json: Option<String>,
+    /// Relay URL that delivered this event.
+    pub relay_url: Option<String>,
+}
+
+/// Result of a successful `send_message` call.
+#[derive(Debug, Clone)]
+pub struct SendResult {
+    /// Nostr event ID of the published event (hex).
+    pub event_id: String,
+    /// Serialized Nostr event JSON (for resend support).
+    pub nostr_event_json: Option<String>,
+    /// Serialized KCMessage payload JSON.
+    pub payload_json: Option<String>,
+    /// List of relay URLs that the event was published to.
+    pub connected_relays: Vec<String>,
+    /// Address rotation update from the encrypt step.
+    pub addr_update: crate::address::AddressUpdate,
+}
+
+// ─── ProtocolClient ─────────────────────────────────────────────
+
+/// Multi-session protocol client.
+///
+/// Manages Signal sessions, peer mappings, relay transport, and subscription addresses.
+/// All protocol state (sessions, peer indexes, pending friend requests) lives here.
+/// App-layer state (rooms, messages, contacts, settings) is NOT part of this struct.
+pub struct ProtocolClient {
+    /// The user's Nostr identity.
+    pub identity: Option<Identity>,
+    /// Nostr relay transport.
+    pub transport: Option<Transport>,
+    /// Protocol-level encrypted storage (Signal sessions, peers, addresses, dedup).
+    pub storage: Arc<Mutex<SecureStorage>>,
+    /// Per-peer Signal chat sessions, keyed by peer's signal identity hex.
+    pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
+    /// Nostr pubkey → Signal identity mapping.
+    pub peer_nostr_to_signal: HashMap<String, String>,
+    /// Reverse: Signal identity → Nostr pubkey.
+    pub peer_signal_to_nostr: HashMap<String, String>,
+    /// Receiving ratchet address → peer signal ID for O(1) message routing.
+    pub receiving_addr_to_peer: HashMap<String, String>,
+    /// Pending outbound friend requests, keyed by request ID.
+    pub pending_outbound: HashMap<String, FriendRequestState>,
+    /// Signal group manager.
+    pub group_manager: GroupManager,
+    /// Next available Signal device ID.
+    pub next_signal_device_id: u32,
+    /// Active relay subscription IDs.
+    pub subscription_ids: Vec<String>,
+    /// Last known relay URLs.
+    pub last_relay_urls: Vec<String>,
+}
+
+impl ProtocolClient {
+    /// Create a new ProtocolClient with the given SecureStorage.
+    pub fn new(storage: Arc<Mutex<SecureStorage>>) -> Self {
+        Self {
+            identity: None,
+            transport: None,
+            storage,
+            sessions: HashMap::new(),
+            peer_nostr_to_signal: HashMap::new(),
+            peer_signal_to_nostr: HashMap::new(),
+            receiving_addr_to_peer: HashMap::new(),
+            pending_outbound: HashMap::new(),
+            group_manager: GroupManager::new(),
+            next_signal_device_id: 1,
+            subscription_ids: Vec::new(),
+            last_relay_urls: Vec::new(),
+        }
+    }
+
+    /// Restore all sessions, peer mappings, pending FRs, and groups from storage.
+    ///
+    /// Returns the number of active sessions restored.
+    pub fn restore_sessions(&mut self) -> Result<u32> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or_else(|| KeychatError::Identity("call import_identity first".into()))?;
+        let storage = self.storage.clone();
+
+        let store = storage
+            .lock()
+            .map_err(|e| KeychatError::Storage(format!("storage lock: {e}")))?;
+
+        let mut restored_count: u32 = 0;
+        let mut max_device_id: u32 = 0;
+
+        // ── Phase 1: Read all data from DB while holding the lock ──
+
+        type ParticipantRow = (String, u32, Vec<u8>, Vec<u8>, u32);
+        let mut participant_rows: Vec<ParticipantRow> = Vec::new();
+
+        type FrRow = (
+            String, u32, Vec<u8>, Vec<u8>, u32,
+            u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>,
+            String, String,
+        );
+        let mut fr_rows: Vec<FrRow> = Vec::new();
+
+        let peers = store
+            .list_peers()
+            .map_err(|e| KeychatError::Storage(format!("list_peers: {e}")))?;
+        let peer_ids = store
+            .list_signal_participants()
+            .map_err(|e| KeychatError::Storage(format!("list_signal_participants: {e}")))?;
+        let all_addresses = store
+            .load_all_peer_addresses()
+            .map_err(|e| KeychatError::Storage(format!("load_all_peer_addresses: {e}")))?;
+        let fr_ids = store
+            .list_pending_frs()
+            .map_err(|e| KeychatError::Storage(format!("list_pending_frs: {e}")))?;
+
+        tracing::info!(
+            "RESTORE: peers={} participants={} addresses={} frs={}",
+            peers.len(),
+            peer_ids.len(),
+            all_addresses.len(),
+            fr_ids.len()
+        );
+
+        for peer_signal_id in &peer_ids {
+            match store.load_signal_participant(peer_signal_id) {
+                Ok(Some((device_id, id_pub, id_priv, reg_id, _spk_id, _spk_rec))) => {
+                    participant_rows.push((
+                        peer_signal_id.clone(),
+                        device_id,
+                        id_pub,
+                        id_priv,
+                        reg_id,
+                    ));
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "restore: no data for participant {}",
+                        &peer_signal_id[..16.min(peer_signal_id.len())]
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "restore: load participant {} failed: {e}",
+                        &peer_signal_id[..16.min(peer_signal_id.len())]
+                    );
+                }
+            }
+        }
+
+        for fr_id in &fr_ids {
+            match store.load_pending_fr(fr_id) {
+                Ok(Some((
+                    device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec,
+                    kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey,
+                ))) => {
+                    fr_rows.push((
+                        fr_id.clone(),
+                        device_id,
+                        id_pub,
+                        id_priv,
+                        reg_id,
+                        spk_id,
+                        spk_rec,
+                        pk_id,
+                        pk_rec,
+                        kpk_id,
+                        kpk_rec,
+                        first_inbox_secret,
+                        peer_nostr_pubkey,
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "restore pending FR {} failed: {e}",
+                        &fr_id[..16.min(fr_id.len())]
+                    );
+                }
+            }
+        }
+
+        // Drop the Mutex guard so restore_persistent can lock it
+        drop(store);
+
+        // ── Phase 2: Reconstruct objects (may lock storage internally) ──
+
+        // 1. Restore peer mappings
+        for peer in &peers {
+            self.peer_nostr_to_signal
+                .insert(peer.nostr_pubkey.clone(), peer.signal_id.clone());
+            self.peer_signal_to_nostr
+                .insert(peer.signal_id.clone(), peer.nostr_pubkey.clone());
+        }
+        if !peers.is_empty() {
+            tracing::info!("restored {} peer mappings", peers.len());
+        }
+
+        // 2. Restore active sessions with per-peer identity
+        let addr_map: HashMap<String, _> = all_addresses.into_iter().collect();
+
+        for (peer_signal_id, device_id, id_pub, id_priv, reg_id) in participant_rows {
+            if device_id > max_device_id {
+                max_device_id = device_id;
+            }
+
+            let identity_key = match crate::IdentityKey::decode(&id_pub) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!(
+                        "restore session {}: decode identity: {e}",
+                        &peer_signal_id[..16.min(peer_signal_id.len())]
+                    );
+                    continue;
+                }
+            };
+            let private_key = match crate::SignalPrivateKey::deserialize(&id_priv) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!(
+                        "restore session {}: decode private key: {e}",
+                        &peer_signal_id[..16.min(peer_signal_id.len())]
+                    );
+                    continue;
+                }
+            };
+            let identity_key_pair = crate::IdentityKeyPair::new(identity_key, private_key);
+
+            let signal = match crate::SignalParticipant::restore_persistent(
+                identity.pubkey_hex(),
+                device_id,
+                identity_key_pair,
+                reg_id,
+                storage.clone(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        "restore session {}: create participant failed: {e}",
+                        &peer_signal_id[..16.min(peer_signal_id.len())]
+                    );
+                    continue;
+                }
+            };
+
+            let addresses = if let Some(addr_state) = addr_map.get(&peer_signal_id) {
+                AddressManager::from_serialized(&peer_signal_id, addr_state.clone())
+            } else {
+                AddressManager::new()
+            };
+
+            // Build reverse index: receiving_address → peer_signal_id
+            for addr in addresses.get_all_receiving_address_strings() {
+                self.receiving_addr_to_peer
+                    .insert(addr, peer_signal_id.clone());
+            }
+
+            let session = ChatSession::new(signal, addresses, identity.clone());
+            self.sessions.insert(
+                peer_signal_id.clone(),
+                Arc::new(tokio::sync::Mutex::new(session)),
+            );
+            restored_count += 1;
+        }
+
+        // 3. Restore pending outbound friend requests (per-peer identity)
+        for (
+            fr_id, device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec,
+            kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey,
+        ) in fr_rows
+        {
+            if device_id > max_device_id {
+                max_device_id = device_id;
+            }
+
+            let keys = match crate::reconstruct_prekey_material(
+                &id_pub, &id_priv, reg_id, spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!(
+                        "restore pending FR {}: reconstruct keys failed: {e}",
+                        &fr_id[..16.min(fr_id.len())]
+                    );
+                    continue;
+                }
+            };
+
+            let signal = match crate::SignalParticipant::persistent(
+                identity.pubkey_hex(),
+                device_id,
+                keys,
+                storage.clone(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        "restore pending FR {}: create participant failed: {e}",
+                        &fr_id[..16.min(fr_id.len())]
+                    );
+                    continue;
+                }
+            };
+
+            let first_inbox_keys =
+                match crate::EphemeralKeypair::from_secret_hex(&first_inbox_secret) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::error!(
+                            "restore pending FR {}: reconstruct first_inbox failed: {e}",
+                            &fr_id[..16.min(fr_id.len())]
+                        );
+                        continue;
+                    }
+                };
+
+            self.pending_outbound.insert(
+                fr_id.clone(),
+                FriendRequestState {
+                    signal_participant: signal,
+                    first_inbox_keys,
+                    request_id: fr_id.clone(),
+                    peer_nostr_pubkey,
+                },
+            );
+        }
+        if !fr_ids.is_empty() {
+            tracing::info!("restored {} pending friend requests", fr_ids.len());
+        }
+
+        // 4. Restore signal groups
+        {
+            let store = storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("storage lock: {e}")))?;
+            self.group_manager.load_all(&store).map_err(|e| {
+                tracing::error!("restore: load_all groups failed: {e}");
+                KeychatError::Storage(format!("load_all groups: {e}"))
+            })?;
+            if self.group_manager.group_count() > 0 {
+                tracing::info!(
+                    "restored {} signal groups",
+                    self.group_manager.group_count()
+                );
+            }
+        }
+
+        // Update device_id counter to avoid collisions
+        if max_device_id >= self.next_signal_device_id {
+            self.next_signal_device_id = max_device_id + 1;
+        }
+
+        tracing::info!(
+            "restore complete: {} sessions, {} pending FRs, {} groups, next_device_id={}",
+            restored_count,
+            self.pending_outbound.len(),
+            self.group_manager.group_count(),
+            self.next_signal_device_id
+        );
+
+        Ok(restored_count)
+    }
+
+    /// Connect to Nostr relays.
+    ///
+    /// If `relay_urls` is empty, loads from DB or falls back to defaults.
+    pub async fn connect(&mut self, relay_urls: Vec<String>) -> Result<()> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or_else(|| KeychatError::Identity("call import_identity first".into()))?;
+
+        // Resolve relay URLs: parameter → DB → defaults
+        let urls = if !relay_urls.is_empty() {
+            relay_urls
+        } else {
+            let storage = self.storage.clone();
+            let db_relays = storage
+                .lock()
+                .ok()
+                .and_then(|s| s.list_relays().ok())
+                .unwrap_or_default();
+            if !db_relays.is_empty() {
+                db_relays
+            } else {
+                crate::transport::DEFAULT_RELAYS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+        };
+
+        tracing::info!("connecting to {} relays: {:?}", urls.len(), urls);
+
+        // Create transport, inject storage for persistent dedup, add relays, connect
+        let mut transport = Transport::new(identity.keys()).await?;
+        transport.set_storage(self.storage.clone());
+        // Prune old dedup records on connect
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.prune_processed_events(86400 * 7); // 7 days
+        }
+        for url in &urls {
+            transport.add_relay(url).await.map_err(|e| {
+                tracing::error!("add_relay({url}) failed: {e}");
+                e
+            })?;
+        }
+        transport.connect().await;
+        tracing::info!("relay transport connected");
+
+        // Persist the relay list to DB
+        if let Ok(store) = self.storage.lock() {
+            for url in &urls {
+                let _ = store.save_relay(url);
+            }
+        }
+
+        self.transport = Some(transport);
+        self.last_relay_urls = urls;
+        self.subscription_ids.clear();
+        Ok(())
+    }
+
+    /// Disconnect from all relays and stop background tasks.
+    ///
+    /// Note: event_loop_stop and reconnect_stop channels are managed by the caller
+    /// (e.g. the FFI layer), since they relate to tasks the caller spawns.
+    pub async fn disconnect(&mut self) -> Result<()> {
+        tracing::info!("disconnecting from relays");
+        self.subscription_ids.clear();
+        if let Some(t) = self.transport.take() {
+            t.disconnect().await.map_err(|e| {
+                tracing::error!("disconnect failed: {e}");
+                e
+            })?;
+        }
+        tracing::info!("disconnected");
+        Ok(())
+    }
+
+    /// Add a relay at runtime, connect to it, and persist to DB.
+    pub async fn add_relay(&self, url: &str) -> Result<()> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        transport.add_relay_and_connect(url).await?;
+
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.save_relay(url);
+        }
+        tracing::info!("added relay: {url}");
+        Ok(())
+    }
+
+    /// Remove a relay at runtime and delete from DB.
+    pub async fn remove_relay(&self, url: &str) -> Result<()> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        transport.remove_relay(url).await?;
+
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.delete_relay(url);
+        }
+        tracing::info!("removed relay: {url}");
+        Ok(())
+    }
+
+    /// Get the current relay URL list.
+    pub async fn get_relays(&self) -> Result<Vec<String>> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        Ok(transport.get_relays().await)
+    }
+
+    /// Get only the currently connected relay URLs.
+    pub async fn connected_relays(&self) -> Result<Vec<String>> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        Ok(transport.connected_relays().await)
+    }
+
+    /// Get relay URLs with their connection status.
+    pub async fn get_relay_statuses(&self) -> Result<Vec<(String, String)>> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        Ok(transport.get_relay_statuses().await)
+    }
+
+    /// Reconnect to all relays (re-enables disabled ones).
+    pub async fn reconnect_relays(&self) -> Result<()> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        transport.reconnect().await?;
+        tracing::info!("reconnected to all relays");
+        Ok(())
+    }
+
+    /// Collect pubkeys for subscription, split into identity keys and ratchet keys.
+    ///
+    /// Identity keys receive NIP-59 GiftWrap with ±2 day timestamp randomization,
+    /// so they need `since = cursor - 2 days`. Ratchet keys are newly derived
+    /// and have no historical messages, so they use `since = now()`.
+    pub async fn collect_subscribe_pubkeys(
+        &self,
+    ) -> (Vec<nostr::PublicKey>, Vec<nostr::PublicKey>) {
+        let identity_pk = self
+            .identity
+            .as_ref()
+            .and_then(|id| nostr::PublicKey::from_hex(&id.pubkey_hex()).ok());
+
+        // Identity keys: receive NIP-59 with randomized outer timestamps
+        let mut identity_pubkeys = Vec::new();
+        if let Some(pk) = identity_pk {
+            identity_pubkeys.push(pk);
+        }
+        // Pending outbound first-inbox keys also receive NIP-59 friend request responses
+        for state in self.pending_outbound.values() {
+            if let Ok(pk) = nostr::PublicKey::from_hex(&state.first_inbox_keys.pubkey_hex()) {
+                identity_pubkeys.push(pk);
+            }
+        }
+
+        // Ratchet keys: newly derived Signal addresses, no historical messages
+        let mut ratchet_pubkeys = Vec::new();
+        for session_mutex in self.sessions.values() {
+            let session = session_mutex.lock().await;
+            for addr_str in session.addresses.get_all_receiving_address_strings() {
+                if let Ok(pk) = nostr::PublicKey::from_hex(&addr_str) {
+                    ratchet_pubkeys.push(pk);
+                }
+            }
+        }
+
+        (identity_pubkeys, ratchet_pubkeys)
+    }
+
+    /// Refresh relay subscriptions with current identity + ratchet addresses.
+    pub async fn refresh_subscriptions(&mut self) -> Result<()> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected.".into()))?;
+
+        let relay_cursor = self
+            .storage
+            .lock()
+            .ok()
+            .and_then(|s| s.get_min_relay_cursor().ok())
+            .unwrap_or(0);
+
+        let (identity_pubkeys, ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+
+        // Subscribe identity keys with cursor-based since (±2 day randomization)
+        let identity_since = if relay_cursor > 0 {
+            Some(nostr::Timestamp::from(relay_cursor.saturating_sub(2 * 86400)))
+        } else {
+            None
+        };
+        let mut new_sub_ids = Vec::new();
+        if !identity_pubkeys.is_empty() {
+            let id = transport
+                .subscribe(identity_pubkeys, identity_since)
+                .await?;
+            new_sub_ids.push(id.to_string());
+        }
+
+        // Subscribe ratchet keys with since = now()
+        if !ratchet_pubkeys.is_empty() {
+            let id = transport
+                .subscribe(ratchet_pubkeys, Some(nostr::Timestamp::now()))
+                .await?;
+            new_sub_ids.push(id.to_string());
+        }
+
+        // Unsubscribe old subscriptions before replacing IDs
+        for old_id in &self.subscription_ids {
+            transport
+                .unsubscribe(crate::SubscriptionId::new(old_id))
+                .await;
+        }
+        self.subscription_ids = new_sub_ids;
+
+        Ok(())
+    }
+
+    /// Get all receiving addresses across all sessions (for debugging).
+    pub async fn get_all_receiving_addresses(&self) -> Vec<String> {
+        let mut all = Vec::new();
+        for session_mutex in self.sessions.values() {
+            let session = session_mutex.lock().await;
+            all.extend(session.addresses.get_all_receiving_address_strings());
+        }
+        all
+    }
+
+    /// Update address state, reverse index, and relay subscriptions after a successful decrypt.
+    pub async fn update_addresses_after_decrypt(
+        &mut self,
+        peer_signal_hex: &str,
+        session_mutex: &Arc<tokio::sync::Mutex<ChatSession>>,
+        addr_update: &crate::address::AddressUpdate,
+    ) {
+        if !addr_update.new_receiving.is_empty() {
+            // Re-subscribe with updated ratchet addresses
+            let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+            if !all_ratchet_pubkeys.is_empty() {
+                if let Some(transport) = self.transport.as_ref() {
+                    let old_ratchet_id = self
+                        .subscription_ids
+                        .last()
+                        .map(|s| crate::SubscriptionId::new(s));
+                    if let Ok(new_id) = transport
+                        .resubscribe(
+                            old_ratchet_id,
+                            all_ratchet_pubkeys,
+                            Some(nostr::Timestamp::now()),
+                        )
+                        .await
+                    {
+                        if let Some(last) = self.subscription_ids.last_mut() {
+                            *last = new_id.to_string();
+                        } else {
+                            self.subscription_ids.push(new_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !addr_update.new_receiving.is_empty() || addr_update.new_sending.is_some() {
+            // Persist address state
+            let addr_state_opt = {
+                let session = session_mutex.lock().await;
+                session.addresses.to_serialized(peer_signal_hex)
+            };
+            if let Some(addr_state) = addr_state_opt {
+                if let Ok(store) = self.storage.lock() {
+                    if let Err(e) = store.save_peer_addresses(peer_signal_hex, &addr_state) {
+                        tracing::error!("persist address state failed: {e}");
+                    }
+                }
+            }
+
+            // Update reverse index
+            for addr in &addr_update.new_receiving {
+                self.receiving_addr_to_peer
+                    .insert(addr.clone(), peer_signal_hex.to_string());
+            }
+            for addr in &addr_update.dropped_receiving {
+                self.receiving_addr_to_peer.remove(addr);
+            }
+        }
+    }
+}

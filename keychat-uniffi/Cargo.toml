@@ -9,6 +9,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [dependencies]
 uniffi = { version = "0.28", features = ["cli", "tokio"] }
 libkeychat = { path = "../libkeychat", features = ["storage", "mls"] }
+keychat-app-core = { path = "../keychat-app-core" }
 nostr = "0.37"
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }

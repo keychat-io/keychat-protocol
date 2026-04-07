@@ -70,6 +70,7 @@ pub mod mls_extension;
 #[cfg(feature = "mls")]
 pub mod mls_provider;
 pub mod nip44;
+pub mod orchestrator;
 pub mod payment;
 pub mod persistent_signal_store;
 pub mod session;
@@ -144,6 +145,11 @@ pub use storage::{
     DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,
 };
 pub use transport::{PublishResult, RelayHealth, Transport, DEFAULT_RELAYS};
+pub use orchestrator::{
+    FriendApprovedContext, FriendRejectedContext, FriendRequestContext, GroupChangeKind,
+    GroupChangedContext, GroupInviteContext, MessageReceivedContext, Nip17DmContext,
+    OrchestratorDelegate, ProtocolClient, SendResult,
+};
 
 // Re-export key nostr types for convenience
 pub use nostr::message::relay::RelayMessage;

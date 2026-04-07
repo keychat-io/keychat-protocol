@@ -23,15 +23,15 @@ impl KeychatClient {
         let (identity, storage, signal_device_id, identity_pubkey) = {
             let mut inner = self.inner.write().await;
             let id = inner
-                .identity
+                .protocol.identity
                 .clone()
                 .ok_or(KeychatUniError::NotInitialized {
                     msg: "no identity".into(),
                 })?;
             let pubkey_hex = id.pubkey_hex();
-            let did = inner.next_signal_device_id;
-            inner.next_signal_device_id += 1;
-            (id, inner.storage.clone(), did, pubkey_hex)
+            let did = inner.protocol.next_signal_device_id;
+            inner.protocol.next_signal_device_id += 1;
+            (id, inner.protocol.storage.clone(), did, pubkey_hex)
         }; // lock dropped
 
         // 2. Generate fresh per-peer keys and send (async, no lock held)
@@ -84,7 +84,7 @@ impl KeychatClient {
         {
             let inner = self.inner.read().await;
             let transport = inner
-                .transport
+                .protocol.transport
                 .as_ref()
                 .ok_or(KeychatUniError::Transport {
                     msg: "Not connected to any relay. Please check your network.".into(),
@@ -95,7 +95,7 @@ impl KeychatClient {
         // 4. Store pending state in memory
         {
             let mut inner = self.inner.write().await;
-            inner.pending_outbound.insert(request_id.clone(), state);
+            inner.protocol.pending_outbound.insert(request_id.clone(), state);
         }
 
         // 5. Refresh subscriptions to include first_inbox for this pending FR
@@ -149,13 +149,13 @@ impl KeychatClient {
         let (identity, storage, signal_device_id, received) = {
             let mut inner = self.inner.write().await;
             let id = inner
-                .identity
+                .protocol.identity
                 .clone()
                 .ok_or(KeychatUniError::NotInitialized {
                     msg: "no identity".into(),
                 })?;
 
-            let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            let store = inner.protocol.storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
             let (sender_pubkey_hex, message_json, payload_json) = store
@@ -193,9 +193,9 @@ impl KeychatClient {
                 created_at: 0,
             };
 
-            let did = inner.next_signal_device_id;
-            inner.next_signal_device_id += 1;
-            (id, inner.storage.clone(), did, received)
+            let did = inner.protocol.next_signal_device_id;
+            inner.protocol.next_signal_device_id += 1;
+            (id, inner.protocol.storage.clone(), did, received)
         }; // lock dropped
 
         // 2. Accept (async, no lock) — fresh per-peer identity
@@ -222,7 +222,7 @@ impl KeychatClient {
         {
             let inner = self.inner.read().await;
             let transport = inner
-                .transport
+                .protocol.transport
                 .as_ref()
                 .ok_or(KeychatUniError::Transport {
                     msg: "Not connected to any relay. Please check your network.".into(),
@@ -274,19 +274,19 @@ impl KeychatClient {
 
         {
             let mut inner = self.inner.write().await;
-            inner.sessions.insert(
+            inner.protocol.sessions.insert(
                 peer_signal_hex.clone(),
                 Arc::new(tokio::sync::Mutex::new(session)),
             );
             inner
-                .peer_nostr_to_signal
+                .protocol.peer_nostr_to_signal
                 .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
             inner
-                .peer_signal_to_nostr
+                .protocol.peer_signal_to_nostr
                 .insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
             // Update reverse index for O(1) message routing
             for addr in &recv_addrs {
-                inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+                inner.protocol.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
             }
         }
 
@@ -348,7 +348,7 @@ impl KeychatClient {
         // Load sender info before deleting
         let (sender_pubkey_hex, identity_pubkey) = {
             let inner = self.inner.read().await;
-            let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+            let store = inner.protocol.storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
             let fr = store

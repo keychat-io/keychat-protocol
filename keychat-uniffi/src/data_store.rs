@@ -436,7 +436,7 @@ impl KeychatClient {
         sender_pubkey: String,
     ) -> Result<Option<String>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+        let store = inner.protocol.storage.lock().map_err(|e| KeychatUniError::Storage {
             msg: format!("storage lock: {e}"),
         })?;
         store

@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use libkeychat::{
     reconstruct_prekey_material, AddressManager, ChatSession, DeviceId, EphemeralKeypair,
-    FriendRequestState, GroupManager, Identity, SecureStorage, SignalParticipant, Transport,
+    FriendRequestState, GroupManager, Identity, ProtocolClient, SecureStorage, SignalParticipant,
+    Transport,
 };
 
 /// Default Signal device ID used throughout the FFI layer.
@@ -40,26 +41,14 @@ pub(crate) fn lock_app_storage_result(
 }
 
 pub(crate) struct ClientInner {
-    pub identity: Option<Identity>,
-    pub transport: Option<Transport>,
-    pub storage: Arc<std::sync::Mutex<SecureStorage>>,
+    /// Protocol-level state: sessions, peer mappings, transport, etc.
+    pub protocol: ProtocolClient,
+    /// App-layer SQLCipher database (rooms, messages, contacts, settings).
     pub app_storage: Arc<std::sync::Mutex<AppStorage>>,
-    pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
-    pub peer_nostr_to_signal: HashMap<String, String>,
-    /// Reverse index: signal_id → nostr_pubkey for O(1) reverse lookup.
-    pub peer_signal_to_nostr: HashMap<String, String>,
-    /// Reverse index: receiving_address_hex → peer_signal_id for O(1) message routing.
-    pub receiving_addr_to_peer: HashMap<String, String>,
-    pub pending_outbound: HashMap<String, FriendRequestState>,
-    pub group_manager: GroupManager,
-    pub next_signal_device_id: u32,
     pub event_listener: Option<Box<dyn EventListener>>,
     pub data_listener: Option<Box<dyn DataListener>>,
     pub event_loop_stop: Option<tokio::sync::watch::Sender<bool>>,
     pub reconnect_stop: Option<tokio::sync::watch::Sender<bool>>,
-    pub last_relay_urls: Vec<String>,
-    /// Active subscription IDs — cleared and replaced on each start_event_loop().
-    pub subscription_ids: Vec<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -121,25 +110,15 @@ impl KeychatClient {
             .build()
             .map_err(|e| KeychatUniError::Transport { msg: e.to_string() })?;
 
+        let protocol_storage = Arc::new(std::sync::Mutex::new(storage));
         Ok(Self {
             inner: tokio::sync::RwLock::new(ClientInner {
-                identity: None,
-                transport: None,
-                storage: Arc::new(std::sync::Mutex::new(storage)),
+                protocol: ProtocolClient::new(protocol_storage),
                 app_storage: Arc::new(std::sync::Mutex::new(app_storage)),
-                sessions: HashMap::new(),
-                peer_nostr_to_signal: HashMap::new(),
-                peer_signal_to_nostr: HashMap::new(),
-                receiving_addr_to_peer: HashMap::new(),
-                pending_outbound: HashMap::new(),
-                group_manager: GroupManager::new(),
-                next_signal_device_id: 1,
                 event_listener: None,
                 data_listener: None,
                 event_loop_stop: None,
                 reconnect_stop: None,
-                last_relay_urls: Vec::new(),
-                subscription_ids: Vec::new(),
             }),
             runtime: Arc::new(runtime),
             db_path,
@@ -381,7 +360,7 @@ impl KeychatClient {
         let mnemonic = result.mnemonic.clone();
 
         let mut inner = self.inner.write().await;
-        inner.identity = Some(result.identity);
+        inner.protocol.identity = Some(result.identity);
         tracing::info!("identity created: {}", &pubkey_hex[..16]);
 
         let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
@@ -400,7 +379,7 @@ impl KeychatClient {
         let pubkey_hex = identity.pubkey_hex();
 
         let mut inner = self.inner.write().await;
-        inner.identity = Some(identity);
+        inner.protocol.identity = Some(identity);
         tracing::info!("identity imported: {}", &pubkey_hex[..16]);
 
         // Cache identity pubkey — immutable after import.
@@ -422,13 +401,13 @@ impl KeychatClient {
         let inner = self.inner.read().await;
 
         // In-memory state
-        let mem_sessions = inner.sessions.len();
-        let mem_pending_out = inner.pending_outbound.len();
-        let mem_peer_map = inner.peer_nostr_to_signal.len();
+        let mem_sessions = inner.protocol.sessions.len();
+        let mem_pending_out = inner.protocol.pending_outbound.len();
+        let mem_peer_map = inner.protocol.peer_nostr_to_signal.len();
 
         // DB state
         let store = inner
-            .storage
+            .protocol.storage
             .lock()
             .map_err(|e| KeychatUniError::Transport {
                 msg: format!("storage lock: {e}"),
@@ -469,274 +448,13 @@ impl KeychatClient {
     /// `PersistentSessionStore::load_session()` — no prekey re-injection needed.
     pub async fn restore_sessions(&self) -> Result<u32, KeychatUniError> {
         let mut inner = self.inner.write().await;
-        let identity = inner
-            .identity
-            .clone()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "call import_identity first".into(),
-            })?;
-        let storage = inner.storage.clone();
-
-        let store = storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
-        })?;
-
-        let mut restored_count: u32 = 0;
-        let mut max_device_id: u32 = 0;
-
-        // ── Phase 1: Read all data from DB while holding the lock ──
-
-        // Per-peer identity: (peer_signal_id, device_id, id_pub, id_priv, reg_id)
-        type ParticipantRow = (String, u32, Vec<u8>, Vec<u8>, u32);
-        let mut participant_rows: Vec<ParticipantRow> = Vec::new();
-
-        // Pending FR data (needs full prekey material — handshake not complete)
-        type FrRow = (
-            String, u32, Vec<u8>, Vec<u8>, u32,
-            u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>,
-            String, String,
-        );
-        let mut fr_rows: Vec<FrRow> = Vec::new();
-
-        let peers = store.list_peers().map_err(|e| {
-            tracing::error!("restore: list_peers failed: {e}");
-            KeychatUniError::Storage { msg: format!("list_peers: {e}") }
-        })?;
-        let peer_ids = store.list_signal_participants().map_err(|e| {
-            tracing::error!("restore: list_signal_participants failed: {e}");
-            KeychatUniError::Storage { msg: format!("list_signal_participants: {e}") }
-        })?;
-        let all_addresses = store.load_all_peer_addresses().map_err(|e| {
-            tracing::error!("restore: load_all_peer_addresses failed: {e}");
-            KeychatUniError::Storage { msg: format!("load_all_peer_addresses: {e}") }
-        })?;
-        let fr_ids = store.list_pending_frs().map_err(|e| {
-            tracing::error!("restore: list_pending_frs failed: {e}");
-            KeychatUniError::Storage { msg: format!("list_pending_frs: {e}") }
-        })?;
-        tracing::info!(
-            "RESTORE: peers={} participants={} addresses={} frs={}",
-            peers.len(), peer_ids.len(), all_addresses.len(), fr_ids.len()
-        );
-
-        for peer_signal_id in &peer_ids {
-            match store.load_signal_participant(peer_signal_id) {
-                Ok(Some((device_id, id_pub, id_priv, reg_id, _spk_id, _spk_rec))) => {
-                    participant_rows.push((peer_signal_id.clone(), device_id, id_pub, id_priv, reg_id));
-                }
-                Ok(None) => {
-                    tracing::warn!("restore: no data for participant {}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                }
-                Err(e) => {
-                    tracing::error!("restore: load participant {} failed: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                }
-            }
-        }
-
-        // Pending FRs need full prekey material (handshake not complete)
-        for fr_id in &fr_ids {
-            match store.load_pending_fr(fr_id) {
-                Ok(Some((device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey))) => {
-                    fr_rows.push((fr_id.clone(), device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!("restore pending FR {} failed: {e}", &fr_id[..16.min(fr_id.len())]);
-                }
-            }
-        }
-
-        // ── Drop the Mutex guard so restore_persistent can lock it ──
-        drop(store);
-
-        // ── Phase 2: Reconstruct objects (may lock storage internally) ──
-
-        // 1. Restore peer mappings
-        for peer in &peers {
-            inner
-                .peer_nostr_to_signal
-                .insert(peer.nostr_pubkey.clone(), peer.signal_id.clone());
-            inner
-                .peer_signal_to_nostr
-                .insert(peer.signal_id.clone(), peer.nostr_pubkey.clone());
-        }
-        if !peers.is_empty() {
-            tracing::info!("restored {} peer mappings", peers.len());
-        }
-
-        // 2. Restore active sessions with per-peer identity
-        let addr_map: HashMap<String, _> = all_addresses.into_iter().collect();
-
-        for (peer_signal_id, device_id, id_pub, id_priv, reg_id) in participant_rows {
-            if device_id > max_device_id {
-                max_device_id = device_id;
-            }
-
-            let identity_key = match libkeychat::IdentityKey::decode(&id_pub) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!("restore session {}: decode identity: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                    continue;
-                }
-            };
-            let private_key = match libkeychat::SignalPrivateKey::deserialize(&id_priv) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!("restore session {}: decode private key: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                    continue;
-                }
-            };
-            let identity_key_pair = libkeychat::IdentityKeyPair::new(identity_key, private_key);
-
-            let signal = match SignalParticipant::restore_persistent(
-                identity.pubkey_hex(),
-                device_id,
-                identity_key_pair,
-                reg_id,
-                storage.clone(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("restore session {}: create participant failed: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                    continue;
-                }
-            };
-
-            let addresses = if let Some(addr_state) = addr_map.get(&peer_signal_id) {
-                AddressManager::from_serialized(&peer_signal_id, addr_state.clone())
-            } else {
-                AddressManager::new()
-            };
-
-            // Build reverse index: receiving_address → peer_signal_id
-            for addr in addresses.get_all_receiving_address_strings() {
-                inner.receiving_addr_to_peer.insert(addr, peer_signal_id.clone());
-            }
-
-            let session = ChatSession::new(signal, addresses, identity.clone());
-            inner.sessions.insert(
-                peer_signal_id.clone(),
-                Arc::new(tokio::sync::Mutex::new(session)),
-            );
-            restored_count += 1;
-        }
-
-        // 3. Restore pending outbound friend requests (per-peer identity)
-        for (
-            fr_id,
-            device_id,
-            id_pub,
-            id_priv,
-            reg_id,
-            spk_id,
-            spk_rec,
-            pk_id,
-            pk_rec,
-            kpk_id,
-            kpk_rec,
-            first_inbox_secret,
-            peer_nostr_pubkey,
-        ) in fr_rows
-        {
-            if device_id > max_device_id {
-                max_device_id = device_id;
-            }
-
-            let keys = match reconstruct_prekey_material(
-                &id_pub, &id_priv, reg_id, spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
-            ) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!(
-                        "restore pending FR {}: reconstruct keys failed: {e}",
-                        &fr_id[..16.min(fr_id.len())]
-                    );
-                    continue;
-                }
-            };
-
-            let signal = match SignalParticipant::persistent(
-                identity.pubkey_hex(),
-                device_id,
-                keys,
-                storage.clone(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(
-                        "restore pending FR {}: create participant failed: {e}",
-                        &fr_id[..16.min(fr_id.len())]
-                    );
-                    continue;
-                }
-            };
-
-            let first_inbox_keys = match EphemeralKeypair::from_secret_hex(&first_inbox_secret) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!(
-                        "restore pending FR {}: reconstruct first_inbox failed: {e}",
-                        &fr_id[..16.min(fr_id.len())]
-                    );
-                    continue;
-                }
-            };
-
-            inner.pending_outbound.insert(
-                fr_id.clone(),
-                FriendRequestState {
-                    signal_participant: signal,
-                    first_inbox_keys,
-                    request_id: fr_id.clone(),
-                    peer_nostr_pubkey,
-                },
-            );
-        }
-        if !fr_ids.is_empty() {
-            tracing::info!("restored {} pending friend requests", fr_ids.len());
-        }
-
-        // 4. Restore signal groups
-        {
-            let storage_arc = inner.storage.clone();
-            let store = storage_arc.lock().map_err(|e| KeychatUniError::Storage {
-                msg: format!("storage lock: {e}"),
-            })?;
-            inner.group_manager.load_all(&store).map_err(|e| {
-                tracing::error!("restore: load_all groups failed: {e}");
-                KeychatUniError::Storage {
-                    msg: format!("load_all groups: {e}"),
-                }
-            })?;
-            if inner.group_manager.group_count() > 0 {
-                tracing::info!(
-                    "restored {} signal groups",
-                    inner.group_manager.group_count()
-                );
-            }
-        }
-
-        // Update device_id counter to avoid collisions
-        if max_device_id >= inner.next_signal_device_id {
-            inner.next_signal_device_id = max_device_id + 1;
-        }
-
-        tracing::info!(
-            "restore complete: {} sessions, {} pending FRs, {} groups, next_device_id={}",
-            restored_count,
-            inner.pending_outbound.len(),
-            inner.group_manager.group_count(),
-            inner.next_signal_device_id
-        );
-
-        Ok(restored_count)
+        inner.protocol.restore_sessions().map_err(Into::into)
     }
 
-    /// Checkpoint the WAL and close the database cleanly.
     /// Call before dropping the client if another client will reopen the same DB.
     pub async fn close_storage(&self) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
+        let store = inner.protocol.storage.lock().map_err(|e| KeychatUniError::Storage {
             msg: format!("storage lock: {e}"),
         })?;
         store.checkpoint().map_err(|e| KeychatUniError::Storage {
@@ -759,7 +477,7 @@ impl KeychatClient {
         let (identity, urls) = {
             let inner = self.inner.read().await;
             let identity = inner
-                .identity
+                .protocol.identity
                 .clone()
                 .ok_or(KeychatUniError::NotInitialized {
                     msg: "call create_identity first".into(),
@@ -769,7 +487,7 @@ impl KeychatClient {
                 relay_urls
             } else {
                 // Try loading from DB
-                let storage = inner.storage.clone();
+                let storage = inner.protocol.storage.clone();
                 let db_relays = storage
                     .lock()
                     .ok()
@@ -793,7 +511,7 @@ impl KeychatClient {
         let mut transport = Transport::new(identity.keys()).await?;
         let storage_for_transport = {
             let inner = self.inner.read().await;
-            inner.storage.clone()
+            inner.protocol.storage.clone()
         };
         transport.set_storage(storage_for_transport.clone());
         // Prune old dedup records on connect
@@ -812,7 +530,7 @@ impl KeychatClient {
 
         // 3. Persist the relay list to DB
         {
-            let storage = self.inner.read().await.storage.clone();
+            let storage = self.inner.read().await.protocol.storage.clone();
             let store = storage.lock();
             if let Ok(store) = store {
                 for url in &urls {
@@ -823,22 +541,22 @@ impl KeychatClient {
 
         // 4. Re-acquire lock to store transport and relay list
         let mut inner = self.inner.write().await;
-        inner.transport = Some(transport);
-        inner.last_relay_urls = urls;
+        inner.protocol.transport = Some(transport);
+        inner.protocol.last_relay_urls = urls;
         // Clear any stale subscription IDs from a previous connect session
-        inner.subscription_ids.clear();
+        inner.protocol.subscription_ids.clear();
         Ok(())
     }
 
     /// Add a relay at runtime, connect to it, and persist to DB.
     pub async fn add_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         transport.add_relay_and_connect(&url).await?;
 
-        let storage = inner.storage.clone();
+        let storage = inner.protocol.storage.clone();
         if let Ok(store) = storage.lock() {
             let _ = store.save_relay(&url);
         }
@@ -849,12 +567,12 @@ impl KeychatClient {
     /// Remove a relay at runtime and delete from DB.
     pub async fn remove_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         transport.remove_relay(&url).await?;
 
-        let storage = inner.storage.clone();
+        let storage = inner.protocol.storage.clone();
         if let Ok(store) = storage.lock() {
             let _ = store.delete_relay(&url);
         }
@@ -865,7 +583,7 @@ impl KeychatClient {
     /// Get the current relay URL list.
     pub async fn get_relays(&self) -> Result<Vec<String>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         Ok(transport.get_relays().await)
@@ -874,7 +592,7 @@ impl KeychatClient {
     /// Get only the currently connected relay URLs.
     pub async fn connected_relays(&self) -> Result<Vec<String>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         Ok(transport.connected_relays().await)
@@ -883,7 +601,7 @@ impl KeychatClient {
     /// Get relay URLs with their connection status.
     pub async fn get_relay_statuses(&self) -> Result<Vec<RelayStatusInfo>, KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         Ok(transport
@@ -897,7 +615,7 @@ impl KeychatClient {
     /// Reconnect to all relays (re-enables disabled ones).
     pub async fn reconnect_relays(&self) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         transport.reconnect().await?;
@@ -908,7 +626,7 @@ impl KeychatClient {
     /// Reconnect a specific relay.
     pub async fn reconnect_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         transport.reconnect_relay(&url).await?;
@@ -926,7 +644,7 @@ impl KeychatClient {
                 msg: format!("invalid event JSON: {e}"),
             })?;
         let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
         let result = transport.rebroadcast_event(event).await?;
@@ -947,9 +665,9 @@ impl KeychatClient {
         let (transport, event_loop_tx, reconnect_tx) = {
             let mut inner = self.inner.write().await;
             // Clear subscription IDs — they belong to the old transport
-            inner.subscription_ids.clear();
+            inner.protocol.subscription_ids.clear();
             (
-                inner.transport.take(),
+                inner.protocol.transport.take(),
                 inner.event_loop_stop.take(),
                 inner.reconnect_stop.take(),
             )
@@ -991,27 +709,27 @@ impl KeychatClient {
         // 2. Disconnect transport
         {
             let mut inner = self.inner.write().await;
-            if let Some(t) = inner.transport.take() {
+            if let Some(t) = inner.protocol.transport.take() {
                 let _ = t.disconnect().await;
             }
         }
 
         // 3. Clear all in-memory state + DB
-        let storage = self.inner.read().await.storage.clone();
+        let storage = self.inner.read().await.protocol.storage.clone();
         {
             let mut inner = self.inner.write().await;
-            inner.sessions.clear();
-            inner.peer_nostr_to_signal.clear();
-            inner.peer_signal_to_nostr.clear();
-            inner.receiving_addr_to_peer.clear();
-            inner.pending_outbound.clear();
-            inner.group_manager = libkeychat::GroupManager::new();
-            inner.identity = None;
-            inner.next_signal_device_id = 1;
+            inner.protocol.sessions.clear();
+            inner.protocol.peer_nostr_to_signal.clear();
+            inner.protocol.peer_signal_to_nostr.clear();
+            inner.protocol.receiving_addr_to_peer.clear();
+            inner.protocol.pending_outbound.clear();
+            inner.protocol.group_manager = libkeychat::GroupManager::new();
+            inner.protocol.identity = None;
+            inner.protocol.next_signal_device_id = 1;
             inner.event_loop_stop = None;
             inner.reconnect_stop = None;
-            inner.subscription_ids.clear();
-            inner.last_relay_urls.clear();
+            inner.protocol.subscription_ids.clear();
+            inner.protocol.last_relay_urls.clear();
         }
         if let Ok(store) = storage.lock() {
             store
@@ -1040,17 +758,17 @@ impl KeychatClient {
     /// For 1:1: clears session, signal participant, peer mapping, addresses.
     /// For groups: removes from GroupManager + storage.
     pub async fn remove_room(&self, room_id: String) -> Result<(), KeychatUniError> {
-        let storage = self.inner.read().await.storage.clone();
+        let storage = self.inner.read().await.protocol.storage.clone();
         let mut found = false;
 
         // Try as 1:1 peer first (room_id = nostr pubkey)
         {
             let mut inner = self.inner.write().await;
-            if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&room_id) {
-                inner.peer_signal_to_nostr.remove(&signal_id);
-                inner.sessions.remove(&signal_id);
-                inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != room_id);
+            if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&room_id) {
+                inner.protocol.peer_signal_to_nostr.remove(&signal_id);
+                inner.protocol.sessions.remove(&signal_id);
+                inner.protocol.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
+                inner.protocol.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != room_id);
                 drop(inner);
 
                 // Delete from DB (no write lock held)
@@ -1069,13 +787,13 @@ impl KeychatClient {
         // Try as Signal group
         if !found {
             let mut inner = self.inner.write().await;
-            if inner.group_manager.get_group(&room_id).is_some() {
+            if inner.protocol.group_manager.get_group(&room_id).is_some() {
                 if let Ok(store) = storage.lock() {
                     let _ = inner
-                        .group_manager
+                        .protocol.group_manager
                         .remove_group_persistent(&room_id, &store);
                 } else {
-                    inner.group_manager.remove_group(&room_id);
+                    inner.protocol.group_manager.remove_group(&room_id);
                 }
                 tracing::info!(
                     "remove_room: removed group {}",
@@ -1123,17 +841,17 @@ impl KeychatClient {
     /// This API is designed for situations where you want to clean up just one peer's session
     /// without removing the entire room/contact.
     pub async fn remove_session(&self, peer_pubkey: String) -> Result<(), KeychatUniError> {
-        let storage = self.inner.read().await.storage.clone();
+        let storage = self.inner.read().await.protocol.storage.clone();
 
         {
             let mut inner = self.inner.write().await;
 
             // Remove signal session
-            if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&peer_pubkey) {
-                inner.peer_signal_to_nostr.remove(&signal_id);
-                inner.sessions.remove(&signal_id);
-                inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
+            if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&peer_pubkey) {
+                inner.protocol.peer_signal_to_nostr.remove(&signal_id);
+                inner.protocol.sessions.remove(&signal_id);
+                inner.protocol.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
+                inner.protocol.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
 
                 // Clean up in DB (no write lock held during DB operations)
                 drop(inner);
@@ -1211,7 +929,7 @@ impl KeychatClient {
         // Ratchet keys are newly derived addresses with no history — use now().
         let identity_since = {
             let inner = self.inner.read().await;
-            let storage = inner.storage.lock().unwrap_or_else(|e| e.into_inner());
+            let storage = inner.protocol.storage.lock().unwrap_or_else(|e| e.into_inner());
             let cursor = storage.get_min_relay_cursor().unwrap_or(0);
             drop(storage);
             drop(inner);
@@ -1263,7 +981,7 @@ impl KeychatClient {
         // preventing duplicate REQ accumulation.
         let old_ids: Vec<String> = {
             let inner = self.inner.read().await;
-            inner.subscription_ids.clone()
+            inner.protocol.subscription_ids.clone()
         };
         let mut old_iter = old_ids.into_iter().map(|s| libkeychat::SubscriptionId::new(s));
 
@@ -1271,7 +989,7 @@ impl KeychatClient {
 
         {
             let inner = self.inner.read().await;
-            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay. Please check your network.".into(),
             })?;
 
@@ -1306,7 +1024,7 @@ impl KeychatClient {
         // Persist new subscription IDs
         {
             let mut inner = self.inner.write().await;
-            inner.subscription_ids = new_sub_ids;
+            inner.protocol.subscription_ids = new_sub_ids;
         }
 
         // Create stop channel
@@ -1554,7 +1272,7 @@ impl KeychatClient {
     pub(crate) async fn try_reconnect(&self) -> Result<(), KeychatUniError> {
         let relay_urls = {
             let inner = self.inner.read().await;
-            inner.last_relay_urls.clone()
+            inner.protocol.last_relay_urls.clone()
         };
 
         if relay_urls.is_empty() {
@@ -1566,7 +1284,7 @@ impl KeychatClient {
         // Reconnect existing transport if available
         {
             let inner = self.inner.read().await;
-            if let Some(ref transport) = inner.transport {
+            if let Some(ref transport) = inner.protocol.transport {
                 transport.reconnect().await?;
                 return Ok(());
             }

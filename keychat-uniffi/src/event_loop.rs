@@ -36,7 +36,7 @@ impl KeychatClient {
         // Get the nostr client (clone) under read lock, then drop lock
         let nostr_client = {
             let inner = self.inner.read().await;
-            match inner.transport.as_ref() {
+            match inner.protocol.transport.as_ref() {
                 Some(t) => t.client().clone(),
                 None => {
                     self.emit_event(ClientEvent::EventLoopError {
@@ -102,7 +102,7 @@ impl KeychatClient {
                             // Deduplicate via Transport
                             let deduped = {
                                 let inner = self.inner.read().await;
-                                match inner.transport.as_ref() {
+                                match inner.protocol.transport.as_ref() {
                                     Some(t) => t.deduplicate((*event).clone()).await,
                                     None => None,
                                 }
@@ -253,7 +253,7 @@ impl KeychatClient {
                     .as_secs();
                 let event_ts = event.created_at.as_u64().min(now);
                 let inner = self.inner.read().await;
-                let storage = inner.storage.lock().unwrap_or_else(|e| e.into_inner());
+                let storage = inner.protocol.storage.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = storage.update_relay_cursor(url, event_ts) {
                     tracing::error!("failed to update relay cursor for {}: {e}", url);
                 }
@@ -265,7 +265,7 @@ impl KeychatClient {
     async fn try_handle_friend_request(&self, event: &Event) -> bool {
         let identity = {
             let inner = self.inner.read().await;
-            inner.identity.clone()
+            inner.protocol.identity.clone()
         };
         let Some(identity) = identity else {
             tracing::warn!("Step1: no identity set, skipping friend request check");
@@ -314,7 +314,7 @@ impl KeychatClient {
                     return true;
                 }
             };
-            let storage = self.inner.read().await.storage.clone();
+            let storage = self.inner.read().await.protocol.storage.clone();
             let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let store = storage.lock().map_err(|e| format!("{e}"))?;
                 store.save_inbound_fr(
@@ -461,7 +461,7 @@ impl KeychatClient {
         let pending_keys: Vec<(String, String, String)> = {
             let inner = self.inner.read().await;
             inner
-                .pending_outbound
+                .protocol.pending_outbound
                 .iter()
                 .map(|(k, v)| {
                     (
@@ -492,7 +492,7 @@ impl KeychatClient {
             // Try decrypt under write lock (need &mut signal_participant)
             let result = {
                 let mut inner = self.inner.write().await;
-                if let Some(state) = inner.pending_outbound.get_mut(request_id) {
+                if let Some(state) = inner.protocol.pending_outbound.get_mut(request_id) {
                     let r = receive_signal_message(
                         &mut state.signal_participant,
                         &remote_address,
@@ -560,8 +560,8 @@ impl KeychatClient {
 
                     // Take the state out and create ChatSession
                     let mut inner = self.inner.write().await;
-                    if let Some(mut state) = inner.pending_outbound.remove(request_id) {
-                        let identity = match inner.identity.clone() {
+                    if let Some(mut state) = inner.protocol.pending_outbound.remove(request_id) {
+                        let identity = match inner.protocol.identity.clone() {
                             Some(id) => id,
                             None => continue,
                         };
@@ -639,19 +639,19 @@ impl KeychatClient {
                         let session =
                             ChatSession::new(state.signal_participant, addresses, identity);
 
-                        inner.sessions.insert(
+                        inner.protocol.sessions.insert(
                             peer_signal_hex.clone(),
                             Arc::new(tokio::sync::Mutex::new(session)),
                         );
                         inner
-                            .peer_nostr_to_signal
+                            .protocol.peer_nostr_to_signal
                             .insert(peer_nostr_id.clone(), peer_signal_hex.clone());
                         inner
-                            .peer_signal_to_nostr
+                            .protocol.peer_signal_to_nostr
                             .insert(peer_signal_hex.clone(), peer_nostr_id.clone());
                         // Update reverse index for O(1) message routing
                         for addr in &recv_addrs {
-                            inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+                            inner.protocol.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
                         }
 
                         tracing::info!(
@@ -662,7 +662,7 @@ impl KeychatClient {
 
                         // Persist session state to SQLCipher
                         {
-                            let store_result = inner.storage.lock();
+                            let store_result = inner.protocol.storage.lock();
                             if let Err(ref e) = store_result {
                                 tracing::error!(
                                     "[Step2]: storage lock poisoned, session NOT persisted: {e}"
@@ -705,8 +705,8 @@ impl KeychatClient {
                         } // store MutexGuard dropped here
 
                         // Save address state (after store lock released, safe to await session)
-                        let storage_for_addr = inner.storage.clone();
-                        if let Some(session_mutex) = inner.sessions.get(&peer_signal_hex) {
+                        let storage_for_addr = inner.protocol.storage.clone();
+                        if let Some(session_mutex) = inner.protocol.sessions.get(&peer_signal_hex) {
                             let sess = session_mutex.lock().await;
                             if let Some(addr_state) = sess.addresses.to_serialized(&peer_signal_hex)
                             {
@@ -736,20 +736,20 @@ impl KeychatClient {
                         if !all_ratchet_pubkeys.is_empty() {
                             let old_ratchet_id = {
                                 let inner = self.inner.read().await;
-                                inner.subscription_ids.last().map(|s| libkeychat::SubscriptionId::new(s))
+                                inner.protocol.subscription_ids.last().map(|s| libkeychat::SubscriptionId::new(s))
                             };
                             let inner = self.inner.read().await;
-                            if let Some(transport) = inner.transport.as_ref() {
+                            if let Some(transport) = inner.protocol.transport.as_ref() {
                                 if let Ok(new_id) = transport
                                     .resubscribe(old_ratchet_id, all_ratchet_pubkeys, Some(Timestamp::now()))
                                     .await
                                 {
                                     drop(inner);
                                     let mut inner = self.inner.write().await;
-                                    if let Some(last) = inner.subscription_ids.last_mut() {
+                                    if let Some(last) = inner.protocol.subscription_ids.last_mut() {
                                         *last = new_id.to_string();
                                     } else {
-                                        inner.subscription_ids.push(new_id.to_string());
+                                        inner.protocol.subscription_ids.push(new_id.to_string());
                                     }
                                 }
                             }
@@ -861,7 +861,7 @@ impl KeychatClient {
 
                     // Remove from pending
                     let mut inner = self.inner.write().await;
-                    inner.pending_outbound.remove(request_id);
+                    inner.protocol.pending_outbound.remove(request_id);
 
                     // Update room status to rejected
                     let identity_pubkey = self.cached_identity_pubkey();
@@ -919,7 +919,7 @@ impl KeychatClient {
 
         let (peer_id, session_arc) = {
             let inner = self.inner.read().await;
-            let peer_id = match inner.receiving_addr_to_peer.get(&first_p) {
+            let peer_id = match inner.protocol.receiving_addr_to_peer.get(&first_p) {
                 Some(id) => id.clone(),
                 None => {
                     tracing::warn!(
@@ -930,7 +930,7 @@ impl KeychatClient {
                     return false;
                 }
             };
-            let session = match inner.sessions.get(&peer_id) {
+            let session = match inner.protocol.sessions.get(&peer_id) {
                 Some(s) => s.clone(),
                 None => {
                     tracing::warn!(
@@ -983,7 +983,7 @@ impl KeychatClient {
                 let sender_nostr_pubkey = {
                     let inner = self.inner.read().await;
                     inner
-                        .peer_signal_to_nostr
+                        .protocol.peer_signal_to_nostr
                         .get(peer_signal_hex)
                         .cloned()
                         .unwrap_or_else(|| peer_signal_hex.clone())
@@ -1014,7 +1014,7 @@ impl KeychatClient {
     ) -> bool {
         let identity = {
             let inner = self.inner.read().await;
-            inner.identity.clone()
+            inner.protocol.identity.clone()
         };
         let Some(identity) = identity else {
             return false;
@@ -1150,20 +1150,20 @@ impl KeychatClient {
             if !all_ratchet_pubkeys.is_empty() {
                 let old_ratchet_id = {
                     let inner = self.inner.read().await;
-                    inner.subscription_ids.last().map(|s| libkeychat::SubscriptionId::new(s))
+                    inner.protocol.subscription_ids.last().map(|s| libkeychat::SubscriptionId::new(s))
                 };
                 let inner = self.inner.read().await;
-                if let Some(transport) = inner.transport.as_ref() {
+                if let Some(transport) = inner.protocol.transport.as_ref() {
                     if let Ok(new_id) = transport
                         .resubscribe(old_ratchet_id, all_ratchet_pubkeys, Some(Timestamp::now()))
                         .await
                     {
                         drop(inner);
                         let mut inner = self.inner.write().await;
-                        if let Some(last) = inner.subscription_ids.last_mut() {
+                        if let Some(last) = inner.protocol.subscription_ids.last_mut() {
                             *last = new_id.to_string();
                         } else {
-                            inner.subscription_ids.push(new_id.to_string());
+                            inner.protocol.subscription_ids.push(new_id.to_string());
                         }
                     }
                 }
@@ -1178,7 +1178,7 @@ impl KeychatClient {
             if let Some(addr_state) = addr_state_opt {
                 let storage = {
                     let inner = self.inner.read().await;
-                    inner.storage.clone()
+                    inner.protocol.storage.clone()
                 };
                 let save_result =
                     storage.lock().map_err(|e| e.to_string()).and_then(|store| {
@@ -1193,10 +1193,10 @@ impl KeychatClient {
 
             let mut inner = self.inner.write().await;
             for addr in &addr_update.new_receiving {
-                inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.to_string());
+                inner.protocol.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.to_string());
             }
             for addr in &addr_update.dropped_receiving {
-                inner.receiving_addr_to_peer.remove(addr);
+                inner.protocol.receiving_addr_to_peer.remove(addr);
             }
         }
     }
@@ -1232,9 +1232,9 @@ impl KeychatClient {
                                 {
                                     let mut inner = self.inner.write().await;
                                     let gid = group.group_id.clone();
-                                    inner.group_manager.add_group(group);
-                                    if let Ok(store) = inner.storage.clone().lock() {
-                                        let _ = inner.group_manager.save_group(&gid, &store);
+                                    inner.protocol.group_manager.add_group(group);
+                                    if let Ok(store) = inner.protocol.storage.clone().lock() {
+                                        let _ = inner.protocol.group_manager.save_group(&gid, &store);
                                     }
                                 }
 
@@ -1300,11 +1300,11 @@ impl KeychatClient {
                         // Update GroupManager + persist
                         if let Some(ref member_id) = removed_member {
                             let mut inner = self.inner.write().await;
-                            if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
+                            if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
                                 g.remove_member(member_id);
                             }
-                            if let Ok(store) = inner.storage.clone().lock() {
-                                let _ = inner.group_manager.save_group(&group_id, &store);
+                            if let Ok(store) = inner.protocol.storage.clone().lock() {
+                                let _ = inner.protocol.group_manager.save_group(&group_id, &store);
                             }
                         }
 
@@ -1343,11 +1343,11 @@ impl KeychatClient {
                         // Remove member from group + persist
                         if let Some(ref member_id) = left_member {
                             let mut inner = self.inner.write().await;
-                            if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
+                            if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
                                 g.remove_member(member_id);
                             }
-                            if let Ok(store) = inner.storage.clone().lock() {
-                                let _ = inner.group_manager.save_group(&group_id, &store);
+                            if let Ok(store) = inner.protocol.storage.clone().lock() {
+                                let _ = inner.protocol.group_manager.save_group(&group_id, &store);
                             }
                         }
 
@@ -1380,15 +1380,15 @@ impl KeychatClient {
                         // Remove group from manager + protocol storage
                         let app_storage_clone = {
                             let mut inner = self.inner.write().await;
-                            if let Ok(store) = inner.storage.clone().lock() {
+                            if let Ok(store) = inner.protocol.storage.clone().lock() {
                                 if let Err(e) = inner
-                                    .group_manager
+                                    .protocol.group_manager
                                     .remove_group_persistent(&group_id, &store)
                                 {
                                     warn!("remove_group_persistent: {e}");
                                 }
                             } else {
-                                inner.group_manager.remove_group(&group_id);
+                                inner.protocol.group_manager.remove_group(&group_id);
                             }
                             inner.app_storage.clone()
                         };
@@ -1432,12 +1432,12 @@ impl KeychatClient {
                             let app_storage_clone;
                             {
                                 let mut inner = self.inner.write().await;
-                                if let Some(g) = inner.group_manager.get_group_mut(&group_id) {
+                                if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
                                     g.name = name.clone();
                                 }
-                                if let Ok(store) = inner.storage.clone().lock() {
+                                if let Ok(store) = inner.protocol.storage.clone().lock() {
                                     if let Err(e) =
-                                        inner.group_manager.save_group(&group_id, &store)
+                                        inner.protocol.group_manager.save_group(&group_id, &store)
                                     {
                                         warn!("save_group: {e}");
                                     }
@@ -1703,12 +1703,12 @@ impl KeychatClient {
         let (identity_pk, session_arcs, pending_pks) = {
             let inner = self.inner.read().await;
             let identity_pk = inner
-                .identity
+                .protocol.identity
                 .as_ref()
                 .and_then(|id| PublicKey::from_hex(&id.pubkey_hex()).ok());
-            let session_arcs: Vec<_> = inner.sessions.values().cloned().collect();
+            let session_arcs: Vec<_> = inner.protocol.sessions.values().cloned().collect();
             let pending_pks: Vec<_> = inner
-                .pending_outbound
+                .protocol.pending_outbound
                 .values()
                 .filter_map(|s| PublicKey::from_hex(&s.first_inbox_keys.pubkey_hex()).ok())
                 .collect();

@@ -102,7 +102,7 @@ impl KeychatClient {
         let connected = {
             let inner = self.inner.read().await;
             let transport = inner
-                .transport
+                .protocol.transport
                 .as_ref()
                 .ok_or(KeychatUniError::Transport {
                     msg: "Not connected to any relay. Please check your network.".into(),
@@ -119,20 +119,20 @@ impl KeychatClient {
         let (session_mutex, peer_signal_hex, identity_pubkey) = {
             let inner = self.inner.read().await;
             let peer_pubkey = room_id.split(':').next().unwrap_or(&room_id);
-            if inner.group_manager.get_group(peer_pubkey).is_some() {
+            if inner.protocol.group_manager.get_group(peer_pubkey).is_some() {
                 return Err(KeychatUniError::InvalidArgument {
                     msg: format!("room {} is a group — use send_group_text/send_group_file", &peer_pubkey[..16.min(peer_pubkey.len())]),
                 });
             }
             let signal_hex = inner
-                .peer_nostr_to_signal
+                .protocol.peer_nostr_to_signal
                 .get(peer_pubkey)
                 .ok_or(KeychatUniError::PeerNotFound {
                     peer_id: peer_pubkey.to_string(),
                 })?
                 .clone();
             let session = inner
-                .sessions
+                .protocol.sessions
                 .get(&signal_hex)
                 .ok_or(KeychatUniError::PeerNotFound {
                     peer_id: signal_hex.clone(),
@@ -204,7 +204,7 @@ impl KeychatClient {
         {
             let inner = self.inner.read().await;
             let transport = inner
-                .transport
+                .protocol.transport
                 .as_ref()
                 .ok_or(KeychatUniError::Transport {
                     msg: "Not connected to any relay. Please check your network.".into(),
@@ -249,10 +249,10 @@ impl KeychatClient {
         if !addr_update.new_receiving.is_empty() || !addr_update.dropped_receiving.is_empty() {
             let mut inner = self.inner.write().await;
             for addr in &addr_update.new_receiving {
-                inner.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+                inner.protocol.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
             }
             for addr in &addr_update.dropped_receiving {
-                inner.receiving_addr_to_peer.remove(addr);
+                inner.protocol.receiving_addr_to_peer.remove(addr);
             }
         }
 
@@ -277,7 +277,7 @@ impl KeychatClient {
         // Check relay connection
         let connected = {
             let inner = self.inner.read().await;
-            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay.".into(),
             })?;
             transport.connected_relays().await
@@ -291,7 +291,7 @@ impl KeychatClient {
         // Get identity keys
         let identity = {
             let inner = self.inner.read().await;
-            inner.identity.clone().ok_or(KeychatUniError::NotInitialized {
+            inner.protocol.identity.clone().ok_or(KeychatUniError::NotInitialized {
                 msg: "no identity set".into(),
             })?
         };
@@ -346,7 +346,7 @@ impl KeychatClient {
         // Publish to relays
         {
             let inner = self.inner.read().await;
-            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
+            let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay.".into(),
             })?;
             transport.publish_event_async(gift_wrap).await?;
