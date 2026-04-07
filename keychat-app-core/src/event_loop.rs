@@ -281,7 +281,34 @@ impl AppClient {
     /// 2. Friend approve/reject response (pending outbound states)
     /// 3. Existing Signal session message
     /// 4. NIP-17 DM fallback (unwrap succeeds but not a keychat protocol message)
-    async fn handle_incoming_event(
+    /// Handle a relay OK response (NIP-01).
+    pub async fn handle_relay_ok(
+        &self,
+        event_id: &str,
+        relay_url: &str,
+        status: bool,
+        message: &str,
+    ) {
+        tracing::info!(
+            "⬆️ RELAY_OK relay={} eventId={} ok={} msg={}",
+            relay_url, &event_id[..16.min(event_id.len())], status, &message[..80.min(message.len())]
+        );
+        let update = {
+            let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.handle_relay_ok(event_id, relay_url, status, message)
+        };
+        if let Some(update) = update {
+            self.apply_relay_status_update(update).await;
+        }
+        self.emit_event(ClientEvent::RelayOk {
+            event_id: event_id.to_string(),
+            relay_url: relay_url.to_string(),
+            success: status,
+            message: message.to_string(),
+        }).await;
+    }
+
+    pub async fn handle_incoming_event(
         &self,
         event: &Event,
         relay_url: Option<String>,
@@ -1712,7 +1739,7 @@ impl AppClient {
 
     /// Apply a relay status update: write to DB and notify Swift.
     /// Called on every relay OK and on timeout — gives real-time status updates.
-    pub(crate) async fn apply_relay_status_update(
+    pub async fn apply_relay_status_update(
         &self,
         update: crate::relay_tracker::RelayStatusUpdate,
     ) {

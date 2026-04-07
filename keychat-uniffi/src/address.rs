@@ -6,7 +6,10 @@ impl KeychatClient {
     /// Called after address rotation or on reconnect.
     /// Uses cursor-based `since` for identity keys, `now()` for ratchet keys.
     pub(crate) async fn refresh_subscriptions(&self) -> Result<(), KeychatUniError> {
-        let (identity_pubkeys, ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+        let (identity_pubkeys, ratchet_pubkeys) = {
+            let inner = self.app.inner.read().await;
+            inner.protocol.collect_subscribe_pubkeys().await
+        };
         let total = identity_pubkeys.len() + ratchet_pubkeys.len();
         if total == 0 {
             tracing::debug!("📡 SUB: no pubkeys to subscribe");

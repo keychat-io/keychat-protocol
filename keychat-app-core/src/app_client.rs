@@ -556,6 +556,35 @@ impl AppClient {
         }
     }
 
+    // ─── Auto-Reconnect ──────────────────────────────────────────
+
+    pub async fn enable_auto_reconnect(&self, _max_delay_secs: u32) -> AppResult<()> {
+        // TODO: Implement auto-reconnect loop (was in keychat-uniffi client.rs)
+        tracing::warn!("enable_auto_reconnect: not yet implemented in app-core");
+        Ok(())
+    }
+
+    pub async fn disable_auto_reconnect(&self) {
+        let mut inner = self.inner.write().await;
+        if let Some(tx) = inner.reconnect_stop.take() {
+            let _ = tx.send(true);
+        }
+    }
+
+    pub async fn check_connection(&self) -> ConnectionStatus {
+        let inner = self.inner.read().await;
+        match &inner.protocol.transport {
+            Some(t) => {
+                if t.connected_relays().await.is_empty() {
+                    ConnectionStatus::Disconnected
+                } else {
+                    ConnectionStatus::Connected
+                }
+            }
+            None => ConnectionStatus::Disconnected,
+        }
+    }
+
     // ─── Debug ──────────────────────────────────────────────────
 
     pub async fn debug_state_summary(&self) -> AppResult<String> {

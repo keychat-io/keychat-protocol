@@ -865,4 +865,222 @@ impl ProtocolClient {
             }
         }
     }
+
+    // ─── Protocol-level send/receive ────────────────────────────
+
+    /// Send an encrypted message to a peer via Signal session.
+    ///
+    /// Pure protocol: session lookup → encrypt → publish → address index update.
+    /// Does NOT write to app_storage, emit DataChange, or track relay status.
+    /// Returns `SendResult` for the caller to handle persistence.
+    pub async fn send_message_core(
+        &mut self,
+        peer_pubkey: &str,
+        msg: &crate::KCMessage,
+    ) -> Result<SendResult> {
+        // 1. Check relay connection
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        let connected = transport.connected_relays().await;
+        if connected.is_empty() {
+            return Err(KeychatError::Transport("Not connected to any relay.".into()));
+        }
+
+        // 2. Resolve peer → signal session
+        let signal_hex = self
+            .peer_nostr_to_signal
+            .get(peer_pubkey)
+            .ok_or_else(|| KeychatError::SignalSession(format!("peer not found: {}", &peer_pubkey[..16.min(peer_pubkey.len())])))?
+            .clone();
+        let session_mutex = self
+            .sessions
+            .get(&signal_hex)
+            .ok_or_else(|| KeychatError::SignalSession(format!("no session for signal id: {}", &signal_hex[..16.min(signal_hex.len())])))?
+            .clone();
+
+        // 3. Encrypt via Signal session
+        let device_id = crate::DeviceId::new(1).expect("device_id 1 is valid");
+        let remote_addr = crate::ProtocolAddress::new(signal_hex.clone(), device_id);
+        let payload_json = msg.to_json().ok();
+        let (event, addr_update) = {
+            let mut session = session_mutex.lock().await;
+            session.send_message(&signal_hex, &remote_addr, msg).await?
+        };
+
+        // 4. Serialize for resend support
+        let nostr_event_json = serde_json::to_string(&event).ok();
+        let event_id = event.id.to_hex();
+
+        // 5. Publish to relays
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("transport lost".into()))?;
+        transport.publish_event_async(event).await?;
+
+        tracing::info!(
+            "⬆️ SENT eventId={} to {} relays",
+            &event_id[..16.min(event_id.len())],
+            connected.len()
+        );
+
+        // 6. Update address reverse index
+        for addr in &addr_update.new_receiving {
+            self.receiving_addr_to_peer.insert(addr.clone(), signal_hex.clone());
+        }
+        for addr in &addr_update.dropped_receiving {
+            self.receiving_addr_to_peer.remove(addr);
+        }
+
+        Ok(SendResult {
+            event_id,
+            nostr_event_json,
+            payload_json,
+            connected_relays: connected,
+            addr_update,
+        })
+    }
+
+    /// Try to decrypt an incoming event as a friend request (Step 1).
+    ///
+    /// Returns `Some(FriendRequestContext)` if successful, `None` if not a friend request.
+    /// Pure protocol: unwraps gift wrap, verifies globalSign, persists to SecureStorage.
+    /// Does NOT write to app_storage.
+    pub async fn try_decrypt_friend_request(
+        &self,
+        event: &crate::Event,
+    ) -> Option<FriendRequestContext> {
+        let identity = self.identity.as_ref()?;
+
+        let received = match crate::receive_friend_request(identity, event) {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+
+        let request_id = received.message.id.clone()
+            .unwrap_or_else(|| format!("fr-{}", event.id.to_hex()));
+        let sender_pubkey = received.sender_pubkey_hex.clone();
+        let sender_name = received.payload.name.clone();
+        let message = received.payload.message.clone();
+        let created_at = received.created_at;
+
+        tracing::info!(
+            "[Step1] OK: friendRequest from={} name={:?}",
+            &sender_pubkey[..16.min(sender_pubkey.len())],
+            sender_name
+        );
+
+        // Persist inbound FR to SecureStorage
+        let message_json = serde_json::to_string(&received.message).ok();
+        let payload_json = serde_json::to_string(&received.payload).ok();
+        if let (Some(ref mj), Some(ref pj)) = (&message_json, &payload_json) {
+            if let Ok(store) = self.storage.lock() {
+                let _ = store.save_inbound_fr(&request_id, &sender_pubkey, mj, pj);
+            }
+        }
+
+        Some(FriendRequestContext {
+            request_id,
+            sender_pubkey,
+            sender_name,
+            message,
+            created_at,
+            event_id: event.id.to_hex(),
+            message_json,
+            payload_json,
+        })
+    }
+
+
+    // ─── Complex decrypt methods (TODO: move full logic from app-core) ──
+
+    /// Try to decrypt an incoming event with pending outbound FR states (Step 2).
+    ///
+    /// Currently a simplified version that only decrypts. The full session creation
+    /// logic (relocate_session, AddressManager setup, persist) remains in keychat-app-core.
+    /// TODO: Move the complete try_handle_friend_approve logic here.
+    pub fn try_decrypt_pending_outbound(
+        &mut self,
+        event: &crate::Event,
+    ) -> Option<(String, crate::KCMessage)> {
+        let pending_keys: Vec<(String, String)> = self
+            .pending_outbound
+            .iter()
+            .map(|(k, v)| (k.clone(), v.signal_participant.identity_public_key_hex()))
+            .collect();
+
+        let device_id = crate::DeviceId::new(1).expect("valid");
+
+        for (request_id, signal_id_hex) in &pending_keys {
+            let remote_address = crate::ProtocolAddress::new(signal_id_hex.clone(), device_id);
+
+            let result = if let Some(state) = self.pending_outbound.get_mut(request_id) {
+                crate::receive_signal_message(
+                    &mut state.signal_participant,
+                    &remote_address,
+                    event,
+                )
+            } else {
+                continue;
+            };
+
+            if let Ok((msg, _decrypt_result)) = result {
+                return Some((request_id.clone(), msg));
+            }
+        }
+        None
+    }
+
+    /// Try to decrypt an incoming event with existing sessions (Step 3).
+    ///
+    /// Uses O(1) p-tag routing via receiving_addr_to_peer.
+    /// Returns (peer_signal_hex, KCMessage, MessageMetadata, AddressUpdate, session_mutex).
+    pub async fn try_decrypt_session_message(
+        &self,
+        event: &crate::Event,
+    ) -> Option<(String, crate::KCMessage, crate::MessageMetadata, crate::address::AddressUpdate, Arc<tokio::sync::Mutex<crate::ChatSession>>)> {
+        let p_tags = crate::extract_p_tags(event);
+        let first_p = p_tags.first()?;
+
+        let (peer_id, session_arc) = {
+            let peer_id = self.receiving_addr_to_peer.get(first_p)?.clone();
+            let session = self.sessions.get(&peer_id)?.clone();
+            (peer_id, session)
+        };
+
+        let device_id = crate::DeviceId::new(1).expect("valid");
+        let remote_address = crate::ProtocolAddress::new(peer_id.clone(), device_id);
+
+        let result = {
+            let mut session = session_arc.lock().await;
+            session.receive_message(&peer_id, &remote_address, event)
+        };
+
+        let (msg, metadata, addr_update) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Step3: decrypt failed for peer={}: {e}", &peer_id[..16.min(peer_id.len())]);
+                return None;
+            }
+        };
+
+        Some((peer_id, msg, metadata, addr_update, session_arc))
+    }
+
+    /// Try to unwrap as NIP-17 DM (Step 4 fallback).
+    pub fn try_decrypt_nip17_dm(&self, event: &crate::Event) -> Option<Nip17DmContext> {
+        let identity = self.identity.as_ref()?;
+        let unwrapped = crate::giftwrap::unwrap_gift_wrap(identity.keys(), event).ok()?;
+
+        Some(Nip17DmContext {
+            event_id: event.id.to_hex(),
+            sender_pubkey: unwrapped.sender_pubkey.to_hex(),
+            content: unwrapped.content.clone(),
+            created_at: unwrapped.created_at.as_u64(),
+            nostr_event_json: None,
+            relay_url: None,
+        })
+    }
 }
