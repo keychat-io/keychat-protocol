@@ -30,6 +30,7 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
 │                     keychat-app-sdk                          │
 │                    (thin glue layer)                         │
 │                                                             │
+│  App Data (rooms, messages, contacts, attachments)          │
 │  App Storage (SQLCipher) · Relay Publish & Tracking         │
 │  UI Callbacks (EventListener / DataListener)                │
 │  HTTP File Upload/Download · Event Loop Infrastructure      │
