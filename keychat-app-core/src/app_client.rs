@@ -809,6 +809,19 @@ impl AppClient {
         Ok(path)
     }
 
+    /// Rebroadcast raw event JSON. Returns (success_urls, failed_url_error_pairs).
+    pub async fn rebroadcast_event_internal(
+        &self, event_json: &str,
+    ) -> AppResult<(Vec<String>, Vec<(String, String)>)> {
+        let event: nostr::Event = serde_json::from_str(event_json)
+            .map_err(|e| AppError::Transport(format!("invalid event JSON: {e}")))?;
+        let inner = self.inner.read().await;
+        let transport = inner.protocol.transport.as_ref()
+            .ok_or(AppError::Transport("Not connected.".into()))?;
+        let result = transport.rebroadcast_event(event).await?;
+        Ok((result.success_relays, result.failed_relays))
+    }
+
     pub async fn rebroadcast_event(&self, event_json: String) -> AppResult<PublishResultInfo> {
         let (success_relays, failed_relays) = self.rebroadcast_event_internal(&event_json).await?;
         Ok(PublishResultInfo {
