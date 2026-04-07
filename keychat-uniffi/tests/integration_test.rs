@@ -1385,7 +1385,363 @@ async_test!(nip17_dm_send_and_receive_roundtrip, {
     bob.stop_event_loop().await;
     alice.disconnect().await.unwrap();
     bob.disconnect().await.unwrap();
-    // Event loop holds an Arc clone internally; drop on a blocking thread
-    // to avoid Runtime-in-Runtime panic (same pattern as existing network tests).
     tokio::task::spawn_blocking(move || { drop(alice); drop(bob); }).await.unwrap();
 });
+
+// ─── Full Lifecycle Test ────────────────────────────────────────────────────
+//
+// Exercises the complete protocol lifecycle:
+//   Phase 1: Three-party friend requests (Alice↔Bob, Alice↔Tom, Bob↔Tom)
+//   Phase 2: Bidirectional Signal-encrypted DM between all 3 pairs (6 directions)
+//   Phase 3: Signal group creation, invite delivery, multi-party group messaging
+//   Phase 4: Session persistence — close, reopen, restore_sessions, continue ratchet
+//   Phase 5: DB state verification (rooms, members, addresses)
+//
+// MLS groups are NOT exposed at the UniFFI layer yet — add Phase 3b when ready.
+
+#[test]
+#[ignore = "requires network: wss://backup.keychat.io"]
+fn full_lifecycle_three_party() {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+
+            // ══════════════════════════════════════════════════════════════
+            // Phase 1: Create identities, connect, establish 3 friendships
+            // ══════════════════════════════════════════════════════════════
+
+            let alice = Arc::new(make_client(&dir, "alice.db"));
+            let bob = Arc::new(make_client(&dir, "bob.db"));
+            let tom = Arc::new(make_client(&dir, "tom.db"));
+
+            let alice_r = alice.create_identity().await.unwrap();
+            let bob_r = bob.create_identity().await.unwrap();
+            let tom_r = tom.create_identity().await.unwrap();
+            let alice_pub = alice_r.pubkey_hex.clone();
+            let bob_pub = bob_r.pubkey_hex.clone();
+            let tom_pub = tom_r.pubkey_hex.clone();
+            let alice_mnemonic = alice_r.mnemonic.clone();
+            let bob_mnemonic = bob_r.mnemonic.clone();
+            let tom_mnemonic = tom_r.mnemonic.clone();
+
+            alice.connect(vec![TEST_RELAY.into()]).await.unwrap();
+            bob.connect(vec![TEST_RELAY.into()]).await.unwrap();
+            tom.connect(vec![TEST_RELAY.into()]).await.unwrap();
+
+            let an = Arc::new(tokio::sync::Notify::new());
+            let bn = Arc::new(tokio::sync::Notify::new());
+            let tn = Arc::new(tokio::sync::Notify::new());
+            let (al, ae) = CapturingEventListener::new(an.clone());
+            let (bl, be) = CapturingEventListener::new(bn.clone());
+            let (tl, te) = CapturingEventListener::new(tn.clone());
+            alice.set_event_listener(Box::new(al)).await;
+            bob.set_event_listener(Box::new(bl)).await;
+            tom.set_event_listener(Box::new(tl)).await;
+
+            Arc::clone(&alice).start_event_loop().await.unwrap();
+            Arc::clone(&bob).start_event_loop().await.unwrap();
+            Arc::clone(&tom).start_event_loop().await.unwrap();
+
+            // Alice ↔ Bob
+            establish_friendship(&alice, "Alice", &bob, "Bob", &be, &bn, &ae, &an).await;
+            eprintln!("[Phase1] Alice ↔ Bob ✓");
+
+            ae.lock().unwrap().clear();
+            // Alice ↔ Tom
+            establish_friendship(&alice, "Alice", &tom, "Tom", &te, &tn, &ae, &an).await;
+            eprintln!("[Phase1] Alice ↔ Tom ✓");
+
+            be.lock().unwrap().clear();
+            te.lock().unwrap().clear();
+            // Bob ↔ Tom
+            establish_friendship(&bob, "Bob", &tom, "Tom", &te, &tn, &be, &bn).await;
+            eprintln!("[Phase1] Bob ↔ Tom ✓");
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // Verify receiving addresses exist (ratchet-derived)
+            let a_addrs = alice.get_all_receiving_addresses().await;
+            let b_addrs = bob.get_all_receiving_addresses().await;
+            let t_addrs = tom.get_all_receiving_addresses().await;
+            assert!(!a_addrs.is_empty(), "Alice needs receiving addresses");
+            assert!(!b_addrs.is_empty(), "Bob needs receiving addresses");
+            assert!(!t_addrs.is_empty(), "Tom needs receiving addresses");
+            eprintln!("[Phase1] Addresses: A={}, B={}, T={}", a_addrs.len(), b_addrs.len(), t_addrs.len());
+
+            // ══════════════════════════════════════════════════════════════
+            // Phase 2: Bidirectional DM — all 6 directions
+            // ══════════════════════════════════════════════════════════════
+
+            ae.lock().unwrap().clear();
+            be.lock().unwrap().clear();
+            te.lock().unwrap().clear();
+
+            let wait_msg = |evts: &Arc<Mutex<Vec<ClientEvent>>>,
+                            ntf: &Arc<tokio::sync::Notify>,
+                            expected: &str| {
+                let evts = evts.clone();
+                let ntf = ntf.clone();
+                let expected = expected.to_string();
+                async move {
+                    wait_for_event(&evts, &ntf, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if *c == expected)
+                    }).await
+                }
+            };
+
+            alice.send_text(bob_pub.clone(), "dm:A→B".into(), None, None, None).await.unwrap();
+            assert!(wait_msg(&be, &bn, "dm:A→B").await, "Bob should get A→B");
+            eprintln!("[Phase2] A→B ✓");
+
+            bob.send_text(alice_pub.clone(), "dm:B→A".into(), None, None, None).await.unwrap();
+            assert!(wait_msg(&ae, &an, "dm:B→A").await, "Alice should get B→A");
+            eprintln!("[Phase2] B→A ✓");
+
+            alice.send_text(tom_pub.clone(), "dm:A→T".into(), None, None, None).await.unwrap();
+            assert!(wait_msg(&te, &tn, "dm:A→T").await, "Tom should get A→T");
+            eprintln!("[Phase2] A→T ✓");
+
+            ae.lock().unwrap().clear();
+            tom.send_text(alice_pub.clone(), "dm:T→A".into(), None, None, None).await.unwrap();
+            assert!(wait_msg(&ae, &an, "dm:T→A").await, "Alice should get T→A");
+            eprintln!("[Phase2] T→A ✓");
+
+            te.lock().unwrap().clear();
+            bob.send_text(tom_pub.clone(), "dm:B→T".into(), None, None, None).await.unwrap();
+            assert!(wait_msg(&te, &tn, "dm:B→T").await, "Tom should get B→T");
+            eprintln!("[Phase2] B→T ✓");
+
+            be.lock().unwrap().clear();
+            tom.send_text(bob_pub.clone(), "dm:T→B".into(), None, None, None).await.unwrap();
+            assert!(wait_msg(&be, &bn, "dm:T→B").await, "Bob should get T→B");
+            eprintln!("[Phase2] T→B ✓ — all 6 DM directions verified");
+
+            // ══════════════════════════════════════════════════════════════
+            // Phase 3: Signal Group — create, invite, 3-party messaging
+            // ══════════════════════════════════════════════════════════════
+
+            ae.lock().unwrap().clear();
+            be.lock().unwrap().clear();
+            te.lock().unwrap().clear();
+
+            let gi = alice.create_signal_group(
+                "Lifecycle".into(),
+                vec![
+                    GroupMemberInput { nostr_pubkey: bob_pub.clone(), name: "Bob".into() },
+                    GroupMemberInput { nostr_pubkey: tom_pub.clone(), name: "Tom".into() },
+                ],
+            ).await.unwrap();
+            let gid = gi.group_id.clone();
+            assert_eq!(gi.member_count, 3);
+            eprintln!("[Phase3] Group created: id={}…", &gid[..16]);
+
+            assert!(
+                wait_for_event(&be, &bn, 30, |e| matches!(e, ClientEvent::GroupInviteReceived { .. })).await,
+                "Bob should get group invite"
+            );
+            assert!(
+                wait_for_event(&te, &tn, 30, |e| matches!(e, ClientEvent::GroupInviteReceived { .. })).await,
+                "Tom should get group invite"
+            );
+            eprintln!("[Phase3] Invites received");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let wait_group = |evts: &Arc<Mutex<Vec<ClientEvent>>>,
+                              ntf: &Arc<tokio::sync::Notify>,
+                              expected: &str| {
+                let evts = evts.clone();
+                let ntf = ntf.clone();
+                let expected = expected.to_string();
+                async move {
+                    wait_for_event(&evts, &ntf, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), group_id: Some(_), .. } if *c == expected)
+                    }).await
+                }
+            };
+
+            // Alice → group
+            be.lock().unwrap().clear(); te.lock().unwrap().clear();
+            alice.send_group_text(gid.clone(), "grp:Alice".into(), None).await.unwrap();
+            assert!(wait_group(&be, &bn, "grp:Alice").await, "Bob should get Alice's group msg");
+            assert!(wait_group(&te, &tn, "grp:Alice").await, "Tom should get Alice's group msg");
+            eprintln!("[Phase3] Alice→group ✓");
+
+            // Bob → group
+            ae.lock().unwrap().clear(); te.lock().unwrap().clear();
+            bob.send_group_text(gid.clone(), "grp:Bob".into(), None).await.unwrap();
+            assert!(wait_group(&ae, &an, "grp:Bob").await, "Alice should get Bob's group msg");
+            assert!(wait_group(&te, &tn, "grp:Bob").await, "Tom should get Bob's group msg");
+            eprintln!("[Phase3] Bob→group ✓");
+
+            // Tom → group
+            ae.lock().unwrap().clear(); be.lock().unwrap().clear();
+            tom.send_group_text(gid.clone(), "grp:Tom".into(), None).await.unwrap();
+            assert!(wait_group(&ae, &an, "grp:Tom").await, "Alice should get Tom's group msg");
+            assert!(wait_group(&be, &bn, "grp:Tom").await, "Bob should get Tom's group msg");
+            eprintln!("[Phase3] Tom→group ✓ — all group messaging verified");
+
+            // ══════════════════════════════════════════════════════════════
+            // Phase 4: Session persistence — restart and verify ratchet
+            // ══════════════════════════════════════════════════════════════
+
+            let pre_a = alice.get_all_receiving_addresses().await;
+            let pre_b = bob.get_all_receiving_addresses().await;
+            let pre_t = tom.get_all_receiving_addresses().await;
+            eprintln!("[Phase4] Pre-restart addrs: A={}, B={}, T={}", pre_a.len(), pre_b.len(), pre_t.len());
+
+            // Graceful shutdown
+            alice.stop_event_loop().await;
+            bob.stop_event_loop().await;
+            tom.stop_event_loop().await;
+            alice.close_storage().await.unwrap();
+            bob.close_storage().await.unwrap();
+            tom.close_storage().await.unwrap();
+            alice.disconnect().await.unwrap();
+            bob.disconnect().await.unwrap();
+            tom.disconnect().await.unwrap();
+            tokio::task::spawn_blocking(move || { drop(alice); drop(bob); drop(tom); }).await.unwrap();
+            eprintln!("[Phase4] Clients shut down");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // Reopen from same DB
+            let a2 = Arc::new(make_client(&dir, "alice.db"));
+            let b2 = Arc::new(make_client(&dir, "bob.db"));
+            let t2 = Arc::new(make_client(&dir, "tom.db"));
+
+            assert_eq!(a2.import_identity(alice_mnemonic).await.unwrap(), alice_pub);
+            assert_eq!(b2.import_identity(bob_mnemonic).await.unwrap(), bob_pub);
+            assert_eq!(t2.import_identity(tom_mnemonic).await.unwrap(), tom_pub);
+
+            let ar = a2.restore_sessions().await.unwrap();
+            let br = b2.restore_sessions().await.unwrap();
+            let tr = t2.restore_sessions().await.unwrap();
+            eprintln!("[Phase4] Restored: A={ar}, B={br}, T={tr}");
+            assert!(ar >= 2, "Alice restore ≥2, got {ar}");
+            assert!(br >= 2, "Bob restore ≥2, got {br}");
+            assert!(tr >= 2, "Tom restore ≥2, got {tr}");
+
+            // Address counts must match (ratchet NOT reset)
+            let post_a = a2.get_all_receiving_addresses().await;
+            let post_b = b2.get_all_receiving_addresses().await;
+            let post_t = t2.get_all_receiving_addresses().await;
+            assert_eq!(post_a.len(), pre_a.len(), "Alice addr count should match pre-restart");
+            assert_eq!(post_b.len(), pre_b.len(), "Bob addr count should match pre-restart");
+            assert_eq!(post_t.len(), pre_t.len(), "Tom addr count should match pre-restart");
+            eprintln!("[Phase4] Address counts match ✓");
+
+            // Reconnect
+            a2.connect(vec![TEST_RELAY.into()]).await.unwrap();
+            b2.connect(vec![TEST_RELAY.into()]).await.unwrap();
+            t2.connect(vec![TEST_RELAY.into()]).await.unwrap();
+
+            let an2 = Arc::new(tokio::sync::Notify::new());
+            let bn2 = Arc::new(tokio::sync::Notify::new());
+            let tn2 = Arc::new(tokio::sync::Notify::new());
+            let (al2, ae2) = CapturingEventListener::new(an2.clone());
+            let (bl2, be2) = CapturingEventListener::new(bn2.clone());
+            let (tl2, te2) = CapturingEventListener::new(tn2.clone());
+            a2.set_event_listener(Box::new(al2)).await;
+            b2.set_event_listener(Box::new(bl2)).await;
+            t2.set_event_listener(Box::new(tl2)).await;
+
+            Arc::clone(&a2).start_event_loop().await.unwrap();
+            Arc::clone(&b2).start_event_loop().await.unwrap();
+            Arc::clone(&t2).start_event_loop().await.unwrap();
+
+            // Wait for relays to be fully connected (TLS handshake may retry)
+            for attempt in 1..=15 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let a_relays = a2.connected_relays().await.unwrap_or_default();
+                let b_relays = b2.connected_relays().await.unwrap_or_default();
+                let t_relays = t2.connected_relays().await.unwrap_or_default();
+                if !a_relays.is_empty() && !b_relays.is_empty() && !t_relays.is_empty() {
+                    eprintln!("[Phase4] All relays connected after {attempt} attempts");
+                    break;
+                }
+                if attempt == 15 {
+                    panic!("Relays did not reconnect within 30s");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Post-restart DMs (prove ratchet continues)
+            let wait2 = |evts: &Arc<Mutex<Vec<ClientEvent>>>,
+                         ntf: &Arc<tokio::sync::Notify>,
+                         expected: &str| {
+                let evts = evts.clone();
+                let ntf = ntf.clone();
+                let expected = expected.to_string();
+                async move {
+                    wait_for_event(&evts, &ntf, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if *c == expected)
+                    }).await
+                }
+            };
+
+            a2.send_text(bob_pub.clone(), "restart:A→B".into(), None, None, None).await.unwrap();
+            assert!(wait2(&be2, &bn2, "restart:A→B").await, "Post-restart A→B failed");
+            eprintln!("[Phase4] Post-restart A→B ✓");
+
+            b2.send_text(alice_pub.clone(), "restart:B→A".into(), None, None, None).await.unwrap();
+            assert!(wait2(&ae2, &an2, "restart:B→A").await, "Post-restart B→A failed");
+            eprintln!("[Phase4] Post-restart B→A ✓");
+
+            ae2.lock().unwrap().clear();
+            t2.send_text(alice_pub.clone(), "restart:T→A".into(), None, None, None).await.unwrap();
+            assert!(wait2(&ae2, &an2, "restart:T→A").await, "Post-restart T→A failed");
+            eprintln!("[Phase4] Post-restart T→A ✓");
+
+            // Post-restart group message
+            be2.lock().unwrap().clear(); te2.lock().unwrap().clear();
+            a2.send_group_text(gid.clone(), "restart:grp".into(), None).await.unwrap();
+            let wait_g2 = |evts: &Arc<Mutex<Vec<ClientEvent>>>,
+                           ntf: &Arc<tokio::sync::Notify>,
+                           expected: &str| {
+                let evts = evts.clone();
+                let ntf = ntf.clone();
+                let expected = expected.to_string();
+                async move {
+                    wait_for_event(&evts, &ntf, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), group_id: Some(_), .. } if *c == expected)
+                    }).await
+                }
+            };
+            assert!(wait_g2(&be2, &bn2, "restart:grp").await, "Post-restart group msg → Bob failed");
+            assert!(wait_g2(&te2, &tn2, "restart:grp").await, "Post-restart group msg → Tom failed");
+            eprintln!("[Phase4] Post-restart group ✓ — ratchet continuity verified");
+
+            // ══════════════════════════════════════════════════════════════
+            // Phase 5: Final DB state verification
+            // ══════════════════════════════════════════════════════════════
+
+            let rooms = a2.get_rooms(alice_pub.clone()).await.unwrap();
+            let dm_n = rooms.iter().filter(|r| r.room_type == RoomType::Dm).count();
+            let grp_n = rooms.iter().filter(|r| r.room_type == RoomType::SignalGroup).count();
+            assert_eq!(dm_n, 2, "Alice should have 2 DM rooms");
+            assert!(grp_n >= 1, "Alice should have ≥1 group room");
+
+            let mems = a2.get_signal_group_members(gid).await.unwrap();
+            assert_eq!(mems.len(), 3, "Group still 3 members");
+            eprintln!("[Phase5] DB: {dm_n} DMs, {grp_n} groups, {} members ✓", mems.len());
+
+            // Cleanup
+            a2.stop_event_loop().await;
+            b2.stop_event_loop().await;
+            t2.stop_event_loop().await;
+            a2.disconnect().await.unwrap();
+            b2.disconnect().await.unwrap();
+            t2.disconnect().await.unwrap();
+            tokio::task::spawn_blocking(move || { drop(a2); drop(b2); drop(t2); }).await.unwrap();
+
+            eprintln!("══════════════════════════════════════════");
+            eprintln!("  FULL LIFECYCLE TEST PASSED");
+            eprintln!("══════════════════════════════════════════");
+        });
+    })
+    .join()
+    .unwrap();
+}
