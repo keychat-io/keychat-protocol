@@ -8,12 +8,51 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
 - **Addressing** — Receiving and sending addresses are decoupled from identity and continuously rotate
 - **Stamps** — Cashu ecash tokens attached to messages as anonymous micropayments to relays
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Client Apps                            │
+├──────────────┬──────────────┬───────────────┬───────────────┤
+│   iOS App    │ Android App  │  Desktop App  │  keychat-cli  │
+│   (Swift)    │  (Kotlin)    │ (Tauri/etc.)  │   (Rust)      │
+└──────┬───────┴──────┬───────┴───────┬───────┴───────┬───────┘
+       │              │               │               │
+       ▼              ▼               │               │
+┌─────────────────────────────┐      │               │
+│      keychat-uniffi         │      │               │
+│  (thin FFI export layer)    │      │               │
+│  UniFFI → Swift / Kotlin    │      │               │
+└──────────────┬──────────────┘      │               │
+               │                     │               │
+               ▼                     ▼               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     keychat-app-sdk                          │
+│              (cross-platform business logic)                 │
+│                                                             │
+│  Messaging · Event Loop · Groups · Friend Requests          │
+│  App Storage (SQLCipher) · Relay Tracking · Media           │
+│  Callbacks (EventListener / DataListener)                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                       libkeychat                            │
+│                  (protocol implementation)                   │
+│                                                             │
+│  Identity (BIP-39/NIP-06) · Signal Protocol (PQXDH)        │
+│  MLS (RFC 9420) · NIP-17/44 Encryption · Nostr Transport   │
+│  Address Rotation · Cashu Stamps · Secure Storage           │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ## Contents
 
 ### Core
 
 - **[libkeychat](libkeychat/)** — Rust implementation of the Keychat protocol
-- **[keychat-uniffi](keychat-uniffi/)** — UniFFI bindings for Swift/Kotlin/Python clients
+- **[keychat-app-sdk](keychat-app-sdk/)** — Cross-platform app SDK with messaging, storage, and event handling
+- **[keychat-uniffi](keychat-uniffi/)** — Thin UniFFI export layer for Swift/Kotlin bindings
 - **[Keychat Spec](SPEC.md)** — Authoritative protocol specification (v0.4.0-draft)
 - **[Client Guide](libkeychat/docs/client-guide.md)** — KeychatClient API guide and usage examples
 
