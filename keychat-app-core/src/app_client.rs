@@ -907,7 +907,7 @@ impl AppClient {
     ) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.update_contact_name(&pubkey, &identity_pubkey, &petname)
+        store.update_app_contact(&pubkey, &identity_pubkey, Some(&petname), None, None)
             .map_err(|e| AppError::Storage(format!("update_petname: {e}")))
     }
 
