@@ -1215,6 +1215,58 @@ impl ProtocolClient {
         Ok((peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex))
     }
 
+    // ─── Group Protocol ──────────────────────────────────────
+
+    /// Send a message to all members of a Signal group (fan-out encrypt + publish).
+    /// Returns (msgid, event_ids, relay_status_json).
+    pub async fn send_group_message_protocol(
+        &mut self,
+        group_id: &str,
+        msg: &crate::KCMessage,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let group = self.group_manager.get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {}", &group_id[..16.min(group_id.len())])))?
+            .clone();
+
+        let transport = self.transport.as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
+
+        let mut event_ids = Vec::new();
+        let mut connected_relays = Vec::new();
+
+        // Fan-out encrypt to each other member
+        for member in group.other_members() {
+            let signal_id = &member.signal_id;
+            let session_arc = match self.sessions.get(signal_id) {
+                Some(s) => s.clone(),
+                None => {
+                    tracing::warn!("group send: no session for member {}", &signal_id[..16.min(signal_id.len())]);
+                    continue;
+                }
+            };
+            let mut session = session_arc.lock().await;
+            let addr_clone = session.addresses.clone();
+            match crate::send_group_message(&mut session.signal, &group, msg, &addr_clone).await {
+                Ok(events) => {
+                    for (_member_id, event) in events {
+                        let eid = event.id.to_hex();
+                        transport.publish_event_async(event).await?;
+                        event_ids.push(eid);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("group send to {} failed: {e}", &signal_id[..16.min(signal_id.len())]);
+                }
+            }
+        }
+
+        if !event_ids.is_empty() {
+            connected_relays = transport.connected_relays().await;
+        }
+
+        Ok((event_ids, connected_relays))
+    }
+
     /// Reject a friend request: delete from SecureStorage.
     pub fn reject_friend_request_protocol(&self, request_id: &str) -> Result<String> {
         let store = self.storage.lock()
