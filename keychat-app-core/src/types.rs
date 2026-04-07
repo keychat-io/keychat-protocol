@@ -183,3 +183,253 @@ pub enum DataChange {
 pub trait DataListener: Send + Sync {
     fn on_data_change(&self, change: DataChange);
 }
+
+// ─── Event Types ────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub enum MessageKind {
+    Text,
+    Files,
+    Cashu,
+    LightningInvoice,
+    FriendRequest,
+    FriendApprove,
+    FriendReject,
+    ProfileSync,
+    RelaySyncInvite,
+    SignalGroupInvite,
+    SignalGroupMemberRemoved,
+    SignalGroupSelfLeave,
+    SignalGroupDissolve,
+    SignalGroupNameChanged,
+    SignalGroupNicknameChanged,
+    MlsGroupInvite,
+    AgentActions,
+    AgentOptions,
+    AgentConfirm,
+    AgentReply,
+    TaskRequest,
+    TaskResponse,
+    SkillQuery,
+    SkillDeclare,
+    EventNotify,
+    StreamChunk,
+    Location,
+    Contact,
+    Sticker,
+    Reaction,
+    MessageDelete,
+    MessageEdit,
+    ReadReceipt,
+    Typing,
+    Poll,
+    PollVote,
+    CallSignal,
+    GroupPinMessage,
+    GroupAnnouncement,
+}
+
+impl From<libkeychat::KCMessageKind> for MessageKind {
+    fn from(k: libkeychat::KCMessageKind) -> Self {
+        match k {
+            libkeychat::KCMessageKind::Text => MessageKind::Text,
+            libkeychat::KCMessageKind::Files => MessageKind::Files,
+            libkeychat::KCMessageKind::Cashu => MessageKind::Cashu,
+            libkeychat::KCMessageKind::LightningInvoice => MessageKind::LightningInvoice,
+            libkeychat::KCMessageKind::FriendRequest => MessageKind::FriendRequest,
+            libkeychat::KCMessageKind::FriendApprove => MessageKind::FriendApprove,
+            libkeychat::KCMessageKind::FriendReject => MessageKind::FriendReject,
+            libkeychat::KCMessageKind::SignalGroupInvite => MessageKind::SignalGroupInvite,
+            libkeychat::KCMessageKind::SignalGroupMemberRemoved => MessageKind::SignalGroupMemberRemoved,
+            libkeychat::KCMessageKind::SignalGroupSelfLeave => MessageKind::SignalGroupSelfLeave,
+            libkeychat::KCMessageKind::SignalGroupDissolve => MessageKind::SignalGroupDissolve,
+            libkeychat::KCMessageKind::SignalGroupNameChanged => MessageKind::SignalGroupNameChanged,
+            libkeychat::KCMessageKind::MlsGroupInvite => MessageKind::MlsGroupInvite,
+            libkeychat::KCMessageKind::AgentReply => MessageKind::AgentReply,
+            _ => MessageKind::Text,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum GroupChangeKind {
+    MemberRemoved,
+    SelfLeave,
+    NameChanged,
+}
+
+#[derive(Clone, Debug)]
+pub enum ClientEvent {
+    FriendRequestReceived {
+        request_id: String,
+        sender_pubkey: String,
+        sender_name: String,
+        message: Option<String>,
+        created_at: u64,
+    },
+    FriendRequestAccepted {
+        peer_pubkey: String,
+        peer_name: String,
+    },
+    FriendRequestRejected {
+        peer_pubkey: String,
+    },
+    MessageReceived {
+        room_id: String,
+        sender_pubkey: String,
+        kind: MessageKind,
+        content: Option<String>,
+        payload: Option<String>,
+        event_id: String,
+        fallback: Option<String>,
+        reply_to_event_id: Option<String>,
+        group_id: Option<String>,
+        thread_id: Option<String>,
+        nostr_event_json: Option<String>,
+        relay_url: Option<String>,
+    },
+    GroupInviteReceived {
+        room_id: String,
+        group_type: String,
+        group_name: String,
+        inviter_pubkey: String,
+    },
+    GroupMemberChanged {
+        room_id: String,
+        kind: GroupChangeKind,
+        member_pubkey: Option<String>,
+        new_value: Option<String>,
+    },
+    GroupDissolved {
+        room_id: String,
+    },
+    EventLoopError {
+        description: String,
+    },
+    RelayOk {
+        event_id: String,
+        relay_url: String,
+        success: bool,
+        message: String,
+    },
+}
+
+/// Listener for protocol events (friend requests, messages, groups).
+pub trait EventListener: Send + Sync {
+    fn on_event(&self, event: ClientEvent);
+}
+
+// ─── Record Types (used by all clients) ─────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct CreateIdentityResult {
+    pub pubkey_hex: String,
+    pub mnemonic: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContactInfo {
+    pub nostr_pubkey_hex: String,
+    pub signal_id_hex: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingFriendRequest {
+    pub request_id: String,
+    pub peer_nostr_pubkey: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SentMessage {
+    pub event_id: String,
+    pub payload_json: Option<String>,
+    pub nostr_event_json: Option<String>,
+    pub connected_relays: Vec<String>,
+    pub new_receiving_addresses: Vec<String>,
+    pub dropped_receiving_addresses: Vec<String>,
+    pub new_sending_address: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplyToPayload {
+    pub target_event_id: String,
+    pub content: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum FileCategory {
+    Image,
+    Video,
+    Voice,
+    Audio,
+    Document,
+    Text,
+    Archive,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct FilePayload {
+    pub category: FileCategory,
+    pub url: String,
+    pub mime_type: Option<String>,
+    pub suffix: Option<String>,
+    pub size: u64,
+    pub key: String,
+    pub iv: String,
+    pub hash: String,
+    pub source_name: Option<String>,
+    pub audio_duration: Option<u32>,
+    pub amplitude_samples: Option<Vec<f64>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupMemberInput {
+    pub nostr_pubkey: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SignalGroupInfo {
+    pub group_id: String,
+    pub name: String,
+    pub member_count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupMemberInfo {
+    pub nostr_pubkey: String,
+    pub name: String,
+    pub is_admin: bool,
+    pub is_me: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupSentMessage {
+    pub msgid: String,
+    pub group_id: String,
+    pub event_ids: Vec<String>,
+    pub payload_json: Option<String>,
+    pub nostr_event_json: Option<String>,
+    pub relay_status_json: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublishResultInfo {
+    pub event_id: String,
+    pub success_relays: Vec<String>,
+    pub failed_relays: Vec<FailedRelayInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FailedRelayInfo {
+    pub url: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RelayStatusInfo {
+    pub url: String,
+    pub status: String,
+}

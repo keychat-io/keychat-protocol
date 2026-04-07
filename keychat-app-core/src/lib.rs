@@ -4,10 +4,12 @@
 //! relay send tracking, and the `OrchestratorDelegate` implementation
 //! that bridges protocol events to app storage and UI notifications.
 
+pub mod app_client;
 pub mod app_storage;
 pub mod relay_tracker;
 pub mod types;
 
+pub use app_client::{AppClient, AppError, AppResult};
 pub use app_storage::AppStorage;
 pub use relay_tracker::{RelaySendTracker, RelayStatusUpdate};
 pub use types::*;
