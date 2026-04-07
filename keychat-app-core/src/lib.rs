@@ -6,6 +6,7 @@
 
 pub mod app_client;
 pub mod app_storage;
+pub mod delegate;
 pub mod event_loop;
 pub mod friend_request;
 pub mod group;
