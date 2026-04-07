@@ -8,6 +8,7 @@ pub mod app_client;
 pub mod app_storage;
 pub mod data_store;
 pub mod delegate;
+pub mod media;
 pub mod event_loop;
 pub mod friend_request;
 pub mod group;
