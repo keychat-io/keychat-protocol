@@ -16,4 +16,4 @@ build/
 .DS_Store
 .idea/
 .vscode/
-.backup
+.backup.claude/worktrees/

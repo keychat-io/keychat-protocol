@@ -497,4 +497,307 @@ impl AppClient {
              addrs={addrs} pending_fr={pending} groups={groups}"
         ))
     }
+
+    // ─── Identity / Room / Session Removal ──────────────────────
+
+    pub async fn remove_identity(&self) -> AppResult<()> {
+        tracing::info!("remove_identity: clearing all data");
+
+        // 1. Stop event loop and reconnect loop
+        {
+            let inner = self.inner.read().await;
+            if let Some(ref stop_tx) = inner.event_loop_stop {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(ref stop_tx) = inner.reconnect_stop {
+                let _ = stop_tx.send(true);
+            }
+        }
+
+        // 2. Disconnect transport
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(t) = inner.protocol.transport.take() {
+                let _ = t.disconnect().await;
+            }
+        }
+
+        // 3. Clear all in-memory state + DB
+        let storage = self.inner.read().await.protocol.storage.clone();
+        {
+            let mut inner = self.inner.write().await;
+            inner.protocol.sessions.clear();
+            inner.protocol.peer_nostr_to_signal.clear();
+            inner.protocol.peer_signal_to_nostr.clear();
+            inner.protocol.receiving_addr_to_peer.clear();
+            inner.protocol.pending_outbound.clear();
+            inner.protocol.group_manager = libkeychat::GroupManager::new();
+            inner.protocol.identity = None;
+            inner.protocol.next_signal_device_id = 1;
+            inner.event_loop_stop = None;
+            inner.reconnect_stop = None;
+            inner.protocol.subscription_ids.clear();
+            inner.protocol.last_relay_urls.clear();
+        }
+        if let Ok(store) = storage.lock() {
+            store.delete_all_data().map_err(|e| AppError::Storage(format!("delete_all_data: {e}")))?;
+        }
+        let app_storage = self.inner.read().await.app_storage.clone();
+        {
+            let store = lock_app_storage(&app_storage);
+            store.delete_all_data().map_err(|e| AppError::Storage(format!("delete_all_app_data: {e}")))?;
+        }
+
+        tracing::info!("remove_identity: done");
+        Ok(())
+    }
+
+    pub async fn remove_room(&self, room_id: String) -> AppResult<()> {
+        let storage = self.inner.read().await.protocol.storage.clone();
+        let mut found = false;
+
+        // Try as 1:1 peer first
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&room_id) {
+                inner.protocol.peer_signal_to_nostr.remove(&signal_id);
+                inner.protocol.sessions.remove(&signal_id);
+                inner.protocol.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
+                inner.protocol.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != room_id);
+                drop(inner);
+
+                if let Ok(store) = storage.lock() {
+                    let _ = store.delete_peer_data(&signal_id, &room_id);
+                }
+                tracing::info!("remove_room: removed 1:1 peer {}", &room_id[..16.min(room_id.len())]);
+                found = true;
+            }
+        }
+
+        // Try as Signal group
+        if !found {
+            let mut inner = self.inner.write().await;
+            if inner.protocol.group_manager.get_group(&room_id).is_some() {
+                if let Ok(store) = storage.lock() {
+                    let _ = inner.protocol.group_manager.remove_group_persistent(&room_id, &store);
+                } else {
+                    inner.protocol.group_manager.remove_group(&room_id);
+                }
+                tracing::info!("remove_room: removed group {}", &room_id[..16.min(room_id.len())]);
+                found = true;
+            }
+        }
+
+        // Try as MLS group
+        if !found {
+            if let Ok(store) = storage.lock() {
+                let _ = store.delete_mls_group_id(&room_id);
+            }
+            tracing::warn!("remove_room: room {} not found", &room_id[..16.min(room_id.len())]);
+        }
+
+        // Clean up app_* tables
+        let identity_pubkey = self.cached_identity_pubkey();
+        if !identity_pubkey.is_empty() {
+            let app_room_id = make_room_id(&room_id, &identity_pubkey);
+            let app_storage = self.inner.read().await.app_storage.clone();
+            {
+                let store = lock_app_storage(&app_storage);
+                if let Err(e) = store.delete_app_room(&app_room_id) {
+                    tracing::warn!("remove_room: delete_app_room: {e}");
+                }
+                if let Err(e) = store.delete_app_contact(&room_id, &identity_pubkey) {
+                    tracing::warn!("remove_room: delete_app_contact: {e}");
+                }
+            }
+            self.emit_data_change(DataChange::RoomListChanged).await;
+            self.emit_data_change(DataChange::ContactListChanged).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn remove_session(&self, peer_pubkey: String) -> AppResult<()> {
+        let storage = self.inner.read().await.protocol.storage.clone();
+
+        {
+            let mut inner = self.inner.write().await;
+            if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&peer_pubkey) {
+                inner.protocol.peer_signal_to_nostr.remove(&signal_id);
+                inner.protocol.sessions.remove(&signal_id);
+                inner.protocol.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
+                inner.protocol.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
+                drop(inner);
+
+                if let Ok(store) = storage.lock() {
+                    let _ = store.delete_peer_data(&signal_id, &peer_pubkey);
+                }
+                tracing::info!("remove_session: removed session for peer {}", &peer_pubkey[..16.min(peer_pubkey.len())]);
+            } else {
+                tracing::warn!("remove_session: no session found for peer {}", &peer_pubkey[..16.min(peer_pubkey.len())]);
+            }
+        }
+
+        let identity_pubkey = self.cached_identity_pubkey();
+        if !identity_pubkey.is_empty() {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            {
+                let store = lock_app_storage(&app_storage);
+                if let Err(e) = store.delete_app_contact(&peer_pubkey, &identity_pubkey) {
+                    tracing::warn!("remove_session: delete_app_contact: {e}");
+                }
+            }
+            self.emit_data_change(DataChange::ContactListChanged).await;
+        }
+
+        Ok(())
+    }
+
+    // ─── File Storage Operations ────────────────────────────────
+
+    pub async fn resolve_local_file(&self, msgid: String, file_hash: String) -> Option<String> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage(&inner.app_storage);
+        store.get_attachment_local_path(&msgid, &file_hash).ok().flatten().and_then(|p| {
+            if std::path::Path::new(&p).exists() { Some(p) } else { None }
+        })
+    }
+
+    pub async fn upsert_attachment(
+        &self,
+        msgid: String,
+        file_hash: String,
+        room_id: String,
+        local_path: Option<String>,
+        transfer_state: u32,
+    ) -> AppResult<()> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage(&inner.app_storage);
+        store.upsert_attachment(&msgid, &file_hash, &room_id, local_path.as_deref(), transfer_state as i32)
+            .map_err(|e| AppError::Storage(format!("upsert_attachment: {e}")))
+    }
+
+    pub async fn set_audio_played(&self, msgid: String, file_hash: String) -> AppResult<()> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage(&inner.app_storage);
+        store.set_audio_played(&msgid, &file_hash)
+            .map_err(|e| AppError::Storage(format!("set_audio_played: {e}")))
+    }
+
+    pub async fn is_audio_played(&self, msgid: String, file_hash: String) -> bool {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage(&inner.app_storage);
+        store.is_audio_played(&msgid, &file_hash)
+    }
+
+    pub fn save_file_locally(
+        &self,
+        data: Vec<u8>,
+        file_name: String,
+        room_id: String,
+    ) -> AppResult<String> {
+        let dir = self.get_room_files_dir(room_id);
+        std::fs::create_dir_all(&dir).map_err(|e| AppError::Storage(format!("create dir: {e}")))?;
+        let path = format!("{}/{}", dir, file_name);
+        std::fs::write(&path, &data).map_err(|e| AppError::Storage(format!("write file: {e}")))?;
+        Ok(path)
+    }
+
+    pub async fn rebroadcast_event(&self, event_json: String) -> AppResult<PublishResultInfo> {
+        let (success_relays, failed_relays) = self.rebroadcast_event_internal(&event_json).await?;
+        Ok(PublishResultInfo {
+            event_id: {
+                let event: nostr::Event = serde_json::from_str(&event_json)
+                    .map_err(|e| AppError::Transport(format!("invalid event JSON: {e}")))?;
+                event.id.to_hex()
+            },
+            success_relays,
+            failed_relays: failed_relays.into_iter().map(|(url, error)| FailedRelayInfo { url, error }).collect(),
+        })
+    }
+
+    // ─── Data Store Write Methods ───────────────────────────────
+
+    pub async fn delete_setting(&self, key: String) -> AppResult<()> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        store.delete_setting(&key).map_err(|e| AppError::Storage(format!("delete_setting: {e}")))
+    }
+
+    pub async fn get_room(&self, room_id: String) -> AppResult<Option<RoomInfo>> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        match store.get_app_room(&room_id).map_err(|e| AppError::Storage(format!("get_room: {e}")))? {
+            Some(r) => Ok(Some(RoomInfo {
+                id: r.id,
+                to_main_pubkey: r.to_main_pubkey,
+                identity_pubkey: r.identity_pubkey,
+                status: RoomStatus::from_i32(r.status),
+                room_type: RoomType::from_i32(r.room_type),
+                name: r.name,
+                avatar: r.avatar,
+                peer_signal_identity_key: r.peer_signal_identity_key,
+                parent_room_id: r.parent_room_id,
+                last_message_content: r.last_message_content,
+                last_message_at: r.last_message_at,
+                unread_count: r.unread_count,
+                created_at: r.created_at,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_message_by_msgid(&self, msgid: String) -> AppResult<Option<MessageInfo>> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        match store.get_app_message_by_msgid(&msgid).map_err(|e| AppError::Storage(format!("get_message: {e}")))? {
+            Some(r) => Ok(Some(MessageInfo {
+                msgid: r.msgid, event_id: r.event_id, room_id: r.room_id,
+                identity_pubkey: r.identity_pubkey, sender_pubkey: r.sender_pubkey,
+                content: r.content, is_me_send: r.is_me_send, is_read: r.is_read,
+                status: MessageStatus::from_i32(r.status),
+                reply_to_event_id: r.reply_to_event_id, reply_to_content: r.reply_to_content,
+                payload_json: r.payload_json, nostr_event_json: r.nostr_event_json,
+                relay_status_json: r.relay_status_json, local_file_path: r.local_file_path,
+                local_meta: r.local_meta, created_at: r.created_at,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn should_auto_download(&self, file_size: u64) -> AppResult<bool> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        let limit_mb = store.get_setting("autoDownloadLimitMB")
+            .unwrap_or(None)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10);
+        Ok(file_size <= limit_mb * 1024 * 1024)
+    }
+
+    pub async fn get_active_media_server(&self) -> AppResult<String> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        Ok(store.get_setting("activeMediaServer")
+            .unwrap_or(None)
+            .unwrap_or_else(|| "https://blossom.keychat.io".to_string()))
+    }
+
+    pub async fn update_contact_petname(
+        &self, pubkey: String, identity_pubkey: String, petname: String,
+    ) -> AppResult<()> {
+        let inner = self.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        store.update_contact_name(&pubkey, &identity_pubkey, &petname)
+            .map_err(|e| AppError::Storage(format!("update_petname: {e}")))
+    }
+
+    /// Get the protocol-level inbound request ID for a sender.
+    pub async fn get_inbound_request_id(&self, sender_pubkey: String) -> AppResult<Option<String>> {
+        let inner = self.inner.read().await;
+        let store = inner.protocol.storage.lock()
+            .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
+        store.get_inbound_fr_request_id_by_sender(&sender_pubkey)
+            .map_err(|e| AppError::Storage(format!("get_inbound_request_id: {e}")))
+    }
 }

@@ -6,6 +6,8 @@
 
 pub mod app_client;
 pub mod app_storage;
+pub mod friend_request;
+pub mod group;
 pub mod messaging;
 pub mod relay_tracker;
 pub mod types;
