@@ -21,7 +21,7 @@ impl KeychatClient {
     ) -> Result<PendingFriendRequest, KeychatUniError> {
         // 1. Extract needed data, drop lock before async
         let (identity, storage, signal_device_id, identity_pubkey) = {
-            let mut inner = self.inner.write().await;
+            let mut inner = self.app.inner.write().await;
             let id = inner
                 .protocol.identity
                 .clone()
@@ -82,7 +82,7 @@ impl KeychatClient {
 
         // 3. Publish async — don't block waiting for relay OK responses
         {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let transport = inner
                 .protocol.transport
                 .as_ref()
@@ -94,7 +94,7 @@ impl KeychatClient {
 
         // 4. Store pending state in memory
         {
-            let mut inner = self.inner.write().await;
+            let mut inner = self.app.inner.write().await;
             inner.protocol.pending_outbound.insert(request_id.clone(), state);
         }
 
@@ -108,7 +108,7 @@ impl KeychatClient {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let fr_storage = self.inner.read().await.app_storage.clone();
+        let fr_storage = self.app.inner.read().await.app_storage.clone();
         {
             let store = crate::client::lock_app_storage(&fr_storage);
             if let Err(e) = store.transaction(|_| {
@@ -147,7 +147,7 @@ impl KeychatClient {
     ) -> Result<ContactInfo, KeychatUniError> {
         // 1. Load inbound FR from DB, extract needed data
         let (identity, storage, signal_device_id, received) = {
-            let mut inner = self.inner.write().await;
+            let mut inner = self.app.inner.write().await;
             let id = inner
                 .protocol.identity
                 .clone()
@@ -220,7 +220,7 @@ impl KeychatClient {
         // 3. Publish approval event async
         let accept_event_id_hex = accepted.event.id.to_hex();
         {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let transport = inner
                 .protocol.transport
                 .as_ref()
@@ -273,7 +273,7 @@ impl KeychatClient {
         );
 
         {
-            let mut inner = self.inner.write().await;
+            let mut inner = self.app.inner.write().await;
             inner.protocol.sessions.insert(
                 peer_signal_hex.clone(),
                 Arc::new(tokio::sync::Mutex::new(session)),
@@ -304,7 +304,7 @@ impl KeychatClient {
             .unwrap_or_default()
             .as_secs() as i64;
         let msgid = format!("accept-{}", request_id);
-        let accept_storage = self.inner.read().await.app_storage.clone();
+        let accept_storage = self.app.inner.read().await.app_storage.clone();
         {
             let store = crate::client::lock_app_storage(&accept_storage);
             store.transaction(|_| {
@@ -347,7 +347,7 @@ impl KeychatClient {
     ) -> Result<(), KeychatUniError> {
         // Load sender info before deleting
         let (sender_pubkey_hex, identity_pubkey) = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let store = inner.protocol.storage.lock().map_err(|e| KeychatUniError::Storage {
                 msg: format!("storage lock: {e}"),
             })?;
@@ -372,7 +372,7 @@ impl KeychatClient {
         // Update room status to rejected (-1)
         if !sender_pubkey_hex.is_empty() && !identity_pubkey.is_empty() {
             let room_id = crate::types::make_room_id(&sender_pubkey_hex, &identity_pubkey);
-            let rej_storage = self.inner.read().await.app_storage.clone();
+            let rej_storage = self.app.inner.read().await.app_storage.clone();
             {
                 let store = crate::client::lock_app_storage(&rej_storage);
                 if let Err(e) = store.update_app_room(

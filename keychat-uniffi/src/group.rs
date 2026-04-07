@@ -20,7 +20,7 @@ impl KeychatClient {
         &self,
         events: Vec<(String, nostr::Event)>,
     ) -> Result<Vec<String>, KeychatUniError> {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let transport = inner
             .protocol.transport
             .as_ref()
@@ -46,7 +46,7 @@ impl KeychatClient {
         group: &SignalGroup,
         msg: &KCMessage,
     ) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
@@ -104,7 +104,7 @@ impl KeychatClient {
     ) -> Result<SignalGroupInfo, KeychatUniError> {
         // Collect data under read lock, clone session Arc, then drop lock before await
         let (my_nostr_pubkey, first_session_arc, other_members, member_sessions) = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
 
             let identity = inner
                 .protocol.identity
@@ -190,7 +190,7 @@ impl KeychatClient {
         let _ = self.broadcast_group_events(all_events).await;
 
         // Store group in manager + persist
-        let mut inner = self.inner.write().await;
+        let mut inner = self.app.inner.write().await;
         let gid = group.group_id.clone();
         inner.protocol.group_manager.add_group(group);
         if let Ok(store) = inner.protocol.storage.clone().lock() {
@@ -222,7 +222,7 @@ impl KeychatClient {
         &self,
         group_id: String,
     ) -> Result<Vec<GroupMemberInfo>, KeychatUniError> {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let group = inner
             .protocol.group_manager
             .get_group(&group_id)
@@ -323,7 +323,7 @@ impl KeychatClient {
     /// Leave a Signal group. Notifies all members.
     pub async fn leave_signal_group(&self, group_id: String) -> Result<(), KeychatUniError> {
         let group = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner.protocol.group_manager.get_group(&group_id)
                 .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
                 .clone()
@@ -334,7 +334,7 @@ impl KeychatClient {
         self.send_group_admin_to_all(&group, &msg).await?;
 
         // Remove group from manager + storage
-        let mut inner = self.inner.write().await;
+        let mut inner = self.app.inner.write().await;
         if let Ok(store) = inner.protocol.storage.clone().lock() {
             let _ = inner.protocol.group_manager.remove_group_persistent(&group_id, &store);
         } else {
@@ -348,7 +348,7 @@ impl KeychatClient {
     /// Dissolve a Signal group (admin only). Notifies all members.
     pub async fn dissolve_signal_group(&self, group_id: String) -> Result<(), KeychatUniError> {
         let group = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner.protocol.group_manager.get_group(&group_id)
                 .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
                 .clone()
@@ -358,7 +358,7 @@ impl KeychatClient {
         let msg = build_group_admin_message(KCMessageKind::SignalGroupDissolve, &group, payload);
         self.send_group_admin_to_all(&group, &msg).await?;
 
-        let mut inner = self.inner.write().await;
+        let mut inner = self.app.inner.write().await;
         if let Ok(store) = inner.protocol.storage.clone().lock() {
             let _ = inner.protocol.group_manager.remove_group_persistent(&group_id, &store);
         } else {
@@ -376,7 +376,7 @@ impl KeychatClient {
         member_nostr_pubkey: String,
     ) -> Result<(), KeychatUniError> {
         let (group, removed_signal_id) = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let group = inner.protocol.group_manager.get_group(&group_id)
                 .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
                 .clone();
@@ -392,7 +392,7 @@ impl KeychatClient {
         self.send_group_admin_to_all(&group, &msg).await?;
 
         // Update group state + persist
-        let mut inner = self.inner.write().await;
+        let mut inner = self.app.inner.write().await;
         if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
             g.remove_member(&removed_signal_id);
         }
@@ -415,7 +415,7 @@ impl KeychatClient {
         new_name: String,
     ) -> Result<(), KeychatUniError> {
         let group = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner.protocol.group_manager.get_group(&group_id)
                 .ok_or(KeychatUniError::PeerNotFound { peer_id: group_id.clone() })?
                 .clone()
@@ -425,7 +425,7 @@ impl KeychatClient {
         let msg = build_group_admin_message(KCMessageKind::SignalGroupNameChanged, &group, payload);
         self.send_group_admin_to_all(&group, &msg).await?;
 
-        let mut inner = self.inner.write().await;
+        let mut inner = self.app.inner.write().await;
         if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
             g.name = new_name.clone();
         }
@@ -452,7 +452,7 @@ impl KeychatClient {
     ) -> Result<GroupSentMessage, KeychatUniError> {
         // 1. Gather group, identity, check connectivity
         let (group, identity_pubkey, connected_relays) = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
 
             let group = inner
                 .protocol.group_manager
@@ -498,7 +498,7 @@ impl KeychatClient {
 
         // 3. Save message to DB (status=0 sending) — Swift shows it immediately
         {
-            let send_storage = self.inner.read().await.app_storage.clone();
+            let send_storage = self.app.inner.read().await.app_storage.clone();
             let store = crate::client::lock_app_storage(&send_storage);
             if let Err(e) = store.save_app_message(
                 &msgid,
@@ -550,7 +550,7 @@ impl KeychatClient {
         let mut pending: Vec<PendingEvent> = Vec::new();
 
         {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             for member in group.other_members() {
                 let signal_id = match inner.protocol.peer_nostr_to_signal.get(&member.nostr_pubkey) {
                     Some(sid) => sid.clone(),
@@ -597,7 +597,7 @@ impl KeychatClient {
 
         // 5b. Publish events to relays
         {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay. Please check your network.".into(),
             })?;
@@ -614,8 +614,7 @@ impl KeychatClient {
             .map(|p| (p.eid.clone(), p.member_name.clone()))
             .collect();
         let initial_relay_json = {
-            let mut tracker = self
-                .relay_tracker
+            let mut tracker = self.app.relay_tracker
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             tracker.track_group(
@@ -628,7 +627,7 @@ impl KeychatClient {
 
         let nostr_event_json = format!("[{}]", nostr_events_json.join(","));
         {
-            let send_storage = self.inner.read().await.app_storage.clone();
+            let send_storage = self.app.inner.read().await.app_storage.clone();
             let store = crate::client::lock_app_storage(&send_storage);
             let event_id_ref = event_ids.first().map(|s| s.as_str());
             if let Err(e) = store.update_app_message(

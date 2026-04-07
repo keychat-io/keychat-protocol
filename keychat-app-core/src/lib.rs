@@ -9,7 +9,10 @@ pub mod app_storage;
 pub mod relay_tracker;
 pub mod types;
 
-pub use app_client::{AppClient, AppError, AppResult};
+pub use app_client::{
+    AppClient, AppClientInner, AppError, AppResult,
+    default_device_id, lock_app_storage, lock_app_storage_result,
+};
 pub use app_storage::AppStorage;
 pub use relay_tracker::{RelaySendTracker, RelayStatusUpdate};
 pub use types::*;

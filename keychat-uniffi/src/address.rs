@@ -34,7 +34,7 @@ impl KeychatClient {
 
         // Read cursor for identity key since parameter
         let identity_since = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let storage = inner.protocol.storage.lock().unwrap_or_else(|e| e.into_inner());
             let cursor = storage.get_min_relay_cursor().unwrap_or(0);
             if cursor > 0 {
@@ -48,7 +48,7 @@ impl KeychatClient {
         };
         let ratchet_since = Some(libkeychat::Timestamp::now());
 
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
             msg: "Not connected to any relay. Please check your network.".into(),
         })?;
@@ -73,7 +73,7 @@ impl KeychatClient {
     /// C-FFI1: uses .lock().await to avoid silently skipping busy sessions.
     pub async fn get_all_receiving_addresses(&self) -> Vec<String> {
         let session_arcs: Vec<_> = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner.protocol.sessions.values().cloned().collect()
         };
         let mut addrs = Vec::new();

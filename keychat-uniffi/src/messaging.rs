@@ -100,7 +100,7 @@ impl KeychatClient {
     ) -> Result<SentMessage, KeychatUniError> {
         // 1. Check relay connection
         let connected = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let transport = inner
                 .protocol.transport
                 .as_ref()
@@ -117,7 +117,7 @@ impl KeychatClient {
 
         // 2. Get session and peer info (reject group rooms — use send_group_text/send_group_file)
         let (session_mutex, peer_signal_hex, identity_pubkey) = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let peer_pubkey = room_id.split(':').next().unwrap_or(&room_id);
             if inner.protocol.group_manager.get_group(peer_pubkey).is_some() {
                 return Err(KeychatUniError::InvalidArgument {
@@ -164,7 +164,7 @@ impl KeychatClient {
             .as_secs() as i64;
         let my_pubkey = self.cached_identity_pubkey();
 
-        let send_storage = self.inner.read().await.app_storage.clone();
+        let send_storage = self.app.inner.read().await.app_storage.clone();
         {
             let store = crate::client::lock_app_storage(&send_storage);
             if let Err(e) = store.save_app_message(
@@ -202,7 +202,7 @@ impl KeychatClient {
 
         // 7. Publish to relays
         {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let transport = inner
                 .protocol.transport
                 .as_ref()
@@ -220,8 +220,7 @@ impl KeychatClient {
 
         // 8. Relay tracker — initial JSON written to DB immediately
         let initial_relay_json = {
-            let mut tracker = self
-                .relay_tracker
+            let mut tracker = self.app.relay_tracker
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             tracker.track(
@@ -232,7 +231,7 @@ impl KeychatClient {
             )
         };
         {
-            let store_arc = self.inner.read().await.app_storage.clone();
+            let store_arc = self.app.inner.read().await.app_storage.clone();
             let store = crate::client::lock_app_storage(&store_arc);
             let _ = store.update_app_message(
                 &event_id, None, None, Some(&initial_relay_json),
@@ -247,7 +246,7 @@ impl KeychatClient {
 
         // 9. Update reverse index for O(1) message routing
         if !addr_update.new_receiving.is_empty() || !addr_update.dropped_receiving.is_empty() {
-            let mut inner = self.inner.write().await;
+            let mut inner = self.app.inner.write().await;
             for addr in &addr_update.new_receiving {
                 inner.protocol.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
             }
@@ -276,7 +275,7 @@ impl KeychatClient {
     ) -> Result<SentMessage, KeychatUniError> {
         // Check relay connection
         let connected = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay.".into(),
             })?;
@@ -290,7 +289,7 @@ impl KeychatClient {
 
         // Get identity keys
         let identity = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner.protocol.identity.clone().ok_or(KeychatUniError::NotInitialized {
                 msg: "no identity set".into(),
             })?
@@ -320,7 +319,7 @@ impl KeychatClient {
             .as_secs() as i64;
 
         {
-            let app_storage = self.inner.read().await.app_storage.clone();
+            let app_storage = self.app.inner.read().await.app_storage.clone();
             let store = crate::client::lock_app_storage(&app_storage);
             if let Err(e) = store.save_app_message(
                 &event_id, Some(&event_id), &room_id, &identity_pubkey,
@@ -345,7 +344,7 @@ impl KeychatClient {
 
         // Publish to relays
         {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay.".into(),
             })?;
@@ -372,7 +371,7 @@ impl KeychatClient {
     pub async fn retry_failed_messages(&self) -> Result<u32, KeychatUniError> {
         // 1. Query failed messages from DB
         let failed_messages = {
-            let storage = self.inner.read().await.app_storage.clone();
+            let storage = self.app.inner.read().await.app_storage.clone();
             let store = crate::client::lock_app_storage_result(&storage)?;
             store
                 .get_app_failed_messages()
@@ -391,7 +390,7 @@ impl KeychatClient {
         );
 
         let mut retried = 0u32;
-        let retry_storage = self.inner.read().await.app_storage.clone();
+        let retry_storage = self.app.inner.read().await.app_storage.clone();
         for msg in &failed_messages {
             let event_json = match &msg.nostr_event_json {
                 Some(json) => json.clone(),

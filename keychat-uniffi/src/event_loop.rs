@@ -35,7 +35,7 @@ impl KeychatClient {
     ) {
         // Get the nostr client (clone) under read lock, then drop lock
         let nostr_client = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             match inner.protocol.transport.as_ref() {
                 Some(t) => t.client().clone(),
                 None => {
@@ -60,8 +60,7 @@ impl KeychatClient {
                     _ = timeout_stop_rx.changed() => {
                         tracing::info!("relay timeout task: stop signal received");
                         // Final cleanup of any resolved entries before exit
-                        let mut tracker = self_timeout
-                            .relay_tracker
+                        let mut tracker = self_timeout.app.relay_tracker
                             .lock()
                             .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
                         tracker.cleanup_resolved();
@@ -69,8 +68,7 @@ impl KeychatClient {
                     }
                     _ = interval.tick() => {
                         let updates = {
-                            let mut tracker = self_timeout
-                                .relay_tracker
+                            let mut tracker = self_timeout.app.relay_tracker
                                 .lock()
                                 .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
                             tracker.check_timeouts(5)
@@ -101,7 +99,7 @@ impl KeychatClient {
 
                             // Deduplicate via Transport
                             let deduped = {
-                                let inner = self.inner.read().await;
+                                let inner = self.app.inner.read().await;
                                 match inner.protocol.transport.as_ref() {
                                     Some(t) => t.deduplicate((*event).clone()).await,
                                     None => None,
@@ -156,7 +154,7 @@ impl KeychatClient {
                             );
                             // Update relay tracker and persist status change
                             let update = {
-                                let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut tracker = self.app.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
                                 tracker.handle_relay_ok(&eid, &relay_url.to_string(), status, &message)
                             };
                             if let Some(update) = update {
@@ -252,7 +250,7 @@ impl KeychatClient {
                     .unwrap_or_default()
                     .as_secs();
                 let event_ts = event.created_at.as_u64().min(now);
-                let inner = self.inner.read().await;
+                let inner = self.app.inner.read().await;
                 let storage = inner.protocol.storage.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = storage.update_relay_cursor(url, event_ts) {
                     tracing::error!("failed to update relay cursor for {}: {e}", url);
@@ -264,7 +262,7 @@ impl KeychatClient {
     /// Step 1: Try to parse as an inbound friend request.
     async fn try_handle_friend_request(&self, event: &Event) -> bool {
         let identity = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner.protocol.identity.clone()
         };
         let Some(identity) = identity else {
@@ -314,7 +312,7 @@ impl KeychatClient {
                     return true;
                 }
             };
-            let storage = self.inner.read().await.protocol.storage.clone();
+            let storage = self.app.inner.read().await.protocol.storage.clone();
             let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let store = storage.lock().map_err(|e| format!("{e}"))?;
                 store.save_inbound_fr(
@@ -342,7 +340,7 @@ impl KeychatClient {
             // Check if this sender is already a friend (room exists with status=Enabled).
             // If so, auto-approve instead of requiring manual confirmation.
             let existing_room_status = {
-                let app_storage = self.inner.read().await.app_storage.clone();
+                let app_storage = self.app.inner.read().await.app_storage.clone();
                 let store = crate::client::lock_app_storage(&app_storage);
                 let room_id = crate::types::make_room_id(&sender_pubkey, &identity_pubkey);
                 store
@@ -355,7 +353,7 @@ impl KeychatClient {
 
             // DB writes under sync lock (no await while lock held)
             let saved_room_id = {
-                let app_storage = self.inner.read().await.app_storage.clone();
+                let app_storage = self.app.inner.read().await.app_storage.clone();
                 let store = crate::client::lock_app_storage(&app_storage);
                 // Dedup: skip if this event was already persisted
                 if store
@@ -420,7 +418,7 @@ impl KeychatClient {
                     &sender_pubkey[..16.min(sender_pubkey.len())]
                 );
                 let my_name = {
-                    let app_storage = self.inner.read().await.app_storage.clone();
+                    let app_storage = self.app.inner.read().await.app_storage.clone();
                     let store = crate::client::lock_app_storage(&app_storage);
                     store
                         .get_setting("owner_name")
@@ -459,7 +457,7 @@ impl KeychatClient {
     /// Step 2: Try to decrypt with pending outbound FR states (looking for approve/reject).
     async fn try_handle_friend_approve(&self, event: &Event) -> bool {
         let pending_keys: Vec<(String, String, String)> = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner
                 .protocol.pending_outbound
                 .iter()
@@ -491,7 +489,7 @@ impl KeychatClient {
 
             // Try decrypt under write lock (need &mut signal_participant)
             let result = {
-                let mut inner = self.inner.write().await;
+                let mut inner = self.app.inner.write().await;
                 if let Some(state) = inner.protocol.pending_outbound.get_mut(request_id) {
                     let r = receive_signal_message(
                         &mut state.signal_participant,
@@ -559,7 +557,7 @@ impl KeychatClient {
                     );
 
                     // Take the state out and create ChatSession
-                    let mut inner = self.inner.write().await;
+                    let mut inner = self.app.inner.write().await;
                     if let Some(mut state) = inner.protocol.pending_outbound.remove(request_id) {
                         let identity = match inner.protocol.identity.clone() {
                             Some(id) => id,
@@ -735,17 +733,17 @@ impl KeychatClient {
                         let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
                         if !all_ratchet_pubkeys.is_empty() {
                             let old_ratchet_id = {
-                                let inner = self.inner.read().await;
+                                let inner = self.app.inner.read().await;
                                 inner.protocol.subscription_ids.last().map(|s| libkeychat::SubscriptionId::new(s))
                             };
-                            let inner = self.inner.read().await;
+                            let inner = self.app.inner.read().await;
                             if let Some(transport) = inner.protocol.transport.as_ref() {
                                 if let Ok(new_id) = transport
                                     .resubscribe(old_ratchet_id, all_ratchet_pubkeys, Some(Timestamp::now()))
                                     .await
                                 {
                                     drop(inner);
-                                    let mut inner = self.inner.write().await;
+                                    let mut inner = self.app.inner.write().await;
                                     if let Some(last) = inner.protocol.subscription_ids.last_mut() {
                                         *last = new_id.to_string();
                                     } else {
@@ -769,7 +767,7 @@ impl KeychatClient {
 
                             // DB writes under sync lock (no await while lock held)
                             let saved_room_id = {
-                                let app_storage = self.inner.read().await.app_storage.clone();
+                                let app_storage = self.app.inner.read().await.app_storage.clone();
                                 {
                                     let store = crate::client::lock_app_storage(&app_storage);
                                     // Dedup: skip if this event was already persisted
@@ -860,7 +858,7 @@ impl KeychatClient {
                     let peer_pubkey = peer_nostr_pubkey.clone();
 
                     // Remove from pending
-                    let mut inner = self.inner.write().await;
+                    let mut inner = self.app.inner.write().await;
                     inner.protocol.pending_outbound.remove(request_id);
 
                     // Update room status to rejected
@@ -918,7 +916,7 @@ impl KeychatClient {
         };
 
         let (peer_id, session_arc) = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let peer_id = match inner.protocol.receiving_addr_to_peer.get(&first_p) {
                 Some(id) => id.clone(),
                 None => {
@@ -981,7 +979,7 @@ impl KeychatClient {
                 ).await;
 
                 let sender_nostr_pubkey = {
-                    let inner = self.inner.read().await;
+                    let inner = self.app.inner.read().await;
                     inner
                         .protocol.peer_signal_to_nostr
                         .get(peer_signal_hex)
@@ -1013,7 +1011,7 @@ impl KeychatClient {
         nostr_event_json: Option<String>,
     ) -> bool {
         let identity = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             inner.protocol.identity.clone()
         };
         let Some(identity) = identity else {
@@ -1057,7 +1055,7 @@ impl KeychatClient {
 
         // Persist to app DB
         {
-            let app_storage = self.inner.read().await.app_storage.clone();
+            let app_storage = self.app.inner.read().await.app_storage.clone();
             let store = crate::client::lock_app_storage(&app_storage);
 
             // Create or update room (type = Nip17Dm = 3)
@@ -1149,17 +1147,17 @@ impl KeychatClient {
             let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
             if !all_ratchet_pubkeys.is_empty() {
                 let old_ratchet_id = {
-                    let inner = self.inner.read().await;
+                    let inner = self.app.inner.read().await;
                     inner.protocol.subscription_ids.last().map(|s| libkeychat::SubscriptionId::new(s))
                 };
-                let inner = self.inner.read().await;
+                let inner = self.app.inner.read().await;
                 if let Some(transport) = inner.protocol.transport.as_ref() {
                     if let Ok(new_id) = transport
                         .resubscribe(old_ratchet_id, all_ratchet_pubkeys, Some(Timestamp::now()))
                         .await
                     {
                         drop(inner);
-                        let mut inner = self.inner.write().await;
+                        let mut inner = self.app.inner.write().await;
                         if let Some(last) = inner.protocol.subscription_ids.last_mut() {
                             *last = new_id.to_string();
                         } else {
@@ -1177,7 +1175,7 @@ impl KeychatClient {
             };
             if let Some(addr_state) = addr_state_opt {
                 let storage = {
-                    let inner = self.inner.read().await;
+                    let inner = self.app.inner.read().await;
                     inner.protocol.storage.clone()
                 };
                 let save_result =
@@ -1191,7 +1189,7 @@ impl KeychatClient {
                 }
             }
 
-            let mut inner = self.inner.write().await;
+            let mut inner = self.app.inner.write().await;
             for addr in &addr_update.new_receiving {
                 inner.protocol.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.to_string());
             }
@@ -1230,7 +1228,7 @@ impl KeychatClient {
 
                                 // Store in GroupManager + persist
                                 {
-                                    let mut inner = self.inner.write().await;
+                                    let mut inner = self.app.inner.write().await;
                                     let gid = group.group_id.clone();
                                     inner.protocol.group_manager.add_group(group);
                                     if let Ok(store) = inner.protocol.storage.clone().lock() {
@@ -1244,7 +1242,7 @@ impl KeychatClient {
                                     if !identity_pubkey.is_empty() {
                                         let saved = {
                                             let app_storage =
-                                                self.inner.read().await.app_storage.clone();
+                                                self.app.inner.read().await.app_storage.clone();
                                             let store =
                                                 crate::client::lock_app_storage(&app_storage);
                                             store
@@ -1299,7 +1297,7 @@ impl KeychatClient {
 
                         // Update GroupManager + persist
                         if let Some(ref member_id) = removed_member {
-                            let mut inner = self.inner.write().await;
+                            let mut inner = self.app.inner.write().await;
                             if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
                                 g.remove_member(member_id);
                             }
@@ -1342,7 +1340,7 @@ impl KeychatClient {
 
                         // Remove member from group + persist
                         if let Some(ref member_id) = left_member {
-                            let mut inner = self.inner.write().await;
+                            let mut inner = self.app.inner.write().await;
                             if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
                                 g.remove_member(member_id);
                             }
@@ -1379,7 +1377,7 @@ impl KeychatClient {
 
                         // Remove group from manager + protocol storage
                         let app_storage_clone = {
-                            let mut inner = self.inner.write().await;
+                            let mut inner = self.app.inner.write().await;
                             if let Ok(store) = inner.protocol.storage.clone().lock() {
                                 if let Err(e) = inner
                                     .protocol.group_manager
@@ -1431,7 +1429,7 @@ impl KeychatClient {
                         if let Some(ref name) = new_name {
                             let app_storage_clone;
                             {
-                                let mut inner = self.inner.write().await;
+                                let mut inner = self.app.inner.write().await;
                                 if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
                                     g.name = name.clone();
                                 }
@@ -1505,7 +1503,7 @@ impl KeychatClient {
 
                         // DB writes under sync lock (no await while lock held)
                         let saved_msgid = if !identity_pubkey.is_empty() {
-                            let app_storage = self.inner.read().await.app_storage.clone();
+                            let app_storage = self.app.inner.read().await.app_storage.clone();
                             {
                                 let store = crate::client::lock_app_storage(&app_storage);
                                 if store.is_app_message_duplicate(&event_id).unwrap_or(false) {
@@ -1640,7 +1638,7 @@ impl KeychatClient {
             None // still pending — don't change message status yet
         };
 
-        let app_storage = self.inner.read().await.app_storage.clone();
+        let app_storage = self.app.inner.read().await.app_storage.clone();
         {
             let store = crate::client::lock_app_storage(&app_storage);
             if let Err(e) = store.update_app_message(
@@ -1672,24 +1670,31 @@ impl KeychatClient {
 
         // Clean up resolved entries from tracker memory
         if update.all_resolved {
-            let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tracker = self.app.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
             tracker.cleanup_resolved();
         }
     }
 
     /// Emit a ClientEvent to the registered EventListener.
+    /// The event_listener is a keychat_app_core::EventListener (wrapped by EventListenerBridge).
+    /// We convert our UniFFI ClientEvent back to app-core format for the bridge,
+    /// which then converts it forward to the UniFFI EventListener.
+    /// TODO: Once event construction moves to app-core, this double-conversion goes away.
     pub(crate) async fn emit_event(&self, event: ClientEvent) {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         if let Some(listener) = &inner.event_listener {
-            listener.on_event(event);
+            // Convert uniffi::ClientEvent → app_core::ClientEvent
+            let core_event = crate::client::uniffi_to_core_client_event(event);
+            listener.on_event(core_event);
         }
     }
 
     /// Emit a DataChange to the registered DataListener.
     pub(crate) async fn emit_data_change(&self, change: DataChange) {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         if let Some(listener) = &inner.data_listener {
-            listener.on_data_change(change);
+            let core_change = crate::client::uniffi_to_core_data_change(change);
+            listener.on_data_change(core_change);
         }
     }
 
@@ -1701,7 +1706,7 @@ impl KeychatClient {
     pub(crate) async fn collect_subscribe_pubkeys(&self) -> (Vec<PublicKey>, Vec<PublicKey>) {
         // Collect session Arcs under read lock, then drop the lock before awaiting session mutexes
         let (identity_pk, session_arcs, pending_pks) = {
-            let inner = self.inner.read().await;
+            let inner = self.app.inner.read().await;
             let identity_pk = inner
                 .protocol.identity
                 .as_ref()

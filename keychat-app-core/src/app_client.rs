@@ -72,7 +72,7 @@ pub type AppResult<T> = std::result::Result<T, AppError>;
 
 // ─── Internal State ─────────────────────────────────────────────
 
-pub(crate) struct AppClientInner {
+pub struct AppClientInner {
     /// Protocol-level state: sessions, peer mappings, transport, etc.
     pub protocol: ProtocolClient,
     /// App-layer SQLCipher database (rooms, messages, contacts, settings).
@@ -84,7 +84,7 @@ pub(crate) struct AppClientInner {
 }
 
 /// Lock app_storage Mutex, recovering from poison.
-pub(crate) fn lock_app_storage(
+pub fn lock_app_storage(
     mutex: &Mutex<AppStorage>,
 ) -> std::sync::MutexGuard<'_, AppStorage> {
     mutex.lock().unwrap_or_else(|e| {
@@ -94,14 +94,14 @@ pub(crate) fn lock_app_storage(
 }
 
 /// Lock app_storage Mutex, returning Result for error propagation.
-pub(crate) fn lock_app_storage_result(
+pub fn lock_app_storage_result(
     mutex: &Mutex<AppStorage>,
 ) -> AppResult<std::sync::MutexGuard<'_, AppStorage>> {
     mutex.lock().map_err(|e| AppError::Storage(format!("app_storage lock: {e}")))
 }
 
 /// Default Signal device ID.
-pub(crate) fn default_device_id() -> DeviceId {
+pub fn default_device_id() -> DeviceId {
     DeviceId::new(1).expect("device_id 1 is always valid")
 }
 
@@ -111,14 +111,14 @@ static TRACING_INIT: Once = Once::new();
 
 /// The shared application client — used by CLI, daemon, TUI, and (via UniFFI wrapper) mobile apps.
 pub struct AppClient {
-    pub(crate) inner: tokio::sync::RwLock<AppClientInner>,
-    pub(crate) runtime: Arc<tokio::runtime::Runtime>,
-    pub(crate) db_path: String,
+    pub inner: tokio::sync::RwLock<AppClientInner>,
+    pub runtime: Arc<tokio::runtime::Runtime>,
+    pub db_path: String,
     /// Base directory for file storage: {app_support}/files/
-    pub(crate) files_dir: String,
-    pub(crate) relay_tracker: Mutex<RelaySendTracker>,
+    pub files_dir: String,
+    pub relay_tracker: Mutex<RelaySendTracker>,
     /// Cached identity pubkey hex — set once in import_identity(), never changes.
-    pub(crate) identity_pubkey_hex: tokio::sync::OnceCell<String>,
+    pub identity_pubkey_hex: tokio::sync::OnceCell<String>,
 }
 
 impl AppClient {
