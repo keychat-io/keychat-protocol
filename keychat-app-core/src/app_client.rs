@@ -577,6 +577,25 @@ impl AppClient {
             .map_err(|e| AppError::Storage(format!("get_message_count: {e}")))
     }
 
+    /// Debug: print subscription state — receiving addresses and subscription IDs.
+    pub async fn debug_subscription_state(&self) -> String {
+        let inner = self.inner.read().await;
+        let sub_ids = &inner.protocol.subscription_ids;
+        let addr_count = inner.protocol.receiving_addr_to_peer.len();
+        let (identity_pks, ratchet_pks) = inner.protocol.collect_subscribe_pubkeys().await;
+        let ratchet_hex: Vec<String> = ratchet_pks
+            .iter()
+            .map(|pk| pk.to_hex()[..16].to_string())
+            .collect();
+        format!(
+            "sub_ids={} addr_to_peer={} identity_pks={} ratchet_pks=[{}]",
+            sub_ids.len(),
+            addr_count,
+            identity_pks.len(),
+            ratchet_hex.join(", ")
+        )
+    }
+
     // ─── Event Emission Helpers ─────────────────────────────────
 
     pub(crate) async fn emit_event(&self, event: ClientEvent) {

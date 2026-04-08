@@ -1668,6 +1668,11 @@ fn full_lifecycle_three_party() {
             be.lock().unwrap().clear();
             te.lock().unwrap().clear();
 
+            // Debug: print subscription state of all 3 clients before group creation
+            eprintln!("[Phase3-debug] Alice: {}", alice.debug_subscription_state().await);
+            eprintln!("[Phase3-debug] Bob: {}", bob.debug_subscription_state().await);
+            eprintln!("[Phase3-debug] Tom: {}", tom.debug_subscription_state().await);
+
             let gi = alice.create_signal_group(
                 "Lifecycle".into(),
                 vec![

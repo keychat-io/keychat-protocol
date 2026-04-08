@@ -116,14 +116,23 @@ impl AppClient {
                                     let relay = relay_url.to_string();
                                     let event_json = serde_json::to_string(&event).ok();
 
-                                    // Update relay cursor
-                                    let event_ts = event.created_at.as_u64();
-                                    let cursor_storage = self.inner.read().await.protocol.storage.clone();
-                                    if let Ok(store) = cursor_storage.lock() {
+                                    self.handle_incoming_event(&event, Some(relay.clone()), event_json).await;
+
+                                    // Update relay cursor AFTER handling (only for handled events).
+                                    // Clamp to now() to prevent NIP-17's randomized ±2 day
+                                    // timestamps from advancing cursor into the future.
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let event_ts = event.created_at.as_u64().min(now);
+                                    {
+                                        let inner = self.inner.read().await;
+                                        let storage = inner.protocol.storage.clone();
+                                        drop(inner);
+                                        let store = storage.lock().unwrap_or_else(|e| e.into_inner());
                                         let _ = store.update_relay_cursor(&relay, event_ts);
                                     }
-
-                                    self.handle_incoming_event(&event, Some(relay), event_json).await;
                                 }
                             }
                         }
@@ -134,11 +143,13 @@ impl AppClient {
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            tracing::error!("event loop notification error: {e}");
-                            self.emit_event(ClientEvent::EventLoopError {
-                                description: format!("notification error: {e}"),
-                            }).await;
-                            break;
+                            // Lagged = slow consumer, messages were skipped — continue
+                            // Closed = channel closed — break
+                            if matches!(e, tokio::sync::broadcast::error::RecvError::Closed) {
+                                tracing::info!("event loop: broadcast channel closed");
+                                break;
+                            }
+                            tracing::warn!("event loop: broadcast lagged, some events skipped: {e}");
                         }
                     }
                 }
@@ -186,15 +197,21 @@ impl AppClient {
                             tracing::error!("[Step2] complete_friend_approve failed: {e}");
                         }
                     }
-                    // Re-subscribe to include new ratchet-derived receiving addresses
+                } else if msg.kind == libkeychat::KCMessageKind::FriendReject {
+                    // Don't remove yet — on_friend_approve_app_persist reads peer_pubkey from it
+                }
+                // Drop write lock BEFORE async subscribe (critical for deadlock prevention)
+                drop(inner);
+
+                // Re-subscribe to include new ratchet-derived receiving addresses
+                if msg.kind == libkeychat::KCMessageKind::FriendApprove {
+                    let mut inner = self.inner.write().await;
                     if let Err(e) = inner.protocol.refresh_subscriptions().await {
                         tracing::warn!("[Step2] refresh_subscriptions after approve: {e}");
                     }
-                } else if msg.kind == libkeychat::KCMessageKind::FriendReject {
-                    // Remove from pending
-                    inner.protocol.pending_outbound.remove(&request_id);
+                    drop(inner);
                 }
-                drop(inner);
+
                 self.on_friend_approve_app_persist(&request_id, &msg, event)
                     .await;
                 return;
@@ -207,13 +224,60 @@ impl AppClient {
             inner.protocol.try_decrypt_session_message(event).await
         };
         if let Some((peer_signal_hex, msg, metadata, addr_update, session_mutex)) = step3 {
-            // Update addresses
+            // Update address state + reverse index (write lock)
             {
                 let mut inner = self.inner.write().await;
                 inner
                     .protocol
                     .update_addresses_after_decrypt(&peer_signal_hex, &session_mutex, &addr_update)
                     .await;
+            } // write lock dropped
+
+            // Re-subscribe with ALL ratchet keys.
+            // Read lock is OK here — we just need to call transport.resubscribe()
+            // which sends REQ via WebSocket. Read lock doesn't block other reads.
+            if !addr_update.new_receiving.is_empty() {
+                let inner = self.inner.read().await;
+                let (_, ratchet_pks) = inner.protocol.collect_subscribe_pubkeys().await;
+                if !ratchet_pks.is_empty() {
+                    if let Some(transport) = inner.protocol.transport.as_ref() {
+                        let old_ratchet_id = if inner.protocol.subscription_ids.len() >= 2 {
+                            Some(libkeychat::SubscriptionId::new(
+                                &inner.protocol.subscription_ids[1],
+                            ))
+                        } else {
+                            None
+                        };
+
+                        // Use relay cursor instead of now() to avoid filtering out
+                        // events sent in the same second as the subscription.
+                        let ratchet_since = {
+                            let storage = inner
+                                .protocol
+                                .storage
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let cursor = storage.get_min_relay_cursor().unwrap_or(0);
+                            if cursor > 0 {
+                                Some(libkeychat::Timestamp::from(cursor.saturating_sub(60)))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Ok(new_id) = transport
+                            .resubscribe(old_ratchet_id, ratchet_pks, ratchet_since)
+                            .await
+                        {
+                            drop(inner);
+                            let mut inner = self.inner.write().await;
+                            if inner.protocol.subscription_ids.len() >= 2 {
+                                inner.protocol.subscription_ids[1] = new_id.to_string();
+                            } else {
+                                inner.protocol.subscription_ids.push(new_id.to_string());
+                            }
+                        }
+                    }
+                }
             }
 
             let sender_nostr_pubkey = {
@@ -231,6 +295,7 @@ impl AppClient {
                 metadata,
                 sender_nostr_pubkey,
                 peer_signal_hex,
+                session_mutex,
                 event,
                 relay_url,
                 nostr_event_json,
@@ -328,6 +393,19 @@ impl AppClient {
             }
         };
 
+        // Check if this is an existing friend (re-keying) — auto-approve
+        let is_existing_friend = {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let rid = make_room_id(&ctx.sender_pubkey, &identity_pubkey);
+            store
+                .get_app_room(&rid)
+                .ok()
+                .flatten()
+                .map(|r| r.status == RoomStatus::Enabled.to_i32())
+                .unwrap_or(false)
+        };
+
         if let Some(room_id) = saved_room_id {
             self.emit_data_change(DataChange::RoomListChanged).await;
             self.emit_data_change(DataChange::ContactListChanged).await;
@@ -336,13 +414,31 @@ impl AppClient {
         }
 
         self.emit_event(ClientEvent::FriendRequestReceived {
-            request_id: ctx.request_id,
-            sender_pubkey: ctx.sender_pubkey,
-            sender_name: ctx.sender_name,
-            message: ctx.message,
+            request_id: ctx.request_id.clone(),
+            sender_pubkey: ctx.sender_pubkey.clone(),
+            sender_name: ctx.sender_name.clone(),
+            message: ctx.message.clone(),
             created_at: ctx.created_at,
         })
         .await;
+
+        // Auto-approve if this is a re-key from an existing friend
+        if is_existing_friend {
+            let my_name = self
+                .get_identities()
+                .await
+                .ok()
+                .and_then(|ids| ids.into_iter().next())
+                .map(|id| id.name)
+                .unwrap_or_default();
+            match self
+                .accept_friend_request(ctx.request_id.clone(), my_name)
+                .await
+            {
+                Ok(_) => tracing::info!("auto-approved friend request from existing friend"),
+                Err(e) => tracing::warn!("auto-approve failed: {e}"),
+            }
+        }
     }
 
     async fn on_friend_approve_app_persist(
@@ -481,6 +577,10 @@ impl AppClient {
 
             self.emit_event(ClientEvent::FriendRequestRejected { peer_pubkey })
                 .await;
+
+            // Now remove from pending_outbound (deferred from Step 2)
+            let mut inner = self.inner.write().await;
+            inner.protocol.pending_outbound.remove(request_id);
         }
     }
 
@@ -490,11 +590,241 @@ impl AppClient {
         metadata: libkeychat::MessageMetadata,
         sender_nostr_pubkey: String,
         _peer_signal_hex: String,
+        session_mutex: Arc<tokio::sync::Mutex<libkeychat::ChatSession>>,
         event: &libkeychat::Event,
         relay_url: Option<String>,
         nostr_event_json: Option<String>,
     ) {
         let identity_pubkey = self.cached_identity_pubkey();
+
+        // ── Group-specific message dispatch ──────────────────────────
+        match msg.kind {
+            libkeychat::KCMessageKind::SignalGroupInvite => {
+                let my_signal_id = {
+                    let session = session_mutex.lock().await;
+                    session.signal.identity_public_key_hex()
+                };
+                match libkeychat::receive_group_invite(&msg, &my_signal_id) {
+                    Ok(group) => {
+                        let group_id = group.group_id.clone();
+                        let group_name = group.name.clone();
+                        tracing::info!(
+                            "[group] invite received: id={} name={} from={}",
+                            &group_id[..16.min(group_id.len())],
+                            group_name,
+                            &sender_nostr_pubkey[..16.min(sender_nostr_pubkey.len())]
+                        );
+                        // Store in GroupManager + persist
+                        {
+                            let mut inner = self.inner.write().await;
+                            let gid = group.group_id.clone();
+                            inner.protocol.group_manager.add_group(group);
+                            if let Ok(store) = inner.protocol.storage.clone().lock() {
+                                let _ = inner.protocol.group_manager.save_group(&gid, &store);
+                            }
+                        }
+                        // Persist group room to app storage
+                        if !identity_pubkey.is_empty() {
+                            let saved = {
+                                let app_storage = self.inner.read().await.app_storage.clone();
+                                let store = lock_app_storage(&app_storage);
+                                store
+                                    .save_app_room(
+                                        &group_id,
+                                        &identity_pubkey,
+                                        RoomStatus::Enabled.to_i32(),
+                                        RoomType::SignalGroup.to_i32(),
+                                        Some(&group_name),
+                                        None,
+                                        None,
+                                    )
+                                    .ok()
+                            };
+                            if saved.is_some() {
+                                self.emit_data_change(DataChange::RoomListChanged).await;
+                            }
+                        }
+                        self.emit_event(ClientEvent::GroupInviteReceived {
+                            room_id: group_id,
+                            group_type: "signal".into(),
+                            group_name,
+                            inviter_pubkey: sender_nostr_pubkey,
+                        })
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to parse group invite: {e}");
+                    }
+                }
+                return;
+            }
+
+            libkeychat::KCMessageKind::SignalGroupMemberRemoved => {
+                let group_id = msg.group_id.clone().unwrap_or_default();
+                let removed_member = msg
+                    .extra
+                    .get("signalGroupAdmin")
+                    .and_then(|v| v.get("memberId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                tracing::info!(
+                    "[group] member removed: group={} member={:?}",
+                    &group_id[..16.min(group_id.len())],
+                    removed_member
+                );
+                if let Some(ref member_id) = removed_member {
+                    let mut inner = self.inner.write().await;
+                    if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
+                        g.remove_member(member_id);
+                    }
+                    if let Ok(store) = inner.protocol.storage.clone().lock() {
+                        let _ = inner.protocol.group_manager.save_group(&group_id, &store);
+                    }
+                }
+                let full_room_id = make_room_id(&group_id, &identity_pubkey);
+                self.emit_data_change(DataChange::RoomUpdated {
+                    room_id: full_room_id,
+                })
+                .await;
+                self.emit_event(ClientEvent::GroupMemberChanged {
+                    room_id: group_id,
+                    kind: GroupChangeKind::MemberRemoved,
+                    member_pubkey: removed_member,
+                    new_value: None,
+                })
+                .await;
+                return;
+            }
+
+            libkeychat::KCMessageKind::SignalGroupSelfLeave => {
+                let group_id = msg.group_id.clone().unwrap_or_default();
+                let left_member = msg
+                    .extra
+                    .get("signalGroupAdmin")
+                    .and_then(|v| v.get("memberId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                tracing::info!(
+                    "[group] member left: group={} member={:?}",
+                    &group_id[..16.min(group_id.len())],
+                    left_member
+                );
+                if let Some(ref member_id) = left_member {
+                    let mut inner = self.inner.write().await;
+                    if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
+                        g.remove_member(member_id);
+                    }
+                    if let Ok(store) = inner.protocol.storage.clone().lock() {
+                        let _ = inner.protocol.group_manager.save_group(&group_id, &store);
+                    }
+                }
+                let full_room_id = make_room_id(&group_id, &identity_pubkey);
+                self.emit_data_change(DataChange::RoomUpdated {
+                    room_id: full_room_id,
+                })
+                .await;
+                self.emit_event(ClientEvent::GroupMemberChanged {
+                    room_id: group_id,
+                    kind: GroupChangeKind::SelfLeave,
+                    member_pubkey: left_member,
+                    new_value: None,
+                })
+                .await;
+                return;
+            }
+
+            libkeychat::KCMessageKind::SignalGroupDissolve => {
+                let group_id = msg.group_id.clone().unwrap_or_default();
+                tracing::info!(
+                    "[group] dissolved: group={}",
+                    &group_id[..16.min(group_id.len())]
+                );
+                let app_storage_clone = {
+                    let mut inner = self.inner.write().await;
+                    if let Ok(store) = inner.protocol.storage.clone().lock() {
+                        if let Err(e) = inner
+                            .protocol
+                            .group_manager
+                            .remove_group_persistent(&group_id, &store)
+                        {
+                            tracing::warn!("remove_group_persistent: {e}");
+                        }
+                    } else {
+                        inner.protocol.group_manager.remove_group(&group_id);
+                    }
+                    inner.app_storage.clone()
+                };
+                {
+                    let full_room_id = make_room_id(&group_id, &identity_pubkey);
+                    let app_store = lock_app_storage(&app_storage_clone);
+                    if let Err(e) = app_store.delete_app_room(&full_room_id) {
+                        tracing::warn!("delete_app_room: {e}");
+                    }
+                }
+                self.emit_data_change(DataChange::RoomDeleted {
+                    room_id: make_room_id(&group_id, &identity_pubkey),
+                })
+                .await;
+                self.emit_event(ClientEvent::GroupDissolved { room_id: group_id })
+                    .await;
+                return;
+            }
+
+            libkeychat::KCMessageKind::SignalGroupNameChanged => {
+                let group_id = msg.group_id.clone().unwrap_or_default();
+                let new_name = msg
+                    .extra
+                    .get("signalGroupAdmin")
+                    .and_then(|v| v.get("newName"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                tracing::info!(
+                    "[group] renamed: group={} newName={:?}",
+                    &group_id[..16.min(group_id.len())],
+                    new_name
+                );
+                if let Some(ref name) = new_name {
+                    let app_storage_clone;
+                    {
+                        let mut inner = self.inner.write().await;
+                        if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
+                            g.name = name.clone();
+                        }
+                        if let Ok(store) = inner.protocol.storage.clone().lock() {
+                            let _ = inner.protocol.group_manager.save_group(&group_id, &store);
+                        }
+                        app_storage_clone = inner.app_storage.clone();
+                    }
+                    let full_room_id = make_room_id(&group_id, &identity_pubkey);
+                    {
+                        let app_store = lock_app_storage(&app_storage_clone);
+                        if let Err(e) =
+                            app_store.update_app_room(&full_room_id, None, Some(name), None, None)
+                        {
+                            tracing::warn!("update_app_room name: {e}");
+                        }
+                    }
+                }
+                let full_room_id = make_room_id(&group_id, &identity_pubkey);
+                self.emit_data_change(DataChange::RoomUpdated {
+                    room_id: full_room_id,
+                })
+                .await;
+                self.emit_event(ClientEvent::GroupMemberChanged {
+                    room_id: group_id,
+                    kind: GroupChangeKind::NameChanged,
+                    member_pubkey: None,
+                    new_value: new_name,
+                })
+                .await;
+                return;
+            }
+
+            // All other message kinds (Text, Files, etc.) — generic persistence below
+            _ => {}
+        }
+
+        // ── Generic message persistence ──────────────────────────────
         let kind: MessageKind = msg.kind.clone().into();
         let content = msg.text.as_ref().map(|t| t.content.clone());
         let payload_json = msg.to_json().ok();
@@ -506,11 +836,6 @@ impl AppClient {
             .reply_to
             .as_ref()
             .and_then(|r| r.target_event_id.clone());
-
-        // Handle group-specific messages (invite, member changes, etc.)
-        // For now, all messages go through the generic persistence path.
-        // Group-specific handling (invite acceptance, member removal) is done
-        // in the full try_handle_session_message in the legacy path.
 
         let room_id_base = if let Some(ref gid) = group_id {
             gid.clone()

@@ -808,12 +808,15 @@ impl ProtocolClient {
         }
 
         if !ratchet_pubkeys.is_empty() {
+            // Use cursor - 60s instead of now() to avoid race condition:
+            // events sent in the same second as the subscription would be filtered out.
+            let ratchet_since = if relay_cursor > 0 {
+                Some(nostr::Timestamp::from(relay_cursor.saturating_sub(60)))
+            } else {
+                None
+            };
             let id = transport
-                .resubscribe(
-                    old_iter.next(),
-                    ratchet_pubkeys,
-                    Some(nostr::Timestamp::now()),
-                )
+                .resubscribe(old_iter.next(), ratchet_pubkeys, ratchet_since)
                 .await?;
             new_sub_ids.push(id.to_string());
         }
@@ -845,32 +848,8 @@ impl ProtocolClient {
         session_mutex: &Arc<tokio::sync::Mutex<ChatSession>>,
         addr_update: &crate::address::AddressUpdate,
     ) {
-        if !addr_update.new_receiving.is_empty() {
-            // Re-subscribe with updated ratchet addresses
-            let (_, all_ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
-            if !all_ratchet_pubkeys.is_empty() {
-                if let Some(transport) = self.transport.as_ref() {
-                    let old_ratchet_id = self
-                        .subscription_ids
-                        .last()
-                        .map(|s| crate::SubscriptionId::new(s));
-                    if let Ok(new_id) = transport
-                        .resubscribe(
-                            old_ratchet_id,
-                            all_ratchet_pubkeys,
-                            Some(nostr::Timestamp::now()),
-                        )
-                        .await
-                    {
-                        if let Some(last) = self.subscription_ids.last_mut() {
-                            *last = new_id.to_string();
-                        } else {
-                            self.subscription_ids.push(new_id.to_string());
-                        }
-                    }
-                }
-            }
-        }
+        // Note: relay re-subscription is done by the caller AFTER dropping write lock,
+        // so that relay WebSocket messages can actually be sent.
 
         if !addr_update.new_receiving.is_empty() || addr_update.new_sending.is_some() {
             // Persist address state
@@ -1087,12 +1066,37 @@ impl ProtocolClient {
         Arc<tokio::sync::Mutex<crate::ChatSession>>,
     )> {
         let p_tags = crate::extract_p_tags(event);
-        let first_p = p_tags.first()?;
+        let first_p = match p_tags.first() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("Step3: event {} has no p-tag", &event.id.to_hex()[..16]);
+                return None;
+            }
+        };
 
-        let (peer_id, session_arc) = {
-            let peer_id = self.receiving_addr_to_peer.get(first_p)?.clone();
-            let session = self.sessions.get(&peer_id)?.clone();
-            (peer_id, session)
+        let (peer_id, session_arc) = match self.receiving_addr_to_peer.get(first_p) {
+            Some(peer_id) => {
+                let peer_id = peer_id.clone();
+                match self.sessions.get(&peer_id) {
+                    Some(session) => (peer_id, session.clone()),
+                    None => {
+                        tracing::warn!(
+                            "Step3: peer {} in index but no session",
+                            &peer_id[..16.min(peer_id.len())]
+                        );
+                        return None;
+                    }
+                }
+            }
+            None => {
+                tracing::debug!(
+                    "Step3: p-tag {} not in receiving_addr_to_peer (have {} addrs), event={}",
+                    &first_p[..16.min(first_p.len())],
+                    self.receiving_addr_to_peer.len(),
+                    &event.id.to_hex()[..16]
+                );
+                return None;
+            }
         };
 
         let device_id = crate::DeviceId::new(1).expect("valid");

@@ -107,7 +107,14 @@ impl AppClient {
         // 1. Protocol: encrypt + publish + address update
         let result = {
             let mut inner = self.inner.write().await;
-            inner.protocol.send_message_core(&peer_pubkey, &msg).await?
+            let r = inner.protocol.send_message_core(&peer_pubkey, &msg).await?;
+            // §9.2: "After encrypt: new_receiving_addr is YOUR new address. Subscribe to it."
+            if !r.addr_update.new_receiving.is_empty() {
+                if let Err(e) = inner.protocol.refresh_subscriptions().await {
+                    tracing::warn!("refresh_subscriptions after send: {e}");
+                }
+            }
+            r
         };
 
         // 2. App: persist message to DB

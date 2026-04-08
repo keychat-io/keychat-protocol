@@ -275,6 +275,11 @@ impl KeychatClient {
         Ok(Self { app })
     }
 
+    /// Debug: show subscription state for diagnostics.
+    pub async fn debug_subscription_state(&self) -> String {
+        self.app.debug_subscription_state().await
+    }
+
     // ─── File Storage ────────────────────────────────────────────────
 
     /// Get the base files directory path.

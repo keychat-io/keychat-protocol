@@ -18,9 +18,6 @@ impl KeychatClient {
             .await
             .map_err(KeychatUniError::from)?;
 
-        // Refresh subscriptions to include first_inbox for this pending FR
-        let _ = self.refresh_subscriptions().await;
-
         Ok(PendingFriendRequest {
             request_id: result.request_id,
             peer_nostr_pubkey: result.peer_nostr_pubkey,
@@ -37,9 +34,6 @@ impl KeychatClient {
             .accept_friend_request(request_id, my_name)
             .await
             .map_err(KeychatUniError::from)?;
-
-        // Refresh subscriptions after session is established
-        let _ = self.refresh_subscriptions().await;
 
         Ok(ContactInfo {
             nostr_pubkey_hex: result.nostr_pubkey_hex,

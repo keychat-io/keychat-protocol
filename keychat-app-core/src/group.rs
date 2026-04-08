@@ -1,6 +1,13 @@
-//! Signal Group — delegates protocol to ProtocolClient, handles app persistence.
+//! Signal Group — read-lock pattern matching pre-refactor behavior.
+//!
+//! Key insight: group operations (create, send) must NOT hold inner write lock
+//! during session mutex lock + relay publish. The pre-refactor code used read lock,
+//! collected session Arcs, dropped the lock, then operated on sessions.
 
-use libkeychat::{build_multi_file_message, KCFilePayload, KCMessage};
+use libkeychat::{
+    build_multi_file_message, create_signal_group, encrypt_for_group_member, send_group_invite,
+    KCFilePayload, KCMessage,
+};
 
 use crate::app_client::{lock_app_storage, AppClient, AppError, AppResult};
 use crate::types::*;
@@ -11,21 +18,73 @@ impl AppClient {
         name: String,
         members: Vec<GroupMemberInput>,
     ) -> AppResult<SignalGroupInfo> {
-        let member_tuples: Vec<(String, String)> = members
-            .iter()
-            .map(|m| (m.nostr_pubkey.clone(), m.name.clone()))
-            .collect();
-
-        // 1. Protocol: create group, send invites, persist to GroupManager
-        let (group_id, group_name, member_count) = {
-            let mut inner = self.inner.write().await;
-            inner
+        // Collect under read lock, then drop — matching pre-refactor pattern
+        let (my_nostr, first_session_arc, other_members, member_sessions) = {
+            let inner = self.inner.read().await;
+            let identity = inner
                 .protocol
-                .create_group_protocol(&name, member_tuples)
-                .await?
+                .identity
+                .as_ref()
+                .ok_or(AppError::NotInitialized("no identity set".into()))?;
+            let my_nostr = identity.pubkey_hex();
+            let first_session_arc = inner.protocol.sessions.values().next().cloned();
+            let mut other_members = Vec::new();
+            let mut member_sessions = Vec::new();
+            for m in &members {
+                let sid = inner
+                    .protocol
+                    .peer_nostr_to_signal
+                    .get(&m.nostr_pubkey)
+                    .ok_or(AppError::PeerNotFound(m.nostr_pubkey.clone()))?
+                    .clone();
+                let sarc = inner
+                    .protocol
+                    .sessions
+                    .get(&sid)
+                    .ok_or(AppError::PeerNotFound(sid.clone()))?
+                    .clone();
+                other_members.push((sid.clone(), m.nostr_pubkey.clone(), m.name.clone()));
+                member_sessions.push((sid, sarc));
+            }
+            (my_nostr, first_session_arc, other_members, member_sessions)
+        }; // read lock dropped
+
+        let my_signal_id = if let Some(sm) = first_session_arc {
+            let s = sm.lock().await;
+            s.signal.identity_public_key_hex()
+        } else {
+            my_nostr.clone()
         };
 
-        // 2. App: save room
+        let group = create_signal_group(&name, &my_signal_id, &my_nostr, "Me", other_members);
+        let group_id = group.group_id.clone();
+        let group_name = group.name.clone();
+        let member_count = group.members.len() as u32;
+
+        // Send invite — no inner lock held
+        for (signal_id, session_arc) in &member_sessions {
+            let mut session = session_arc.lock().await;
+            let addr = session.addresses.clone();
+            let event = send_group_invite(&mut session.signal, &group, signal_id, &addr)
+                .await
+                .map_err(|e| AppError::Signal(e.to_string()))?;
+            let inner = self.inner.read().await;
+            if let Some(t) = inner.protocol.transport.as_ref() {
+                let _ = t.publish_event_async(event).await;
+            }
+        }
+
+        // Store group + persist (write lock)
+        {
+            let mut inner = self.inner.write().await;
+            let gid = group.group_id.clone();
+            inner.protocol.group_manager.add_group(group);
+            if let Ok(store) = inner.protocol.storage.clone().lock() {
+                let _ = inner.protocol.group_manager.save_group(&gid, &store);
+            }
+        }
+
+        // App: save room
         let identity_pubkey = self.cached_identity_pubkey();
         {
             let app_storage = self.inner.read().await.app_storage.clone();
@@ -168,7 +227,7 @@ impl AppClient {
         Ok(())
     }
 
-    /// Shared fan-out logic: protocol encrypt+publish, then app persistence.
+    /// Fan-out: read lock → collect → drop → encrypt+publish (no write lock during send)
     async fn send_group_message_internal(
         &self,
         group_id: String,
@@ -180,16 +239,62 @@ impl AppClient {
         msg.group_id = Some(group_id.clone());
         let payload_json = msg.to_json().ok();
 
-        // 1. Protocol: fan-out encrypt + publish
-        let (event_ids, connected_relays) = {
-            let mut inner = self.inner.write().await;
-            inner
+        // Collect under read lock
+        let (group, member_sessions, connected_relays) = {
+            let inner = self.inner.read().await;
+            let group = inner
                 .protocol
-                .send_group_message_protocol(&group_id, &msg)
-                .await?
-        };
+                .group_manager
+                .get_group(&group_id)
+                .ok_or(AppError::PeerNotFound(group_id.clone()))?
+                .clone();
+            let transport = inner
+                .protocol
+                .transport
+                .as_ref()
+                .ok_or(AppError::Transport("Not connected".into()))?;
+            let connected = transport.connected_relays().await;
+            let mut sessions = Vec::new();
+            for member in group.other_members() {
+                if let Some(sid) = inner
+                    .protocol
+                    .peer_nostr_to_signal
+                    .get(&member.nostr_pubkey)
+                {
+                    if let Some(s) = inner.protocol.sessions.get(sid) {
+                        sessions.push((sid.clone(), s.clone()));
+                    }
+                }
+            }
+            (group, sessions, connected)
+        }; // read lock dropped
 
-        // 2. App: persist message
+        if connected_relays.is_empty() {
+            return Err(AppError::Transport("Not connected".into()));
+        }
+
+        // Encrypt + publish without inner lock
+        let mut event_ids = Vec::new();
+        for (signal_id, session_arc) in &member_sessions {
+            let mut session = session_arc.lock().await;
+            let addr = session.addresses.clone();
+            match encrypt_for_group_member(&mut session.signal, signal_id, &msg, &addr).await {
+                Ok(event) => {
+                    let eid = event.id.to_hex();
+                    let inner = self.inner.read().await;
+                    if let Some(t) = inner.protocol.transport.as_ref() {
+                        let _ = t.publish_event_async(event).await;
+                    }
+                    event_ids.push(eid);
+                }
+                Err(e) => tracing::error!(
+                    "group send to {} failed: {e}",
+                    &signal_id[..16.min(signal_id.len())]
+                ),
+            }
+        }
+
+        // App persistence
         let full_room_id = make_room_id(&group_id, &identity_pubkey);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -234,8 +339,7 @@ impl AppClient {
         })
         .await;
 
-        // 3. Relay tracker
-        let members: Vec<(String, String)> = event_ids
+        let members_for_tracker: Vec<(String, String)> = event_ids
             .iter()
             .enumerate()
             .map(|(i, eid)| (eid.clone(), format!("member_{i}")))
@@ -245,17 +349,17 @@ impl AppClient {
             tracker.track_group(
                 msgid.clone(),
                 full_room_id.clone(),
-                members,
+                members_for_tracker,
                 connected_relays,
             )
         };
         {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
-            let event_id_ref = event_ids.first().map(|s| s.as_str());
+            let eid_ref = event_ids.first().map(|s| s.as_str());
             let _ = store.update_app_message(
                 &msgid,
-                event_id_ref,
+                eid_ref,
                 None,
                 Some(&initial_relay_json),
                 None,
