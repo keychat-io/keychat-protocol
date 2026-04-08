@@ -149,6 +149,7 @@ async fn dispatch(
 
         // ── Signal Groups ──
         "/sg-create" => cmd_sg_create(&client, args).await?,
+        "/sg-list" => cmd_sg_list(&client).await?,
         "/sg-chat" => cmd_sg_chat(args, active_room_id)?,
         "/sg-leave" => cmd_sg_leave(&client, args).await?,
         "/sg-dissolve" => cmd_sg_dissolve(&client, args).await?,
@@ -1102,11 +1103,32 @@ async fn cmd_sg_create(client: &AppClient, args: &str) -> anyhow::Result<()> {
     ));
     let info = client.create_signal_group(name, members).await?;
     print_ok(&format!(
-        "Group created: {} (id: {}, {} members)",
+        "Signal group created: \"{}\" ({})",
         info.name.green(),
-        short_key(&info.group_id).cyan(),
-        info.member_count
+        &info.group_id[..16.min(info.group_id.len())]
     ));
+    println!("  Full group ID: {}", info.group_id.cyan());
+    println!("  Members: {}", info.member_count);
+    println!("  Use {} to select this group chat", format!("/sg-chat {}", info.group_id).green());
+    Ok(())
+}
+
+async fn cmd_sg_list(client: &AppClient) -> anyhow::Result<()> {
+    let pubkey = client.get_pubkey_hex().await?;
+    let rooms = client.get_rooms(pubkey).await?;
+    let groups: Vec<_> = rooms.iter().filter(|r| r.room_type == RoomType::SignalGroup).collect();
+    if groups.is_empty() {
+        print_sys("No signal groups.");
+        return Ok(());
+    }
+    println!("  {}", "Signal Groups:".bold());
+    for g in &groups {
+        let name = g.name.as_deref().unwrap_or("(unnamed)");
+        // Extract the group_id from room_id (format: "group_id:identity_pubkey")
+        let gid = g.id.split(':').next().unwrap_or(&g.id);
+        println!("    {} — {}", gid.cyan(), name);
+    }
+    println!("  Use {} to select a group chat", "/sg-chat <group_id>".green());
     Ok(())
 }
 
@@ -1575,6 +1597,7 @@ fn print_help() {
         "    {}  Create group",
         "/sg-create <name> <pubkey...>".green()
     );
+    println!("    {}  List groups (with full IDs)", "/sg-list".green());
     println!("    {}  Select group chat", "/sg-chat <group_id>".green());
     println!("    {}  Leave group", "/sg-leave <group_id>".green());
     println!(
