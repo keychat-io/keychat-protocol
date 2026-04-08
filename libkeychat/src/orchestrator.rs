@@ -1004,7 +1004,7 @@ impl ProtocolClient {
     pub fn try_decrypt_pending_outbound(
         &mut self,
         event: &crate::Event,
-    ) -> Option<(String, crate::KCMessage)> {
+    ) -> Option<(String, crate::KCMessage, crate::SignalDecryptResult)> {
         let pending_keys: Vec<(String, String)> = self
             .pending_outbound
             .iter()
@@ -1026,8 +1026,8 @@ impl ProtocolClient {
                 continue;
             };
 
-            if let Ok((msg, _decrypt_result)) = result {
-                return Some((request_id.clone(), msg));
+            if let Ok((msg, decrypt_result)) = result {
+                return Some((request_id.clone(), msg, decrypt_result));
             }
         }
         None
@@ -1418,6 +1418,7 @@ impl ProtocolClient {
         &mut self,
         request_id: &str,
         msg: &crate::KCMessage,
+        decrypt_result: &crate::SignalDecryptResult,
     ) -> Result<(String, String, String)> {
         // Extract peer info from signal_prekey_auth
         let peer_name = msg.signal_prekey_auth.as_ref()
@@ -1461,9 +1462,21 @@ impl ProtocolClient {
 
         // Create AddressManager + ChatSession
         let mut addresses = crate::AddressManager::new();
-        // Use the peer's first_inbox from the original friend request
-        // (the pending state has the first_inbox_keys we generated)
         addresses.add_peer(&peer_signal_hex, None, Some(peer_nostr_id.clone()));
+
+        // Process decrypt result to register ratchet-derived addresses
+        if let Some(bob_addr) = decrypt_result.bob_derived_address.as_deref() {
+            match addresses.on_decrypt(
+                &peer_signal_hex,
+                Some(bob_addr),
+                decrypt_result.alice_addrs.as_deref(),
+            ) {
+                Ok(_update) => {}
+                Err(e) => {
+                    tracing::warn!("complete_friend_approve: on_decrypt failed: {e}");
+                }
+            }
+        }
 
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = crate::ChatSession::new(state.signal_participant, addresses, identity);
@@ -1602,7 +1615,7 @@ impl ProtocolClient {
                                     // Step 2: Try friend approve/reject
                                     {
                                         let mut inner = client.write().await;
-                                        if let Some((request_id, msg)) = inner.try_decrypt_pending_outbound(&event) {
+                                        if let Some((request_id, msg, _decrypt_result)) = inner.try_decrypt_pending_outbound(&event) {
                                             if msg.kind == crate::KCMessageKind::FriendApprove {
                                                 // Full session creation happens here
                                                 // Extract peer info from signal_prekey_auth

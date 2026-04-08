@@ -165,10 +165,10 @@ impl AppClient {
         // Step 2: Try pending outbound (friend approve/reject)
         {
             let mut inner = self.inner.write().await;
-            if let Some((request_id, msg)) = inner.protocol.try_decrypt_pending_outbound(event) {
+            if let Some((request_id, msg, decrypt_result)) = inner.protocol.try_decrypt_pending_outbound(event) {
                 if msg.kind == libkeychat::KCMessageKind::FriendApprove {
-                    // Complete session creation (the critical missing step)
-                    match inner.protocol.complete_friend_approve(&request_id, &msg).await {
+                    // Complete session creation with ratchet address registration
+                    match inner.protocol.complete_friend_approve(&request_id, &msg, &decrypt_result).await {
                         Ok(_) => {
                             tracing::info!("[Step2] Session created for approve reqId={}", &request_id[..16.min(request_id.len())]);
                         }
