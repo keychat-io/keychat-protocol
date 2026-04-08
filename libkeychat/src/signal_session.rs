@@ -563,6 +563,11 @@ impl SignalParticipant {
         hex::encode(self.identity_key_pair.identity_key().serialize())
     }
 
+    /// Get the identity key pair (for persistence).
+    pub fn identity_key_pair(&self) -> &IdentityKeyPair {
+        &self.identity_key_pair
+    }
+
     /// Move a session record from one ProtocolAddress to another.
     /// Used after decrypting a FriendApprove PreKeySignalMessage:
     /// the decrypt used the local identity key as remote_address (wrong),

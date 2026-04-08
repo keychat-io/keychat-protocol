@@ -1410,6 +1410,109 @@ impl ProtocolClient {
         Ok(())
     }
 
+    /// Complete friend approve: create ChatSession, update peer mappings, persist.
+    ///
+    /// Called after try_decrypt_pending_outbound returns a FriendApprove message.
+    /// Extracts the pending state, creates the Signal session, and updates all indexes.
+    pub async fn complete_friend_approve(
+        &mut self,
+        request_id: &str,
+        msg: &crate::KCMessage,
+    ) -> Result<(String, String, String)> {
+        // Extract peer info from signal_prekey_auth
+        let peer_name = msg.signal_prekey_auth.as_ref()
+            .map(|a| a.name.clone()).unwrap_or_default();
+        let peer_signal_id = msg.signal_prekey_auth.as_ref()
+            .map(|a| a.signal_id.clone()).unwrap_or_default();
+        let peer_nostr_id = msg.signal_prekey_auth.as_ref()
+            .map(|a| a.nostr_id.clone())
+            .unwrap_or_else(|| {
+                self.pending_outbound.get(request_id)
+                    .map(|s| s.peer_nostr_pubkey.clone())
+                    .unwrap_or_default()
+            });
+
+        let peer_signal_hex = if peer_signal_id.is_empty() {
+            peer_nostr_id.clone()
+        } else {
+            peer_signal_id
+        };
+
+        // Take the state out of pending_outbound
+        let mut state = self.pending_outbound.remove(request_id)
+            .ok_or_else(|| KeychatError::FriendRequest(
+                format!("pending state not found for {request_id}")
+            ))?;
+
+        let identity = self.identity.clone()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+
+        let device_id = crate::DeviceId::new(1).expect("valid");
+
+        // Relocate session if peer signal key differs from our decrypt address
+        let our_signal_hex = state.signal_participant.identity_public_key_hex();
+        if peer_signal_hex != our_signal_hex {
+            let from_addr = crate::ProtocolAddress::new(our_signal_hex.clone(), device_id);
+            let to_addr = crate::ProtocolAddress::new(peer_signal_hex.clone(), device_id);
+            if let Err(e) = state.signal_participant.relocate_session(&from_addr, &to_addr) {
+                tracing::warn!("relocate_session failed: {e}");
+            }
+        }
+
+        // Create AddressManager + ChatSession
+        let mut addresses = crate::AddressManager::new();
+        // Use the peer's first_inbox from the original friend request
+        // (the pending state has the first_inbox_keys we generated)
+        addresses.add_peer(&peer_signal_hex, None, Some(peer_nostr_id.clone()));
+
+        let recv_addrs = addresses.get_all_receiving_address_strings();
+        let session = crate::ChatSession::new(state.signal_participant, addresses, identity);
+
+        // Persist to SecureStorage
+        if let Ok(store) = self.storage.lock() {
+            // Save signal participant identity (pub + priv key for restore_sessions)
+            let id_pub = session.signal.identity_key_pair().identity_key().serialize().to_vec();
+            let id_priv = session.signal.identity_key_pair().private_key().serialize().to_vec();
+            let _ = store.save_signal_participant(
+                &peer_signal_hex,
+                u32::from(session.signal.address().device_id()),
+                &id_pub, &id_priv,
+                session.signal.registration_id(),
+                0, &[],
+            );
+
+            // Save peer address state
+            if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
+                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+            }
+
+            // Save peer mapping
+            let _ = store.save_peer_mapping(&peer_nostr_id, &peer_signal_hex, &peer_name);
+
+            // Delete the pending FR
+            let _ = store.delete_pending_fr(request_id);
+        }
+
+        // Update in-memory state
+        self.sessions.insert(
+            peer_signal_hex.clone(),
+            Arc::new(tokio::sync::Mutex::new(session)),
+        );
+        self.peer_nostr_to_signal.insert(peer_nostr_id.clone(), peer_signal_hex.clone());
+        self.peer_signal_to_nostr.insert(peer_signal_hex.clone(), peer_nostr_id.clone());
+        for addr in &recv_addrs {
+            self.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+        }
+
+        tracing::info!(
+            "[complete_friend_approve] session created: signal={} nostr={}",
+            &peer_signal_hex[..16.min(peer_signal_hex.len())],
+            &peer_nostr_id[..16.min(peer_nostr_id.len())]
+        );
+
+        Ok((peer_signal_hex, peer_nostr_id, peer_name))
+    }
+
     /// Reject a friend request: delete from SecureStorage.
     pub fn reject_friend_request_protocol(&self, request_id: &str) -> Result<String> {
         let store = self.storage.lock()

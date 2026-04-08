@@ -166,6 +166,20 @@ impl AppClient {
         {
             let mut inner = self.inner.write().await;
             if let Some((request_id, msg)) = inner.protocol.try_decrypt_pending_outbound(event) {
+                if msg.kind == libkeychat::KCMessageKind::FriendApprove {
+                    // Complete session creation (the critical missing step)
+                    match inner.protocol.complete_friend_approve(&request_id, &msg).await {
+                        Ok(_) => {
+                            tracing::info!("[Step2] Session created for approve reqId={}", &request_id[..16.min(request_id.len())]);
+                        }
+                        Err(e) => {
+                            tracing::error!("[Step2] complete_friend_approve failed: {e}");
+                        }
+                    }
+                } else if msg.kind == libkeychat::KCMessageKind::FriendReject {
+                    // Remove from pending
+                    inner.protocol.pending_outbound.remove(&request_id);
+                }
                 drop(inner);
                 self.on_friend_approve_app_persist(&request_id, &msg, event).await;
                 return;
