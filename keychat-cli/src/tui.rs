@@ -24,7 +24,7 @@ use crossterm::event::{
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use keychat_app_core::{
-    ClientEvent, DataChange, GroupMemberInput, AppClient, MessageStatus, RoomStatus, RoomType,
+    AppClient, ClientEvent, DataChange, GroupMemberInput, MessageStatus, RoomStatus, RoomType,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -180,6 +180,8 @@ struct App {
     identity_hex: Option<String>,
     identity_name: Option<String>,
     owner_pubkey: Option<String>,
+    /// Pending inbound friend requests: (request_id, sender_pubkey, sender_name)
+    pending_requests: Vec<(String, String, String)>,
     connected_relays: usize,
     total_relays: usize,
     // Control
@@ -220,6 +222,7 @@ impl App {
             identity_hex: None,
             identity_name: None,
             owner_pubkey: None,
+            pending_requests: Vec::new(),
             connected_relays: 0,
             total_relays: 0,
             should_quit: false,
@@ -692,15 +695,17 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    if app.messages.is_empty() {
-        // Show command output
+    // Always show command_output (notifications, /requests results, etc.)
+    if !app.command_output.is_empty() {
         for (msg, color) in &app.command_output {
             lines.push(Line::from(Span::styled(
                 format!("  {msg}"),
                 Style::default().fg(*color),
             )));
         }
-    } else {
+    }
+
+    if !app.messages.is_empty() {
         // Render chat messages with bubble layout
         let mut last_date: Option<String> = None;
         let mut last_sender: Option<(bool, String)> = None; // (is_me, pubkey)
@@ -1181,7 +1186,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  /add <pk> [greeting]  /accept <id>  /reject <id>  /contacts",
+            "  /add <pk> [greeting]  /requests  /accept <id>  /reject <id>",
             Style::default().fg(Color::Green),
         )),
         Line::from(Span::styled(
@@ -1610,6 +1615,7 @@ const COMMANDS: &[&str] = &[
     "/reconnect",
     "/status",
     "/add",
+    "/requests",
     "/accept",
     "/reject",
     "/contacts",
@@ -1746,16 +1752,15 @@ async fn process_command(app: &mut App, input: &str) {
                         Color::Green,
                     );
                     app.push_output(String::new(), Color::White);
-                    app.push_output("Pubkey (hex):".into(), Color::DarkGray);
-                    app.push_output(pubkey_hex, Color::Cyan);
-                    app.push_output(String::new(), Color::White);
-                    app.push_output("npub:".into(), Color::DarkGray);
-                    app.push_output(npub.clone(), Color::Cyan);
-                    app.push_output(String::new(), Color::White);
-
                     for line in render_qr_lines(&npub) {
                         app.push_output(line, Color::White);
                     }
+                    app.push_output(String::new(), Color::White);
+                    app.push_output("Pubkey (hex):".into(), Color::DarkGray);
+                    app.push_output(pubkey_hex, Color::Cyan);
+                    app.push_output(String::new(), Color::White);
+                    app.push_output("npub (share this):".into(), Color::DarkGray);
+                    app.push_output(npub.clone(), Color::Cyan);
                     app.push_output(String::new(), Color::White);
                     app.push_output("Mnemonic (SAVE THIS!):".into(), Color::Yellow);
                     let words: Vec<&str> = mnemonic.split_whitespace().collect();
@@ -1998,6 +2003,26 @@ async fn process_command(app: &mut App, input: &str) {
                 }
             }
         }
+        "/requests" => {
+            if app.pending_requests.is_empty() {
+                app.push_output("No pending friend requests.".into(), app.theme.muted);
+            } else {
+                app.push_output(
+                    format!("Pending friend requests ({}):", app.pending_requests.len()),
+                    Color::Yellow,
+                );
+                let items: Vec<_> = app
+                    .pending_requests
+                    .iter()
+                    .map(|(rid, pubkey, name)| {
+                        format!("  {} ({}) — /accept {rid}", name, short_key(pubkey))
+                    })
+                    .collect();
+                for line in items {
+                    app.push_output(line, Color::Cyan);
+                }
+            }
+        }
         "/accept" => {
             let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
             if parts.is_empty() || parts[0].is_empty() {
@@ -2007,7 +2032,10 @@ async fn process_command(app: &mut App, input: &str) {
             let name = if parts.len() > 1 {
                 parts[1].to_string()
             } else {
-                "CLI User".to_string()
+                app.identity_name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "CLI User".to_string())
             };
             tracing::info!("Accepting friend request: {}", parts[0]);
             match app
@@ -2018,6 +2046,7 @@ async fn process_command(app: &mut App, input: &str) {
                 Ok(contact) => {
                     tracing::info!("Friend request accepted: {}", contact.display_name);
                     app.push_output(format!("Accepted: {}", contact.display_name), Color::Green);
+                    app.pending_requests.retain(|(rid, _, _)| rid != parts[0]);
                     refresh_rooms(app).await;
                     refresh_contacts(app).await;
                 }
@@ -2037,7 +2066,11 @@ async fn process_command(app: &mut App, input: &str) {
                 .reject_friend_request(args.to_string(), None)
                 .await
             {
-                Ok(_) => app.push_output("Friend request rejected".into(), Color::Yellow),
+                Ok(_) => {
+                    app.push_output("Friend request rejected".into(), Color::Yellow);
+                    app.pending_requests
+                        .retain(|(rid, _, _)| rid != args.trim());
+                }
                 Err(e) => app.show_error(format!("Reject failed: {e}")),
             }
         }
@@ -2608,96 +2641,93 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
                 "Friend request received: name={sender_name}, pubkey={}, request_id={request_id}",
                 &sender_pubkey[..16.min(sender_pubkey.len())]
             );
+
             let is_owner = app.owner_pubkey.as_deref() == Some(sender_pubkey.as_str());
             let should_auto_approve = app.owner_pubkey.is_none() || is_owner;
+
             if should_auto_approve {
+                // Auto-approve: first friend becomes owner, or owner re-adding
                 let reason = if is_owner {
-                    "owner request"
+                    "owner"
                 } else {
                     "first friend → owner"
                 };
                 tracing::info!("Auto-approving ({reason}): {sender_name}");
                 app.push_output(format!("Auto-approving {sender_name}..."), Color::Green);
 
-                // Get display name for accept response
-                let my_name = if let Ok(ids) = app.client.get_identities().await {
-                    ids.first()
-                        .map(|i| i.name.clone())
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| "CLI User".to_string())
-                } else {
-                    "CLI User".to_string()
-                };
+                let my_name = app
+                    .identity_name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "CLI User".to_string());
 
-                // Retry up to 3 times — relay may still be connecting
-                let mut accepted = false;
-                for attempt in 0..3 {
-                    match app
-                        .client
-                        .accept_friend_request(request_id.clone(), my_name.clone())
-                        .await
-                    {
-                        Ok(contact) => {
-                            if app.owner_pubkey.is_none() {
-                                save_owner(&app.client, sender_pubkey).await;
-                                app.owner_pubkey = Some(sender_pubkey.clone());
-                                tracing::info!(
+                match app
+                    .client
+                    .accept_friend_request(request_id.clone(), my_name)
+                    .await
+                {
+                    Ok(contact) => {
+                        if app.owner_pubkey.is_none() {
+                            save_owner(&app.client, sender_pubkey).await;
+                            app.owner_pubkey = Some(sender_pubkey.clone());
+                            app.push_output(
+                                format!(
                                     "Owner set: {} ({})",
                                     contact.display_name,
-                                    &sender_pubkey[..16.min(sender_pubkey.len())]
-                                );
-                                app.push_output(
-                                    format!(
-                                        "Owner set: {} ({})",
-                                        contact.display_name,
-                                        short_key(sender_pubkey)
-                                    ),
-                                    Color::Green,
-                                );
-                            } else {
-                                tracing::info!("Approved owner request: {}", contact.display_name);
-                                app.push_output(
-                                    format!("Approved: {} (owner)", contact.display_name),
-                                    Color::Green,
-                                );
-                            }
-                            app.notify(format!("{} approved", contact.display_name));
-                            refresh_contacts(app).await;
-                            // Refresh rooms and auto-select the new conversation
-                            refresh_rooms(app).await;
-                            if let Some(identity) = &app.identity_hex {
-                                let new_room_id = format!("{}:{}", sender_pubkey, identity);
-                                if let Some(pos) = app.display_rows.iter().position(|r| {
-                                    matches!(&r.kind, DisplayRowKind::Room { room_id, .. } if room_id == &new_room_id)
-                                }) {
-                                    app.room_state.select(Some(pos));
-                                    load_messages(app, &new_room_id).await;
-                                    app.active_panel = Panel::Input;
-                                }
-                            }
-                            accepted = true;
-                            break;
+                                    short_key(sender_pubkey)
+                                ),
+                                Color::Green,
+                            );
                         }
-                        Err(e) => {
-                            tracing::warn!("Auto-approve attempt {} failed: {e}", attempt + 1);
-                            if attempt < 2 {
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        app.notify(format!("{} approved", contact.display_name));
+                        refresh_contacts(app).await;
+                        refresh_rooms(app).await;
+                        // Auto-select the new conversation
+                        if let Some(identity) = &app.identity_hex {
+                            let new_room_id = format!("{}:{}", sender_pubkey, identity);
+                            if let Some(pos) = app.display_rows.iter().position(|r| {
+                                matches!(&r.kind, DisplayRowKind::Room { room_id, .. } if room_id == &new_room_id)
+                            }) {
+                                app.room_state.select(Some(pos));
+                                load_messages(app, &new_room_id).await;
+                                app.active_panel = Panel::Input;
                             }
                         }
                     }
-                }
-                if !accepted {
-                    app.push_output(
-                        format!("Auto-approve failed. Manual: /accept {request_id}"),
-                        Color::Red,
-                    );
+                    Err(e) => {
+                        // Auto-approve failed — fall back to manual
+                        tracing::warn!("Auto-approve failed: {e}");
+                        app.pending_requests.push((
+                            request_id.clone(),
+                            sender_pubkey.clone(),
+                            sender_name.clone(),
+                        ));
+                        app.push_output(
+                            format!("Auto-approve failed. /accept {request_id}"),
+                            Color::Red,
+                        );
+                    }
                 }
             } else {
-                tracing::info!("Owner exists, queuing for manual approval");
+                // Non-owner: queue for manual approval, show request_id clearly
+                app.pending_requests.push((
+                    request_id.clone(),
+                    sender_pubkey.clone(),
+                    sender_name.clone(),
+                ));
+                tracing::info!(
+                    "pending_requests count after push: {}",
+                    app.pending_requests.len()
+                );
                 app.push_output(
-                    format!("Friend request from {sender_name}. /accept {request_id}"),
+                    format!(
+                        "📩 Friend request from: {sender_name} ({})",
+                        short_key(sender_pubkey)
+                    ),
                     Color::Yellow,
                 );
+                app.push_output(format!("   /accept {request_id}"), Color::Cyan);
+                app.push_output(format!("   /reject {request_id}"), Color::DarkGray);
                 app.notify(format!("Friend request from {sender_name}"));
             }
             refresh_rooms(app).await;

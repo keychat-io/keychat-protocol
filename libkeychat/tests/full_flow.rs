@@ -14,9 +14,9 @@ use base64::Engine;
 use libkeychat::{
     accept_friend_request_persistent, create_signal_group, generate_prekey_material,
     receive_friend_request, receive_group_message, receive_signal_message,
-    send_friend_request_persistent, send_signal_message, serialize_prekey_material,
-    AddressManager, EphemeralKeypair, GroupManager, Identity, KCMessage, KCMessageKind,
-    MlsParticipant, ProtocolAddress, SecureStorage, SignalParticipant,
+    send_friend_request_persistent, send_signal_message, serialize_prekey_material, AddressManager,
+    EphemeralKeypair, GroupManager, Identity, KCMessage, KCMessageKind, MlsParticipant,
+    ProtocolAddress, SecureStorage, SignalParticipant,
 };
 use libsignal_protocol::DeviceId;
 
@@ -54,7 +54,6 @@ impl TestUser {
             db_path,
         }
     }
-
 }
 
 // ─── Part 1: Friend Requests ──────────────────────────────────────────────
@@ -62,10 +61,7 @@ impl TestUser {
 /// Simulate Alice sending a friend request to Bob, Bob receiving and approving it.
 /// Returns (alice_peer_signal_id (Bob's signal id seen by Alice),
 ///          bob_peer_signal_id (Alice's signal id seen by Bob)).
-async fn do_friend_request(
-    sender: &mut TestUser,
-    receiver: &mut TestUser,
-) -> (String, String) {
+async fn do_friend_request(sender: &mut TestUser, receiver: &mut TestUser) -> (String, String) {
     // 1. Sender sends friend request (persistent)
     let keys = generate_prekey_material().unwrap();
     let (ser_pub, ser_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
@@ -76,7 +72,15 @@ async fn do_friend_request(
     {
         let store = sender.storage.lock().unwrap();
         store
-            .save_signal_participant(&signal_id_hex, 1, &ser_pub, &ser_priv, reg_id, spk_id, &spk_rec)
+            .save_signal_participant(
+                &signal_id_hex,
+                1,
+                &ser_pub,
+                &ser_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+            )
             .unwrap();
     }
 
@@ -104,7 +108,15 @@ async fn do_friend_request(
     {
         let store = receiver.storage.lock().unwrap();
         store
-            .save_signal_participant(&accept_signal_id, 1, &a_pub, &a_priv, a_reg, a_spk_id, &a_spk_rec)
+            .save_signal_participant(
+                &accept_signal_id,
+                1,
+                &a_pub,
+                &a_priv,
+                a_reg,
+                a_spk_id,
+                &a_spk_rec,
+            )
             .unwrap();
     }
 
@@ -127,7 +139,9 @@ async fn do_friend_request(
     let bob_signal_addr = ProtocolAddress::new(bob_signal_id.clone(), device_id_1());
 
     let mut alice_signal = fr_state.signal_participant;
-    let decrypt_result = alice_signal.decrypt_bytes(&bob_signal_addr, &ciphertext).unwrap();
+    let decrypt_result = alice_signal
+        .decrypt_bytes(&bob_signal_addr, &ciphertext)
+        .unwrap();
 
     let approve_json = String::from_utf8(decrypt_result).unwrap();
     let approve_msg = KCMessage::try_parse(&approve_json).unwrap();
@@ -174,29 +188,26 @@ async fn do_friend_request(
 async fn send_and_verify(
     sender: &mut TestUser,
     receiver: &mut TestUser,
-    peer_signal_id_at_sender: &str,   // receiver's signal ID (key in sender's sessions)
-    peer_signal_id_at_receiver: &str,  // sender's signal ID (key in receiver's sessions)
+    peer_signal_id_at_sender: &str, // receiver's signal ID (key in sender's sessions)
+    peer_signal_id_at_receiver: &str, // sender's signal ID (key in receiver's sessions)
     text: &str,
 ) {
     let entry = sender.sessions.get_mut(peer_signal_id_at_sender).unwrap();
-    let to_address = entry.addr_mgr.resolve_send_address(peer_signal_id_at_sender).unwrap();
+    let to_address = entry
+        .addr_mgr
+        .resolve_send_address(peer_signal_id_at_sender)
+        .unwrap();
     let msg = KCMessage::text(text);
-    let event = send_signal_message(
-        &mut entry.signal,
-        &entry.remote_addr,
-        &msg,
-        &to_address,
-    )
-    .await
-    .unwrap();
+    let event = send_signal_message(&mut entry.signal, &entry.remote_addr, &msg, &to_address)
+        .await
+        .unwrap();
 
-    let recv_entry = receiver.sessions.get_mut(peer_signal_id_at_receiver).unwrap();
-    let (received, _dr) = receive_signal_message(
-        &mut recv_entry.signal,
-        &recv_entry.remote_addr,
-        &event,
-    )
-    .unwrap();
+    let recv_entry = receiver
+        .sessions
+        .get_mut(peer_signal_id_at_receiver)
+        .unwrap();
+    let (received, _dr) =
+        receive_signal_message(&mut recv_entry.signal, &recv_entry.remote_addr, &event).unwrap();
 
     assert_eq!(received.kind, KCMessageKind::Text);
     assert_eq!(received.text.as_ref().unwrap().content, text);
@@ -282,7 +293,10 @@ async fn test_signal_small_group(
         &bob_groups,
     )
     .unwrap();
-    assert_eq!(received.text.as_ref().unwrap().content, "Hello Signal group from Alice!");
+    assert_eq!(
+        received.text.as_ref().unwrap().content,
+        "Hello Signal group from Alice!"
+    );
     assert_eq!(metadata.group_id, group_id);
 
     // Alice sends the same group message to Tom (via her per-peer session with Tom)
@@ -307,7 +321,10 @@ async fn test_signal_small_group(
         &tom_groups,
     )
     .unwrap();
-    assert_eq!(received_tom.text.as_ref().unwrap().content, "Hello Signal group from Alice!");
+    assert_eq!(
+        received_tom.text.as_ref().unwrap().content,
+        "Hello Signal group from Alice!"
+    );
     assert_eq!(metadata_tom.group_id, group_id);
 
     println!("[Signal Group] All members received group messages successfully");
@@ -330,7 +347,9 @@ fn test_mls_large_group() {
     let tom_kp = tom_mls.generate_key_package().unwrap();
 
     // Alice adds Bob and Tom
-    let (_commit, welcome) = alice_mls.add_members(group_id, vec![bob_kp, tom_kp]).unwrap();
+    let (_commit, welcome) = alice_mls
+        .add_members(group_id, vec![bob_kp, tom_kp])
+        .unwrap();
 
     // Bob and Tom join
     let joined_bob = bob_mls.join_group(&welcome).unwrap();
@@ -346,13 +365,19 @@ fn test_mls_large_group() {
     // Bob decrypts
     let (decrypted_bob, sender_bob) = bob_mls.decrypt(group_id, &ciphertext).unwrap();
     let dec_msg_bob = KCMessage::try_parse(&String::from_utf8(decrypted_bob).unwrap()).unwrap();
-    assert_eq!(dec_msg_bob.text.as_ref().unwrap().content, "Hello MLS group from Alice!");
+    assert_eq!(
+        dec_msg_bob.text.as_ref().unwrap().content,
+        "Hello MLS group from Alice!"
+    );
     assert_eq!(sender_bob, "alice_mls");
 
     // Tom decrypts
     let (decrypted_tom, sender_tom) = tom_mls.decrypt(group_id, &ciphertext).unwrap();
     let dec_msg_tom = KCMessage::try_parse(&String::from_utf8(decrypted_tom).unwrap()).unwrap();
-    assert_eq!(dec_msg_tom.text.as_ref().unwrap().content, "Hello MLS group from Alice!");
+    assert_eq!(
+        dec_msg_tom.text.as_ref().unwrap().content,
+        "Hello MLS group from Alice!"
+    );
     assert_eq!(sender_tom, "alice_mls");
 
     // Bob sends a message
@@ -362,12 +387,18 @@ fn test_mls_large_group() {
 
     let (dec_alice, sender) = alice_mls.decrypt(group_id, &bob_ct).unwrap();
     let dec_alice_msg = KCMessage::try_parse(&String::from_utf8(dec_alice).unwrap()).unwrap();
-    assert_eq!(dec_alice_msg.text.as_ref().unwrap().content, "Bob reporting in MLS!");
+    assert_eq!(
+        dec_alice_msg.text.as_ref().unwrap().content,
+        "Bob reporting in MLS!"
+    );
     assert_eq!(sender, "bob_mls");
 
     let (dec_tom2, sender2) = tom_mls.decrypt(group_id, &bob_ct).unwrap();
     let dec_tom2_msg = KCMessage::try_parse(&String::from_utf8(dec_tom2).unwrap()).unwrap();
-    assert_eq!(dec_tom2_msg.text.as_ref().unwrap().content, "Bob reporting in MLS!");
+    assert_eq!(
+        dec_tom2_msg.text.as_ref().unwrap().content,
+        "Bob reporting in MLS!"
+    );
     assert_eq!(sender2, "bob_mls");
 
     // Tom sends a message
@@ -377,12 +408,18 @@ fn test_mls_large_group() {
 
     let (dec_a3, s3) = alice_mls.decrypt(group_id, &tom_ct).unwrap();
     let dec_a3_msg = KCMessage::try_parse(&String::from_utf8(dec_a3).unwrap()).unwrap();
-    assert_eq!(dec_a3_msg.text.as_ref().unwrap().content, "Tom here in MLS!");
+    assert_eq!(
+        dec_a3_msg.text.as_ref().unwrap().content,
+        "Tom here in MLS!"
+    );
     assert_eq!(s3, "tom_mls");
 
     let (dec_b3, s4) = bob_mls.decrypt(group_id, &tom_ct).unwrap();
     let dec_b3_msg = KCMessage::try_parse(&String::from_utf8(dec_b3).unwrap()).unwrap();
-    assert_eq!(dec_b3_msg.text.as_ref().unwrap().content, "Tom here in MLS!");
+    assert_eq!(
+        dec_b3_msg.text.as_ref().unwrap().content,
+        "Tom here in MLS!"
+    );
     assert_eq!(s4, "tom_mls");
 
     println!("[MLS Group] All members sent and received messages successfully");
@@ -401,7 +438,10 @@ async fn test_persistence_restart(
     // Record ratchet state before restart — encrypt a message to advance ratchet
     let pre_restart_msg = KCMessage::text("pre-restart canary");
     let entry = sender.sessions.get_mut(peer_id_at_sender).unwrap();
-    let to_addr = entry.addr_mgr.resolve_send_address(peer_id_at_sender).unwrap();
+    let to_addr = entry
+        .addr_mgr
+        .resolve_send_address(peer_id_at_sender)
+        .unwrap();
     let event = send_signal_message(
         &mut entry.signal,
         &entry.remote_addr,
@@ -412,12 +452,8 @@ async fn test_persistence_restart(
     .unwrap();
 
     let recv_entry = receiver.sessions.get_mut(peer_id_at_receiver).unwrap();
-    let (dec, _) = receive_signal_message(
-        &mut recv_entry.signal,
-        &recv_entry.remote_addr,
-        &event,
-    )
-    .unwrap();
+    let (dec, _) =
+        receive_signal_message(&mut recv_entry.signal, &recv_entry.remote_addr, &event).unwrap();
     assert_eq!(dec.text.as_ref().unwrap().content, "pre-restart canary");
 
     // Save sender's participant to persistent storage, then "restart"
@@ -435,7 +471,7 @@ async fn test_persistence_restart(
                 &id_pub,
                 &id_priv,
                 reg_id,
-                1, // spk_id
+                1,   // spk_id
                 &[], // spk_rec — not needed for restore_persistent
             )
             .unwrap();
@@ -474,7 +510,10 @@ async fn test_persistence_restart(
     // Post-restart: sender sends another message — ratchet must continue, NOT reset
     let post_restart_msg = KCMessage::text("post-restart message");
     let entry = sender.sessions.get_mut(peer_id_at_sender).unwrap();
-    let to_addr = entry.addr_mgr.resolve_send_address(peer_id_at_sender).unwrap();
+    let to_addr = entry
+        .addr_mgr
+        .resolve_send_address(peer_id_at_sender)
+        .unwrap();
     let post_event = send_signal_message(
         &mut entry.signal,
         &entry.remote_addr,
@@ -486,18 +525,18 @@ async fn test_persistence_restart(
 
     // Receiver decrypts post-restart message
     let recv_entry = receiver.sessions.get_mut(peer_id_at_receiver).unwrap();
-    let (dec2, _) = receive_signal_message(
-        &mut recv_entry.signal,
-        &recv_entry.remote_addr,
-        &post_event,
-    )
-    .unwrap();
+    let (dec2, _) =
+        receive_signal_message(&mut recv_entry.signal, &recv_entry.remote_addr, &post_event)
+            .unwrap();
     assert_eq!(dec2.text.as_ref().unwrap().content, "post-restart message");
 
     // Verify bidirectional: receiver sends back after sender's restart
     let reply_msg = KCMessage::text("reply after your restart");
     let recv_entry = receiver.sessions.get_mut(peer_id_at_receiver).unwrap();
-    let recv_to = recv_entry.addr_mgr.resolve_send_address(peer_id_at_receiver).unwrap();
+    let recv_to = recv_entry
+        .addr_mgr
+        .resolve_send_address(peer_id_at_receiver)
+        .unwrap();
     let reply_event = send_signal_message(
         &mut recv_entry.signal,
         &recv_entry.remote_addr,
@@ -508,13 +547,12 @@ async fn test_persistence_restart(
     .unwrap();
 
     let entry = sender.sessions.get_mut(peer_id_at_sender).unwrap();
-    let (dec3, _) = receive_signal_message(
-        &mut entry.signal,
-        &entry.remote_addr,
-        &reply_event,
-    )
-    .unwrap();
-    assert_eq!(dec3.text.as_ref().unwrap().content, "reply after your restart");
+    let (dec3, _) =
+        receive_signal_message(&mut entry.signal, &entry.remote_addr, &reply_event).unwrap();
+    assert_eq!(
+        dec3.text.as_ref().unwrap().content,
+        "reply after your restart"
+    );
 
     println!(
         "[Persistence] {} <-> {}: ratchet survived restart, bidirectional messaging works",
@@ -538,53 +576,122 @@ async fn full_flow_friend_request_messaging_groups_persistence() {
 
     // Alice adds Bob
     let (alice_bob_peer, bob_alice_peer) = do_friend_request(&mut alice, &mut bob).await;
-    println!("[FR] Alice <-> Bob established: alice sees bob as {}", &alice_bob_peer[..16]);
+    println!(
+        "[FR] Alice <-> Bob established: alice sees bob as {}",
+        &alice_bob_peer[..16]
+    );
 
     // Alice adds Tom
     let (alice_tom_peer, tom_alice_peer) = do_friend_request(&mut alice, &mut tom).await;
-    println!("[FR] Alice <-> Tom established: alice sees tom as {}", &alice_tom_peer[..16]);
+    println!(
+        "[FR] Alice <-> Tom established: alice sees tom as {}",
+        &alice_tom_peer[..16]
+    );
 
     // Bob adds Tom (so all three are friends)
     let (bob_tom_peer, tom_bob_peer) = do_friend_request(&mut bob, &mut tom).await;
-    println!("[FR] Bob <-> Tom established: bob sees tom as {}", &bob_tom_peer[..16]);
+    println!(
+        "[FR] Bob <-> Tom established: bob sees tom as {}",
+        &bob_tom_peer[..16]
+    );
 
     println!("\n=== Phase 2: 1:1 Signal Messaging ===");
 
     // Alice → Bob
-    send_and_verify(&mut alice, &mut bob, &alice_bob_peer, &bob_alice_peer, "Hello Bob from Alice!").await;
+    send_and_verify(
+        &mut alice,
+        &mut bob,
+        &alice_bob_peer,
+        &bob_alice_peer,
+        "Hello Bob from Alice!",
+    )
+    .await;
     // Bob → Alice
-    send_and_verify(&mut bob, &mut alice, &bob_alice_peer, &alice_bob_peer, "Hello Alice from Bob!").await;
+    send_and_verify(
+        &mut bob,
+        &mut alice,
+        &bob_alice_peer,
+        &alice_bob_peer,
+        "Hello Alice from Bob!",
+    )
+    .await;
     println!("[1:1] Alice <-> Bob: bidirectional OK");
 
     // Alice → Tom
-    send_and_verify(&mut alice, &mut tom, &alice_tom_peer, &tom_alice_peer, "Hello Tom from Alice!").await;
+    send_and_verify(
+        &mut alice,
+        &mut tom,
+        &alice_tom_peer,
+        &tom_alice_peer,
+        "Hello Tom from Alice!",
+    )
+    .await;
     // Tom → Alice
-    send_and_verify(&mut tom, &mut alice, &tom_alice_peer, &alice_tom_peer, "Hello Alice from Tom!").await;
+    send_and_verify(
+        &mut tom,
+        &mut alice,
+        &tom_alice_peer,
+        &alice_tom_peer,
+        "Hello Alice from Tom!",
+    )
+    .await;
     println!("[1:1] Alice <-> Tom: bidirectional OK");
 
     // Bob → Tom
-    send_and_verify(&mut bob, &mut tom, &bob_tom_peer, &tom_bob_peer, "Hello Tom from Bob!").await;
+    send_and_verify(
+        &mut bob,
+        &mut tom,
+        &bob_tom_peer,
+        &tom_bob_peer,
+        "Hello Tom from Bob!",
+    )
+    .await;
     // Tom → Bob
-    send_and_verify(&mut tom, &mut bob, &tom_bob_peer, &bob_tom_peer, "Hello Bob from Tom!").await;
+    send_and_verify(
+        &mut tom,
+        &mut bob,
+        &tom_bob_peer,
+        &bob_tom_peer,
+        "Hello Bob from Tom!",
+    )
+    .await;
     println!("[1:1] Bob <-> Tom: bidirectional OK");
 
     // Multiple messages in sequence to exercise ratchet advancement
     for i in 1..=5 {
         let text = format!("Ratchet msg #{i} from Alice");
-        send_and_verify(&mut alice, &mut bob, &alice_bob_peer, &bob_alice_peer, &text).await;
+        send_and_verify(
+            &mut alice,
+            &mut bob,
+            &alice_bob_peer,
+            &bob_alice_peer,
+            &text,
+        )
+        .await;
     }
     for i in 1..=5 {
         let text = format!("Ratchet msg #{i} from Bob");
-        send_and_verify(&mut bob, &mut alice, &bob_alice_peer, &alice_bob_peer, &text).await;
+        send_and_verify(
+            &mut bob,
+            &mut alice,
+            &bob_alice_peer,
+            &alice_bob_peer,
+            &text,
+        )
+        .await;
     }
     println!("[1:1] Ratchet advancement (10 messages alternating): OK");
 
     println!("\n=== Phase 3a: Signal Small Group ===");
 
     test_signal_small_group(
-        &mut alice, &mut bob, &mut tom,
-        &alice_bob_peer, &alice_tom_peer,
-        &bob_alice_peer, &tom_alice_peer,
+        &mut alice,
+        &mut bob,
+        &mut tom,
+        &alice_bob_peer,
+        &alice_tom_peer,
+        &bob_alice_peer,
+        &tom_alice_peer,
     )
     .await;
 
@@ -595,18 +702,10 @@ async fn full_flow_friend_request_messaging_groups_persistence() {
     println!("\n=== Phase 4: Persistence / Restart ===");
 
     // Test persistence for Alice-Bob session
-    test_persistence_restart(
-        &mut alice, &mut bob,
-        &alice_bob_peer, &bob_alice_peer,
-    )
-    .await;
+    test_persistence_restart(&mut alice, &mut bob, &alice_bob_peer, &bob_alice_peer).await;
 
     // Test persistence for Bob-Tom session
-    test_persistence_restart(
-        &mut bob, &mut tom,
-        &bob_tom_peer, &tom_bob_peer,
-    )
-    .await;
+    test_persistence_restart(&mut bob, &mut tom, &bob_tom_peer, &tom_bob_peer).await;
 
     println!("\n=== All phases passed! ===");
 }

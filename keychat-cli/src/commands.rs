@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use chrono::TimeZone;
 use keychat_app_core::{
-    ClientEvent, DataChange, DataListener, EventListener, FileCategory, FilePayload, AppClient,
-    AppError, RoomType,
+    AppClient, AppError, ClientEvent, DataChange, DataListener, EventListener, FileCategory,
+    FilePayload, RoomType,
 };
 use tokio::sync::broadcast;
 
@@ -131,10 +131,7 @@ pub enum SendResult {
 
 /// Send a text message to a room, routing to the correct API based on room type.
 /// This is the single source of truth for message routing — all modes must use this.
-pub async fn send_to_room(
-    client: &AppClient,
-    room_id: &str,
-) -> Result<RoomType, AppError> {
+pub async fn send_to_room(client: &AppClient, room_id: &str) -> Result<RoomType, AppError> {
     // Just resolve room type — caller handles sending with the right API
     if let Some(room) = client.get_room(room_id.to_string()).await? {
         Ok(room.room_type)
@@ -186,7 +183,9 @@ pub async fn send_file_message(
     message: Option<String>,
 ) -> Result<SendResult, AppError> {
     if files.is_empty() {
-        return Err(AppError::InvalidArgument("files list cannot be empty".into(),));
+        return Err(AppError::InvalidArgument(
+            "files list cannot be empty".into(),
+        ));
     }
 
     if let Some(room) = client.get_room(room_id.to_string()).await? {
@@ -223,7 +222,9 @@ pub async fn upload_and_prepare_file(
     file_path: &Path,
     server_url: &str,
 ) -> Result<FilePayload, AppError> {
-    let data = fs::read(file_path).map_err(|e| AppError::InvalidArgument(format!("Failed to read file {}: {e}", file_path.display()),))?;
+    let data = fs::read(file_path).map_err(|e| {
+        AppError::InvalidArgument(format!("Failed to read file {}: {e}", file_path.display()))
+    })?;
 
     let route = if keychat_app_core::is_relay_server(server_url.to_string()) {
         "relay-presigned"
@@ -233,7 +234,11 @@ pub async fn upload_and_prepare_file(
 
     let result = keychat_app_core::encrypt_and_upload_routed(data, server_url.to_string())
         .await
-        .map_err(|e| AppError::MediaTransfer(format!("upload route={route}, server={server_url}, error={e}"),))?;
+        .map_err(|e| {
+            AppError::MediaTransfer(format!(
+                "upload route={route}, server={server_url}, error={e}"
+            ))
+        })?;
 
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let category = category_from_extension(ext);
@@ -520,10 +525,7 @@ pub async fn create_identity(
 
 /// Import identity from mnemonic with full persistence.
 /// Returns pubkey_hex.
-pub async fn import_identity(
-    client: &AppClient,
-    mnemonic: &str,
-) -> Result<String, AppError> {
+pub async fn import_identity(client: &AppClient, mnemonic: &str) -> Result<String, AppError> {
     let pubkey = client.import_identity(mnemonic.to_string()).await?;
     save_mnemonic(client, mnemonic).await;
 

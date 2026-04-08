@@ -596,7 +596,8 @@ pub async fn encrypt_for_group_member(
     address_manager: &AddressManager,
 ) -> Result<Event> {
     let json = message.to_json()?;
-    let remote_address = ProtocolAddress::new(member_signal_id.to_string(), DeviceId::new(1).unwrap());
+    let remote_address =
+        ProtocolAddress::new(member_signal_id.to_string(), DeviceId::new(1).unwrap());
     let to_address = address_manager.resolve_send_address(member_signal_id)?;
     let ct = signal.encrypt(&remote_address, json.as_bytes())?;
     build_mode1_event(&ct.bytes, &to_address).await

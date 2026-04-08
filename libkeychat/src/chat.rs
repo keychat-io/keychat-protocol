@@ -1087,7 +1087,9 @@ mod tests {
         let agent_npub = EphemeralKeypair::generate().pubkey_hex();
 
         // Normal mode: single p-tag
-        let event_normal = build_mode1_event(b"ciphertext", &ratchet_addr).await.unwrap();
+        let event_normal = build_mode1_event(b"ciphertext", &ratchet_addr)
+            .await
+            .unwrap();
         let p_tags_normal = extract_p_tags(&event_normal);
         assert_eq!(p_tags_normal.len(), 1);
         assert_eq!(p_tags_normal[0], ratchet_addr);
@@ -1099,15 +1101,24 @@ mod tests {
                 .unwrap();
         let p_tags_dual = extract_p_tags(&event_dual);
         assert_eq!(p_tags_dual.len(), 2);
-        assert_eq!(p_tags_dual[0], ratchet_addr, "first p-tag should be ratchet address");
-        assert_eq!(p_tags_dual[1], agent_npub, "second p-tag should be agent npub");
+        assert_eq!(
+            p_tags_dual[0], ratchet_addr,
+            "first p-tag should be ratchet address"
+        );
+        assert_eq!(
+            p_tags_dual[1], agent_npub,
+            "second p-tag should be agent npub"
+        );
     }
 
     #[test]
     fn friend_approve_public_agent_serialization() {
         let msg = KCMessage::friend_approve_public_agent("fr-001".into(), Some("Welcome".into()));
         let json = msg.to_json().unwrap();
-        assert!(json.contains("\"publicAgent\":true"), "should contain publicAgent field");
+        assert!(
+            json.contains("\"publicAgent\":true"),
+            "should contain publicAgent field"
+        );
 
         let parsed = KCMessage::try_parse(&json).unwrap();
         let payload = parsed.friend_approve.unwrap();
@@ -1118,7 +1129,10 @@ mod tests {
     fn friend_approve_without_public_agent() {
         let msg = KCMessage::friend_approve("fr-002".into(), None);
         let json = msg.to_json().unwrap();
-        assert!(!json.contains("publicAgent"), "should not contain publicAgent when None");
+        assert!(
+            !json.contains("publicAgent"),
+            "should not contain publicAgent when None"
+        );
 
         let parsed = KCMessage::try_parse(&json).unwrap();
         let payload = parsed.friend_approve.unwrap();

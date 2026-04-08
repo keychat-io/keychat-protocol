@@ -1,6 +1,6 @@
 //! Signal Group — thin UniFFI delegation to keychat-app-core::AppClient.
 
-use crate::client::{KeychatClient, convert_file_payload, convert_reply_to};
+use crate::client::{convert_file_payload, convert_reply_to, KeychatClient};
 use crate::error::KeychatUniError;
 use crate::types::*;
 
@@ -124,4 +124,3 @@ fn convert_group_sent_message(m: keychat_app_core::GroupSentMessage) -> GroupSen
         relay_status_json: m.relay_status_json,
     }
 }
-

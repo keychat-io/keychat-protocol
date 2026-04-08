@@ -61,56 +61,135 @@ impl keychat_app_core::DataListener for DataListenerBridge {
 }
 
 pub(crate) fn convert_client_event(e: keychat_app_core::ClientEvent) -> crate::types::ClientEvent {
-    use keychat_app_core::ClientEvent as CE;
     use crate::types::ClientEvent as UE;
+    use keychat_app_core::ClientEvent as CE;
     match e {
-        CE::FriendRequestReceived { request_id, sender_pubkey, sender_name, message, created_at } =>
-            UE::FriendRequestReceived { request_id, sender_pubkey, sender_name, message, created_at },
-        CE::FriendRequestAccepted { peer_pubkey, peer_name } =>
-            UE::FriendRequestAccepted { peer_pubkey, peer_name },
-        CE::FriendRequestRejected { peer_pubkey } =>
-            UE::FriendRequestRejected { peer_pubkey },
-        CE::MessageReceived { room_id, sender_pubkey, kind, content, payload, event_id, fallback, reply_to_event_id, group_id, thread_id, nostr_event_json, relay_url } =>
-            UE::MessageReceived { room_id, sender_pubkey, kind: convert_message_kind(kind), content, payload, event_id, fallback, reply_to_event_id, group_id, thread_id, nostr_event_json, relay_url },
-        CE::GroupInviteReceived { room_id, group_type, group_name, inviter_pubkey } =>
-            UE::GroupInviteReceived { room_id, group_type, group_name, inviter_pubkey },
-        CE::GroupMemberChanged { room_id, kind, member_pubkey, new_value } =>
-            UE::GroupMemberChanged { room_id, kind: convert_group_change_kind(kind), member_pubkey, new_value },
+        CE::FriendRequestReceived {
+            request_id,
+            sender_pubkey,
+            sender_name,
+            message,
+            created_at,
+        } => UE::FriendRequestReceived {
+            request_id,
+            sender_pubkey,
+            sender_name,
+            message,
+            created_at,
+        },
+        CE::FriendRequestAccepted {
+            peer_pubkey,
+            peer_name,
+        } => UE::FriendRequestAccepted {
+            peer_pubkey,
+            peer_name,
+        },
+        CE::FriendRequestRejected { peer_pubkey } => UE::FriendRequestRejected { peer_pubkey },
+        CE::MessageReceived {
+            room_id,
+            sender_pubkey,
+            kind,
+            content,
+            payload,
+            event_id,
+            fallback,
+            reply_to_event_id,
+            group_id,
+            thread_id,
+            nostr_event_json,
+            relay_url,
+        } => UE::MessageReceived {
+            room_id,
+            sender_pubkey,
+            kind: convert_message_kind(kind),
+            content,
+            payload,
+            event_id,
+            fallback,
+            reply_to_event_id,
+            group_id,
+            thread_id,
+            nostr_event_json,
+            relay_url,
+        },
+        CE::GroupInviteReceived {
+            room_id,
+            group_type,
+            group_name,
+            inviter_pubkey,
+        } => UE::GroupInviteReceived {
+            room_id,
+            group_type,
+            group_name,
+            inviter_pubkey,
+        },
+        CE::GroupMemberChanged {
+            room_id,
+            kind,
+            member_pubkey,
+            new_value,
+        } => UE::GroupMemberChanged {
+            room_id,
+            kind: convert_group_change_kind(kind),
+            member_pubkey,
+            new_value,
+        },
         CE::GroupDissolved { room_id } => UE::GroupDissolved { room_id },
         CE::EventLoopError { description } => UE::EventLoopError { description },
-        CE::RelayOk { event_id, relay_url, success, message } =>
-            UE::RelayOk { event_id, relay_url, success, message },
+        CE::RelayOk {
+            event_id,
+            relay_url,
+            success,
+            message,
+        } => UE::RelayOk {
+            event_id,
+            relay_url,
+            success,
+            message,
+        },
     }
 }
 
 pub(crate) fn convert_message_kind(k: keychat_app_core::MessageKind) -> crate::types::MessageKind {
-    use keychat_app_core::MessageKind as MK;
     use crate::types::MessageKind as UK;
+    use keychat_app_core::MessageKind as MK;
     match k {
-        MK::Text => UK::Text, MK::Files => UK::Files, MK::Cashu => UK::Cashu,
-        MK::LightningInvoice => UK::LightningInvoice, MK::FriendRequest => UK::FriendRequest,
-        MK::FriendApprove => UK::FriendApprove, MK::FriendReject => UK::FriendReject,
-        MK::ProfileSync => UK::ProfileSync, MK::SignalGroupInvite => UK::SignalGroupInvite,
+        MK::Text => UK::Text,
+        MK::Files => UK::Files,
+        MK::Cashu => UK::Cashu,
+        MK::LightningInvoice => UK::LightningInvoice,
+        MK::FriendRequest => UK::FriendRequest,
+        MK::FriendApprove => UK::FriendApprove,
+        MK::FriendReject => UK::FriendReject,
+        MK::ProfileSync => UK::ProfileSync,
+        MK::SignalGroupInvite => UK::SignalGroupInvite,
         MK::SignalGroupMemberRemoved => UK::SignalGroupMemberRemoved,
         MK::SignalGroupSelfLeave => UK::SignalGroupSelfLeave,
         MK::SignalGroupDissolve => UK::SignalGroupDissolve,
         MK::SignalGroupNameChanged => UK::SignalGroupNameChanged,
-        MK::MlsGroupInvite => UK::MlsGroupInvite, MK::AgentReply => UK::AgentReply,
+        MK::MlsGroupInvite => UK::MlsGroupInvite,
+        MK::AgentReply => UK::AgentReply,
         _ => UK::Text,
     }
 }
 
-pub(crate) fn convert_group_change_kind(k: keychat_app_core::GroupChangeKind) -> crate::types::GroupChangeKind {
+pub(crate) fn convert_group_change_kind(
+    k: keychat_app_core::GroupChangeKind,
+) -> crate::types::GroupChangeKind {
     match k {
-        keychat_app_core::GroupChangeKind::MemberRemoved => crate::types::GroupChangeKind::MemberRemoved,
+        keychat_app_core::GroupChangeKind::MemberRemoved => {
+            crate::types::GroupChangeKind::MemberRemoved
+        }
         keychat_app_core::GroupChangeKind::SelfLeave => crate::types::GroupChangeKind::SelfLeave,
-        keychat_app_core::GroupChangeKind::NameChanged => crate::types::GroupChangeKind::NameChanged,
+        keychat_app_core::GroupChangeKind::NameChanged => {
+            crate::types::GroupChangeKind::NameChanged
+        }
     }
 }
 
 pub(crate) fn convert_data_change(c: keychat_app_core::DataChange) -> crate::types::DataChange {
-    use keychat_app_core::DataChange as DC;
     use crate::types::DataChange as UD;
+    use keychat_app_core::DataChange as DC;
     match c {
         DC::RoomUpdated { room_id } => UD::RoomUpdated { room_id },
         DC::RoomDeleted { room_id } => UD::RoomDeleted { room_id },
@@ -122,30 +201,48 @@ pub(crate) fn convert_data_change(c: keychat_app_core::DataChange) -> crate::typ
         DC::IdentityListChanged => UD::IdentityListChanged,
         DC::ConnectionStatusChanged { status, message } => UD::ConnectionStatusChanged {
             status: match status {
-                keychat_app_core::ConnectionStatus::Disconnected => crate::types::ConnectionStatus::Disconnected,
-                keychat_app_core::ConnectionStatus::Connecting => crate::types::ConnectionStatus::Connecting,
-                keychat_app_core::ConnectionStatus::Connected => crate::types::ConnectionStatus::Connected,
-                keychat_app_core::ConnectionStatus::Reconnecting => crate::types::ConnectionStatus::Reconnecting,
-                keychat_app_core::ConnectionStatus::Failed => crate::types::ConnectionStatus::Failed,
+                keychat_app_core::ConnectionStatus::Disconnected => {
+                    crate::types::ConnectionStatus::Disconnected
+                }
+                keychat_app_core::ConnectionStatus::Connecting => {
+                    crate::types::ConnectionStatus::Connecting
+                }
+                keychat_app_core::ConnectionStatus::Connected => {
+                    crate::types::ConnectionStatus::Connected
+                }
+                keychat_app_core::ConnectionStatus::Reconnecting => {
+                    crate::types::ConnectionStatus::Reconnecting
+                }
+                keychat_app_core::ConnectionStatus::Failed => {
+                    crate::types::ConnectionStatus::Failed
+                }
             },
             message,
         },
     }
 }
 
-
 // ─── Shared type conversions (used by messaging.rs + group.rs) ──
 
 pub(crate) fn convert_file_payload(f: crate::types::FilePayload) -> keychat_app_core::FilePayload {
     keychat_app_core::FilePayload {
         category: convert_file_category(f.category),
-        url: f.url, mime_type: f.mime_type, suffix: f.suffix, size: f.size,
-        key: f.key, iv: f.iv, hash: f.hash, source_name: f.source_name,
-        audio_duration: f.audio_duration, amplitude_samples: f.amplitude_samples,
+        url: f.url,
+        mime_type: f.mime_type,
+        suffix: f.suffix,
+        size: f.size,
+        key: f.key,
+        iv: f.iv,
+        hash: f.hash,
+        source_name: f.source_name,
+        audio_duration: f.audio_duration,
+        amplitude_samples: f.amplitude_samples,
     }
 }
 
-pub(crate) fn convert_file_category(c: crate::types::FileCategory) -> keychat_app_core::FileCategory {
+pub(crate) fn convert_file_category(
+    c: crate::types::FileCategory,
+) -> keychat_app_core::FileCategory {
     match c {
         crate::types::FileCategory::Image => keychat_app_core::FileCategory::Image,
         crate::types::FileCategory::Video => keychat_app_core::FileCategory::Video,
@@ -158,7 +255,9 @@ pub(crate) fn convert_file_category(c: crate::types::FileCategory) -> keychat_ap
     }
 }
 
-pub(crate) fn convert_reply_to(r: crate::types::ReplyToPayload) -> keychat_app_core::ReplyToPayload {
+pub(crate) fn convert_reply_to(
+    r: crate::types::ReplyToPayload,
+) -> keychat_app_core::ReplyToPayload {
     keychat_app_core::ReplyToPayload {
         target_event_id: r.target_event_id,
         content: r.content,
@@ -247,9 +346,7 @@ impl KeychatClient {
     /// Get the files directory for a specific room.
     pub fn get_room_files_dir(&self, room_id: String) -> String {
         // Sanitize room_id to prevent path traversal
-        let sanitized: String = room_id
-            .replace(['/', '\\'], "_")
-            .replace("..", "__");
+        let sanitized: String = room_id.replace(['/', '\\'], "_").replace("..", "__");
         let path = std::path::Path::new(&self.app.files_dir).join(&sanitized);
         path.to_string_lossy().to_string()
     }
@@ -438,7 +535,8 @@ impl KeychatClient {
 
     /// Return the cached identity pubkey hex, or empty string if not yet imported.
     pub(crate) fn cached_identity_pubkey(&self) -> String {
-        self.app.identity_pubkey_hex
+        self.app
+            .identity_pubkey_hex
             .get()
             .cloned()
             .unwrap_or_default()
@@ -455,7 +553,8 @@ impl KeychatClient {
 
         // DB state
         let store = inner
-            .protocol.storage
+            .protocol
+            .storage
             .lock()
             .map_err(|e| KeychatUniError::Transport {
                 msg: format!("storage lock: {e}"),
@@ -502,9 +601,13 @@ impl KeychatClient {
     /// Call before dropping the client if another client will reopen the same DB.
     pub async fn close_storage(&self) -> Result<(), KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let store = inner.protocol.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
-        })?;
+        let store = inner
+            .protocol
+            .storage
+            .lock()
+            .map_err(|e| KeychatUniError::Storage {
+                msg: format!("storage lock: {e}"),
+            })?;
         store.checkpoint().map_err(|e| KeychatUniError::Storage {
             msg: format!("checkpoint: {e}"),
         })?;
@@ -512,7 +615,8 @@ impl KeychatClient {
     }
 
     pub async fn get_pubkey_hex(&self) -> Result<String, KeychatUniError> {
-        self.app.identity_pubkey_hex
+        self.app
+            .identity_pubkey_hex
             .get()
             .cloned()
             .ok_or(KeychatUniError::NotInitialized {
@@ -524,12 +628,14 @@ impl KeychatClient {
         // 1. Resolve relay URLs: parameter → DB → defaults
         let (identity, urls) = {
             let inner = self.app.inner.read().await;
-            let identity = inner
-                .protocol.identity
-                .clone()
-                .ok_or(KeychatUniError::NotInitialized {
-                    msg: "call create_identity first".into(),
-                })?;
+            let identity =
+                inner
+                    .protocol
+                    .identity
+                    .clone()
+                    .ok_or(KeychatUniError::NotInitialized {
+                        msg: "call create_identity first".into(),
+                    })?;
 
             let urls = if !relay_urls.is_empty() {
                 relay_urls
@@ -599,9 +705,13 @@ impl KeychatClient {
     /// Add a relay at runtime, connect to it, and persist to DB.
     pub async fn add_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         transport.add_relay_and_connect(&url).await?;
 
         let storage = inner.protocol.storage.clone();
@@ -615,9 +725,13 @@ impl KeychatClient {
     /// Remove a relay at runtime and delete from DB.
     pub async fn remove_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         transport.remove_relay(&url).await?;
 
         let storage = inner.protocol.storage.clone();
@@ -631,27 +745,39 @@ impl KeychatClient {
     /// Get the current relay URL list.
     pub async fn get_relays(&self) -> Result<Vec<String>, KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         Ok(transport.get_relays().await)
     }
 
     /// Get only the currently connected relay URLs.
     pub async fn connected_relays(&self) -> Result<Vec<String>, KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         Ok(transport.connected_relays().await)
     }
 
     /// Get relay URLs with their connection status.
     pub async fn get_relay_statuses(&self) -> Result<Vec<RelayStatusInfo>, KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         Ok(transport
             .get_relay_statuses()
             .await
@@ -663,9 +789,13 @@ impl KeychatClient {
     /// Reconnect to all relays (re-enables disabled ones).
     pub async fn reconnect_relays(&self) -> Result<(), KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         transport.reconnect().await?;
         tracing::info!("reconnected to all relays");
         Ok(())
@@ -674,9 +804,13 @@ impl KeychatClient {
     /// Reconnect a specific relay.
     pub async fn reconnect_relay(&self, url: String) -> Result<(), KeychatUniError> {
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         transport.reconnect_relay(&url).await?;
         tracing::info!("reconnected relay: {url}");
         Ok(())
@@ -692,9 +826,13 @@ impl KeychatClient {
                 msg: format!("invalid event JSON: {e}"),
             })?;
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         let result = transport.rebroadcast_event(event).await?;
         Ok(PublishResultInfo {
             event_id: result.event_id.to_hex(),
@@ -749,9 +887,11 @@ impl KeychatClient {
     }
 
     pub async fn remove_session(&self, peer_pubkey: String) -> Result<(), KeychatUniError> {
-        self.app.remove_session(peer_pubkey).await.map_err(Into::into)
+        self.app
+            .remove_session(peer_pubkey)
+            .await
+            .map_err(Into::into)
     }
-
 
     /// Register an event listener for receiving async events from the event loop.
     pub async fn set_event_listener(&self, listener: Box<dyn EventListener>) {
@@ -763,6 +903,4 @@ impl KeychatClient {
         let mut inner = self.app.inner.write().await;
         inner.data_listener = Some(Box::new(DataListenerBridge(listener)));
     }
-
 }
-

@@ -16,36 +16,62 @@ impl AppClient {
         // 1. Protocol: generate keys, publish, persist to SecureStorage, store in memory
         let (request_id, event_id_hex) = {
             let mut inner = self.inner.write().await;
-            inner.protocol.send_friend_request_protocol(&peer_nostr_pubkey, &my_name, &device_id).await?
+            inner
+                .protocol
+                .send_friend_request_protocol(&peer_nostr_pubkey, &my_name, &device_id)
+                .await?
         };
 
         // 2. App: persist to app_storage
         let peer_npub = npub_from_hex(peer_nostr_pubkey.clone()).unwrap_or_default();
         let room_id = make_room_id(&peer_nostr_pubkey, &identity_pubkey);
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
             let _ = store.transaction(|_| {
                 store.save_app_room(
-                    &peer_nostr_pubkey, &identity_pubkey,
-                    RoomStatus::Requesting.to_i32(), RoomType::Dm.to_i32(), None, None, None,
+                    &peer_nostr_pubkey,
+                    &identity_pubkey,
+                    RoomStatus::Requesting.to_i32(),
+                    RoomType::Dm.to_i32(),
+                    None,
+                    None,
+                    None,
                 )?;
                 store.save_app_contact(&peer_nostr_pubkey, &peer_npub, &identity_pubkey, None)?;
                 store.save_app_message(
-                    &request_id, Some(&event_id_hex), &room_id, &identity_pubkey,
-                    &identity_pubkey, "[Friend Request Sent]", true,
-                    MessageStatus::Success.to_i32(), now,
+                    &request_id,
+                    Some(&event_id_hex),
+                    &room_id,
+                    &identity_pubkey,
+                    &identity_pubkey,
+                    "[Friend Request Sent]",
+                    true,
+                    MessageStatus::Success.to_i32(),
+                    now,
                 )?;
-                store.update_app_room(&room_id, None, None, Some("[Friend Request Sent]"), Some(now))?;
+                store.update_app_room(
+                    &room_id,
+                    None,
+                    None,
+                    Some("[Friend Request Sent]"),
+                    Some(now),
+                )?;
                 Ok(())
             });
         }
 
         self.emit_data_change(DataChange::RoomListChanged).await;
         self.emit_data_change(DataChange::ContactListChanged).await;
-        self.emit_data_change(DataChange::MessageAdded { room_id, msgid: request_id.clone() }).await;
+        self.emit_data_change(DataChange::MessageAdded {
+            room_id,
+            msgid: request_id.clone(),
+        })
+        .await;
 
         // Re-subscribe to include the new first_inbox address for receiving the approve response
         {
@@ -55,7 +81,10 @@ impl AppClient {
             }
         }
 
-        Ok(PendingFriendRequest { request_id, peer_nostr_pubkey })
+        Ok(PendingFriendRequest {
+            request_id,
+            peer_nostr_pubkey,
+        })
     }
 
     pub async fn accept_friend_request(
@@ -66,36 +95,54 @@ impl AppClient {
         // 1. Protocol: load FR, generate keys, accept, create session, persist, publish
         let (peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex) = {
             let mut inner = self.inner.write().await;
-            inner.protocol.accept_friend_request_protocol(&request_id, &my_name).await?
+            inner
+                .protocol
+                .accept_friend_request_protocol(&request_id, &my_name)
+                .await?
         };
 
         // 2. App: update room, create message
         let identity_pubkey = self.cached_identity_pubkey();
         let room_id = make_room_id(&peer_nostr_hex, &identity_pubkey);
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         let msgid = format!("accept-{}", request_id);
         {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
             let _ = store.transaction(|_| {
                 store.update_app_room(
-                    &room_id, Some(RoomStatus::Enabled.to_i32()), None,
-                    Some("[Friend Request Accepted]"), Some(now),
+                    &room_id,
+                    Some(RoomStatus::Enabled.to_i32()),
+                    None,
+                    Some("[Friend Request Accepted]"),
+                    Some(now),
                 )?;
                 store.update_contact_name(&peer_nostr_hex, &identity_pubkey, &peer_name)?;
                 store.save_app_message(
-                    &msgid, Some(&event_id_hex), &room_id, &identity_pubkey,
-                    &identity_pubkey, "[Friend Request Accepted]", true,
-                    MessageStatus::Success.to_i32(), now,
+                    &msgid,
+                    Some(&event_id_hex),
+                    &room_id,
+                    &identity_pubkey,
+                    &identity_pubkey,
+                    "[Friend Request Accepted]",
+                    true,
+                    MessageStatus::Success.to_i32(),
+                    now,
                 )?;
                 Ok(())
             });
         }
 
-        self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
+        self.emit_data_change(DataChange::RoomUpdated {
+            room_id: room_id.clone(),
+        })
+        .await;
         self.emit_data_change(DataChange::ContactListChanged).await;
-        self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+        self.emit_data_change(DataChange::MessageAdded { room_id, msgid })
+            .await;
 
         // Re-subscribe to include new ratchet-derived addresses
         {
@@ -105,7 +152,11 @@ impl AppClient {
             }
         }
 
-        Ok(ContactInfo { nostr_pubkey_hex: peer_nostr_hex, signal_id_hex: peer_signal_hex, display_name: peer_name })
+        Ok(ContactInfo {
+            nostr_pubkey_hex: peer_nostr_hex,
+            signal_id_hex: peer_signal_hex,
+            display_name: peer_name,
+        })
     }
 
     pub async fn reject_friend_request(
@@ -127,11 +178,15 @@ impl AppClient {
                 let app_storage = self.inner.read().await.app_storage.clone();
                 let store = lock_app_storage(&app_storage);
                 let _ = store.update_app_room(
-                    &room_id, Some(RoomStatus::Rejected.to_i32()), None,
-                    Some("[Friend Request Rejected]"), None,
+                    &room_id,
+                    Some(RoomStatus::Rejected.to_i32()),
+                    None,
+                    Some("[Friend Request Rejected]"),
+                    None,
                 );
             }
-            self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+            self.emit_data_change(DataChange::RoomUpdated { room_id })
+                .await;
         }
 
         Ok(())

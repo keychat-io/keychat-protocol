@@ -44,8 +44,7 @@ async fn wait_for_event<F>(
 where
     F: Fn(&ClientEvent) -> bool,
 {
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         {
             let guard = events.lock().unwrap();
@@ -56,12 +55,9 @@ where
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::timeout(
-            deadline - tokio::time::Instant::now(),
-            notify.notified(),
-        )
-        .await
-        .ok();
+        tokio::time::timeout(deadline - tokio::time::Instant::now(), notify.notified())
+            .await
+            .ok();
     }
 }
 
@@ -100,7 +96,11 @@ async fn establish_friendship(
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let pending = sender
-        .send_friend_request(receiver_pubkey.clone(), sender_name.into(), "device-1".into())
+        .send_friend_request(
+            receiver_pubkey.clone(),
+            sender_name.into(),
+            "device-1".into(),
+        )
         .await
         .unwrap();
 
@@ -109,7 +109,10 @@ async fn establish_friendship(
         matches!(e, ClientEvent::FriendRequestReceived { .. })
     })
     .await;
-    assert!(got_request, "receiver did not receive friend request in time");
+    assert!(
+        got_request,
+        "receiver did not receive friend request in time"
+    );
 
     // Extract request_id
     let request_id = {
@@ -136,7 +139,10 @@ async fn establish_friendship(
         matches!(e, ClientEvent::FriendRequestAccepted { .. })
     })
     .await;
-    assert!(got_accepted, "sender did not receive friend request acceptance in time");
+    assert!(
+        got_accepted,
+        "sender did not receive friend request acceptance in time"
+    );
 
     (sender_pubkey, receiver_pubkey)
 }
@@ -197,7 +203,11 @@ impl DataListener for TestDataListener {
             DataChange::ContactListChanged => "ContactListChanged".into(),
             DataChange::IdentityListChanged => "IdentityListChanged".into(),
             DataChange::ConnectionStatusChanged { status, message } => {
-                format!("ConnectionStatusChanged:{:?}:{}", status, message.unwrap_or_default())
+                format!(
+                    "ConnectionStatusChanged:{:?}:{}",
+                    status,
+                    message.unwrap_or_default()
+                )
             }
         };
         self.changes.lock().unwrap().push(label);
@@ -399,12 +409,7 @@ async_test!(app_identity_crud_via_ffi, {
 
     // Update identity
     client
-        .update_app_identity_ffi(
-            "abcd1234".into(),
-            Some("Alice Updated".into()),
-            None,
-            None,
-        )
+        .update_app_identity_ffi("abcd1234".into(), Some("Alice Updated".into()), None, None)
         .await
         .unwrap();
 
@@ -435,8 +440,12 @@ async_test!(app_room_and_message_crud_via_ffi, {
     // Create a room via FFI
     let room_id = client
         .save_app_room_ffi(
-            "peer_pubkey_hex".into(), identity_npub.into(),
-            RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()), None,
+            "peer_pubkey_hex".into(),
+            identity_npub.into(),
+            RoomStatus::Enabled,
+            RoomType::Dm,
+            Some("Bob".into()),
+            None,
         )
         .await
         .unwrap();
@@ -456,20 +465,40 @@ async_test!(app_room_and_message_crud_via_ffi, {
     // Add messages via FFI
     client
         .save_app_message_ffi(
-            "msg1".into(), Some("evt1".into()), room_id.clone(), identity_npub.into(),
-            "peer_pubkey_hex".into(), "Hello!".into(), false, MessageStatus::Success, 1000,
+            "msg1".into(),
+            Some("evt1".into()),
+            room_id.clone(),
+            identity_npub.into(),
+            "peer_pubkey_hex".into(),
+            "Hello!".into(),
+            false,
+            MessageStatus::Success,
+            1000,
         )
         .await
         .unwrap();
     client
         .save_app_message_ffi(
-            "msg2".into(), Some("evt2".into()), room_id.clone(), identity_npub.into(),
-            identity_npub.into(), "Hi back!".into(), true, MessageStatus::Success, 1001,
+            "msg2".into(),
+            Some("evt2".into()),
+            room_id.clone(),
+            identity_npub.into(),
+            identity_npub.into(),
+            "Hi back!".into(),
+            true,
+            MessageStatus::Success,
+            1001,
         )
         .await
         .unwrap();
-    client.increment_app_room_unread_ffi(room_id.clone()).await.unwrap();
-    client.increment_app_room_unread_ffi(room_id.clone()).await.unwrap();
+    client
+        .increment_app_room_unread_ffi(room_id.clone())
+        .await
+        .unwrap();
+    client
+        .increment_app_room_unread_ffi(room_id.clone())
+        .await
+        .unwrap();
 
     // Query messages via FFI
     let msgs = client.get_messages(room_id.clone(), 100, 0).await.unwrap();
@@ -513,15 +542,19 @@ async_test!(app_contact_crud_via_ffi, {
     // Create contacts via FFI
     client
         .save_app_contact_ffi(
-            "pubkey_bob".into(), "npub1bob".into(),
-            identity_npub.into(), Some("Bob".into()),
+            "pubkey_bob".into(),
+            "npub1bob".into(),
+            identity_npub.into(),
+            Some("Bob".into()),
         )
         .await
         .unwrap();
     client
         .save_app_contact_ffi(
-            "pubkey_alice".into(), "npub1alice".into(),
-            identity_npub.into(), Some("Alice".into()),
+            "pubkey_alice".into(),
+            "npub1alice".into(),
+            identity_npub.into(),
+            Some("Alice".into()),
         )
         .await
         .unwrap();
@@ -532,11 +565,7 @@ async_test!(app_contact_crud_via_ffi, {
 
     // Update petname via FFI
     client
-        .update_contact_petname(
-            "pubkey_bob".into(),
-            identity_npub.into(),
-            "Bobby".into(),
-        )
+        .update_contact_petname("pubkey_bob".into(), identity_npub.into(), "Bobby".into())
         .await
         .unwrap();
 
@@ -558,28 +587,55 @@ async_test!(message_dedup_via_ffi, {
 
     // Create room
     let room_id = client
-        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None, None)
+        .save_app_room_ffi(
+            "peer".into(),
+            identity_npub.into(),
+            RoomStatus::Enabled,
+            RoomType::Dm,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
     // First message
     client
         .save_app_message_ffi(
-            "msg1".into(), Some("event_abc".into()), room_id.clone(), identity_npub.into(),
-            "peer".into(), "Hello".into(), false, MessageStatus::Success, 1000,
+            "msg1".into(),
+            Some("event_abc".into()),
+            room_id.clone(),
+            identity_npub.into(),
+            "peer".into(),
+            "Hello".into(),
+            false,
+            MessageStatus::Success,
+            1000,
         )
         .await
         .unwrap();
 
     // Check dedup via FFI
-    assert!(client.is_app_message_duplicate_ffi("event_abc".into()).await.unwrap());
-    assert!(!client.is_app_message_duplicate_ffi("event_xyz".into()).await.unwrap());
+    assert!(client
+        .is_app_message_duplicate_ffi("event_abc".into())
+        .await
+        .unwrap());
+    assert!(!client
+        .is_app_message_duplicate_ffi("event_xyz".into())
+        .await
+        .unwrap());
 
     // INSERT OR IGNORE: second save with same msgid should not error
     client
         .save_app_message_ffi(
-            "msg1".into(), Some("event_abc".into()), room_id.clone(), identity_npub.into(),
-            "peer".into(), "Hello duplicate".into(), false, MessageStatus::Success, 1000,
+            "msg1".into(),
+            Some("event_abc".into()),
+            room_id.clone(),
+            identity_npub.into(),
+            "peer".into(),
+            "Hello duplicate".into(),
+            false,
+            MessageStatus::Success,
+            1000,
         )
         .await
         .unwrap();
@@ -604,15 +660,29 @@ async_test!(message_reply_to_resolution_via_ffi, {
     let identity_npub = "npub1me";
 
     let room_id = client
-        .save_app_room_ffi("peer".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, None, None)
+        .save_app_room_ffi(
+            "peer".into(),
+            identity_npub.into(),
+            RoomStatus::Enabled,
+            RoomType::Dm,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
     // Original message
     client
         .save_app_message_ffi(
-            "msg1".into(), Some("event_original".into()), room_id.clone(), identity_npub.into(),
-            "peer".into(), "Original message".into(), false, MessageStatus::Success, 1000,
+            "msg1".into(),
+            Some("event_original".into()),
+            room_id.clone(),
+            identity_npub.into(),
+            "peer".into(),
+            "Original message".into(),
+            false,
+            MessageStatus::Success,
+            1000,
         )
         .await
         .unwrap();
@@ -620,8 +690,15 @@ async_test!(message_reply_to_resolution_via_ffi, {
     // Reply message
     client
         .save_app_message_ffi(
-            "msg2".into(), Some("event_reply".into()), room_id.clone(), identity_npub.into(),
-            identity_npub.into(), "Reply text".into(), true, MessageStatus::Success, 1001,
+            "msg2".into(),
+            Some("event_reply".into()),
+            room_id.clone(),
+            identity_npub.into(),
+            identity_npub.into(),
+            "Reply text".into(),
+            true,
+            MessageStatus::Success,
+            1001,
         )
         .await
         .unwrap();
@@ -630,7 +707,11 @@ async_test!(message_reply_to_resolution_via_ffi, {
     client
         .update_app_message_ffi(
             "msg2".into(),
-            None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some("event_original".into()),
             Some("Original message".into()),
         )
@@ -658,7 +739,14 @@ async_test!(room_last_message_and_ordering, {
 
     // Room A - older last message
     let room_a_id = client
-        .save_app_room_ffi("peer_a".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Alice".into()), None)
+        .save_app_room_ffi(
+            "peer_a".into(),
+            identity_npub.into(),
+            RoomStatus::Enabled,
+            RoomType::Dm,
+            Some("Alice".into()),
+            None,
+        )
         .await
         .unwrap();
     client
@@ -668,7 +756,14 @@ async_test!(room_last_message_and_ordering, {
 
     // Room B - newer last message
     let room_b_id = client
-        .save_app_room_ffi("peer_b".into(), identity_npub.into(), RoomStatus::Enabled, RoomType::Dm, Some("Bob".into()), None)
+        .save_app_room_ffi(
+            "peer_b".into(),
+            identity_npub.into(),
+            RoomStatus::Enabled,
+            RoomType::Dm,
+            Some("Bob".into()),
+            None,
+        )
         .await
         .unwrap();
     client
@@ -760,9 +855,14 @@ fn network_friend_request_and_accept_db() {
             Arc::clone(&bob).start_event_loop().await.unwrap();
 
             establish_friendship(
-                &alice, "Alice", &bob, "Bob",
-                &bob_events, &bob_notify,
-                &alice_events, &alice_notify,
+                &alice,
+                "Alice",
+                &bob,
+                "Bob",
+                &bob_events,
+                &bob_notify,
+                &alice_events,
+                &alice_notify,
             )
             .await;
 
@@ -978,9 +1078,14 @@ fn network_group_db_state_after_create() {
 
             // Alice ↔ Bob friendship
             establish_friendship(
-                &alice, "Alice", &bob, "Bob",
-                &bob_events, &bob_notify,
-                &alice_events, &alice_notify,
+                &alice,
+                "Alice",
+                &bob,
+                "Bob",
+                &bob_events,
+                &bob_notify,
+                &alice_events,
+                &alice_notify,
             )
             .await;
 
@@ -988,9 +1093,14 @@ fn network_group_db_state_after_create() {
             // Reset alice_events for reuse in second friendship
             alice_events.lock().unwrap().clear();
             establish_friendship(
-                &alice, "Alice", &charlie, "Charlie",
-                &charlie_events, &charlie_notify,
-                &alice_events, &alice_notify,
+                &alice,
+                "Alice",
+                &charlie,
+                "Charlie",
+                &charlie_events,
+                &charlie_notify,
+                &alice_events,
+                &alice_notify,
             )
             .await;
 
@@ -1002,7 +1112,10 @@ fn network_group_db_state_after_create() {
                 .create_signal_group(
                     "TestGroup".into(),
                     vec![
-                        GroupMemberInput { nostr_pubkey: bob_pubkey.clone(), name: "Bob".into() },
+                        GroupMemberInput {
+                            nostr_pubkey: bob_pubkey.clone(),
+                            name: "Bob".into(),
+                        },
                         GroupMemberInput {
                             nostr_pubkey: charlie_pubkey.clone(),
                             name: "Charlie".into(),
@@ -1021,11 +1134,10 @@ fn network_group_db_state_after_create() {
             .await;
             assert!(bob_got_invite, "Bob should receive group invite");
 
-            let charlie_got_invite =
-                wait_for_event(&charlie_events, &charlie_notify, 30, |e| {
-                    matches!(e, ClientEvent::GroupInviteReceived { .. })
-                })
-                .await;
+            let charlie_got_invite = wait_for_event(&charlie_events, &charlie_notify, 30, |e| {
+                matches!(e, ClientEvent::GroupInviteReceived { .. })
+            })
+            .await;
             assert!(charlie_got_invite, "Charlie should receive group invite");
 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1307,7 +1419,10 @@ async_test!(nip17_dm_receive_creates_room_and_message, {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Alice sends NIP-17 DM to Bob (not a keychat protocol message)
-    let sent = alice.send_nip17_dm(bob_pubkey.clone(), "Hello from standard Nostr!".into()).await.unwrap();
+    let sent = alice
+        .send_nip17_dm(bob_pubkey.clone(), "Hello from standard Nostr!".into())
+        .await
+        .unwrap();
     assert!(!sent.event_id.is_empty());
 
     // Bob should receive the message
@@ -1319,14 +1434,24 @@ async_test!(nip17_dm_receive_creates_room_and_message, {
     // Verify room was created as Nip17Dm type
     let bob_rooms = bob.get_rooms(bob_pubkey.clone()).await.unwrap();
     let nip17_room = bob_rooms.iter().find(|r| r.to_main_pubkey == alice_pubkey);
-    assert!(nip17_room.is_some(), "Bob should have a NIP-17 DM room with Alice");
-    assert_eq!(nip17_room.unwrap().room_type, RoomType::Nip17Dm, "Room type should be Nip17Dm");
+    assert!(
+        nip17_room.is_some(),
+        "Bob should have a NIP-17 DM room with Alice"
+    );
+    assert_eq!(
+        nip17_room.unwrap().room_type,
+        RoomType::Nip17Dm,
+        "Room type should be Nip17Dm"
+    );
 
     // Verify message was persisted
     let room_id = format!("{}:{}", alice_pubkey, bob_pubkey);
     let messages = bob.get_messages(room_id, 50, 0).await.unwrap();
     let dm_msgs: Vec<_> = messages.iter().filter(|m| !m.is_me_send).collect();
-    assert!(!dm_msgs.is_empty(), "Bob should have received message in DB");
+    assert!(
+        !dm_msgs.is_empty(),
+        "Bob should have received message in DB"
+    );
     assert_eq!(dm_msgs[0].content, "Hello from standard Nostr!");
 
     bob.stop_event_loop().await;
@@ -1334,7 +1459,12 @@ async_test!(nip17_dm_receive_creates_room_and_message, {
     bob.disconnect().await.unwrap();
     // Event loop holds an Arc clone internally; drop on a blocking thread
     // to avoid Runtime-in-Runtime panic (same pattern as existing network tests).
-    tokio::task::spawn_blocking(move || { drop(alice); drop(bob); }).await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
 });
 
 /// Alice sends NIP-17 DM, Bob replies with NIP-17 DM — full round-trip.
@@ -1366,7 +1496,10 @@ async_test!(nip17_dm_send_and_receive_roundtrip, {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Alice → Bob
-    alice.send_nip17_dm(bob_pubkey.clone(), "Hey Bob, this is Alice!".into()).await.unwrap();
+    alice
+        .send_nip17_dm(bob_pubkey.clone(), "Hey Bob, this is Alice!".into())
+        .await
+        .unwrap();
 
     let bob_got = wait_for_event(&bob_events, &bob_notify, 30, |e| {
         matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "Hey Bob, this is Alice!")
@@ -1374,7 +1507,9 @@ async_test!(nip17_dm_send_and_receive_roundtrip, {
     assert!(bob_got, "Bob should receive Alice's NIP-17 DM");
 
     // Bob → Alice reply
-    bob.send_nip17_dm(alice_pubkey.clone(), "Hi Alice, Bob here!".into()).await.unwrap();
+    bob.send_nip17_dm(alice_pubkey.clone(), "Hi Alice, Bob here!".into())
+        .await
+        .unwrap();
 
     let alice_got = wait_for_event(&alice_events, &alice_notify, 30, |e| {
         matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "Hi Alice, Bob here!")
@@ -1385,7 +1520,12 @@ async_test!(nip17_dm_send_and_receive_roundtrip, {
     bob.stop_event_loop().await;
     alice.disconnect().await.unwrap();
     bob.disconnect().await.unwrap();
-    tokio::task::spawn_blocking(move || { drop(alice); drop(bob); }).await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        drop(alice);
+        drop(bob);
+    })
+    .await
+    .unwrap();
 });
 
 // ─── Full Lifecycle Test ────────────────────────────────────────────────────

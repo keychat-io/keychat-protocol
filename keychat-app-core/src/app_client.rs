@@ -99,9 +99,7 @@ pub struct AppClientInner {
 }
 
 /// Lock app_storage Mutex, recovering from poison.
-pub fn lock_app_storage(
-    mutex: &Mutex<AppStorage>,
-) -> std::sync::MutexGuard<'_, AppStorage> {
+pub fn lock_app_storage(mutex: &Mutex<AppStorage>) -> std::sync::MutexGuard<'_, AppStorage> {
     mutex.lock().unwrap_or_else(|e| {
         tracing::error!("app_storage Mutex poisoned, recovering: {e}");
         e.into_inner()
@@ -112,7 +110,9 @@ pub fn lock_app_storage(
 pub fn lock_app_storage_result(
     mutex: &Mutex<AppStorage>,
 ) -> AppResult<std::sync::MutexGuard<'_, AppStorage>> {
-    mutex.lock().map_err(|e| AppError::Storage(format!("app_storage lock: {e}")))
+    mutex
+        .lock()
+        .map_err(|e| AppError::Storage(format!("app_storage lock: {e}")))
 }
 
 /// Default Signal device ID.
@@ -123,7 +123,11 @@ pub fn default_device_id() -> DeviceId {
 static TRACING_INIT: Once = Once::new();
 
 /// Generate a local file name from source name or hash.
-pub fn local_file_name(source_name: Option<String>, hash: String, suffix: Option<String>) -> String {
+pub fn local_file_name(
+    source_name: Option<String>,
+    hash: String,
+    suffix: Option<String>,
+) -> String {
     if let Some(name) = source_name {
         // Use the original file name if provided
         name
@@ -146,14 +150,23 @@ pub async fn download_and_decrypt(
         .build()
         .map_err(|e| AppError::MediaTransfer(format!("HTTP client: {e}")))?;
 
-    let resp = client.get(&url).send().await
+    let resp = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| AppError::MediaTransfer(format!("download failed: {e}")))?;
 
     if !resp.status().is_success() {
-        return Err(AppError::MediaTransfer(format!("HTTP {} from {}", resp.status().as_u16(), url)));
+        return Err(AppError::MediaTransfer(format!(
+            "HTTP {} from {}",
+            resp.status().as_u16(),
+            url
+        )));
     }
 
-    let ciphertext = resp.bytes().await
+    let ciphertext = resp
+        .bytes()
+        .await
         .map_err(|e| AppError::MediaTransfer(format!("read error: {e}")))?;
 
     let key_bytes: [u8; 32] = hex::decode(&key)
@@ -235,8 +248,8 @@ impl AppClient {
         } else {
             format!("{}_app", db_path)
         };
-        let app_storage =
-            AppStorage::open(&app_db_path, &db_key).map_err(|e| AppError::Storage(format!("open app database: {e}")))?;
+        let app_storage = AppStorage::open(&app_db_path, &db_key)
+            .map_err(|e| AppError::Storage(format!("open app database: {e}")))?;
 
         let files_dir = {
             let db_dir = std::path::Path::new(&db_path)
@@ -271,10 +284,7 @@ impl AppClient {
 
     /// Get the cached identity pubkey hex.
     pub(crate) fn cached_identity_pubkey(&self) -> String {
-        self.identity_pubkey_hex
-            .get()
-            .cloned()
-            .unwrap_or_default()
+        self.identity_pubkey_hex.get().cloned().unwrap_or_default()
     }
 
     // ─── Identity ───────────────────────────────────────────────
@@ -289,7 +299,10 @@ impl AppClient {
 
         let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
 
-        Ok(CreateIdentityResult { pubkey_hex, mnemonic })
+        Ok(CreateIdentityResult {
+            pubkey_hex,
+            mnemonic,
+        })
     }
 
     pub async fn import_identity(&self, mnemonic: String) -> AppResult<String> {
@@ -319,9 +332,14 @@ impl AppClient {
 
     pub async fn close_storage(&self) -> AppResult<()> {
         let inner = self.inner.read().await;
-        let store = inner.protocol.storage.lock()
+        let store = inner
+            .protocol
+            .storage
+            .lock()
             .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
-        store.checkpoint().map_err(|e| AppError::Storage(format!("checkpoint: {e}")))?;
+        store
+            .checkpoint()
+            .map_err(|e| AppError::Storage(format!("checkpoint: {e}")))?;
         Ok(())
     }
 
@@ -426,7 +444,8 @@ impl AppClient {
     pub async fn get_rooms(&self, identity_pubkey: String) -> AppResult<Vec<RoomInfo>> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        let rows = store.get_app_rooms(&identity_pubkey)
+        let rows = store
+            .get_app_rooms(&identity_pubkey)
             .map_err(|e| AppError::Storage(format!("get_rooms: {e}")))?;
         Ok(rows
             .into_iter()
@@ -456,7 +475,8 @@ impl AppClient {
     ) -> AppResult<Vec<MessageInfo>> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        let rows = store.get_app_messages(&room_id, limit, offset)
+        let rows = store
+            .get_app_messages(&room_id, limit, offset)
             .map_err(|e| AppError::Storage(format!("get_messages: {e}")))?;
         Ok(rows
             .into_iter()
@@ -482,13 +502,11 @@ impl AppClient {
             .collect())
     }
 
-    pub async fn get_contacts(
-        &self,
-        identity_pubkey: String,
-    ) -> AppResult<Vec<ContactInfoFull>> {
+    pub async fn get_contacts(&self, identity_pubkey: String) -> AppResult<Vec<ContactInfoFull>> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        let rows = store.get_app_contacts(&identity_pubkey)
+        let rows = store
+            .get_app_contacts(&identity_pubkey)
             .map_err(|e| AppError::Storage(format!("get_contacts: {e}")))?;
         Ok(rows
             .into_iter()
@@ -506,21 +524,24 @@ impl AppClient {
     pub async fn get_setting(&self, key: String) -> AppResult<Option<String>> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.get_setting(&key)
+        store
+            .get_setting(&key)
             .map_err(|e| AppError::Storage(format!("get_setting: {e}")))
     }
 
     pub async fn set_setting(&self, key: String, value: String) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.set_setting(&key, &value)
+        store
+            .set_setting(&key, &value)
             .map_err(|e| AppError::Storage(format!("set_setting: {e}")))
     }
 
     pub async fn get_identities(&self) -> AppResult<Vec<IdentityInfo>> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        let rows = store.get_app_identities()
+        let rows = store
+            .get_app_identities()
             .map_err(|e| AppError::Storage(format!("get_identities: {e}")))?;
         Ok(rows
             .into_iter()
@@ -539,9 +560,11 @@ impl AppClient {
     pub async fn mark_room_read(&self, room_id: String) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.mark_app_messages_read(&room_id)
+        store
+            .mark_app_messages_read(&room_id)
             .map_err(|e| AppError::Storage(format!("mark_messages_read: {e}")))?;
-        store.clear_app_room_unread(&room_id)
+        store
+            .clear_app_room_unread(&room_id)
             .map_err(|e| AppError::Storage(format!("clear_unread: {e}")))?;
         Ok(())
     }
@@ -549,7 +572,8 @@ impl AppClient {
     pub async fn get_message_count(&self, room_id: String) -> AppResult<i32> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.get_app_message_count(&room_id)
+        store
+            .get_app_message_count(&room_id)
             .map_err(|e| AppError::Storage(format!("get_message_count: {e}")))
     }
 
@@ -607,8 +631,15 @@ impl AppClient {
         let addrs = inner.protocol.receiving_addr_to_peer.len();
         let pending = inner.protocol.pending_outbound.len();
         let groups = inner.protocol.group_manager.group_count();
-        let transport = if inner.protocol.transport.is_some() { "connected" } else { "none" };
-        let identity = inner.protocol.identity.as_ref()
+        let transport = if inner.protocol.transport.is_some() {
+            "connected"
+        } else {
+            "none"
+        };
+        let identity = inner
+            .protocol
+            .identity
+            .as_ref()
             .map(|i| format!("{}…", &i.pubkey_hex()[..16]))
             .unwrap_or("none".into());
         Ok(format!(
@@ -659,12 +690,16 @@ impl AppClient {
             inner.protocol.last_relay_urls.clear();
         }
         if let Ok(store) = storage.lock() {
-            store.delete_all_data().map_err(|e| AppError::Storage(format!("delete_all_data: {e}")))?;
+            store
+                .delete_all_data()
+                .map_err(|e| AppError::Storage(format!("delete_all_data: {e}")))?;
         }
         let app_storage = self.inner.read().await.app_storage.clone();
         {
             let store = lock_app_storage(&app_storage);
-            store.delete_all_data().map_err(|e| AppError::Storage(format!("delete_all_app_data: {e}")))?;
+            store
+                .delete_all_data()
+                .map_err(|e| AppError::Storage(format!("delete_all_app_data: {e}")))?;
         }
 
         tracing::info!("remove_identity: done");
@@ -681,14 +716,23 @@ impl AppClient {
             if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&room_id) {
                 inner.protocol.peer_signal_to_nostr.remove(&signal_id);
                 inner.protocol.sessions.remove(&signal_id);
-                inner.protocol.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-                inner.protocol.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != room_id);
+                inner
+                    .protocol
+                    .receiving_addr_to_peer
+                    .retain(|_, v| v != &signal_id);
+                inner
+                    .protocol
+                    .pending_outbound
+                    .retain(|_, s| s.peer_nostr_pubkey != room_id);
                 drop(inner);
 
                 if let Ok(store) = storage.lock() {
                     let _ = store.delete_peer_data(&signal_id, &room_id);
                 }
-                tracing::info!("remove_room: removed 1:1 peer {}", &room_id[..16.min(room_id.len())]);
+                tracing::info!(
+                    "remove_room: removed 1:1 peer {}",
+                    &room_id[..16.min(room_id.len())]
+                );
                 found = true;
             }
         }
@@ -698,11 +742,17 @@ impl AppClient {
             let mut inner = self.inner.write().await;
             if inner.protocol.group_manager.get_group(&room_id).is_some() {
                 if let Ok(store) = storage.lock() {
-                    let _ = inner.protocol.group_manager.remove_group_persistent(&room_id, &store);
+                    let _ = inner
+                        .protocol
+                        .group_manager
+                        .remove_group_persistent(&room_id, &store);
                 } else {
                     inner.protocol.group_manager.remove_group(&room_id);
                 }
-                tracing::info!("remove_room: removed group {}", &room_id[..16.min(room_id.len())]);
+                tracing::info!(
+                    "remove_room: removed group {}",
+                    &room_id[..16.min(room_id.len())]
+                );
                 found = true;
             }
         }
@@ -712,7 +762,10 @@ impl AppClient {
             if let Ok(store) = storage.lock() {
                 let _ = store.delete_mls_group_id(&room_id);
             }
-            tracing::warn!("remove_room: room {} not found", &room_id[..16.min(room_id.len())]);
+            tracing::warn!(
+                "remove_room: room {} not found",
+                &room_id[..16.min(room_id.len())]
+            );
         }
 
         // Clean up app_* tables
@@ -744,16 +797,28 @@ impl AppClient {
             if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&peer_pubkey) {
                 inner.protocol.peer_signal_to_nostr.remove(&signal_id);
                 inner.protocol.sessions.remove(&signal_id);
-                inner.protocol.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-                inner.protocol.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
+                inner
+                    .protocol
+                    .receiving_addr_to_peer
+                    .retain(|_, v| v != &signal_id);
+                inner
+                    .protocol
+                    .pending_outbound
+                    .retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
                 drop(inner);
 
                 if let Ok(store) = storage.lock() {
                     let _ = store.delete_peer_data(&signal_id, &peer_pubkey);
                 }
-                tracing::info!("remove_session: removed session for peer {}", &peer_pubkey[..16.min(peer_pubkey.len())]);
+                tracing::info!(
+                    "remove_session: removed session for peer {}",
+                    &peer_pubkey[..16.min(peer_pubkey.len())]
+                );
             } else {
-                tracing::warn!("remove_session: no session found for peer {}", &peer_pubkey[..16.min(peer_pubkey.len())]);
+                tracing::warn!(
+                    "remove_session: no session found for peer {}",
+                    &peer_pubkey[..16.min(peer_pubkey.len())]
+                );
             }
         }
 
@@ -777,9 +842,17 @@ impl AppClient {
     pub async fn resolve_local_file(&self, msgid: String, file_hash: String) -> Option<String> {
         let inner = self.inner.read().await;
         let store = lock_app_storage(&inner.app_storage);
-        store.get_attachment_local_path(&msgid, &file_hash).ok().flatten().and_then(|p| {
-            if std::path::Path::new(&p).exists() { Some(p) } else { None }
-        })
+        store
+            .get_attachment_local_path(&msgid, &file_hash)
+            .ok()
+            .flatten()
+            .and_then(|p| {
+                if std::path::Path::new(&p).exists() {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
     }
 
     pub async fn upsert_attachment(
@@ -792,14 +865,22 @@ impl AppClient {
     ) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage(&inner.app_storage);
-        store.upsert_attachment(&msgid, &file_hash, &room_id, local_path.as_deref(), transfer_state as i32)
+        store
+            .upsert_attachment(
+                &msgid,
+                &file_hash,
+                &room_id,
+                local_path.as_deref(),
+                transfer_state as i32,
+            )
             .map_err(|e| AppError::Storage(format!("upsert_attachment: {e}")))
     }
 
     pub async fn set_audio_played(&self, msgid: String, file_hash: String) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage(&inner.app_storage);
-        store.set_audio_played(&msgid, &file_hash)
+        store
+            .set_audio_played(&msgid, &file_hash)
             .map_err(|e| AppError::Storage(format!("set_audio_played: {e}")))
     }
 
@@ -824,12 +905,16 @@ impl AppClient {
 
     /// Rebroadcast raw event JSON. Returns (success_urls, failed_url_error_pairs).
     pub async fn rebroadcast_event_internal(
-        &self, event_json: &str,
+        &self,
+        event_json: &str,
     ) -> AppResult<(Vec<String>, Vec<(String, String)>)> {
         let event: nostr::Event = serde_json::from_str(event_json)
             .map_err(|e| AppError::Transport(format!("invalid event JSON: {e}")))?;
         let inner = self.inner.read().await;
-        let transport = inner.protocol.transport.as_ref()
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
             .ok_or(AppError::Transport("Not connected.".into()))?;
         let result = transport.rebroadcast_event(event).await?;
         Ok((result.success_relays, result.failed_relays))
@@ -844,7 +929,10 @@ impl AppClient {
                 event.id.to_hex()
             },
             success_relays,
-            failed_relays: failed_relays.into_iter().map(|(url, error)| FailedRelayInfo { url, error }).collect(),
+            failed_relays: failed_relays
+                .into_iter()
+                .map(|(url, error)| FailedRelayInfo { url, error })
+                .collect(),
         })
     }
 
@@ -853,13 +941,18 @@ impl AppClient {
     pub async fn delete_setting(&self, key: String) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.delete_setting(&key).map_err(|e| AppError::Storage(format!("delete_setting: {e}")))
+        store
+            .delete_setting(&key)
+            .map_err(|e| AppError::Storage(format!("delete_setting: {e}")))
     }
 
     pub async fn get_room(&self, room_id: String) -> AppResult<Option<RoomInfo>> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        match store.get_app_room(&room_id).map_err(|e| AppError::Storage(format!("get_room: {e}")))? {
+        match store
+            .get_app_room(&room_id)
+            .map_err(|e| AppError::Storage(format!("get_room: {e}")))?
+        {
             Some(r) => Ok(Some(RoomInfo {
                 id: r.id,
                 to_main_pubkey: r.to_main_pubkey,
@@ -882,16 +975,28 @@ impl AppClient {
     pub async fn get_message_by_msgid(&self, msgid: String) -> AppResult<Option<MessageInfo>> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        match store.get_app_message_by_msgid(&msgid).map_err(|e| AppError::Storage(format!("get_message: {e}")))? {
+        match store
+            .get_app_message_by_msgid(&msgid)
+            .map_err(|e| AppError::Storage(format!("get_message: {e}")))?
+        {
             Some(r) => Ok(Some(MessageInfo {
-                msgid: r.msgid, event_id: r.event_id, room_id: r.room_id,
-                identity_pubkey: r.identity_pubkey, sender_pubkey: r.sender_pubkey,
-                content: r.content, is_me_send: r.is_me_send, is_read: r.is_read,
+                msgid: r.msgid,
+                event_id: r.event_id,
+                room_id: r.room_id,
+                identity_pubkey: r.identity_pubkey,
+                sender_pubkey: r.sender_pubkey,
+                content: r.content,
+                is_me_send: r.is_me_send,
+                is_read: r.is_read,
                 status: MessageStatus::from_i32(r.status),
-                reply_to_event_id: r.reply_to_event_id, reply_to_content: r.reply_to_content,
-                payload_json: r.payload_json, nostr_event_json: r.nostr_event_json,
-                relay_status_json: r.relay_status_json, local_file_path: r.local_file_path,
-                local_meta: r.local_meta, created_at: r.created_at,
+                reply_to_event_id: r.reply_to_event_id,
+                reply_to_content: r.reply_to_content,
+                payload_json: r.payload_json,
+                nostr_event_json: r.nostr_event_json,
+                relay_status_json: r.relay_status_json,
+                local_file_path: r.local_file_path,
+                local_meta: r.local_meta,
+                created_at: r.created_at,
             })),
             None => Ok(None),
         }
@@ -900,7 +1005,8 @@ impl AppClient {
     pub async fn should_auto_download(&self, file_size: u64) -> AppResult<bool> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        let limit_mb = store.get_setting("autoDownloadLimitMB")
+        let limit_mb = store
+            .get_setting("autoDownloadLimitMB")
             .unwrap_or(None)
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(10);
@@ -910,17 +1016,22 @@ impl AppClient {
     pub async fn get_active_media_server(&self) -> AppResult<String> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        Ok(store.get_setting("activeMediaServer")
+        Ok(store
+            .get_setting("activeMediaServer")
             .unwrap_or(None)
             .unwrap_or_else(|| "https://blossom.keychat.io".to_string()))
     }
 
     pub async fn update_contact_petname(
-        &self, pubkey: String, identity_pubkey: String, petname: String,
+        &self,
+        pubkey: String,
+        identity_pubkey: String,
+        petname: String,
     ) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.update_app_contact(&pubkey, &identity_pubkey, Some(&petname), None, None)
+        store
+            .update_app_contact(&pubkey, &identity_pubkey, Some(&petname), None, None)
             .map_err(|e| AppError::Storage(format!("update_petname: {e}")))
     }
 
@@ -951,23 +1062,36 @@ impl AppClient {
 
         if file_path.exists() {
             if let Some(ref mid) = msgid {
-                let _ = self.upsert_attachment(mid.clone(), hash.clone(), room_id.clone(), Some(relative_path), 2).await;
+                let _ = self
+                    .upsert_attachment(
+                        mid.clone(),
+                        hash.clone(),
+                        room_id.clone(),
+                        Some(relative_path),
+                        2,
+                    )
+                    .await;
             }
             return Ok(file_path.to_string_lossy().to_string());
         }
 
-        std::fs::create_dir_all(&room_dir).map_err(|e| AppError::MediaTransfer(format!("create dir: {e}")))?;
+        std::fs::create_dir_all(&room_dir)
+            .map_err(|e| AppError::MediaTransfer(format!("create dir: {e}")))?;
 
         let plaintext = download_and_decrypt(url, key, iv, hash.clone()).await?;
 
         let tmp_path = room_dir.join(format!(".{file_name}.tmp"));
-        std::fs::write(&tmp_path, &plaintext).map_err(|e| AppError::MediaTransfer(format!("write: {e}")))?;
-        std::fs::rename(&tmp_path, &file_path).map_err(|e| AppError::MediaTransfer(format!("rename: {e}")))?;
+        std::fs::write(&tmp_path, &plaintext)
+            .map_err(|e| AppError::MediaTransfer(format!("write: {e}")))?;
+        std::fs::rename(&tmp_path, &file_path)
+            .map_err(|e| AppError::MediaTransfer(format!("rename: {e}")))?;
 
         tracing::info!("Downloaded {} ({} bytes)", file_name, plaintext.len());
 
         if let Some(ref mid) = msgid {
-            let _ = self.upsert_attachment(mid.clone(), hash, room_id, Some(relative_path), 2).await;
+            let _ = self
+                .upsert_attachment(mid.clone(), hash, room_id, Some(relative_path), 2)
+                .await;
         }
 
         Ok(file_path.to_string_lossy().to_string())
@@ -975,19 +1099,29 @@ impl AppClient {
 
     /// Save an app identity record.
     pub async fn save_app_identity(
-        &self, pubkey_hex: String, npub: String, name: String, index: i32, is_default: bool,
+        &self,
+        pubkey_hex: String,
+        npub: String,
+        name: String,
+        index: i32,
+        is_default: bool,
     ) -> AppResult<()> {
         let inner = self.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
-        store.save_app_identity(&pubkey_hex, &npub, &name, index, is_default)
+        store
+            .save_app_identity(&pubkey_hex, &npub, &name, index, is_default)
             .map_err(|e| AppError::Storage(format!("save_app_identity: {e}")))
     }
 
     pub async fn get_inbound_request_id(&self, sender_pubkey: String) -> AppResult<Option<String>> {
         let inner = self.inner.read().await;
-        let store = inner.protocol.storage.lock()
+        let store = inner
+            .protocol
+            .storage
+            .lock()
             .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
-        store.get_inbound_fr_request_id_by_sender(&sender_pubkey)
+        store
+            .get_inbound_fr_request_id_by_sender(&sender_pubkey)
             .map_err(|e| AppError::Storage(format!("get_inbound_request_id: {e}")))
     }
 }

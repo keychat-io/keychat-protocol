@@ -38,7 +38,11 @@ impl KeychatClient {
         // Read cursor for identity key since parameter
         let identity_since = {
             let inner = self.app.inner.read().await;
-            let storage = inner.protocol.storage.lock().unwrap_or_else(|e| e.into_inner());
+            let storage = inner
+                .protocol
+                .storage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let cursor = storage.get_min_relay_cursor().unwrap_or(0);
             if cursor > 0 {
                 let two_days_secs: u64 = 2 * 24 * 60 * 60;
@@ -52,9 +56,13 @@ impl KeychatClient {
         let ratchet_since = Some(libkeychat::Timestamp::now());
 
         let inner = self.app.inner.read().await;
-        let transport = inner.protocol.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let transport = inner
+            .protocol
+            .transport
+            .as_ref()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
 
         if !identity_pubkeys.is_empty() {
             transport
@@ -62,9 +70,7 @@ impl KeychatClient {
                 .await?;
         }
         if !ratchet_pubkeys.is_empty() {
-            transport
-                .subscribe(ratchet_pubkeys, ratchet_since)
-                .await?;
+            transport.subscribe(ratchet_pubkeys, ratchet_since).await?;
         }
         Ok(())
     }

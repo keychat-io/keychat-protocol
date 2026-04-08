@@ -6,18 +6,17 @@
 pub mod app_client;
 pub mod app_storage;
 pub mod data_store;
-pub mod media;
 pub mod event_loop;
 pub mod friend_request;
 pub mod group;
+pub mod media;
 pub mod messaging;
 pub mod relay_tracker;
 pub mod types;
 
 pub use app_client::{
-    AppClient, AppClientInner, AppError, AppResult,
-    default_device_id, lock_app_storage, lock_app_storage_result,
-    npub_from_hex, hex_from_npub, normalize_to_hex,
+    default_device_id, hex_from_npub, lock_app_storage, lock_app_storage_result, normalize_to_hex,
+    npub_from_hex, AppClient, AppClientInner, AppError, AppResult,
 };
 pub use app_storage::AppStorage;
 pub use relay_tracker::{RelaySendTracker, RelayStatusUpdate};

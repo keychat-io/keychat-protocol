@@ -5,8 +5,8 @@ use crate::types::FileCategory;
 
 // Re-export constants for backward compatibility
 pub use keychat_app_core::media::{
-    BUILT_IN_SERVER, DEFAULT_BLOSSOM_SERVER, DEFAULT_AUTO_DOWNLOAD_LIMIT_MB,
-    MAX_FILE_SIZE, MAX_FILES_PER_MESSAGE,
+    BUILT_IN_SERVER, DEFAULT_AUTO_DOWNLOAD_LIMIT_MB, DEFAULT_BLOSSOM_SERVER, MAX_FILES_PER_MESSAGE,
+    MAX_FILE_SIZE,
 };
 
 // ─── UniFFI-exported free functions ─────────────────────────────
@@ -91,10 +91,15 @@ pub async fn encrypt_and_upload(
     plaintext: Vec<u8>,
     server_url: String,
 ) -> Result<FileUploadResult, KeychatUniError> {
-    let r = keychat_app_core::media::encrypt_and_upload(plaintext, server_url).await
+    let r = keychat_app_core::media::encrypt_and_upload(plaintext, server_url)
+        .await
         .map_err(|e| KeychatUniError::MediaTransfer { msg: e.to_string() })?;
     Ok(FileUploadResult {
-        url: r.url, key: r.key, iv: r.iv, hash: r.hash, size: r.size,
+        url: r.url,
+        key: r.key,
+        iv: r.iv,
+        hash: r.hash,
+        size: r.size,
     })
 }
 
@@ -104,10 +109,15 @@ pub async fn encrypt_and_upload_routed(
     plaintext: Vec<u8>,
     server_url: String,
 ) -> Result<FileUploadResult, KeychatUniError> {
-    let r = keychat_app_core::media::encrypt_and_upload_routed(plaintext, server_url).await
+    let r = keychat_app_core::media::encrypt_and_upload_routed(plaintext, server_url)
+        .await
         .map_err(|e| KeychatUniError::MediaTransfer { msg: e.to_string() })?;
     Ok(FileUploadResult {
-        url: r.url, key: r.key, iv: r.iv, hash: r.hash, size: r.size,
+        url: r.url,
+        key: r.key,
+        iv: r.iv,
+        hash: r.hash,
+        size: r.size,
     })
 }
 
@@ -119,7 +129,8 @@ pub async fn download_and_decrypt(
     iv: String,
     hash: String,
 ) -> Result<Vec<u8>, KeychatUniError> {
-    keychat_app_core::media::download_and_decrypt(url, key, iv, hash).await
+    keychat_app_core::media::download_and_decrypt(url, key, iv, hash)
+        .await
         .map_err(|e| KeychatUniError::MediaTransfer { msg: e.to_string() })
 }
 

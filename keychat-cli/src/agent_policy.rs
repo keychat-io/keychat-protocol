@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use keychat_app_core::{ClientEvent, AppClient};
+use keychat_app_core::{AppClient, ClientEvent};
 use tokio::sync::{broadcast, RwLock};
 
 const SETTING_OWNER: &str = "agent_owner";
@@ -28,11 +28,7 @@ pub struct AgentPolicy {
 }
 
 impl AgentPolicy {
-    pub fn new(
-        client: Arc<AppClient>,
-        auto_accept: bool,
-        agent_name: String,
-    ) -> Self {
+    pub fn new(client: Arc<AppClient>, auto_accept: bool, agent_name: String) -> Self {
         let (pending_tx, _) = broadcast::channel(64);
         Self {
             client,
@@ -227,9 +223,7 @@ async fn handle_friend_request(
     }
 
     // Has owner — queue as pending for owner approval via plugin
-    tracing::info!(
-        "Friend request from {sender_name} queued for owner approval"
-    );
+    tracing::info!("Friend request from {sender_name} queued for owner approval");
     let entry = PendingFriendRequest {
         request_id,
         sender_pubkey,

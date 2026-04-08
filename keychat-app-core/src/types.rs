@@ -12,10 +12,10 @@ pub fn make_room_id(peer_pubkey: &str, identity_pubkey: &str) -> String {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RoomStatus {
-    Requesting,  // 0
-    Enabled,     // 1
-    Approving,   // 2
-    Rejected,    // -1
+    Requesting, // 0
+    Enabled,    // 1
+    Approving,  // 2
+    Rejected,   // -1
 }
 
 impl RoomStatus {
@@ -41,8 +41,8 @@ impl RoomStatus {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RoomType {
-    Dm,           // 0 — Signal-encrypted 1:1 DM
-    SignalGroup,  // 1
+    Dm,          // 0 — Signal-encrypted 1:1 DM
+    SignalGroup, // 1
     MlsGroup,    // 2
     Nip17Dm,     // 3 — Standard NIP-17 DM (no Signal session, NIP-44 only)
 }
@@ -70,9 +70,9 @@ impl RoomType {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MessageStatus {
-    Sending,   // 0
-    Success,   // 1
-    Failed,    // 2
+    Sending, // 0
+    Success, // 1
+    Failed,  // 2
 }
 
 impl MessageStatus {
@@ -169,15 +169,30 @@ pub struct ContactInfoFull {
 
 #[derive(Clone, Debug)]
 pub enum DataChange {
-    RoomUpdated { room_id: String },
-    RoomDeleted { room_id: String },
+    RoomUpdated {
+        room_id: String,
+    },
+    RoomDeleted {
+        room_id: String,
+    },
     RoomListChanged,
-    MessageAdded { room_id: String, msgid: String },
-    MessageUpdated { room_id: String, msgid: String },
-    ContactUpdated { pubkey: String },
+    MessageAdded {
+        room_id: String,
+        msgid: String,
+    },
+    MessageUpdated {
+        room_id: String,
+        msgid: String,
+    },
+    ContactUpdated {
+        pubkey: String,
+    },
     ContactListChanged,
     IdentityListChanged,
-    ConnectionStatusChanged { status: ConnectionStatus, message: Option<String> },
+    ConnectionStatusChanged {
+        status: ConnectionStatus,
+        message: Option<String>,
+    },
 }
 
 /// Listener for data change notifications (implemented by UI layer).
@@ -241,10 +256,14 @@ impl From<libkeychat::KCMessageKind> for MessageKind {
             libkeychat::KCMessageKind::FriendApprove => MessageKind::FriendApprove,
             libkeychat::KCMessageKind::FriendReject => MessageKind::FriendReject,
             libkeychat::KCMessageKind::SignalGroupInvite => MessageKind::SignalGroupInvite,
-            libkeychat::KCMessageKind::SignalGroupMemberRemoved => MessageKind::SignalGroupMemberRemoved,
+            libkeychat::KCMessageKind::SignalGroupMemberRemoved => {
+                MessageKind::SignalGroupMemberRemoved
+            }
             libkeychat::KCMessageKind::SignalGroupSelfLeave => MessageKind::SignalGroupSelfLeave,
             libkeychat::KCMessageKind::SignalGroupDissolve => MessageKind::SignalGroupDissolve,
-            libkeychat::KCMessageKind::SignalGroupNameChanged => MessageKind::SignalGroupNameChanged,
+            libkeychat::KCMessageKind::SignalGroupNameChanged => {
+                MessageKind::SignalGroupNameChanged
+            }
             libkeychat::KCMessageKind::MlsGroupInvite => MessageKind::MlsGroupInvite,
             libkeychat::KCMessageKind::AgentReply => MessageKind::AgentReply,
             _ => MessageKind::Text,

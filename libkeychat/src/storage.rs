@@ -97,7 +97,9 @@ impl SecureStorage {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        let tx = self.conn.unchecked_transaction()
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .map_err(|e| KeychatError::Storage(format!("begin transaction: {e}")))?;
         let result = f(&self.conn)?;
         tx.commit()
@@ -842,7 +844,20 @@ impl SecureStorage {
         &self,
         request_id: &str,
     ) -> Result<
-        Option<(u32, Vec<u8>, Vec<u8>, u32, u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>, String, String)>,
+        Option<(
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+            u32,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            String,
+            String,
+        )>,
     > {
         let mut stmt = self
             .conn
@@ -895,7 +910,13 @@ impl SecureStorage {
             self.load_pending_fr(request_id)?
         {
             self.save_signal_participant(
-                peer_signal_id, device_id, &id_pub, &id_priv, reg_id, spk_id, &spk_rec,
+                peer_signal_id,
+                device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
             )?;
             self.delete_pending_fr(request_id)?;
         }
@@ -1071,9 +1092,7 @@ impl SecureStorage {
                 "UPDATE relays SET last_event_ts = MAX(last_event_ts, ?1) WHERE url = ?2",
                 rusqlite::params![event_ts as i64, url],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to update relay cursor: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("Failed to update relay cursor: {e}")))?;
         Ok(())
     }
 
@@ -1087,9 +1106,7 @@ impl SecureStorage {
                 |row| row.get::<_, i64>(0),
             )
             .map(|v| v as u64)
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to get relay cursor: {e}"))
-            })
+            .map_err(|e| KeychatError::Storage(format!("Failed to get relay cursor: {e}")))
     }
 
     /// Get the minimum subscription cursor across all relays.
@@ -1103,9 +1120,7 @@ impl SecureStorage {
                 |row| row.get::<_, i64>(0),
             )
             .map(|v| v as u64)
-            .map_err(|e| {
-                KeychatError::Storage(format!("Failed to get min relay cursor: {e}"))
-            })
+            .map_err(|e| KeychatError::Storage(format!("Failed to get min relay cursor: {e}")))
     }
 
     // ─── Inbound Friend Requests ─────────────────────────────
@@ -1185,7 +1200,10 @@ impl SecureStorage {
     }
 
     /// Look up an inbound friend request's request_id by sender pubkey.
-    pub fn get_inbound_fr_request_id_by_sender(&self, sender_pubkey_hex: &str) -> Result<Option<String>> {
+    pub fn get_inbound_fr_request_id_by_sender(
+        &self,
+        sender_pubkey_hex: &str,
+    ) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT request_id FROM inbound_friend_requests WHERE sender_pubkey_hex = ?1 LIMIT 1"
         ).map_err(|e| KeychatError::Storage(format!("prepare get_inbound_fr_by_sender: {e}")))?;
@@ -1197,7 +1215,9 @@ impl SecureStorage {
         match result {
             Ok(id) => Ok(Some(id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(KeychatError::Storage(format!("get_inbound_fr_by_sender: {e}"))),
+            Err(e) => Err(KeychatError::Storage(format!(
+                "get_inbound_fr_by_sender: {e}"
+            ))),
         }
     }
 
@@ -1595,10 +1615,15 @@ mod tests {
             .save_pending_fr(
                 "fr-test-123",
                 42,
-                b"id_pub", b"id_priv", 1001,
-                10, b"spk_rec",
-                20, b"pk_rec",
-                30, b"kpk_rec",
+                b"id_pub",
+                b"id_priv",
+                1001,
+                10,
+                b"spk_rec",
+                20,
+                b"pk_rec",
+                30,
+                b"kpk_rec",
                 "first_inbox_secret",
                 "peer_nostr_pubkey",
             )
@@ -1607,7 +1632,9 @@ mod tests {
         assert_eq!(store.list_pending_frs().unwrap().len(), 1);
         assert!(store.list_signal_participants().unwrap().is_empty());
 
-        store.promote_pending_fr("fr-test-123", "peer_signal_id_hex").unwrap();
+        store
+            .promote_pending_fr("fr-test-123", "peer_signal_id_hex")
+            .unwrap();
 
         assert!(store.list_pending_frs().unwrap().is_empty());
         let participants = store.list_signal_participants().unwrap();
@@ -1711,11 +1738,14 @@ mod tests {
             SignalParticipant::from_prekey_material("test-peer".to_string(), 1, keys).unwrap();
 
         // 2. Serialize and save to DB (per-peer identity, no one-time prekeys)
-        let serialized = crate::signal_session::serialize_prekey_material(participant.keys().unwrap());
+        let serialized =
+            crate::signal_session::serialize_prekey_material(participant.keys().unwrap());
         let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
             serialized.unwrap();
 
-        store.save_signal_participant("test-peer", 1, &id_pub, &id_priv, reg_id, spk_id, &spk_rec).unwrap();
+        store
+            .save_signal_participant("test-peer", 1, &id_pub, &id_priv, reg_id, spk_id, &spk_rec)
+            .unwrap();
 
         // 3. Load from DB and verify
         let (d_id, l_pub, _l_priv, l_reg, l_spk_id, _l_spk) =
@@ -1777,7 +1807,10 @@ mod tests {
         store.save_relay("wss://relay.example.com").unwrap();
 
         // Initial cursor is 0
-        assert_eq!(store.get_relay_cursor("wss://relay.example.com").unwrap(), 0);
+        assert_eq!(
+            store.get_relay_cursor("wss://relay.example.com").unwrap(),
+            0
+        );
         assert_eq!(store.get_min_relay_cursor().unwrap(), 0);
 
         // Update cursor
@@ -1966,16 +1999,22 @@ mod tests {
         let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
 
         // Two peers with different identities
-        store.save_signal_participant("peer-A", 1, b"pub-A", b"priv-A", 100, 10, b"spk-A").unwrap();
-        store.save_signal_participant("peer-B", 2, b"pub-B", b"priv-B", 200, 20, b"spk-B").unwrap();
+        store
+            .save_signal_participant("peer-A", 1, b"pub-A", b"priv-A", 100, 10, b"spk-A")
+            .unwrap();
+        store
+            .save_signal_participant("peer-B", 2, b"pub-B", b"priv-B", 200, 20, b"spk-B")
+            .unwrap();
 
-        let (d1, pub1, _priv1, reg1, spk1, _) = store.load_signal_participant("peer-A").unwrap().unwrap();
+        let (d1, pub1, _priv1, reg1, spk1, _) =
+            store.load_signal_participant("peer-A").unwrap().unwrap();
         assert_eq!(d1, 1);
         assert_eq!(pub1, b"pub-A");
         assert_eq!(reg1, 100);
         assert_eq!(spk1, 10);
 
-        let (d2, pub2, _priv2, reg2, spk2, _) = store.load_signal_participant("peer-B").unwrap().unwrap();
+        let (d2, pub2, _priv2, reg2, spk2, _) =
+            store.load_signal_participant("peer-B").unwrap().unwrap();
         assert_eq!(d2, 2);
         assert_eq!(pub2, b"pub-B");
         assert_eq!(reg2, 200);
@@ -1999,23 +2038,30 @@ mod tests {
         let keys = generate_prekey_material().unwrap();
         let identity_key_pair = keys.identity_key_pair;
         let registration_id = keys.registration_id;
-        let participant = SignalParticipant::persistent(
-            "alice".into(), 1, keys, storage.clone(),
-        ).unwrap();
+        let participant =
+            SignalParticipant::persistent("alice".into(), 1, keys, storage.clone()).unwrap();
 
         // Verify the new participant has prekey material
-        assert!(participant.keys().is_some(), "new participant should have prekey material");
+        assert!(
+            participant.keys().is_some(),
+            "new participant should have prekey material"
+        );
 
         // 2. Restore the same participant without prekey material
         let restored = SignalParticipant::restore_persistent(
-            "alice".into(), 1,
+            "alice".into(),
+            1,
             identity_key_pair,
             registration_id,
             storage.clone(),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify restored participant does NOT have prekey material
-        assert!(restored.keys().is_none(), "restored participant must not have prekey material");
+        assert!(
+            restored.keys().is_none(),
+            "restored participant must not have prekey material"
+        );
 
         // But should still have identity info
         assert_eq!(
@@ -2049,8 +2095,10 @@ mod tests {
         let ikp_b = keys_b.identity_key_pair;
         let reg_b = keys_b.registration_id;
 
-        let mut alice = SignalParticipant::persistent("alice".into(), 1, keys_a, storage_a.clone()).unwrap();
-        let mut bob = SignalParticipant::persistent("bob".into(), 1, keys_b, storage_b.clone()).unwrap();
+        let mut alice =
+            SignalParticipant::persistent("alice".into(), 1, keys_a, storage_a.clone()).unwrap();
+        let mut bob =
+            SignalParticipant::persistent("bob".into(), 1, keys_b, storage_b.clone()).unwrap();
 
         let alice_id = alice.identity_public_key_hex();
         let bob_id = bob.identity_public_key_hex();
@@ -2071,20 +2119,35 @@ mod tests {
 
         // 3. Now "restart": restore Alice and Bob using restore_persistent (no prekeys)
         let mut alice_restored = SignalParticipant::restore_persistent(
-            "alice".into(), 1, ikp_a, reg_a, storage_a.clone(),
-        ).unwrap();
-        let mut bob_restored = SignalParticipant::restore_persistent(
-            "bob".into(), 1, ikp_b, reg_b, storage_b.clone(),
-        ).unwrap();
+            "alice".into(),
+            1,
+            ikp_a,
+            reg_a,
+            storage_a.clone(),
+        )
+        .unwrap();
+        let mut bob_restored =
+            SignalParticipant::restore_persistent("bob".into(), 1, ikp_b, reg_b, storage_b.clone())
+                .unwrap();
 
         // 4. Verify they can still communicate
-        let ct3 = alice_restored.encrypt_bytes(&bob_addr, b"after restart").unwrap();
+        let ct3 = alice_restored
+            .encrypt_bytes(&bob_addr, b"after restart")
+            .unwrap();
         let pt3 = bob_restored.decrypt_bytes(&alice_addr, &ct3).unwrap();
-        assert_eq!(pt3, b"after restart", "decrypt must work after restore_persistent");
+        assert_eq!(
+            pt3, b"after restart",
+            "decrypt must work after restore_persistent"
+        );
 
-        let ct4 = bob_restored.encrypt_bytes(&alice_addr, b"also works").unwrap();
+        let ct4 = bob_restored
+            .encrypt_bytes(&alice_addr, b"also works")
+            .unwrap();
         let pt4 = alice_restored.decrypt_bytes(&bob_addr, &ct4).unwrap();
-        assert_eq!(pt4, b"also works", "bidirectional decrypt must work after restore");
+        assert_eq!(
+            pt4, b"also works",
+            "bidirectional decrypt must work after restore"
+        );
 
         // 5. Verify prekey_bundle fails on restored participant (no prekeys)
         assert!(
@@ -2111,8 +2174,10 @@ mod tests {
         let ikp_b = keys_b.identity_key_pair;
         let reg_b = keys_b.registration_id;
 
-        let mut alice = SignalParticipant::persistent("alice".into(), 1, keys_a, storage_a.clone()).unwrap();
-        let mut bob = SignalParticipant::persistent("bob".into(), 1, keys_b, storage_b.clone()).unwrap();
+        let mut alice =
+            SignalParticipant::persistent("alice".into(), 1, keys_a, storage_a.clone()).unwrap();
+        let mut bob =
+            SignalParticipant::persistent("bob".into(), 1, keys_b, storage_b.clone()).unwrap();
 
         let alice_id = alice.identity_public_key_hex();
         let bob_id = bob.identity_public_key_hex();
@@ -2138,20 +2203,28 @@ mod tests {
 
         // Restart both
         let mut alice2 = SignalParticipant::restore_persistent(
-            "alice".into(), 1, ikp_a, reg_a, storage_a.clone(),
-        ).unwrap();
-        let mut bob2 = SignalParticipant::restore_persistent(
-            "bob".into(), 1, ikp_b, reg_b, storage_b.clone(),
-        ).unwrap();
+            "alice".into(),
+            1,
+            ikp_a,
+            reg_a,
+            storage_a.clone(),
+        )
+        .unwrap();
+        let mut bob2 =
+            SignalParticipant::restore_persistent("bob".into(), 1, ikp_b, reg_b, storage_b.clone())
+                .unwrap();
 
         // Continue communication after 10 ratchet advances + restart
-        let ct = alice2.encrypt_bytes(&bob_addr, b"post-restart-multi").unwrap();
+        let ct = alice2
+            .encrypt_bytes(&bob_addr, b"post-restart-multi")
+            .unwrap();
         let pt = bob2.decrypt_bytes(&alice_addr, &ct).unwrap();
         assert_eq!(pt, b"post-restart-multi");
 
-        let ct = bob2.encrypt_bytes(&alice_addr, b"reply-post-restart").unwrap();
+        let ct = bob2
+            .encrypt_bytes(&alice_addr, b"reply-post-restart")
+            .unwrap();
         let pt = alice2.decrypt_bytes(&bob_addr, &ct).unwrap();
         assert_eq!(pt, b"reply-post-restart");
     }
-
 }

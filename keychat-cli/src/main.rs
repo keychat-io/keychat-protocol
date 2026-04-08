@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use keychat_cli::{agent_daemon, commands, daemon, repl, tui};
 use keychat_app_core::AppClient;
+use keychat_cli::{agent_daemon, commands, daemon, repl, tui};
 
 #[derive(Parser)]
 #[command(

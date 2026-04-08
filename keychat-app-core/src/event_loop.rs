@@ -77,7 +77,8 @@ impl AppClient {
                 None => {
                     self.emit_event(ClientEvent::EventLoopError {
                         description: "transport not initialized".into(),
-                    }).await;
+                    })
+                    .await;
                     return;
                 }
             }
@@ -165,23 +166,37 @@ impl AppClient {
         // Step 2: Try pending outbound (friend approve/reject)
         {
             let mut inner = self.inner.write().await;
-            if let Some((request_id, msg, decrypt_result)) = inner.protocol.try_decrypt_pending_outbound(event) {
+            if let Some((request_id, msg, decrypt_result)) =
+                inner.protocol.try_decrypt_pending_outbound(event)
+            {
                 if msg.kind == libkeychat::KCMessageKind::FriendApprove {
                     // Complete session creation with ratchet address registration
-                    match inner.protocol.complete_friend_approve(&request_id, &msg, &decrypt_result).await {
+                    match inner
+                        .protocol
+                        .complete_friend_approve(&request_id, &msg, &decrypt_result)
+                        .await
+                    {
                         Ok(_) => {
-                            tracing::info!("[Step2] Session created for approve reqId={}", &request_id[..16.min(request_id.len())]);
+                            tracing::info!(
+                                "[Step2] Session created for approve reqId={}",
+                                &request_id[..16.min(request_id.len())]
+                            );
                         }
                         Err(e) => {
                             tracing::error!("[Step2] complete_friend_approve failed: {e}");
                         }
+                    }
+                    // Re-subscribe to include new ratchet-derived receiving addresses
+                    if let Err(e) = inner.protocol.refresh_subscriptions().await {
+                        tracing::warn!("[Step2] refresh_subscriptions after approve: {e}");
                     }
                 } else if msg.kind == libkeychat::KCMessageKind::FriendReject {
                     // Remove from pending
                     inner.protocol.pending_outbound.remove(&request_id);
                 }
                 drop(inner);
-                self.on_friend_approve_app_persist(&request_id, &msg, event).await;
+                self.on_friend_approve_app_persist(&request_id, &msg, event)
+                    .await;
                 return;
             }
         }
@@ -195,21 +210,32 @@ impl AppClient {
             // Update addresses
             {
                 let mut inner = self.inner.write().await;
-                inner.protocol.update_addresses_after_decrypt(
-                    &peer_signal_hex, &session_mutex, &addr_update,
-                ).await;
+                inner
+                    .protocol
+                    .update_addresses_after_decrypt(&peer_signal_hex, &session_mutex, &addr_update)
+                    .await;
             }
 
             let sender_nostr_pubkey = {
                 let inner = self.inner.read().await;
-                inner.protocol.peer_signal_to_nostr.get(&peer_signal_hex)
-                    .cloned().unwrap_or_else(|| peer_signal_hex.clone())
+                inner
+                    .protocol
+                    .peer_signal_to_nostr
+                    .get(&peer_signal_hex)
+                    .cloned()
+                    .unwrap_or_else(|| peer_signal_hex.clone())
             };
 
             self.on_message_app_persist(
-                msg, metadata, sender_nostr_pubkey, peer_signal_hex,
-                event, relay_url, nostr_event_json,
-            ).await;
+                msg,
+                metadata,
+                sender_nostr_pubkey,
+                peer_signal_hex,
+                event,
+                relay_url,
+                nostr_event_json,
+            )
+            .await;
             return;
         }
 
@@ -234,7 +260,9 @@ impl AppClient {
         _event: &libkeychat::Event,
     ) {
         let identity_pubkey = self.cached_identity_pubkey();
-        if identity_pubkey.is_empty() { return; }
+        if identity_pubkey.is_empty() {
+            return;
+        }
 
         let fr_content = ctx.message.as_deref().unwrap_or("[Friend Request]");
         let sender_npub = npub_from_hex(ctx.sender_pubkey.clone()).unwrap_or_default();
@@ -243,7 +271,10 @@ impl AppClient {
         let saved_room_id = {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
-            if store.is_app_message_duplicate(&ctx.event_id).unwrap_or(false) {
+            if store
+                .is_app_message_duplicate(&ctx.event_id)
+                .unwrap_or(false)
+            {
                 None
             } else {
                 let room_status = {
@@ -255,30 +286,53 @@ impl AppClient {
                         RoomStatus::Approving.to_i32()
                     }
                 };
-                store.transaction(|_| {
-                    let room_id = store.save_app_room(
-                        &ctx.sender_pubkey, &identity_pubkey, room_status,
-                        RoomType::Dm.to_i32(), Some(&ctx.sender_name), None, None,
-                    )?;
-                    store.save_app_contact(
-                        &ctx.sender_pubkey, &sender_npub, &identity_pubkey, Some(&ctx.sender_name),
-                    )?;
-                    store.save_app_message(
-                        &msgid, Some(&ctx.event_id), &room_id, &identity_pubkey,
-                        &ctx.sender_pubkey, fr_content, false,
-                        MessageStatus::Success.to_i32(), ctx.created_at as i64,
-                    )?;
-                    store.update_app_room(&room_id, None, None, Some(fr_content), Some(ctx.created_at as i64))?;
-                    store.increment_app_room_unread(&room_id)?;
-                    Ok(room_id)
-                }).ok()
+                store
+                    .transaction(|_| {
+                        let room_id = store.save_app_room(
+                            &ctx.sender_pubkey,
+                            &identity_pubkey,
+                            room_status,
+                            RoomType::Dm.to_i32(),
+                            Some(&ctx.sender_name),
+                            None,
+                            None,
+                        )?;
+                        store.save_app_contact(
+                            &ctx.sender_pubkey,
+                            &sender_npub,
+                            &identity_pubkey,
+                            Some(&ctx.sender_name),
+                        )?;
+                        store.save_app_message(
+                            &msgid,
+                            Some(&ctx.event_id),
+                            &room_id,
+                            &identity_pubkey,
+                            &ctx.sender_pubkey,
+                            fr_content,
+                            false,
+                            MessageStatus::Success.to_i32(),
+                            ctx.created_at as i64,
+                        )?;
+                        store.update_app_room(
+                            &room_id,
+                            None,
+                            None,
+                            Some(fr_content),
+                            Some(ctx.created_at as i64),
+                        )?;
+                        store.increment_app_room_unread(&room_id)?;
+                        Ok(room_id)
+                    })
+                    .ok()
             }
         };
 
         if let Some(room_id) = saved_room_id {
             self.emit_data_change(DataChange::RoomListChanged).await;
             self.emit_data_change(DataChange::ContactListChanged).await;
-            self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+            self.emit_data_change(DataChange::MessageAdded { room_id, msgid })
+                .await;
         }
 
         self.emit_event(ClientEvent::FriendRequestReceived {
@@ -287,7 +341,8 @@ impl AppClient {
             sender_name: ctx.sender_name,
             message: ctx.message,
             created_at: ctx.created_at,
-        }).await;
+        })
+        .await;
     }
 
     async fn on_friend_approve_app_persist(
@@ -297,13 +352,26 @@ impl AppClient {
         event: &libkeychat::Event,
     ) {
         if msg.kind == libkeychat::KCMessageKind::FriendApprove {
-            let peer_name = msg.signal_prekey_auth.as_ref()
-                .map(|a| a.name.clone()).unwrap_or_default();
-            let peer_signal_id = msg.signal_prekey_auth.as_ref()
-                .map(|a| a.signal_id.clone()).unwrap_or_default();
-            let peer_nostr_id = msg.signal_prekey_auth.as_ref()
-                .map(|a| a.nostr_id.clone()).unwrap_or_default();
-            let peer_signal_hex = if peer_signal_id.is_empty() { peer_nostr_id.clone() } else { peer_signal_id };
+            let peer_name = msg
+                .signal_prekey_auth
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let peer_signal_id = msg
+                .signal_prekey_auth
+                .as_ref()
+                .map(|a| a.signal_id.clone())
+                .unwrap_or_default();
+            let peer_nostr_id = msg
+                .signal_prekey_auth
+                .as_ref()
+                .map(|a| a.nostr_id.clone())
+                .unwrap_or_default();
+            let peer_signal_hex = if peer_signal_id.is_empty() {
+                peer_nostr_id.clone()
+            } else {
+                peer_signal_id
+            };
 
             let identity_pubkey = self.cached_identity_pubkey();
             if !identity_pubkey.is_empty() {
@@ -311,55 +379,86 @@ impl AppClient {
                 let msgid = format!("fr-accept-{}", request_id);
                 let event_id_hex = event.id.to_hex();
                 let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
 
                 let saved_room_id = {
                     let app_storage = self.inner.read().await.app_storage.clone();
                     let store = lock_app_storage(&app_storage);
-                    if store.is_app_message_duplicate(&event_id_hex).unwrap_or(false) {
+                    if store
+                        .is_app_message_duplicate(&event_id_hex)
+                        .unwrap_or(false)
+                    {
                         None
                     } else {
-                        store.transaction(|_| {
-                            let room_id = store.save_app_room(
-                                &peer_nostr_id, &identity_pubkey,
-                                RoomStatus::Enabled.to_i32(), RoomType::Dm.to_i32(),
-                                Some(&peer_name), Some(&peer_signal_hex), None,
-                            )?;
-                            store.save_app_contact(
-                                &peer_nostr_id, &peer_npub, &identity_pubkey, Some(&peer_name),
-                            )?;
-                            store.save_app_message(
-                                &msgid, Some(&event_id_hex), &room_id, &identity_pubkey,
-                                &peer_nostr_id, "[Friend Request Accepted]", false,
-                                MessageStatus::Success.to_i32(), now,
-                            )?;
-                            store.update_app_room(
-                                &room_id, Some(RoomStatus::Enabled.to_i32()), None,
-                                Some("[Friend Request Accepted]"), Some(now),
-                            )?;
-                            store.increment_app_room_unread(&room_id)?;
-                            Ok(room_id)
-                        }).ok()
+                        store
+                            .transaction(|_| {
+                                let room_id = store.save_app_room(
+                                    &peer_nostr_id,
+                                    &identity_pubkey,
+                                    RoomStatus::Enabled.to_i32(),
+                                    RoomType::Dm.to_i32(),
+                                    Some(&peer_name),
+                                    Some(&peer_signal_hex),
+                                    None,
+                                )?;
+                                store.save_app_contact(
+                                    &peer_nostr_id,
+                                    &peer_npub,
+                                    &identity_pubkey,
+                                    Some(&peer_name),
+                                )?;
+                                store.save_app_message(
+                                    &msgid,
+                                    Some(&event_id_hex),
+                                    &room_id,
+                                    &identity_pubkey,
+                                    &peer_nostr_id,
+                                    "[Friend Request Accepted]",
+                                    false,
+                                    MessageStatus::Success.to_i32(),
+                                    now,
+                                )?;
+                                store.update_app_room(
+                                    &room_id,
+                                    Some(RoomStatus::Enabled.to_i32()),
+                                    None,
+                                    Some("[Friend Request Accepted]"),
+                                    Some(now),
+                                )?;
+                                store.increment_app_room_unread(&room_id)?;
+                                Ok(room_id)
+                            })
+                            .ok()
                     }
                 };
 
                 if let Some(room_id) = saved_room_id {
-                    self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
+                    self.emit_data_change(DataChange::RoomUpdated {
+                        room_id: room_id.clone(),
+                    })
+                    .await;
                     self.emit_data_change(DataChange::ContactListChanged).await;
-                    self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+                    self.emit_data_change(DataChange::MessageAdded { room_id, msgid })
+                        .await;
                 }
             }
 
             self.emit_event(ClientEvent::FriendRequestAccepted {
                 peer_pubkey: peer_nostr_id,
                 peer_name,
-            }).await;
-
+            })
+            .await;
         } else if msg.kind == libkeychat::KCMessageKind::FriendReject {
             let peer_pubkey = {
                 let inner = self.inner.read().await;
-                inner.protocol.pending_outbound.get(request_id)
-                    .map(|s| s.peer_nostr_pubkey.clone()).unwrap_or_default()
+                inner
+                    .protocol
+                    .pending_outbound
+                    .get(request_id)
+                    .map(|s| s.peer_nostr_pubkey.clone())
+                    .unwrap_or_default()
             };
 
             let identity_pubkey = self.cached_identity_pubkey();
@@ -369,14 +468,19 @@ impl AppClient {
                     let app_storage = self.inner.read().await.app_storage.clone();
                     let store = lock_app_storage(&app_storage);
                     let _ = store.update_app_room(
-                        &room_id, Some(RoomStatus::Rejected.to_i32()), None,
-                        Some("[Friend Request Rejected]"), None,
+                        &room_id,
+                        Some(RoomStatus::Rejected.to_i32()),
+                        None,
+                        Some("[Friend Request Rejected]"),
+                        None,
                     );
                 }
-                self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+                self.emit_data_change(DataChange::RoomUpdated { room_id })
+                    .await;
             }
 
-            self.emit_event(ClientEvent::FriendRequestRejected { peer_pubkey }).await;
+            self.emit_event(ClientEvent::FriendRequestRejected { peer_pubkey })
+                .await;
         }
     }
 
@@ -398,7 +502,10 @@ impl AppClient {
         let group_id = msg.group_id.clone();
         let thread_id = msg.thread_id.clone();
         let fallback = msg.fallback.clone();
-        let reply_to_event_id = msg.reply_to.as_ref().and_then(|r| r.target_event_id.clone());
+        let reply_to_event_id = msg
+            .reply_to
+            .as_ref()
+            .and_then(|r| r.target_event_id.clone());
 
         // Handle group-specific messages (invite, member changes, etc.)
         // For now, all messages go through the generic persistence path.
@@ -422,44 +529,75 @@ impl AppClient {
                     let content_str = content.as_deref().unwrap_or("");
                     let display = if content_str.is_empty() {
                         fallback.as_deref().unwrap_or("[Message]")
-                    } else { content_str };
+                    } else {
+                        content_str
+                    };
                     let created_at = event.created_at.as_u64() as i64;
-                    let relay_status = relay_url.as_ref().map(|url| {
-                        format!(r#"[{{"url":"{}","status":"received"}}]"#, url)
-                    });
-                    let room_type = if group_id.is_some() { RoomType::SignalGroup.to_i32() } else { RoomType::Dm.to_i32() };
+                    let relay_status = relay_url
+                        .as_ref()
+                        .map(|url| format!(r#"[{{"url":"{}","status":"received"}}]"#, url));
+                    let room_type = if group_id.is_some() {
+                        RoomType::SignalGroup.to_i32()
+                    } else {
+                        RoomType::Dm.to_i32()
+                    };
 
-                    store.transaction(|_| {
-                        store.save_app_room(
-                            &room_id_base, &identity_pubkey,
-                            RoomStatus::Enabled.to_i32(), room_type, None, None, None,
-                        )?;
-                        store.save_app_message(
-                            &event_id, Some(&event_id), &full_room_id, &identity_pubkey,
-                            &sender_nostr_pubkey, content_str, false,
-                            MessageStatus::Success.to_i32(), created_at,
-                        )?;
-                        store.update_app_message(
-                            &event_id, None, None, relay_status.as_deref(),
-                            payload_json.as_deref(), nostr_event_json.as_deref(),
-                            reply_to_event_id.as_deref(), None,
-                        )?;
-                        store.update_app_room(
-                            &full_room_id, None, None, Some(display), Some(created_at),
-                        )?;
-                        store.increment_app_room_unread(&full_room_id)?;
-                        Ok(event_id.clone())
-                    }).ok()
+                    store
+                        .transaction(|_| {
+                            store.save_app_room(
+                                &room_id_base,
+                                &identity_pubkey,
+                                RoomStatus::Enabled.to_i32(),
+                                room_type,
+                                None,
+                                None,
+                                None,
+                            )?;
+                            store.save_app_message(
+                                &event_id,
+                                Some(&event_id),
+                                &full_room_id,
+                                &identity_pubkey,
+                                &sender_nostr_pubkey,
+                                content_str,
+                                false,
+                                MessageStatus::Success.to_i32(),
+                                created_at,
+                            )?;
+                            store.update_app_message(
+                                &event_id,
+                                None,
+                                None,
+                                relay_status.as_deref(),
+                                payload_json.as_deref(),
+                                nostr_event_json.as_deref(),
+                                reply_to_event_id.as_deref(),
+                                None,
+                            )?;
+                            store.update_app_room(
+                                &full_room_id,
+                                None,
+                                None,
+                                Some(display),
+                                Some(created_at),
+                            )?;
+                            store.increment_app_room_unread(&full_room_id)?;
+                            Ok(event_id.clone())
+                        })
+                        .ok()
                 }
             };
 
             if let Some(msgid) = saved_msgid {
                 self.emit_data_change(DataChange::MessageAdded {
-                    room_id: full_room_id.clone(), msgid,
-                }).await;
+                    room_id: full_room_id.clone(),
+                    msgid,
+                })
+                .await;
                 self.emit_data_change(DataChange::RoomUpdated {
                     room_id: full_room_id.clone(),
-                }).await;
+                })
+                .await;
             }
         }
 
@@ -476,12 +614,15 @@ impl AppClient {
             thread_id,
             nostr_event_json,
             relay_url,
-        }).await;
+        })
+        .await;
     }
 
     async fn on_nip17_dm_app_persist(&self, ctx: libkeychat::Nip17DmContext) {
         let identity_pubkey = self.cached_identity_pubkey();
-        if identity_pubkey.is_empty() { return; }
+        if identity_pubkey.is_empty() {
+            return;
+        }
 
         let room_id = make_room_id(&ctx.sender_pubkey, &identity_pubkey);
         let msgid = ctx.event_id.clone();
@@ -490,24 +631,49 @@ impl AppClient {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
             let _ = store.save_app_room(
-                &ctx.sender_pubkey, &identity_pubkey,
-                RoomStatus::Enabled.to_i32(), RoomType::Nip17Dm.to_i32(),
-                None, None, None,
+                &ctx.sender_pubkey,
+                &identity_pubkey,
+                RoomStatus::Enabled.to_i32(),
+                RoomType::Nip17Dm.to_i32(),
+                None,
+                None,
+                None,
             );
             let _ = store.save_app_message(
-                &msgid, Some(&ctx.event_id), &room_id, &identity_pubkey,
-                &ctx.sender_pubkey, &ctx.content, false,
-                MessageStatus::Success.to_i32(), ctx.created_at as i64,
+                &msgid,
+                Some(&ctx.event_id),
+                &room_id,
+                &identity_pubkey,
+                &ctx.sender_pubkey,
+                &ctx.content,
+                false,
+                MessageStatus::Success.to_i32(),
+                ctx.created_at as i64,
             );
-            let display = if ctx.content.len() > 50 { &ctx.content[..50] } else { &ctx.content };
-            let _ = store.update_app_room(&room_id, None, None, Some(display), Some(ctx.created_at as i64));
+            let display = if ctx.content.len() > 50 {
+                &ctx.content[..50]
+            } else {
+                &ctx.content
+            };
+            let _ = store.update_app_room(
+                &room_id,
+                None,
+                None,
+                Some(display),
+                Some(ctx.created_at as i64),
+            );
             let _ = store.increment_app_room_unread(&room_id);
         }
 
         self.emit_data_change(DataChange::MessageAdded {
-            room_id: room_id.clone(), msgid: msgid.clone(),
-        }).await;
-        self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
+            room_id: room_id.clone(),
+            msgid: msgid.clone(),
+        })
+        .await;
+        self.emit_data_change(DataChange::RoomUpdated {
+            room_id: room_id.clone(),
+        })
+        .await;
 
         self.emit_event(ClientEvent::MessageReceived {
             room_id,
@@ -522,14 +688,24 @@ impl AppClient {
             thread_id: None,
             nostr_event_json: ctx.nostr_event_json,
             relay_url: ctx.relay_url,
-        }).await;
+        })
+        .await;
     }
 
     /// Handle relay OK response.
-    pub async fn handle_relay_ok(&self, event_id: &str, relay_url: &str, status: bool, message: &str) {
+    pub async fn handle_relay_ok(
+        &self,
+        event_id: &str,
+        relay_url: &str,
+        status: bool,
+        message: &str,
+    ) {
         tracing::info!(
             "⬆️ RELAY_OK relay={} eventId={} ok={} msg={}",
-            relay_url, &event_id[..16.min(event_id.len())], status, &message[..80.min(message.len())]
+            relay_url,
+            &event_id[..16.min(event_id.len())],
+            status,
+            &message[..80.min(message.len())]
         );
         let update = {
             let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -543,13 +719,18 @@ impl AppClient {
             relay_url: relay_url.to_string(),
             success: status,
             message: message.to_string(),
-        }).await;
+        })
+        .await;
     }
 
     /// Persist a relay status update to DB.
     pub async fn apply_relay_status_update(&self, update: crate::relay_tracker::RelayStatusUpdate) {
         let msg_status = if update.all_resolved {
-            Some(if update.has_success { MessageStatus::Success.to_i32() } else { MessageStatus::Failed.to_i32() })
+            Some(if update.has_success {
+                MessageStatus::Success.to_i32()
+            } else {
+                MessageStatus::Failed.to_i32()
+            })
         } else {
             None
         };
@@ -558,16 +739,24 @@ impl AppClient {
         {
             let store = lock_app_storage(&app_storage);
             if let Err(e) = store.update_app_message(
-                &update.msgid, None, msg_status, Some(&update.relay_status_json),
-                None, None, None, None,
+                &update.msgid,
+                None,
+                msg_status,
+                Some(&update.relay_status_json),
+                None,
+                None,
+                None,
+                None,
             ) {
                 tracing::warn!("apply_relay_status_update: {e}");
             }
         }
 
         self.emit_data_change(DataChange::MessageUpdated {
-            room_id: update.room_id, msgid: update.msgid,
-        }).await;
+            room_id: update.room_id,
+            msgid: update.msgid,
+        })
+        .await;
 
         if update.all_resolved {
             let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());

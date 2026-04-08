@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use colored::Colorize;
 use keychat_app_core::{
-    ClientEvent, DataChange, GroupMemberInput, AppClient, MessageKind, RoomStatus, RoomType,
+    AppClient, ClientEvent, DataChange, GroupMemberInput, MessageKind, RoomStatus, RoomType,
 };
 use tokio::sync::broadcast;
 
@@ -44,7 +44,9 @@ pub async fn run(
 
     // Shared startup: restore identity → sessions → connect → event loop
     let relay_urls = keychat_app_core::default_relays();
-    if let Some((pubkey, session_count)) = crate::commands::init_and_connect(&client, relay_urls).await {
+    if let Some((pubkey, session_count)) =
+        crate::commands::init_and_connect(&client, relay_urls).await
+    {
         print_sys(&format!("Identity loaded: {}", short_key(&pubkey).cyan()));
         if session_count > 0 {
             print_sys(&format!("Restored {} session(s)", session_count));
@@ -162,7 +164,9 @@ async fn dispatch(
         "/help" => print_help(),
         "/quit" | "/exit" => return Ok(true),
 
-        _ => print_err(&format!("Unknown command: {cmd}. Type /help for available commands.")),
+        _ => print_err(&format!(
+            "Unknown command: {cmd}. Type /help for available commands."
+        )),
     }
 
     Ok(false)
@@ -172,8 +176,13 @@ async fn dispatch(
 
 async fn cmd_create(client: Arc<AppClient>, name: &str) -> anyhow::Result<()> {
     let display_name = if name.is_empty() { "CLI User" } else { name };
-    let (pubkey_hex, npub, mnemonic) = crate::commands::create_identity(&client, display_name).await?;
-    print_ok(&format!("Identity created: {} ({})", display_name.green(), short_key(&pubkey_hex).cyan()));
+    let (pubkey_hex, npub, mnemonic) =
+        crate::commands::create_identity(&client, display_name).await?;
+    print_ok(&format!(
+        "Identity created: {} ({})",
+        display_name.green(),
+        short_key(&pubkey_hex).cyan()
+    ));
     println!("  {} {}", "npub:".dimmed(), npub.cyan());
     print_sys(&format!("Mnemonic (save this!): {}", mnemonic.yellow()));
 
@@ -214,7 +223,11 @@ async fn cmd_backup(client: &AppClient) -> anyhow::Result<()> {
     );
     // Still show identity info
     match client.get_pubkey_hex().await {
-        Ok(pk) => println!("  {} {}", "Current identity:".dimmed(), short_key(&pk).cyan()),
+        Ok(pk) => println!(
+            "  {} {}",
+            "Current identity:".dimmed(),
+            short_key(&pk).cyan()
+        ),
         Err(_) => print_err("No identity loaded"),
     }
     Ok(())
@@ -405,9 +418,7 @@ async fn cmd_accept(client: &AppClient, args: &str) -> anyhow::Result<()> {
         "CLI User".to_string()
     };
 
-    let contact = client
-        .accept_friend_request(request_id, my_name)
-        .await?;
+    let contact = client.accept_friend_request(request_id, my_name).await?;
     print_ok(&format!(
         "Friend request accepted. Contact: {} ({})",
         contact.display_name.green(),
@@ -421,9 +432,7 @@ async fn cmd_reject(client: &AppClient, args: &str) -> anyhow::Result<()> {
         print_err("Usage: /reject <request_id>");
         return Ok(());
     }
-    client
-        .reject_friend_request(args.to_string(), None)
-        .await?;
+    client.reject_friend_request(args.to_string(), None).await?;
     print_ok("Friend request rejected");
     Ok(())
 }
@@ -442,11 +451,7 @@ async fn cmd_contacts(client: &AppClient) -> anyhow::Result<()> {
             .as_deref()
             .or(c.name.as_deref())
             .unwrap_or("(unnamed)");
-        println!(
-            "    {} {}",
-            name.green(),
-            short_key(&c.pubkey).dimmed()
-        );
+        println!("    {} {}", name.green(), short_key(&c.pubkey).dimmed());
     }
     Ok(())
 }
@@ -485,7 +490,10 @@ async fn cmd_chat(
             select(&rooms[idx - 1], active_room_id);
             return Ok(());
         }
-        print_err(&format!("Room index {idx} out of range (1-{})", rooms.len()));
+        print_err(&format!(
+            "Room index {idx} out of range (1-{})",
+            rooms.len()
+        ));
         return Ok(());
     }
 
@@ -501,37 +509,62 @@ async fn cmd_chat(
         select(prefix_matches[0], active_room_id);
         return Ok(());
     } else if prefix_matches.len() > 1 {
-        print_err(&format!("Ambiguous ID prefix '{}' matches {} rooms — use more characters", query, prefix_matches.len()));
+        print_err(&format!(
+            "Ambiguous ID prefix '{}' matches {} rooms — use more characters",
+            query,
+            prefix_matches.len()
+        ));
         return Ok(());
     }
 
     // 4. Try name match (case-insensitive)
     let query_lower = query.to_lowercase();
-    let name_matches: Vec<_> = rooms.iter().filter(|r| {
-        r.name.as_deref().map(|n| n.to_lowercase() == query_lower).unwrap_or(false)
-    }).collect();
+    let name_matches: Vec<_> = rooms
+        .iter()
+        .filter(|r| {
+            r.name
+                .as_deref()
+                .map(|n| n.to_lowercase() == query_lower)
+                .unwrap_or(false)
+        })
+        .collect();
     if name_matches.len() == 1 {
         select(name_matches[0], active_room_id);
         return Ok(());
     } else if name_matches.len() > 1 {
-        print_err(&format!("Ambiguous name '{}' matches {} rooms — use room index or ID", query, name_matches.len()));
+        print_err(&format!(
+            "Ambiguous name '{}' matches {} rooms — use room index or ID",
+            query,
+            name_matches.len()
+        ));
         return Ok(());
     }
 
     // 5. Try name substring match (case-insensitive)
-    let substr_matches: Vec<_> = rooms.iter().filter(|r| {
-        r.name.as_deref().map(|n| n.to_lowercase().contains(&query_lower)).unwrap_or(false)
-    }).collect();
+    let substr_matches: Vec<_> = rooms
+        .iter()
+        .filter(|r| {
+            r.name
+                .as_deref()
+                .map(|n| n.to_lowercase().contains(&query_lower))
+                .unwrap_or(false)
+        })
+        .collect();
     if substr_matches.len() == 1 {
         select(substr_matches[0], active_room_id);
         return Ok(());
     } else if substr_matches.len() > 1 {
-        print_err(&format!("Ambiguous name '{}' matches {} rooms — use room index or ID", query, substr_matches.len()));
+        print_err(&format!(
+            "Ambiguous name '{}' matches {} rooms — use room index or ID",
+            query,
+            substr_matches.len()
+        ));
         return Ok(());
     }
 
     // 6. Try as contact pubkey (hex or npub)
-    let normalized = keychat_app_core::normalize_to_hex(query.to_string()).unwrap_or(query.to_string());
+    let normalized =
+        keychat_app_core::normalize_to_hex(query.to_string()).unwrap_or(query.to_string());
     if let Some(room) = rooms.iter().find(|r| r.to_main_pubkey == normalized) {
         select(room, active_room_id);
         return Ok(());
@@ -581,9 +614,7 @@ async fn cmd_rooms(client: &AppClient) -> anyhow::Result<()> {
                 format!(" — {}", truncated).dimmed().to_string()
             })
             .unwrap_or_default();
-        println!(
-            "  {idx}. {status} [{room_type}] {name}{unread}{last_msg}",
-        );
+        println!("  {idx}. {status} [{room_type}] {name}{unread}{last_msg}",);
         println!(
             "      {} {}  {} {}",
             "ID:".dimmed(),
@@ -597,10 +628,7 @@ async fn cmd_rooms(client: &AppClient) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_read(
-    client: &AppClient,
-    active_room_id: &Option<String>,
-) -> anyhow::Result<()> {
+async fn cmd_read(client: &AppClient, active_room_id: &Option<String>) -> anyhow::Result<()> {
     let room_id = match active_room_id {
         Some(id) => id.clone(),
         None => {
@@ -634,7 +662,10 @@ async fn cmd_history(
         return Ok(());
     }
 
-    println!("  {}", format!("─── Last {} messages ───", messages.len()).bold());
+    println!(
+        "  {}",
+        format!("─── Last {} messages ───", messages.len()).bold()
+    );
     for msg in &messages {
         let time = format_timestamp(msg.created_at as u64);
         let sender = if msg.is_me_send {
@@ -672,7 +703,10 @@ async fn send_chat_message(
     };
 
     match crate::commands::send_message(client, &room_id, text).await? {
-        crate::commands::SendResult::Dm { event_id, relay_count } => {
+        crate::commands::SendResult::Dm {
+            event_id,
+            relay_count,
+        } => {
             print_sys(&format!(
                 "Sent [{}] → {} relay(s)",
                 short_key(&event_id).dimmed(),
@@ -726,10 +760,7 @@ async fn cmd_sendfile(
         print_sys(&format!("Uploading {}...", file_name));
         match crate::commands::upload_and_prepare_file(path, &server).await {
             Ok(payload) => {
-                print_ok(&format!(
-                    "Uploaded {} ({} bytes)",
-                    file_name, payload.size
-                ));
+                print_ok(&format!("Uploaded {} ({} bytes)", file_name, payload.size));
                 payloads.push(payload);
             }
             Err(e) => {
@@ -789,16 +820,36 @@ async fn cmd_upload(client: &AppClient, args: &str) -> anyhow::Result<()> {
         Err(_) => keychat_app_core::default_blossom_server(),
     };
 
-    print_sys(&format!("Uploading {} to {}...", file_name, server.dimmed()));
+    print_sys(&format!(
+        "Uploading {} to {}...",
+        file_name,
+        server.dimmed()
+    ));
 
     match crate::commands::upload_and_prepare_file(path, &server).await {
         Ok(payload) => {
             print_ok(&format!("Uploaded {}", file_name.green()));
             println!("  {} {}", "URL:".dimmed(), payload.url.cyan());
-            println!("  {} {}", "Key:".dimmed(), crate::commands::short_key(&payload.key).cyan());
-            println!("  {} {}", "IV:".dimmed(), crate::commands::short_key(&payload.iv).cyan());
-            println!("  {} {}", "Hash:".dimmed(), crate::commands::short_key(&payload.hash).cyan());
-            println!("  {} {} bytes", "Size:".dimmed(), crate::commands::format_file_size(payload.size).cyan());
+            println!(
+                "  {} {}",
+                "Key:".dimmed(),
+                crate::commands::short_key(&payload.key).cyan()
+            );
+            println!(
+                "  {} {}",
+                "IV:".dimmed(),
+                crate::commands::short_key(&payload.iv).cyan()
+            );
+            println!(
+                "  {} {}",
+                "Hash:".dimmed(),
+                crate::commands::short_key(&payload.hash).cyan()
+            );
+            println!(
+                "  {} {} bytes",
+                "Size:".dimmed(),
+                crate::commands::format_file_size(payload.size).cyan()
+            );
         }
         Err(e) => {
             print_err(&format!("Upload failed: {e}"));
@@ -833,11 +884,26 @@ async fn cmd_download(
         let mut i = 1;
         while i < parts.len() {
             match parts[i] {
-                "--key" => { i += 1; key = parts.get(i).map(|s| s.to_string()); }
-                "--iv" => { i += 1; iv = parts.get(i).map(|s| s.to_string()); }
-                "--hash" => { i += 1; hash = parts.get(i).map(|s| s.to_string()); }
-                "--room" => { i += 1; room_id = parts.get(i).map(|s| s.to_string()); }
-                "--name" => { i += 1; source_name = parts.get(i).map(|s| s.to_string()); }
+                "--key" => {
+                    i += 1;
+                    key = parts.get(i).map(|s| s.to_string());
+                }
+                "--iv" => {
+                    i += 1;
+                    iv = parts.get(i).map(|s| s.to_string());
+                }
+                "--hash" => {
+                    i += 1;
+                    hash = parts.get(i).map(|s| s.to_string());
+                }
+                "--room" => {
+                    i += 1;
+                    room_id = parts.get(i).map(|s| s.to_string());
+                }
+                "--name" => {
+                    i += 1;
+                    source_name = parts.get(i).map(|s| s.to_string());
+                }
                 _ => {}
             }
             i += 1;
@@ -846,7 +912,9 @@ async fn cmd_download(
         let room_id = match room_id {
             Some(id) => id,
             None => {
-                print_err("No room specified. Use /download <url> --room <room_id> or set active chat.");
+                print_err(
+                    "No room specified. Use /download <url> --room <room_id> or set active chat.",
+                );
                 return Ok(());
             }
         };
@@ -854,16 +922,19 @@ async fn cmd_download(
         match (key, iv, hash) {
             (Some(key), Some(iv), Some(hash)) => {
                 print_sys(&format!("Downloading from URL..."));
-                match client.download_and_save(
-                    target.to_string(),
-                    key,
-                    iv,
-                    hash,
-                    source_name,
-                    None, // suffix can be extracted from source_name
-                    room_id,
-                    None, // no msgid for direct URL download
-                ).await {
+                match client
+                    .download_and_save(
+                        target.to_string(),
+                        key,
+                        iv,
+                        hash,
+                        source_name,
+                        None, // suffix can be extracted from source_name
+                        room_id,
+                        None, // no msgid for direct URL download
+                    )
+                    .await
+                {
                     Ok(path) => {
                         print_ok(&format!("Downloaded to {}", path.green()));
                     }
@@ -891,18 +962,23 @@ async fn cmd_download(
     let index: usize = match target.parse() {
         Ok(n) if n >= 1 => n,
         _ => {
-            print_err(&format!("Invalid file index: {target}. Use a number (1-based)."));
+            print_err(&format!(
+                "Invalid file index: {target}. Use a number (1-based)."
+            ));
             return Ok(());
         }
     };
 
     // Fetch messages and find file messages
     let messages = client.get_messages(room_id.clone(), 100, 0).await?;
-    let file_messages: Vec<_> = messages.iter().filter_map(|msg| {
-        msg.payload_json.as_ref().and_then(|json| {
-            crate::commands::parse_file_message(json).map(|parsed| (msg, parsed))
+    let file_messages: Vec<_> = messages
+        .iter()
+        .filter_map(|msg| {
+            msg.payload_json.as_ref().and_then(|json| {
+                crate::commands::parse_file_message(json).map(|parsed| (msg, parsed))
+            })
         })
-    }).collect();
+        .collect();
 
     if file_messages.is_empty() {
         print_err("No file messages found in this room.");
@@ -910,7 +986,11 @@ async fn cmd_download(
     }
 
     // Flatten all file items with their message context
-    let mut all_files: Vec<(usize, &keychat_app_core::MessageInfo, &crate::commands::ParsedFileItem)> = Vec::new();
+    let mut all_files: Vec<(
+        usize,
+        &keychat_app_core::MessageInfo,
+        &crate::commands::ParsedFileItem,
+    )> = Vec::new();
     let mut idx = 1;
     for (msg, parsed) in &file_messages {
         for item in &parsed.items {
@@ -920,7 +1000,10 @@ async fn cmd_download(
     }
 
     if index > all_files.len() {
-        print_err(&format!("File index {index} out of range. Found {} file(s).", all_files.len()));
+        print_err(&format!(
+            "File index {index} out of range. Found {} file(s).",
+            all_files.len()
+        ));
         return Ok(());
     }
 
@@ -929,23 +1012,33 @@ async fn cmd_download(
     let file_name = item.display_name();
 
     // Check if already downloaded
-    if let Some(path) = client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await {
+    if let Some(path) = client
+        .resolve_local_file(msg.msgid.clone(), item.hash.clone())
+        .await
+    {
         print_ok(&format!("File already downloaded: {}", path.green()));
         return Ok(());
     }
 
-    print_sys(&format!("Downloading {} ({})", file_name, crate::commands::format_file_size(item.size)));
+    print_sys(&format!(
+        "Downloading {} ({})",
+        file_name,
+        crate::commands::format_file_size(item.size)
+    ));
 
-    match client.download_and_save(
-        item.url.clone(),
-        item.key.clone(),
-        item.iv.clone(),
-        item.hash.clone(),
-        item.source_name.clone(),
-        item.suffix.clone(),
-        room_id.clone(),
-        Some(msg.msgid.clone()),
-    ).await {
+    match client
+        .download_and_save(
+            item.url.clone(),
+            item.key.clone(),
+            item.iv.clone(),
+            item.hash.clone(),
+            item.source_name.clone(),
+            item.suffix.clone(),
+            room_id.clone(),
+            Some(msg.msgid.clone()),
+        )
+        .await
+    {
         Ok(path) => {
             print_ok(&format!("Downloaded to {}", path.green()));
         }
@@ -992,7 +1085,10 @@ async fn cmd_files(
 
     // Fetch messages and find file messages
     let messages = client.get_messages(room_id.clone(), 100, 0).await?;
-    let mut file_entries: Vec<(keychat_app_core::MessageInfo, crate::commands::ParsedFileMessage)> = Vec::new();
+    let mut file_entries: Vec<(
+        keychat_app_core::MessageInfo,
+        crate::commands::ParsedFileMessage,
+    )> = Vec::new();
 
     for msg in messages {
         if let Some(ref json) = msg.payload_json {
@@ -1020,13 +1116,20 @@ async fn cmd_files(
             let size = crate::commands::format_file_size(item.size);
 
             // Check download status and get local path
-            let (status, display_name) = if let Some(path) = client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await {
+            let (status, display_name) = if let Some(path) = client
+                .resolve_local_file(msg.msgid.clone(), item.hash.clone())
+                .await
+            {
                 ("✓".green().to_string(), path.dimmed().to_string())
             } else {
-                ("○".dimmed().to_string(), item.display_name().bold().to_string())
+                (
+                    "○".dimmed().to_string(),
+                    item.display_name().bold().to_string(),
+                )
             };
 
-            println!("  {} {:>3} {} {} {} {} {}",
+            println!(
+                "  {} {:>3} {} {} {} {} {}",
                 status,
                 format!("[{}]", idx).dimmed(),
                 icon,
@@ -1038,7 +1141,8 @@ async fn cmd_files(
             idx += 1;
         } else {
             // Multiple files in one message
-            println!("  {} {} {} {} {}",
+            println!(
+                "  {} {} {} {} {}",
                 " ".to_string(),
                 format!("[{}-{}]", idx, idx + parsed.items.len() - 1).dimmed(),
                 format!("{} files", parsed.items.len()).yellow(),
@@ -1050,13 +1154,17 @@ async fn cmd_files(
                 let size = crate::commands::format_file_size(item.size);
 
                 // Check download status and get local path
-                let (status, display_name) = if let Some(path) = client.resolve_local_file(msg.msgid.clone(), item.hash.clone()).await {
+                let (status, display_name) = if let Some(path) = client
+                    .resolve_local_file(msg.msgid.clone(), item.hash.clone())
+                    .await
+                {
                     ("✓".green().to_string(), path.dimmed().to_string())
                 } else {
                     ("○".dimmed().to_string(), item.display_name().to_string())
                 };
 
-                println!("  {} {:>3} {} {} {}",
+                println!(
+                    "  {} {:>3} {} {} {}",
                     status,
                     format!("[{}]", idx).dimmed(),
                     icon,
@@ -1069,7 +1177,10 @@ async fn cmd_files(
     }
 
     if idx > 1 {
-        println!("  {}", format!("\nUse /download <index> to download a file.").dimmed());
+        println!(
+            "  {}",
+            format!("\nUse /download <index> to download a file.").dimmed()
+        );
     }
 
     Ok(())
@@ -1087,8 +1198,8 @@ async fn cmd_sg_create(client: &AppClient, args: &str) -> anyhow::Result<()> {
     let members: Vec<GroupMemberInput> = parts[1..]
         .iter()
         .map(|pk| {
-            let normalized =
-                keychat_app_core::normalize_to_hex(pk.to_string()).unwrap_or_else(|_| pk.to_string());
+            let normalized = keychat_app_core::normalize_to_hex(pk.to_string())
+                .unwrap_or_else(|_| pk.to_string());
             GroupMemberInput {
                 nostr_pubkey: normalized.clone(),
                 name: short_key(&normalized),
@@ -1109,14 +1220,20 @@ async fn cmd_sg_create(client: &AppClient, args: &str) -> anyhow::Result<()> {
     ));
     println!("  Full group ID: {}", info.group_id.cyan());
     println!("  Members: {}", info.member_count);
-    println!("  Use {} to select this group chat", format!("/sg-chat {}", info.group_id).green());
+    println!(
+        "  Use {} to select this group chat",
+        format!("/sg-chat {}", info.group_id).green()
+    );
     Ok(())
 }
 
 async fn cmd_sg_list(client: &AppClient) -> anyhow::Result<()> {
     let pubkey = client.get_pubkey_hex().await?;
     let rooms = client.get_rooms(pubkey).await?;
-    let groups: Vec<_> = rooms.iter().filter(|r| r.room_type == RoomType::SignalGroup).collect();
+    let groups: Vec<_> = rooms
+        .iter()
+        .filter(|r| r.room_type == RoomType::SignalGroup)
+        .collect();
     if groups.is_empty() {
         print_sys("No signal groups.");
         return Ok(());
@@ -1128,7 +1245,10 @@ async fn cmd_sg_list(client: &AppClient) -> anyhow::Result<()> {
         let gid = g.id.split(':').next().unwrap_or(&g.id);
         println!("    {} — {}", gid.cyan(), name);
     }
-    println!("  Use {} to select a group chat", "/sg-chat <group_id>".green());
+    println!(
+        "  Use {} to select a group chat",
+        "/sg-chat <group_id>".green()
+    );
     Ok(())
 }
 
@@ -1186,8 +1306,8 @@ async fn cmd_sg_kick(client: &AppClient, args: &str) -> anyhow::Result<()> {
         print_err("Usage: /sg-kick <group_id> <member_pubkey>");
         return Ok(());
     }
-    let member_pk =
-        keychat_app_core::normalize_to_hex(parts[1].to_string()).unwrap_or_else(|_| parts[1].to_string());
+    let member_pk = keychat_app_core::normalize_to_hex(parts[1].to_string())
+        .unwrap_or_else(|_| parts[1].to_string());
     client
         .remove_group_member(parts[0].to_string(), member_pk)
         .await?;
@@ -1233,14 +1353,21 @@ fn spawn_event_printer(
                         payload: Some(ref payload_json),
                         ref event_id,
                         ..
-                    } = event {
+                    } = event
+                    {
                         // Spawn auto-download task
                         let client_clone = Arc::clone(&client);
                         let room_id = room_id.clone();
                         let event_id = event_id.clone();
                         let payload_json = payload_json.clone();
                         tokio::spawn(async move {
-                            handle_file_message_auto_download(client_clone, room_id, event_id, payload_json).await;
+                            handle_file_message_auto_download(
+                                client_clone,
+                                room_id,
+                                event_id,
+                                payload_json,
+                            )
+                            .await;
                         });
                     }
                     print_event(&event);
@@ -1285,7 +1412,11 @@ async fn handle_file_message_auto_download(
     // Process each file item
     for item in &parsed.items {
         // Check if already downloaded
-        if client.resolve_local_file(event_id.clone(), item.hash.clone()).await.is_some() {
+        if client
+            .resolve_local_file(event_id.clone(), item.hash.clone())
+            .await
+            .is_some()
+        {
             continue;
         }
 
@@ -1293,7 +1424,11 @@ async fn handle_file_message_auto_download(
         match client.should_auto_download(item.size).await {
             Ok(true) => {}
             Ok(false) => {
-                tracing::info!("Skipping auto-download for {} (size {} exceeds limit)", item.display_name(), item.size);
+                tracing::info!(
+                    "Skipping auto-download for {} (size {} exceeds limit)",
+                    item.display_name(),
+                    item.size
+                );
                 continue;
             }
             Err(e) => {
@@ -1304,16 +1439,19 @@ async fn handle_file_message_auto_download(
 
         // Download the file
         tracing::info!("Auto-downloading file: {}", item.display_name());
-        match client.download_and_save(
-            item.url.clone(),
-            item.key.clone(),
-            item.iv.clone(),
-            item.hash.clone(),
-            item.source_name.clone(),
-            item.suffix.clone(),
-            room_id.clone(),
-            Some(event_id.clone()),
-        ).await {
+        match client
+            .download_and_save(
+                item.url.clone(),
+                item.key.clone(),
+                item.iv.clone(),
+                item.hash.clone(),
+                item.source_name.clone(),
+                item.suffix.clone(),
+                room_id.clone(),
+                Some(event_id.clone()),
+            )
+            .await
+        {
             Ok(path) => {
                 tracing::info!("Auto-downloaded file to: {path}");
             }
@@ -1415,11 +1553,7 @@ fn print_event(event: &ClientEvent) {
                 group_name.green(),
                 short_key(inviter_pubkey).cyan()
             );
-            eprintln!(
-                "  {} /sg-chat {}",
-                "To join chat:".dimmed(),
-                room_id
-            );
+            eprintln!("  {} /sg-chat {}", "To join chat:".dimmed(), room_id);
         }
         ClientEvent::GroupDissolved { room_id } => {
             eprintln!(
@@ -1442,12 +1576,11 @@ fn print_event(event: &ClientEvent) {
                         member_pubkey.as_deref().unwrap_or("?")
                     )
                 }
-                keychat_app_core::GroupChangeKind::SelfLeave => "A member left the group".to_string(),
+                keychat_app_core::GroupChangeKind::SelfLeave => {
+                    "A member left the group".to_string()
+                }
                 keychat_app_core::GroupChangeKind::NameChanged => {
-                    format!(
-                        "Group renamed to: {}",
-                        new_value.as_deref().unwrap_or("?")
-                    )
+                    format!("Group renamed to: {}", new_value.as_deref().unwrap_or("?"))
                 }
             };
             eprintln!(
@@ -1474,11 +1607,7 @@ fn print_event(event: &ClientEvent) {
             }
         }
         ClientEvent::EventLoopError { description } => {
-            eprintln!(
-                "\r  {} {}",
-                "[event-loop error]".red(),
-                description
-            );
+            eprintln!("\r  {} {}", "[event-loop error]".red(), description);
         }
     }
 }
@@ -1494,7 +1623,12 @@ fn print_data_change(change: &DataChange) {
                 _ => status_str.red(),
             };
             let msg = message.as_deref().unwrap_or("");
-            eprintln!("\r  {} {} {}", "Connection:".dimmed(), colored, msg.dimmed());
+            eprintln!(
+                "\r  {} {} {}",
+                "Connection:".dimmed(),
+                colored,
+                msg.dimmed()
+            );
         }
         // Other data changes are too noisy for the REPL; suppress them.
         _ => {}
@@ -1516,10 +1650,7 @@ fn print_banner() {
         "  {}",
         "Keychat CLI — E2E encrypted messaging over Nostr".bold()
     );
-    println!(
-        "  {}",
-        "Type /help for commands, /quit to exit".dimmed()
-    );
+    println!("  {}", "Type /help for commands, /quit to exit".dimmed());
     println!();
 }
 
@@ -1531,7 +1662,10 @@ fn print_help() {
     println!("    {}  Import from mnemonic", "/import <mnemonic>".green());
     println!("    {}   Show current pubkey", "/whoami".green());
     println!("    {}   Show backup info", "/backup".green());
-    println!("    {}  Remove identity (with confirmation)", "/delete-identity".green());
+    println!(
+        "    {}  Remove identity (with confirmation)",
+        "/delete-identity".green()
+    );
     println!("    {}    Delete ALL data and quit", "/reset".green());
     println!();
     println!("  {}", "Connection:".bold());
@@ -1544,7 +1678,10 @@ fn print_help() {
     println!("    {}  Add a relay", "/add-relay <url>".green());
     println!("    {}  Remove a relay", "/remove-relay <url>".green());
     println!("    {}  Reconnect all relays", "/reconnect".green());
-    println!("    {}   Show connection + identity status", "/status".green());
+    println!(
+        "    {}   Show connection + identity status",
+        "/status".green()
+    );
     println!();
     println!("  {}", "Friends:".bold());
     println!(
@@ -1565,10 +1702,7 @@ fn print_help() {
     );
     println!("    {}    List all rooms", "/rooms".green());
     println!("    {}     Mark current room as read", "/read".green());
-    println!(
-        "    {}  Show message history",
-        "/history [count]".green()
-    );
+    println!("    {}  Show message history", "/history [count]".green());
     println!(
         "    {}  Send file(s) to active chat",
         "/sendfile <path> [path...]".green()
@@ -1587,10 +1721,7 @@ fn print_help() {
         "    {}  Download from URL",
         "/download <url> --key K --iv I --hash H --room R".green()
     );
-    println!(
-        "    {}    List files in room",
-        "/files [room_id]".green()
-    );
+    println!("    {}    List files in room", "/files [room_id]".green());
     println!();
     println!("  {}", "Signal Groups:".bold());
     println!(
@@ -1633,7 +1764,7 @@ fn print_err(msg: &str) {
     eprintln!("  {} {msg}", "ERROR".red().bold());
 }
 
-use crate::commands::{short_key, format_timestamp};
+use crate::commands::{format_timestamp, short_key};
 
 fn format_now() -> String {
     Utc::now().format("%H:%M:%S").to_string()

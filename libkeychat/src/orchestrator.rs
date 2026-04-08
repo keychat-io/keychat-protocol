@@ -165,18 +165,10 @@ pub struct GroupInviteContext {
 /// The kind of group change event.
 #[derive(Debug, Clone)]
 pub enum GroupChangeKind {
-    MemberRemoved {
-        member_pubkey: Option<String>,
-    },
-    SelfLeave {
-        group_id: String,
-    },
-    Dissolve {
-        group_id: String,
-    },
-    NameChanged {
-        new_name: Option<String>,
-    },
+    MemberRemoved { member_pubkey: Option<String> },
+    SelfLeave { group_id: String },
+    Dissolve { group_id: String },
+    NameChanged { new_name: Option<String> },
 }
 
 /// Context for a group change event.
@@ -298,9 +290,19 @@ impl ProtocolClient {
         let mut participant_rows: Vec<ParticipantRow> = Vec::new();
 
         type FrRow = (
-            String, u32, Vec<u8>, Vec<u8>, u32,
-            u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>,
-            String, String,
+            String,
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+            u32,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            String,
+            String,
         );
         let mut fr_rows: Vec<FrRow> = Vec::new();
 
@@ -354,8 +356,18 @@ impl ProtocolClient {
         for fr_id in &fr_ids {
             match store.load_pending_fr(fr_id) {
                 Ok(Some((
-                    device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec,
-                    kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey,
+                    device_id,
+                    id_pub,
+                    id_priv,
+                    reg_id,
+                    spk_id,
+                    spk_rec,
+                    pk_id,
+                    pk_rec,
+                    kpk_id,
+                    kpk_rec,
+                    first_inbox_secret,
+                    peer_nostr_pubkey,
                 ))) => {
                     fr_rows.push((
                         fr_id.clone(),
@@ -468,8 +480,19 @@ impl ProtocolClient {
 
         // 3. Restore pending outbound friend requests (per-peer identity)
         for (
-            fr_id, device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec,
-            kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey,
+            fr_id,
+            device_id,
+            id_pub,
+            id_priv,
+            reg_id,
+            spk_id,
+            spk_rec,
+            pk_id,
+            pk_rec,
+            kpk_id,
+            kpk_rec,
+            first_inbox_secret,
+            peer_nostr_pubkey,
         ) in fr_rows
         {
             if device_id > max_device_id {
@@ -766,32 +789,40 @@ impl ProtocolClient {
 
         // Subscribe identity keys with cursor-based since (±2 day randomization)
         let identity_since = if relay_cursor > 0 {
-            Some(nostr::Timestamp::from(relay_cursor.saturating_sub(2 * 86400)))
+            Some(nostr::Timestamp::from(
+                relay_cursor.saturating_sub(3 * 86400),
+            ))
         } else {
             None
         };
+        // Use resubscribe() for atomic unsub+sub (matches main branch behavior)
+        let old_ids = std::mem::take(&mut self.subscription_ids);
+        let mut old_iter = old_ids.into_iter().map(|s| crate::SubscriptionId::new(s));
+
         let mut new_sub_ids = Vec::new();
         if !identity_pubkeys.is_empty() {
             let id = transport
-                .subscribe(identity_pubkeys, identity_since)
+                .resubscribe(old_iter.next(), identity_pubkeys, identity_since)
                 .await?;
             new_sub_ids.push(id.to_string());
         }
 
-        // Subscribe ratchet keys with since = now()
         if !ratchet_pubkeys.is_empty() {
             let id = transport
-                .subscribe(ratchet_pubkeys, Some(nostr::Timestamp::now()))
+                .resubscribe(
+                    old_iter.next(),
+                    ratchet_pubkeys,
+                    Some(nostr::Timestamp::now()),
+                )
                 .await?;
             new_sub_ids.push(id.to_string());
         }
 
-        // Unsubscribe old subscriptions before replacing IDs
-        for old_id in &self.subscription_ids {
-            transport
-                .unsubscribe(crate::SubscriptionId::new(old_id))
-                .await;
+        // Unsubscribe any remaining stale IDs
+        for leftover in old_iter {
+            transport.unsubscribe(leftover).await;
         }
+
         self.subscription_ids = new_sub_ids;
 
         Ok(())
@@ -885,19 +916,31 @@ impl ProtocolClient {
             .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
         let connected = transport.connected_relays().await;
         if connected.is_empty() {
-            return Err(KeychatError::Transport("Not connected to any relay.".into()));
+            return Err(KeychatError::Transport(
+                "Not connected to any relay.".into(),
+            ));
         }
 
         // 2. Resolve peer → signal session
         let signal_hex = self
             .peer_nostr_to_signal
             .get(peer_pubkey)
-            .ok_or_else(|| KeychatError::SignalSession(format!("peer not found: {}", &peer_pubkey[..16.min(peer_pubkey.len())])))?
+            .ok_or_else(|| {
+                KeychatError::SignalSession(format!(
+                    "peer not found: {}",
+                    &peer_pubkey[..16.min(peer_pubkey.len())]
+                ))
+            })?
             .clone();
         let session_mutex = self
             .sessions
             .get(&signal_hex)
-            .ok_or_else(|| KeychatError::SignalSession(format!("no session for signal id: {}", &signal_hex[..16.min(signal_hex.len())])))?
+            .ok_or_else(|| {
+                KeychatError::SignalSession(format!(
+                    "no session for signal id: {}",
+                    &signal_hex[..16.min(signal_hex.len())]
+                ))
+            })?
             .clone();
 
         // 3. Encrypt via Signal session
@@ -928,7 +971,8 @@ impl ProtocolClient {
 
         // 6. Update address reverse index
         for addr in &addr_update.new_receiving {
-            self.receiving_addr_to_peer.insert(addr.clone(), signal_hex.clone());
+            self.receiving_addr_to_peer
+                .insert(addr.clone(), signal_hex.clone());
         }
         for addr in &addr_update.dropped_receiving {
             self.receiving_addr_to_peer.remove(addr);
@@ -948,10 +992,7 @@ impl ProtocolClient {
     /// Returns `Some(FriendRequestContext)` if successful, `None` if not a friend request.
     /// Pure protocol: unwraps gift wrap, verifies globalSign, persists to SecureStorage.
     /// Does NOT write to app_storage.
-    pub fn try_decrypt_friend_request(
-        &self,
-        event: &crate::Event,
-    ) -> Option<FriendRequestContext> {
+    pub fn try_decrypt_friend_request(&self, event: &crate::Event) -> Option<FriendRequestContext> {
         let identity = self.identity.as_ref()?;
 
         let received = match crate::receive_friend_request(identity, event) {
@@ -959,7 +1000,10 @@ impl ProtocolClient {
             Err(_) => return None,
         };
 
-        let request_id = received.message.id.clone()
+        let request_id = received
+            .message
+            .id
+            .clone()
             .unwrap_or_else(|| format!("fr-{}", event.id.to_hex()));
         let sender_pubkey = received.sender_pubkey_hex.clone();
         let sender_name = received.payload.name.clone();
@@ -993,7 +1037,6 @@ impl ProtocolClient {
         })
     }
 
-
     // ─── Complex decrypt methods (TODO: move full logic from app-core) ──
 
     /// Try to decrypt an incoming event with pending outbound FR states (Step 2).
@@ -1017,11 +1060,7 @@ impl ProtocolClient {
             let remote_address = crate::ProtocolAddress::new(signal_id_hex.clone(), device_id);
 
             let result = if let Some(state) = self.pending_outbound.get_mut(request_id) {
-                crate::receive_signal_message(
-                    &mut state.signal_participant,
-                    &remote_address,
-                    event,
-                )
+                crate::receive_signal_message(&mut state.signal_participant, &remote_address, event)
             } else {
                 continue;
             };
@@ -1040,7 +1079,13 @@ impl ProtocolClient {
     pub async fn try_decrypt_session_message(
         &self,
         event: &crate::Event,
-    ) -> Option<(String, crate::KCMessage, crate::MessageMetadata, crate::address::AddressUpdate, Arc<tokio::sync::Mutex<crate::ChatSession>>)> {
+    ) -> Option<(
+        String,
+        crate::KCMessage,
+        crate::MessageMetadata,
+        crate::address::AddressUpdate,
+        Arc<tokio::sync::Mutex<crate::ChatSession>>,
+    )> {
         let p_tags = crate::extract_p_tags(event);
         let first_p = p_tags.first()?;
 
@@ -1061,7 +1106,10 @@ impl ProtocolClient {
         let (msg, metadata, addr_update) = match result {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Step3: decrypt failed for peer={}: {e}", &peer_id[..16.min(peer_id.len())]);
+                tracing::warn!(
+                    "Step3: decrypt failed for peer={}: {e}",
+                    &peer_id[..16.min(peer_id.len())]
+                );
                 return None;
             }
         };
@@ -1094,7 +1142,9 @@ impl ProtocolClient {
         my_name: &str,
         device_id_str: &str,
     ) -> Result<(String, String)> {
-        let identity = self.identity.clone()
+        let identity = self
+            .identity
+            .clone()
             .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
 
         let signal_device_id = self.next_signal_device_id;
@@ -1105,9 +1155,15 @@ impl ProtocolClient {
             crate::serialize_prekey_material(&keys)?;
 
         let (event, state) = crate::send_friend_request_persistent(
-            &identity, peer_nostr_pubkey, my_name, device_id_str,
-            keys, self.storage.clone(), signal_device_id,
-        ).await?;
+            &identity,
+            peer_nostr_pubkey,
+            my_name,
+            device_id_str,
+            keys,
+            self.storage.clone(),
+            signal_device_id,
+        )
+        .await?;
 
         let request_id = state.request_id.clone();
         let first_inbox_secret = state.first_inbox_keys.secret_hex();
@@ -1115,14 +1171,26 @@ impl ProtocolClient {
         // Persist pending FR to SecureStorage
         if let Ok(store) = self.storage.lock() {
             store.save_pending_fr(
-                &request_id, signal_device_id,
-                &id_pub, &id_priv, reg_id, spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
-                &first_inbox_secret, peer_nostr_pubkey,
+                &request_id,
+                signal_device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+                pk_id,
+                &pk_rec,
+                kpk_id,
+                &kpk_rec,
+                &first_inbox_secret,
+                peer_nostr_pubkey,
             )?;
         }
 
         // Publish
-        let transport = self.transport.as_ref()
+        let transport = self
+            .transport
+            .as_ref()
             .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
         transport.publish_event_async(event.clone()).await?;
 
@@ -1141,15 +1209,20 @@ impl ProtocolClient {
         request_id: &str,
         my_name: &str,
     ) -> Result<(String, String, String, String)> {
-        let identity = self.identity.clone()
+        let identity = self
+            .identity
+            .clone()
             .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
 
         // Load inbound FR
         let (sender_pubkey_hex, message_json, payload_json) = {
-            let store = self.storage.lock()
+            let store = self
+                .storage
+                .lock()
                 .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
-            store.load_inbound_fr(request_id)?
-                .ok_or_else(|| KeychatError::FriendRequest(format!("no inbound FR: {request_id}")))?
+            store.load_inbound_fr(request_id)?.ok_or_else(|| {
+                KeychatError::FriendRequest(format!("no inbound FR: {request_id}"))
+            })?
         };
 
         let message: crate::KCMessage = serde_json::from_str(&message_json)?;
@@ -1158,8 +1231,11 @@ impl ProtocolClient {
             .map_err(|e| KeychatError::FriendRequest(format!("invalid sender pubkey: {e}")))?;
 
         let received = crate::FriendRequestReceived {
-            sender_pubkey, sender_pubkey_hex: sender_pubkey_hex.clone(),
-            message, payload: payload.clone(), created_at: 0,
+            sender_pubkey,
+            sender_pubkey_hex: sender_pubkey_hex.clone(),
+            message,
+            payload: payload.clone(),
+            created_at: 0,
         };
 
         let signal_device_id = self.next_signal_device_id;
@@ -1170,8 +1246,14 @@ impl ProtocolClient {
             crate::serialize_prekey_material(&keys)?;
 
         let accepted = crate::accept_friend_request_persistent(
-            &identity, &received, my_name, keys, self.storage.clone(), signal_device_id,
-        ).await?;
+            &identity,
+            &received,
+            my_name,
+            keys,
+            self.storage.clone(),
+            signal_device_id,
+        )
+        .await?;
 
         let peer_signal_hex = payload.signal_identity_key.clone();
         let peer_nostr_hex = sender_pubkey_hex;
@@ -1179,13 +1261,19 @@ impl ProtocolClient {
 
         // Publish
         let event_id_hex = accepted.event.id.to_hex();
-        let transport = self.transport.as_ref()
+        let transport = self
+            .transport
+            .as_ref()
             .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
         transport.publish_event_async(accepted.event).await?;
 
         // Create session
         let mut addresses = crate::AddressManager::new();
-        addresses.add_peer(&peer_signal_hex, Some(payload.first_inbox.clone()), Some(peer_nostr_hex.clone()));
+        addresses.add_peer(
+            &peer_signal_hex,
+            Some(payload.first_inbox.clone()),
+            Some(peer_nostr_hex.clone()),
+        );
         if accepted.sender_address.is_some() {
             let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
         }
@@ -1195,7 +1283,13 @@ impl ProtocolClient {
         // Persist to SecureStorage
         if let Ok(store) = self.storage.lock() {
             let _ = store.save_signal_participant(
-                &peer_signal_hex, signal_device_id, &id_pub, &id_priv, reg_id, spk_id, &spk_rec,
+                &peer_signal_hex,
+                signal_device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
             );
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
                 let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
@@ -1205,11 +1299,17 @@ impl ProtocolClient {
         }
 
         // Update in-memory state
-        self.sessions.insert(peer_signal_hex.clone(), Arc::new(tokio::sync::Mutex::new(session)));
-        self.peer_nostr_to_signal.insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
-        self.peer_signal_to_nostr.insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
+        self.sessions.insert(
+            peer_signal_hex.clone(),
+            Arc::new(tokio::sync::Mutex::new(session)),
+        );
+        self.peer_nostr_to_signal
+            .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
+        self.peer_signal_to_nostr
+            .insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
         for addr in &recv_addrs {
-            self.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+            self.receiving_addr_to_peer
+                .insert(addr.clone(), peer_signal_hex.clone());
         }
 
         Ok((peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex))
@@ -1224,11 +1324,20 @@ impl ProtocolClient {
         group_id: &str,
         msg: &crate::KCMessage,
     ) -> Result<(Vec<String>, Vec<String>)> {
-        let group = self.group_manager.get_group(group_id)
-            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {}", &group_id[..16.min(group_id.len())])))?
+        let group = self
+            .group_manager
+            .get_group(group_id)
+            .ok_or_else(|| {
+                KeychatError::SignalSession(format!(
+                    "group not found: {}",
+                    &group_id[..16.min(group_id.len())]
+                ))
+            })?
             .clone();
 
-        let transport = self.transport.as_ref()
+        let transport = self
+            .transport
+            .as_ref()
             .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
 
         let mut event_ids = Vec::new();
@@ -1240,7 +1349,10 @@ impl ProtocolClient {
             let session_arc = match self.sessions.get(signal_id) {
                 Some(s) => s.clone(),
                 None => {
-                    tracing::warn!("group send: no session for member {}", &signal_id[..16.min(signal_id.len())]);
+                    tracing::warn!(
+                        "group send: no session for member {}",
+                        &signal_id[..16.min(signal_id.len())]
+                    );
                     continue;
                 }
             };
@@ -1255,7 +1367,10 @@ impl ProtocolClient {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("group send to {} failed: {e}", &signal_id[..16.min(signal_id.len())]);
+                    tracing::error!(
+                        "group send to {} failed: {e}",
+                        &signal_id[..16.min(signal_id.len())]
+                    );
                 }
             }
         }
@@ -1274,23 +1389,43 @@ impl ProtocolClient {
         name: &str,
         members: Vec<(String, String)>, // (nostr_pubkey, display_name)
     ) -> Result<(String, String, u32)> {
-        let identity = self.identity.as_ref()
+        let identity = self
+            .identity
+            .as_ref()
             .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
         let my_nostr = identity.pubkey_hex();
 
         let my_signal_id = if let Some(s) = self.sessions.values().next() {
-            s.try_lock().map(|s| s.signal.identity_public_key_hex()).unwrap_or_else(|_| my_nostr.clone())
-        } else { my_nostr.clone() };
+            s.try_lock()
+                .map(|s| s.signal.identity_public_key_hex())
+                .unwrap_or_else(|_| my_nostr.clone())
+        } else {
+            my_nostr.clone()
+        };
 
         // Resolve members to (signal_id, nostr_pubkey, name)
         let mut other_members = Vec::new();
         let mut member_sessions = Vec::new();
         for (nostr_pk, display_name) in &members {
-            let signal_id = self.peer_nostr_to_signal.get(nostr_pk)
-                .ok_or_else(|| KeychatError::SignalSession(format!("peer not found: {}", &nostr_pk[..16.min(nostr_pk.len())])))?
+            let signal_id = self
+                .peer_nostr_to_signal
+                .get(nostr_pk)
+                .ok_or_else(|| {
+                    KeychatError::SignalSession(format!(
+                        "peer not found: {}",
+                        &nostr_pk[..16.min(nostr_pk.len())]
+                    ))
+                })?
                 .clone();
-            let session = self.sessions.get(&signal_id)
-                .ok_or_else(|| KeychatError::SignalSession(format!("no session: {}", &signal_id[..16.min(signal_id.len())])))?
+            let session = self
+                .sessions
+                .get(&signal_id)
+                .ok_or_else(|| {
+                    KeychatError::SignalSession(format!(
+                        "no session: {}",
+                        &signal_id[..16.min(signal_id.len())]
+                    ))
+                })?
                 .clone();
             other_members.push((signal_id.clone(), nostr_pk.clone(), display_name.clone()));
             member_sessions.push((signal_id, session));
@@ -1302,12 +1437,15 @@ impl ProtocolClient {
         let member_count = group.members.len() as u32;
 
         // Send invite to each member
-        let transport = self.transport.as_ref()
+        let transport = self
+            .transport
+            .as_ref()
             .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
         for (signal_id, session_arc) in &member_sessions {
             let mut session = session_arc.lock().await;
             let addr = session.addresses.clone();
-            let event = crate::send_group_invite(&mut session.signal, &group, signal_id, &addr).await?;
+            let event =
+                crate::send_group_invite(&mut session.signal, &group, signal_id, &addr).await?;
             let _ = transport.publish_event_async(event).await;
         }
 
@@ -1327,7 +1465,9 @@ impl ProtocolClient {
         group: &crate::SignalGroup,
         msg: &crate::KCMessage,
     ) -> Result<()> {
-        let transport = self.transport.as_ref()
+        let transport = self
+            .transport
+            .as_ref()
             .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
 
         for member in group.other_members() {
@@ -1341,9 +1481,17 @@ impl ProtocolClient {
             };
             let mut session = session_arc.lock().await;
             let addr = session.addresses.clone();
-            match crate::encrypt_for_group_member(&mut session.signal, &signal_id, msg, &addr).await {
-                Ok(event) => { let _ = transport.publish_event_async(event).await; }
-                Err(e) => { tracing::warn!("admin send to {} failed: {e}", &signal_id[..16.min(signal_id.len())]); }
+            match crate::encrypt_for_group_member(&mut session.signal, &signal_id, msg, &addr).await
+            {
+                Ok(event) => {
+                    let _ = transport.publish_event_async(event).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "admin send to {} failed: {e}",
+                        &signal_id[..16.min(signal_id.len())]
+                    );
+                }
             }
         }
         Ok(())
@@ -1351,10 +1499,17 @@ impl ProtocolClient {
 
     /// Leave a group: send self-leave msg + remove from manager.
     pub async fn leave_group_protocol(&mut self, group_id: &str) -> Result<()> {
-        let group = self.group_manager.get_group(group_id)
-            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
+        let group = self
+            .group_manager
+            .get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?
+            .clone();
         let payload = serde_json::json!({ "action": "selfLeave", "memberId": group.my_signal_id });
-        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupSelfLeave, &group, payload);
+        let msg = crate::build_group_admin_message(
+            crate::KCMessageKind::SignalGroupSelfLeave,
+            &group,
+            payload,
+        );
         self.send_admin_to_all_protocol(&group, &msg).await?;
         if let Ok(store) = self.storage.lock() {
             let _ = self.group_manager.remove_group_persistent(group_id, &store);
@@ -1366,10 +1521,17 @@ impl ProtocolClient {
 
     /// Dissolve a group: send dissolve msg + remove from manager.
     pub async fn dissolve_group_protocol(&mut self, group_id: &str) -> Result<()> {
-        let group = self.group_manager.get_group(group_id)
-            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
+        let group = self
+            .group_manager
+            .get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?
+            .clone();
         let payload = serde_json::json!({ "action": "dissolve" });
-        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupDissolve, &group, payload);
+        let msg = crate::build_group_admin_message(
+            crate::KCMessageKind::SignalGroupDissolve,
+            &group,
+            payload,
+        );
         self.send_admin_to_all_protocol(&group, &msg).await?;
         if let Ok(store) = self.storage.lock() {
             let _ = self.group_manager.remove_group_persistent(group_id, &store);
@@ -1380,13 +1542,30 @@ impl ProtocolClient {
     }
 
     /// Remove a member from a group: send removal msg + update group.
-    pub async fn remove_member_protocol(&mut self, group_id: &str, member_nostr_pubkey: &str) -> Result<()> {
-        let group = self.group_manager.get_group(group_id)
-            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
-        let removed_signal_id = self.peer_nostr_to_signal.get(member_nostr_pubkey)
-            .ok_or_else(|| KeychatError::SignalSession(format!("peer not found: {member_nostr_pubkey}")))?.clone();
-        let payload = serde_json::json!({ "action": "memberRemoved", "memberId": removed_signal_id });
-        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupMemberRemoved, &group, payload);
+    pub async fn remove_member_protocol(
+        &mut self,
+        group_id: &str,
+        member_nostr_pubkey: &str,
+    ) -> Result<()> {
+        let group = self
+            .group_manager
+            .get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?
+            .clone();
+        let removed_signal_id = self
+            .peer_nostr_to_signal
+            .get(member_nostr_pubkey)
+            .ok_or_else(|| {
+                KeychatError::SignalSession(format!("peer not found: {member_nostr_pubkey}"))
+            })?
+            .clone();
+        let payload =
+            serde_json::json!({ "action": "memberRemoved", "memberId": removed_signal_id });
+        let msg = crate::build_group_admin_message(
+            crate::KCMessageKind::SignalGroupMemberRemoved,
+            &group,
+            payload,
+        );
         self.send_admin_to_all_protocol(&group, &msg).await?;
         if let Some(g) = self.group_manager.get_group_mut(group_id) {
             g.remove_member(&removed_signal_id);
@@ -1399,10 +1578,17 @@ impl ProtocolClient {
 
     /// Rename a group: send name-changed msg + update group.
     pub async fn rename_group_protocol(&mut self, group_id: &str, new_name: &str) -> Result<()> {
-        let group = self.group_manager.get_group(group_id)
-            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?.clone();
+        let group = self
+            .group_manager
+            .get_group(group_id)
+            .ok_or_else(|| KeychatError::SignalSession(format!("group not found: {group_id}")))?
+            .clone();
         let payload = serde_json::json!({ "action": "nameChanged", "newName": new_name });
-        let msg = crate::build_group_admin_message(crate::KCMessageKind::SignalGroupNameChanged, &group, payload);
+        let msg = crate::build_group_admin_message(
+            crate::KCMessageKind::SignalGroupNameChanged,
+            &group,
+            payload,
+        );
         self.send_admin_to_all_protocol(&group, &msg).await?;
         if let Some(g) = self.group_manager.get_group_mut(group_id) {
             g.name = new_name.to_string();
@@ -1421,14 +1607,23 @@ impl ProtocolClient {
         decrypt_result: &crate::SignalDecryptResult,
     ) -> Result<(String, String, String)> {
         // Extract peer info from signal_prekey_auth
-        let peer_name = msg.signal_prekey_auth.as_ref()
-            .map(|a| a.name.clone()).unwrap_or_default();
-        let peer_signal_id = msg.signal_prekey_auth.as_ref()
-            .map(|a| a.signal_id.clone()).unwrap_or_default();
-        let peer_nostr_id = msg.signal_prekey_auth.as_ref()
+        let peer_name = msg
+            .signal_prekey_auth
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        let peer_signal_id = msg
+            .signal_prekey_auth
+            .as_ref()
+            .map(|a| a.signal_id.clone())
+            .unwrap_or_default();
+        let peer_nostr_id = msg
+            .signal_prekey_auth
+            .as_ref()
             .map(|a| a.nostr_id.clone())
             .unwrap_or_else(|| {
-                self.pending_outbound.get(request_id)
+                self.pending_outbound
+                    .get(request_id)
                     .map(|s| s.peer_nostr_pubkey.clone())
                     .unwrap_or_default()
             });
@@ -1440,12 +1635,13 @@ impl ProtocolClient {
         };
 
         // Take the state out of pending_outbound
-        let mut state = self.pending_outbound.remove(request_id)
-            .ok_or_else(|| KeychatError::FriendRequest(
-                format!("pending state not found for {request_id}")
-            ))?;
+        let mut state = self.pending_outbound.remove(request_id).ok_or_else(|| {
+            KeychatError::FriendRequest(format!("pending state not found for {request_id}"))
+        })?;
 
-        let identity = self.identity.clone()
+        let identity = self
+            .identity
+            .clone()
             .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
 
         let device_id = crate::DeviceId::new(1).expect("valid");
@@ -1455,7 +1651,10 @@ impl ProtocolClient {
         if peer_signal_hex != our_signal_hex {
             let from_addr = crate::ProtocolAddress::new(our_signal_hex.clone(), device_id);
             let to_addr = crate::ProtocolAddress::new(peer_signal_hex.clone(), device_id);
-            if let Err(e) = state.signal_participant.relocate_session(&from_addr, &to_addr) {
+            if let Err(e) = state
+                .signal_participant
+                .relocate_session(&from_addr, &to_addr)
+            {
                 tracing::warn!("relocate_session failed: {e}");
             }
         }
@@ -1484,14 +1683,26 @@ impl ProtocolClient {
         // Persist to SecureStorage
         if let Ok(store) = self.storage.lock() {
             // Save signal participant identity (pub + priv key for restore_sessions)
-            let id_pub = session.signal.identity_key_pair().identity_key().serialize().to_vec();
-            let id_priv = session.signal.identity_key_pair().private_key().serialize().to_vec();
+            let id_pub = session
+                .signal
+                .identity_key_pair()
+                .identity_key()
+                .serialize()
+                .to_vec();
+            let id_priv = session
+                .signal
+                .identity_key_pair()
+                .private_key()
+                .serialize()
+                .to_vec();
             let _ = store.save_signal_participant(
                 &peer_signal_hex,
                 u32::from(session.signal.address().device_id()),
-                &id_pub, &id_priv,
+                &id_pub,
+                &id_priv,
                 session.signal.registration_id(),
-                0, &[],
+                0,
+                &[],
             );
 
             // Save peer address state
@@ -1511,10 +1722,13 @@ impl ProtocolClient {
             peer_signal_hex.clone(),
             Arc::new(tokio::sync::Mutex::new(session)),
         );
-        self.peer_nostr_to_signal.insert(peer_nostr_id.clone(), peer_signal_hex.clone());
-        self.peer_signal_to_nostr.insert(peer_signal_hex.clone(), peer_nostr_id.clone());
+        self.peer_nostr_to_signal
+            .insert(peer_nostr_id.clone(), peer_signal_hex.clone());
+        self.peer_signal_to_nostr
+            .insert(peer_signal_hex.clone(), peer_nostr_id.clone());
         for addr in &recv_addrs {
-            self.receiving_addr_to_peer.insert(addr.clone(), peer_signal_hex.clone());
+            self.receiving_addr_to_peer
+                .insert(addr.clone(), peer_signal_hex.clone());
         }
 
         tracing::info!(
@@ -1528,10 +1742,14 @@ impl ProtocolClient {
 
     /// Reject a friend request: delete from SecureStorage.
     pub fn reject_friend_request_protocol(&self, request_id: &str) -> Result<String> {
-        let store = self.storage.lock()
+        let store = self
+            .storage
+            .lock()
             .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
-        let sender = store.load_inbound_fr(request_id)?
-            .map(|(pubkey, _, _)| pubkey).unwrap_or_default();
+        let sender = store
+            .load_inbound_fr(request_id)?
+            .map(|(pubkey, _, _)| pubkey)
+            .unwrap_or_default();
         store.delete_inbound_fr(request_id)?;
         Ok(sender)
     }
@@ -1615,40 +1833,33 @@ impl ProtocolClient {
                                     // Step 2: Try friend approve/reject
                                     {
                                         let mut inner = client.write().await;
-                                        if let Some((request_id, msg, _decrypt_result)) = inner.try_decrypt_pending_outbound(&event) {
+                                        if let Some((request_id, msg, decrypt_result)) = inner.try_decrypt_pending_outbound(&event) {
                                             if msg.kind == crate::KCMessageKind::FriendApprove {
-                                                // Full session creation happens here
-                                                // Extract peer info from signal_prekey_auth
-                                                let peer_name = msg.signal_prekey_auth.as_ref()
-                                                    .map(|a| a.name.clone()).unwrap_or_default();
-                                                let peer_signal_id = msg.signal_prekey_auth.as_ref()
-                                                    .map(|a| a.signal_id.clone()).unwrap_or_default();
-                                                let peer_nostr_id = msg.signal_prekey_auth.as_ref()
-                                                    .map(|a| a.nostr_id.clone())
-                                                    .unwrap_or_else(|| {
-                                                        inner.pending_outbound.get(&request_id)
-                                                            .map(|s| s.peer_nostr_pubkey.clone())
-                                                            .unwrap_or_default()
-                                                    });
-
-                                                let peer_signal_hex = if peer_signal_id.is_empty() {
-                                                    peer_nostr_id.clone()
-                                                } else {
-                                                    peer_signal_id
-                                                };
-
-                                                delegate.on_friend_approved(FriendApprovedContext {
-                                                    request_id,
-                                                    peer_nostr_pubkey: peer_nostr_id,
-                                                    peer_name,
-                                                    peer_signal_id_hex: peer_signal_hex,
-                                                    event_id: event.id.to_hex(),
-                                                }).await;
+                                                // Create session + update mappings + persist
+                                                match inner.complete_friend_approve(&request_id, &msg, &decrypt_result).await {
+                                                    Ok((peer_signal_hex, peer_nostr_id, peer_name)) => {
+                                                        // Re-subscribe to new ratchet addresses
+                                                        let _ = inner.refresh_subscriptions().await;
+                                                        drop(inner);
+                                                        delegate.on_friend_approved(FriendApprovedContext {
+                                                            request_id,
+                                                            peer_nostr_pubkey: peer_nostr_id,
+                                                            peer_name,
+                                                            peer_signal_id_hex: peer_signal_hex,
+                                                            event_id: event.id.to_hex(),
+                                                        }).await;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!("complete_friend_approve failed: {e}");
+                                                        drop(inner);
+                                                    }
+                                                }
                                             } else if msg.kind == crate::KCMessageKind::FriendReject {
                                                 let peer_pubkey = inner.pending_outbound.get(&request_id)
                                                     .map(|s| s.peer_nostr_pubkey.clone())
                                                     .unwrap_or_default();
                                                 inner.pending_outbound.remove(&request_id);
+                                                drop(inner);
                                                 delegate.on_friend_rejected(FriendRejectedContext {
                                                     request_id,
                                                     peer_pubkey,

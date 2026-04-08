@@ -339,11 +339,8 @@ impl SignalParticipant {
         registration_id: u32,
         storage: Arc<Mutex<SecureStorage>>,
     ) -> Result<Self> {
-        let store = SignalProtocolStoreBundle::persistent(
-            storage,
-            identity_key_pair,
-            registration_id,
-        );
+        let store =
+            SignalProtocolStoreBundle::persistent(storage, identity_key_pair, registration_id);
 
         tracing::info!(
             "signal session restored (persistent): name={}",
@@ -584,43 +581,62 @@ impl SignalParticipant {
     }
 
     pub fn signed_prekey_id(&self) -> u32 {
-        self.keys.as_ref().map(|k| u32::from(k.signed_prekey_id)).unwrap_or(0)
+        self.keys
+            .as_ref()
+            .map(|k| u32::from(k.signed_prekey_id))
+            .unwrap_or(0)
     }
 
     pub fn signed_prekey_public_hex(&self) -> Result<String> {
-        let keys = self.keys.as_ref()
+        let keys = self
+            .keys
+            .as_ref()
             .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
         Ok(hex::encode(keys.signed_prekey.public_key()?.serialize()))
     }
 
     pub fn signed_prekey_signature_hex(&self) -> Result<String> {
-        let keys = self.keys.as_ref()
+        let keys = self
+            .keys
+            .as_ref()
             .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
         Ok(hex::encode(keys.signed_prekey.signature()?))
     }
 
     pub fn prekey_id(&self) -> u32 {
-        self.keys.as_ref().map(|k| u32::from(k.prekey_id)).unwrap_or(0)
+        self.keys
+            .as_ref()
+            .map(|k| u32::from(k.prekey_id))
+            .unwrap_or(0)
     }
 
     pub fn prekey_public_hex(&self) -> Result<String> {
-        let keys = self.keys.as_ref()
+        let keys = self
+            .keys
+            .as_ref()
             .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
         Ok(hex::encode(keys.prekey.public_key()?.serialize()))
     }
 
     pub fn kyber_prekey_id(&self) -> u32 {
-        self.keys.as_ref().map(|k| u32::from(k.kyber_prekey_id)).unwrap_or(0)
+        self.keys
+            .as_ref()
+            .map(|k| u32::from(k.kyber_prekey_id))
+            .unwrap_or(0)
     }
 
     pub fn kyber_prekey_public_hex(&self) -> Result<String> {
-        let keys = self.keys.as_ref()
+        let keys = self
+            .keys
+            .as_ref()
             .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
         Ok(hex::encode(keys.kyber_prekey.public_key()?.serialize()))
     }
 
     pub fn kyber_prekey_signature_hex(&self) -> Result<String> {
-        let keys = self.keys.as_ref()
+        let keys = self
+            .keys
+            .as_ref()
             .ok_or_else(|| KeychatError::Signal("no prekey material".into()))?;
         Ok(hex::encode(keys.kyber_prekey.signature()?))
     }

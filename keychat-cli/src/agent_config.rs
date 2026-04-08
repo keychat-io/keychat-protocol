@@ -28,7 +28,9 @@ pub fn resolve_db_key(data_dir: &str) -> anyhow::Result<String> {
             tracing::info!("DB key loaded from KEYCHAT_DB_KEY env var");
             return Ok(key);
         }
-        tracing::warn!("KEYCHAT_DB_KEY env var invalid (expected 64 hex chars), trying next source");
+        tracing::warn!(
+            "KEYCHAT_DB_KEY env var invalid (expected 64 hex chars), trying next source"
+        );
     }
 
     // 2. Keychain (handles legacy file migration internally)
@@ -103,7 +105,9 @@ pub fn save_mnemonic(_data_dir: &str, mnemonic: &str) -> anyhow::Result<()> {
             tracing::info!("Mnemonic stored in system keychain");
             Ok(())
         }
-        Ok(false) => Err(anyhow::anyhow!("System keychain not available — cannot store mnemonic securely")),
+        Ok(false) => Err(anyhow::anyhow!(
+            "System keychain not available — cannot store mnemonic securely"
+        )),
         Err(e) => Err(anyhow::anyhow!("Keychain store failed: {e}")),
     }
 }
@@ -135,7 +139,9 @@ pub fn save_mnemonic_for_agent(agent_id: &str, mnemonic: &str) -> anyhow::Result
         Ok(false) => Err(anyhow::anyhow!(
             "System keychain not available — cannot store mnemonic for agent {agent_id}"
         )),
-        Err(e) => Err(anyhow::anyhow!("Keychain store failed for agent {agent_id}: {e}")),
+        Err(e) => Err(anyhow::anyhow!(
+            "Keychain store failed for agent {agent_id}: {e}"
+        )),
     }
 }
 

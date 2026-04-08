@@ -1116,7 +1116,9 @@ mod tests {
         assert!(!addrs_before.is_empty(), "should have receiving addresses");
 
         // Serialize and rebuild
-        let serialized = mgr.to_serialized("peer-A").expect("serialization should succeed");
+        let serialized = mgr
+            .to_serialized("peer-A")
+            .expect("serialization should succeed");
         let mgr2 = AddressManager::from_serialized("peer-A", serialized);
         let addrs_after = mgr2.get_all_receiving_address_strings();
 
@@ -1179,22 +1181,29 @@ mod tests {
         // First encrypt: generates initial receiving address
         let r1 = alice.encrypt(&bob_addr, b"m1").unwrap();
         bob.decrypt(&alice_addr, &r1.bytes).unwrap();
-        let update1 = mgr.on_encrypt("peer-Z", r1.sender_address.as_deref()).unwrap();
+        let update1 = mgr
+            .on_encrypt("peer-Z", r1.sender_address.as_deref())
+            .unwrap();
 
         let mut reverse_index: HashMap<String, String> = HashMap::new();
         for addr in &update1.new_receiving {
             reverse_index.insert(addr.clone(), "peer-Z".into());
         }
-        assert!(!reverse_index.is_empty(), "first encrypt should produce new receiving addresses");
+        assert!(
+            !reverse_index.is_empty(),
+            "first encrypt should produce new receiving addresses"
+        );
 
         // Second round: bob replies, alice on_decrypt
         let r2 = bob.encrypt(&alice_addr, b"m2").unwrap();
         let d2 = alice.decrypt(&bob_addr, &r2.bytes).unwrap();
-        let update2 = mgr.on_decrypt(
-            "peer-Z",
-            d2.bob_derived_address.as_deref(),
-            d2.alice_addrs.as_deref(),
-        ).unwrap();
+        let update2 = mgr
+            .on_decrypt(
+                "peer-Z",
+                d2.bob_derived_address.as_deref(),
+                d2.alice_addrs.as_deref(),
+            )
+            .unwrap();
 
         // Apply update to reverse index
         for addr in &update2.new_receiving {

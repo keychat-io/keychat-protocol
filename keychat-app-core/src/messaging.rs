@@ -24,8 +24,13 @@ impl AppClient {
                 user_name: None,
             });
         }
-        let display_text = if text.is_empty() { "[Message]".to_string() } else { text };
-        self.send_message_internal(room_id, msg, display_text, reply_to).await
+        let display_text = if text.is_empty() {
+            "[Message]".to_string()
+        } else {
+            text
+        };
+        self.send_message_internal(room_id, msg, display_text, reply_to)
+            .await
     }
 
     pub async fn send_file(
@@ -36,7 +41,9 @@ impl AppClient {
         reply_to: Option<ReplyToPayload>,
     ) -> AppResult<SentMessage> {
         if files.is_empty() {
-            return Err(AppError::InvalidArgument("files list cannot be empty".into()));
+            return Err(AppError::InvalidArgument(
+                "files list cannot be empty".into(),
+            ));
         }
 
         let kc_files: Vec<KCFilePayload> = files
@@ -73,11 +80,16 @@ impl AppClient {
             });
         }
         let display_text = if let Some(ref m) = message {
-            if m.is_empty() { "[File]".to_string() } else { m.clone() }
+            if m.is_empty() {
+                "[File]".to_string()
+            } else {
+                m.clone()
+            }
         } else {
             "[File]".to_string()
         };
-        self.send_message_internal(room_id, msg, display_text, reply_to).await
+        self.send_message_internal(room_id, msg, display_text, reply_to)
+            .await
     }
 
     /// Shared send implementation: protocol send via ProtocolClient + app persistence.
@@ -100,53 +112,84 @@ impl AppClient {
 
         // 2. App: persist message to DB
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
             if let Err(e) = store.save_app_message(
-                &result.event_id, Some(&result.event_id), &room_id, &identity_pubkey,
-                &identity_pubkey, &display_text, true, MessageStatus::Sending.to_i32(), now,
+                &result.event_id,
+                Some(&result.event_id),
+                &room_id,
+                &identity_pubkey,
+                &identity_pubkey,
+                &display_text,
+                true,
+                MessageStatus::Sending.to_i32(),
+                now,
             ) {
                 tracing::error!("PERSIST FAILED: save_app_message (send): {e}");
             }
             if let Err(e) = store.update_app_message(
-                &result.event_id, None, None, None,
-                result.payload_json.as_deref(), result.nostr_event_json.as_deref(),
+                &result.event_id,
+                None,
+                None,
+                None,
+                result.payload_json.as_deref(),
+                result.nostr_event_json.as_deref(),
                 reply_to.as_ref().map(|r| r.target_event_id.as_str()),
                 reply_to.as_ref().and_then(|r| r.content.as_deref()),
             ) {
                 tracing::error!("PERSIST FAILED: update_app_message metadata: {e}");
             }
-            if let Err(e) = store.update_app_room(&room_id, None, None, Some(&display_text), Some(now)) {
+            if let Err(e) =
+                store.update_app_room(&room_id, None, None, Some(&display_text), Some(now))
+            {
                 tracing::error!("PERSIST FAILED: update_app_room: {e}");
             }
         }
 
         // 3. App: emit DataChange
         self.emit_data_change(DataChange::MessageAdded {
-            room_id: room_id.clone(), msgid: result.event_id.clone(),
-        }).await;
-        self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
+            room_id: room_id.clone(),
+            msgid: result.event_id.clone(),
+        })
+        .await;
+        self.emit_data_change(DataChange::RoomUpdated {
+            room_id: room_id.clone(),
+        })
+        .await;
 
         // 4. App: relay tracker
         let initial_relay_json = {
             let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
             tracker.track(
-                result.event_id.clone(), result.event_id.clone(),
-                room_id.clone(), result.connected_relays.clone(),
+                result.event_id.clone(),
+                result.event_id.clone(),
+                room_id.clone(),
+                result.connected_relays.clone(),
             )
         };
         {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
             let _ = store.update_app_message(
-                &result.event_id, None, None, Some(&initial_relay_json), None, None, None, None,
+                &result.event_id,
+                None,
+                None,
+                Some(&initial_relay_json),
+                None,
+                None,
+                None,
+                None,
             );
         }
         self.emit_data_change(DataChange::MessageUpdated {
-            room_id, msgid: result.event_id.clone(),
-        }).await;
+            room_id,
+            msgid: result.event_id.clone(),
+        })
+        .await;
 
         Ok(SentMessage {
             event_id: result.event_id,
@@ -163,7 +206,10 @@ impl AppClient {
     pub async fn send_nip17_dm(&self, peer_pubkey: String, text: String) -> AppResult<SentMessage> {
         let connected = {
             let inner = self.inner.read().await;
-            let transport = inner.protocol.transport.as_ref()
+            let transport = inner
+                .protocol
+                .transport
+                .as_ref()
                 .ok_or(AppError::Transport("Not connected to any relay.".into()))?;
             transport.connected_relays().await
         };
@@ -173,39 +219,61 @@ impl AppClient {
 
         let identity = {
             let inner = self.inner.read().await;
-            inner.protocol.identity.clone()
+            inner
+                .protocol
+                .identity
+                .clone()
                 .ok_or(AppError::NotInitialized("no identity set".into()))?
         };
         let identity_pubkey = identity.pubkey_hex();
 
         let receiver_pk = libkeychat::PublicKey::from_hex(&peer_pubkey)
             .map_err(|e| AppError::Transport(format!("invalid pubkey: {e}")))?;
-        let gift_wrap = libkeychat::giftwrap::create_gift_wrap(identity.keys(), &receiver_pk, &text)
-            .await.map_err(|e| AppError::Transport(format!("create gift wrap: {e}")))?;
+        let gift_wrap =
+            libkeychat::giftwrap::create_gift_wrap(identity.keys(), &receiver_pk, &text)
+                .await
+                .map_err(|e| AppError::Transport(format!("create gift wrap: {e}")))?;
 
         let event_id = gift_wrap.id.to_hex();
         let nostr_event_json = serde_json::to_string(&gift_wrap).ok();
         let room_id = make_room_id(&peer_pubkey, &identity_pubkey);
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
         {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
             let _ = store.save_app_message(
-                &event_id, Some(&event_id), &room_id, &identity_pubkey,
-                &identity_pubkey, &text, true, 0, now,
+                &event_id,
+                Some(&event_id),
+                &room_id,
+                &identity_pubkey,
+                &identity_pubkey,
+                &text,
+                true,
+                0,
+                now,
             );
             let display = if text.len() > 50 { &text[..50] } else { &text };
             let _ = store.update_app_room(&room_id, None, None, Some(display), Some(now));
         }
 
-        self.emit_data_change(DataChange::MessageAdded { room_id: room_id.clone(), msgid: event_id.clone() }).await;
-        self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+        self.emit_data_change(DataChange::MessageAdded {
+            room_id: room_id.clone(),
+            msgid: event_id.clone(),
+        })
+        .await;
+        self.emit_data_change(DataChange::RoomUpdated { room_id })
+            .await;
 
         {
             let inner = self.inner.read().await;
-            let transport = inner.protocol.transport.as_ref()
+            let transport = inner
+                .protocol
+                .transport
+                .as_ref()
                 .ok_or(AppError::Transport("Not connected to any relay.".into()))?;
             transport.publish_event_async(gift_wrap).await?;
         }
@@ -225,41 +293,90 @@ impl AppClient {
         let failed = {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = crate::app_client::lock_app_storage_result(&app_storage)?;
-            store.get_app_failed_messages().map_err(|e| AppError::Storage(format!("{e}")))?
+            store
+                .get_app_failed_messages()
+                .map_err(|e| AppError::Storage(format!("{e}")))?
         };
-        if failed.is_empty() { return Ok(0); }
+        if failed.is_empty() {
+            return Ok(0);
+        }
 
         let mut retried = 0u32;
         for msg in &failed {
-            let Some(ref event_json) = msg.nostr_event_json else { continue };
+            let Some(ref event_json) = msg.nostr_event_json else {
+                continue;
+            };
 
             {
                 let app_storage = self.inner.read().await.app_storage.clone();
                 let store = lock_app_storage(&app_storage);
-                let _ = store.update_app_message(&msg.msgid, None, Some(MessageStatus::Sending.to_i32()), None, None, None, None, None);
+                let _ = store.update_app_message(
+                    &msg.msgid,
+                    None,
+                    Some(MessageStatus::Sending.to_i32()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
             }
 
             match self.rebroadcast_event_internal(event_json).await {
                 Ok((success, failed_relays)) => {
                     let ok = !success.is_empty();
-                    let status = if ok { MessageStatus::Success.to_i32() } else { MessageStatus::Failed.to_i32() };
+                    let status = if ok {
+                        MessageStatus::Success.to_i32()
+                    } else {
+                        MessageStatus::Failed.to_i32()
+                    };
                     let mut relays = Vec::new();
-                    for url in &success { relays.push(serde_json::json!({"url": url, "status": "ok"})); }
-                    for (url, err) in &failed_relays { relays.push(serde_json::json!({"url": url, "status": "failed", "error": err})); }
+                    for url in &success {
+                        relays.push(serde_json::json!({"url": url, "status": "ok"}));
+                    }
+                    for (url, err) in &failed_relays {
+                        relays.push(
+                            serde_json::json!({"url": url, "status": "failed", "error": err}),
+                        );
+                    }
                     let relay_json = serde_json::to_string(&relays).unwrap_or_default();
 
                     {
                         let app_storage = self.inner.read().await.app_storage.clone();
                         let store = lock_app_storage(&app_storage);
-                        let _ = store.update_app_message(&msg.msgid, None, Some(status), Some(&relay_json), None, None, None, None);
+                        let _ = store.update_app_message(
+                            &msg.msgid,
+                            None,
+                            Some(status),
+                            Some(&relay_json),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
                     }
-                    self.emit_data_change(DataChange::MessageUpdated { room_id: msg.room_id.clone(), msgid: msg.msgid.clone() }).await;
-                    if ok { retried += 1; }
+                    self.emit_data_change(DataChange::MessageUpdated {
+                        room_id: msg.room_id.clone(),
+                        msgid: msg.msgid.clone(),
+                    })
+                    .await;
+                    if ok {
+                        retried += 1;
+                    }
                 }
                 Err(_) => {
                     let app_storage = self.inner.read().await.app_storage.clone();
                     let store = lock_app_storage(&app_storage);
-                    let _ = store.update_app_message(&msg.msgid, None, Some(MessageStatus::Failed.to_i32()), None, None, None, None, None);
+                    let _ = store.update_app_message(
+                        &msg.msgid,
+                        None,
+                        Some(MessageStatus::Failed.to_i32()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
                 }
             }
         }

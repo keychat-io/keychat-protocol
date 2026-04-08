@@ -1,6 +1,5 @@
-
-use crate::types::FileCategory;
 use crate::app_client::AppError;
+use crate::types::FileCategory;
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -136,8 +135,7 @@ pub fn decrypt_file_data(
         .map_err(|_| AppError::MediaCrypto("hash must be 32 bytes".into()))?;
 
     libkeychat::decrypt_file(&ciphertext, &key_bytes, &iv_bytes, &hash_bytes)
-        .map_err(|e| AppError::MediaCrypto(e.to_string(),
-        ))
+        .map_err(|e| AppError::MediaCrypto(e.to_string()))
 }
 
 // ─── Blossom upload authorization ───────────────────────────────
@@ -221,10 +219,15 @@ pub async fn encrypt_and_upload(
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::MediaTransfer(format!("Upload HTTP {status}: {body}")));
+        return Err(AppError::MediaTransfer(format!(
+            "Upload HTTP {status}: {body}"
+        )));
     }
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| AppError::MediaTransfer(format!("Upload response parse error: {e}")))?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::MediaTransfer(format!("Upload response parse error: {e}")))?;
 
     let url = json["url"]
         .as_str()
@@ -286,13 +289,19 @@ async fn upload_via_relay(
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::MediaTransfer(format!("Relay params HTTP {status}: {body}")));
+        return Err(AppError::MediaTransfer(format!(
+            "Relay params HTTP {status}: {body}"
+        )));
     }
 
-    let json: serde_json::Value =
-        resp.json().await.map_err(|e| AppError::MediaTransfer(format!("Relay params parse error: {e}")))?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::MediaTransfer(format!("Relay params parse error: {e}")))?;
 
-    let presigned_url = json["url"].as_str().ok_or_else(|| AppError::MediaTransfer("Missing 'url' in relay response".into()))?;
+    let presigned_url = json["url"]
+        .as_str()
+        .ok_or_else(|| AppError::MediaTransfer("Missing 'url' in relay response".into()))?;
     let access_url = json["access_url"]
         .as_str()
         .ok_or_else(|| AppError::MediaTransfer("Missing 'access_url' in relay response".into()))?
@@ -321,7 +330,10 @@ async fn upload_via_relay(
         return Err(AppError::MediaTransfer(format!("S3 upload HTTP {status}")));
     }
 
-    tracing::info!("Relay upload complete → {}…", &access_url[..access_url.len().min(60)]);
+    tracing::info!(
+        "Relay upload complete → {}…",
+        &access_url[..access_url.len().min(60)]
+    );
 
     Ok(FileUploadResult {
         url: access_url,
@@ -371,10 +383,15 @@ pub async fn download_and_decrypt(
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        return Err(AppError::MediaTransfer(format!("Download HTTP {status} from {url}")));
+        return Err(AppError::MediaTransfer(format!(
+            "Download HTTP {status} from {url}"
+        )));
     }
 
-    let ciphertext = resp.bytes().await.map_err(|e| AppError::MediaTransfer(format!("Download read error: {e}")))?;
+    let ciphertext = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::MediaTransfer(format!("Download read error: {e}")))?;
 
     // 2. Decrypt (reuse existing function — handles hash verification)
     decrypt_file_data(ciphertext.to_vec(), key, iv, hash)

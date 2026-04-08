@@ -37,7 +37,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use keychat_app_core::{ClientEvent, DataChange, AppClient};
+use keychat_app_core::{AppClient, ClientEvent, DataChange};
 use serde::Deserialize;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::StreamExt;
@@ -83,11 +83,7 @@ struct AgentEvent {
 }
 
 impl AgentRegistry {
-    fn new(
-        data_dir: String,
-        auto_accept: bool,
-        relay_urls: Vec<String>,
-    ) -> Self {
+    fn new(data_dir: String, auto_accept: bool, relay_urls: Vec<String>) -> Self {
         let (global_event_tx, _) = broadcast::channel(512);
         Self {
             agents: Arc::new(RwLock::new(HashMap::new())),
@@ -140,24 +136,25 @@ impl AgentRegistry {
 
         let pubkey = match mnemonic {
             Some(m) => {
-                let pk = commands::import_identity(&client, &m).await
-                    .map_err(|e| anyhow::anyhow!("failed to import identity for agent {agent_id}: {e}"))?;
+                let pk = commands::import_identity(&client, &m).await.map_err(|e| {
+                    anyhow::anyhow!("failed to import identity for agent {agent_id}: {e}")
+                })?;
                 agent_config::save_mnemonic_for_agent(agent_id, &m)?;
                 pk
             }
-            None => {
-                match commands::restore_identity(&client).await {
-                    Some(pk) => pk,
-                    None => {
-                        let (pk, _npub, mnemonic) =
-                            commands::create_identity(&client, agent_name).await
-                                .map_err(|e| anyhow::anyhow!("failed to create identity for agent {agent_id}: {e}"))?;
-                        agent_config::save_mnemonic_for_agent(agent_id, &mnemonic)?;
-                        tracing::info!("Created new identity for agent {agent_id}");
-                        pk
-                    }
+            None => match commands::restore_identity(&client).await {
+                Some(pk) => pk,
+                None => {
+                    let (pk, _npub, mnemonic) = commands::create_identity(&client, agent_name)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to create identity for agent {agent_id}: {e}")
+                        })?;
+                    agent_config::save_mnemonic_for_agent(agent_id, &mnemonic)?;
+                    tracing::info!("Created new identity for agent {agent_id}");
+                    pk
                 }
-            }
+            },
         };
 
         let npub = keychat_app_core::npub_from_hex(pubkey.clone()).unwrap_or_default();
@@ -216,7 +213,10 @@ impl AgentRegistry {
             pubkey_hex: pubkey,
         });
 
-        self.agents.write().await.insert(agent_id.to_string(), Arc::clone(&instance));
+        self.agents
+            .write()
+            .await
+            .insert(agent_id.to_string(), Arc::clone(&instance));
 
         tracing::info!("Agent {agent_id} booted: {}", &instance.npub);
         Ok(instance)
@@ -228,13 +228,16 @@ impl AgentRegistry {
 
     async fn list_agents(&self) -> Vec<serde_json::Value> {
         let agents = self.agents.read().await;
-        agents.values().map(|a| {
-            serde_json::json!({
-                "id": a.id,
-                "npub": a.npub,
-                "pubkey_hex": a.pubkey_hex,
+        agents
+            .values()
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id,
+                    "npub": a.npub,
+                    "pubkey_hex": a.pubkey_hex,
+                })
             })
-        }).collect()
+            .collect()
     }
 }
 
@@ -283,14 +286,14 @@ pub async fn run(
             }
         }
 
-        let _api_token = agent_config::resolve_api_token(
-            &data_dir,
-            api_token_override.as_deref(),
-        )?;
+        let _api_token = agent_config::resolve_api_token(&data_dir, api_token_override.as_deref())?;
 
         let router = build_multi_router(registry);
 
-        println!("Multi-agent mode: {} agent(s) loaded", existing_agents.len());
+        println!(
+            "Multi-agent mode: {} agent(s) loaded",
+            existing_agents.len()
+        );
         println!("Listening on http://{addr}");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -313,24 +316,23 @@ pub async fn run(
         let mnemonic = agent_config::resolve_mnemonic(&data_dir)?;
         let pubkey = match mnemonic {
             Some(m) => {
-                let pk = commands::import_identity(&client, &m).await
+                let pk = commands::import_identity(&client, &m)
+                    .await
                     .map_err(|e| anyhow::anyhow!("failed to import identity: {e}"))?;
                 agent_config::save_mnemonic(&data_dir, &m)?;
                 pk
             }
-            None => {
-                match commands::restore_identity(&client).await {
-                    Some(pk) => pk,
-                    None => {
-                        let (pk, _npub, mnemonic) =
-                            commands::create_identity(&client, &agent_name).await
-                                .map_err(|e| anyhow::anyhow!("failed to create identity: {e}"))?;
-                        agent_config::save_mnemonic(&data_dir, &mnemonic)?;
-                        tracing::info!("Created new agent identity");
-                        pk
-                    }
+            None => match commands::restore_identity(&client).await {
+                Some(pk) => pk,
+                None => {
+                    let (pk, _npub, mnemonic) = commands::create_identity(&client, &agent_name)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to create identity: {e}"))?;
+                    agent_config::save_mnemonic(&data_dir, &mnemonic)?;
+                    tracing::info!("Created new agent identity");
+                    pk
                 }
-            }
+            },
         };
 
         let npub = keychat_app_core::npub_from_hex(pubkey.clone()).unwrap_or_default();
@@ -359,16 +361,10 @@ pub async fn run(
 
         policy.start(event_tx.subscribe());
 
-        let _api_token = agent_config::resolve_api_token(
-            &data_dir,
-            api_token_override.as_deref(),
-        )?;
+        let _api_token = agent_config::resolve_api_token(&data_dir, api_token_override.as_deref())?;
 
-        let base_router = crate::daemon::build_router(
-            Arc::clone(&client),
-            event_tx.clone(),
-            data_tx.clone(),
-        );
+        let base_router =
+            crate::daemon::build_router(Arc::clone(&client), event_tx.clone(), data_tx.clone());
 
         let legacy_state = LegacyAgentState {
             policy: Arc::clone(&policy),
@@ -390,7 +386,10 @@ pub async fn run(
         println!("Agent ready: {npub}");
         println!("Listening on http://{addr}");
 
-        tracing::info!("Agent {agent_name} ({}) listening on {addr}", &pubkey[..16.min(pubkey.len())]);
+        tracing::info!(
+            "Agent {agent_name} ({}) listening on {addr}",
+            &pubkey[..16.min(pubkey.len())]
+        );
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, router).await?;
@@ -413,10 +412,16 @@ fn build_multi_router(registry: AgentRegistry) -> Router {
         // Messaging
         .route("/agents/{id}/send", post(agent_send_message))
         .route("/agents/{id}/rooms", get(agent_list_rooms))
-        .route("/agents/{id}/rooms/{room_id}/messages", get(agent_get_messages))
+        .route(
+            "/agents/{id}/rooms/{room_id}/messages",
+            get(agent_get_messages),
+        )
         .route("/agents/{id}/contacts", get(agent_list_contacts))
         // Friends
-        .route("/agents/{id}/pending-friends", get(agent_get_pending_friends))
+        .route(
+            "/agents/{id}/pending-friends",
+            get(agent_get_pending_friends),
+        )
         .route("/agents/{id}/approve-friend", post(agent_approve_friend))
         .route("/agents/{id}/reject-friend", post(agent_reject_friend))
         // Owner
@@ -433,9 +438,7 @@ fn build_multi_router(registry: AgentRegistry) -> Router {
 
 // ─── Multi-Agent: List ────────────────────────────────────────
 
-async fn list_agents(
-    State(reg): State<AgentRegistry>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn list_agents(State(reg): State<AgentRegistry>) -> (StatusCode, Json<serde_json::Value>) {
     let agents = reg.list_agents().await;
     ok_json(agents)
 }
@@ -535,7 +538,10 @@ async fn agent_get_status(
 
     let identity = agent.client.get_pubkey_hex().await.ok();
     let relay_statuses = agent.client.get_relay_statuses().await.unwrap_or_default();
-    let connected_count = relay_statuses.iter().filter(|s| s.status == "connected").count();
+    let connected_count = relay_statuses
+        .iter()
+        .filter(|s| s.status == "connected")
+        .count();
 
     ok_json(serde_json::json!({
         "agent_id": id,
@@ -565,23 +571,20 @@ async fn agent_send_message(
     };
 
     match commands::send_message(&agent.client, &req.room_id, &req.text).await {
-        Ok(commands::SendResult::Dm { event_id, relay_count }) => {
-            ok_json(serde_json::json!({
-                "agent_id": id,
-                "event_id": event_id,
-                "relay_count": relay_count,
-            }))
-        }
-        Ok(commands::SendResult::Group { event_count }) => {
-            ok_json(serde_json::json!({
-                "agent_id": id,
-                "type": "group",
-                "event_count": event_count,
-            }))
-        }
-        Ok(commands::SendResult::MlsNotSupported) => {
-            bad_request("MLS groups not yet supported")
-        }
+        Ok(commands::SendResult::Dm {
+            event_id,
+            relay_count,
+        }) => ok_json(serde_json::json!({
+            "agent_id": id,
+            "event_id": event_id,
+            "relay_count": relay_count,
+        })),
+        Ok(commands::SendResult::Group { event_count }) => ok_json(serde_json::json!({
+            "agent_id": id,
+            "type": "group",
+            "event_count": event_count,
+        })),
+        Ok(commands::SendResult::MlsNotSupported) => bad_request("MLS groups not yet supported"),
         Err(e) => bad_request(format!("{e}")),
     }
 }
@@ -646,7 +649,11 @@ async fn agent_get_messages(
         None => return err_json(StatusCode::NOT_FOUND, format!("agent {id} not found")),
     };
 
-    match agent.client.get_messages(room_id, query.limit, query.offset).await {
+    match agent
+        .client
+        .get_messages(room_id, query.limit, query.offset)
+        .await
+    {
         Ok(messages) => {
             let list: Vec<_> = messages
                 .into_iter()
@@ -848,10 +855,18 @@ async fn agent_sse_events(
     State(reg): State<AgentRegistry>,
     Path(id): Path<String>,
     Query(_query): Query<SseQuery>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<
+    Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>,
+    (StatusCode, Json<serde_json::Value>),
+> {
     let agent = match reg.get_agent(&id).await {
         Some(a) => a,
-        None => return Err(err_json(StatusCode::NOT_FOUND, format!("agent {id} not found"))),
+        None => {
+            return Err(err_json(
+                StatusCode::NOT_FOUND,
+                format!("agent {id} not found"),
+            ))
+        }
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(256);
@@ -863,15 +878,16 @@ async fn agent_sse_events(
     tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
             let event_type = crate::daemon::client_event_type_str(&event);
-            let mut json: serde_json::Value = serde_json::from_str(
-                &crate::daemon::serialize_client_event_str(&event)
-            ).unwrap_or_default();
+            let mut json: serde_json::Value =
+                serde_json::from_str(&crate::daemon::serialize_client_event_str(&event))
+                    .unwrap_or_default();
             if let Some(obj) = json.as_object_mut() {
-                obj.insert("agent_id".to_string(), serde_json::Value::String(aid.clone()));
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(aid.clone()),
+                );
             }
-            let sse = SseEvent::default()
-                .event(event_type)
-                .data(json.to_string());
+            let sse = SseEvent::default().event(event_type).data(json.to_string());
             if tx1.send(sse).await.is_err() {
                 break;
             }
@@ -919,7 +935,10 @@ async fn global_sse_events(
             // Inject agent_id into the JSON
             let mut json: serde_json::Value = serde_json::from_str(&ae.json).unwrap_or_default();
             if let Some(obj) = json.as_object_mut() {
-                obj.insert("agent_id".to_string(), serde_json::Value::String(ae.agent_id));
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(ae.agent_id),
+                );
             }
             let sse = SseEvent::default()
                 .event(ae.event_type)

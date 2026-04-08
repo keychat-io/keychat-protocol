@@ -27,7 +27,7 @@ pub struct RelayStatusUpdate {
 
 #[derive(Clone)]
 struct RelayState {
-    status: String,      // "pending", "success", "failed", "timeout"
+    status: String, // "pending", "success", "failed", "timeout"
     error: Option<String>,
 }
 
@@ -67,7 +67,15 @@ impl RelaySendTracker {
     ) -> String {
         let relays: HashMap<String, RelayState> = relay_urls
             .iter()
-            .map(|url| (url.clone(), RelayState { status: "pending".into(), error: None }))
+            .map(|url| {
+                (
+                    url.clone(),
+                    RelayState {
+                        status: "pending".into(),
+                        error: None,
+                    },
+                )
+            })
             .collect();
 
         self.events.insert(
@@ -101,7 +109,15 @@ impl RelaySendTracker {
         for (event_id, member_name) in &members {
             let relays: HashMap<String, RelayState> = relay_urls
                 .iter()
-                .map(|url| (url.clone(), RelayState { status: "pending".into(), error: None }))
+                .map(|url| {
+                    (
+                        url.clone(),
+                        RelayState {
+                            status: "pending".into(),
+                            error: None,
+                        },
+                    )
+                })
                 .collect();
             self.events.insert(
                 event_id.clone(),
@@ -210,8 +226,7 @@ impl RelaySendTracker {
                     if let Some(entry) = self.events.get(eid) {
                         let event_has_success =
                             entry.relays.values().any(|r| r.status == "success");
-                        let event_resolved =
-                            entry.relays.values().all(|r| r.status != "pending");
+                        let event_resolved = entry.relays.values().all(|r| r.status != "pending");
                         if !event_resolved {
                             all_resolved = false;
                         }

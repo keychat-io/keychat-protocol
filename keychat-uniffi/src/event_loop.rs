@@ -13,7 +13,11 @@ use crate::types::*;
 #[uniffi::export(async_runtime = "tokio")]
 impl KeychatClient {
     pub async fn start_event_loop(self: Arc<Self>) -> Result<(), KeychatUniError> {
-        self.app.clone().start_event_loop().await.map_err(Into::into)
+        self.app
+            .clone()
+            .start_event_loop()
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn stop_event_loop(&self) {
@@ -24,7 +28,10 @@ impl KeychatClient {
         self: Arc<Self>,
         max_delay_secs: u32,
     ) -> Result<(), KeychatUniError> {
-        self.app.enable_auto_reconnect(max_delay_secs).await.map_err(Into::into)
+        self.app
+            .enable_auto_reconnect(max_delay_secs)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn disable_auto_reconnect(&self) {

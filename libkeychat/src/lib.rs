@@ -141,15 +141,15 @@ pub use libsignal_protocol::{
     PreKeyId, PreKeyRecord, PreKeySignalMessage, PrivateKey as SignalPrivateKey, ProtocolAddress,
     SignedPreKeyId, SignedPreKeyRecord,
 };
-pub use storage::{
-    DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,
-};
-pub use transport::{PublishResult, RelayHealth, Transport, DEFAULT_RELAYS};
 pub use orchestrator::{
     FriendApprovedContext, FriendRejectedContext, FriendRequestContext, GroupChangeKind,
     GroupChangedContext, GroupInviteContext, MessageReceivedContext, Nip17DmContext,
     OrchestratorDelegate, ProtocolClient, SendResult,
 };
+pub use storage::{
+    DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,
+};
+pub use transport::{PublishResult, RelayHealth, Transport, DEFAULT_RELAYS};
 
 // Re-export key nostr types for convenience
 pub use nostr::message::relay::RelayMessage;
