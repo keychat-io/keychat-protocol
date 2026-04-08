@@ -104,6 +104,7 @@ pub enum ConnectionStatus {
 }
 
 // ─── App Data Query Types ────────────────────────────────────────
+// Note: Timestamps use i64 (from SQLite). The UniFFI layer converts to u64 for Swift/Kotlin.
 
 #[derive(Clone, Debug)]
 pub struct IdentityInfo {
@@ -111,7 +112,7 @@ pub struct IdentityInfo {
     pub nostr_pubkey_hex: String,
     pub name: String,
     pub avatar: Option<String>,
-    pub idx: i32,
+    pub index: i32,
     pub is_default: bool,
     pub created_at: i64,
 }

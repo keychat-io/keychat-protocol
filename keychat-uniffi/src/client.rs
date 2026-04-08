@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use keychat_app_core::{AppClient, AppClientInner};
+use keychat_app_core::AppClient;
 use libkeychat::{
     reconstruct_prekey_material, AddressManager, ChatSession, DeviceId, EphemeralKeypair,
     FriendRequestState, GroupManager, Identity, ProtocolClient, SecureStorage, SignalParticipant,
@@ -31,15 +31,13 @@ pub(crate) fn lock_app_storage_result(
         .map_err(|e| KeychatUniError::Storage { msg: e.to_string() })
 }
 
-/// Type alias — keychat-uniffi modules still reference `ClientInner`.
-pub(crate) type ClientInner = AppClientInner;
-
 #[derive(uniffi::Object)]
 pub struct KeychatClient {
     /// The shared AppClient that holds all state.
     /// CLI and other Rust consumers use AppClient directly.
     /// Swift/Kotlin use KeychatClient (this struct) which adds #[uniffi::export].
-    pub(crate) app: AppClient,
+    /// Arc-wrapped so start_event_loop(self: Arc<AppClient>) can be called.
+    pub(crate) app: std::sync::Arc<AppClient>,
 }
 
 // ─── Trait Bridge Adapters ──────────────────────────────────────
@@ -47,8 +45,6 @@ pub struct KeychatClient {
 // AppClientInner uses keychat_app_core's plain traits. These adapters bridge them.
 
 struct EventListenerBridge(Box<dyn crate::types::EventListener>);
-unsafe impl Send for EventListenerBridge {}
-unsafe impl Sync for EventListenerBridge {}
 
 impl keychat_app_core::EventListener for EventListenerBridge {
     fn on_event(&self, event: keychat_app_core::ClientEvent) {
@@ -57,8 +53,6 @@ impl keychat_app_core::EventListener for EventListenerBridge {
 }
 
 struct DataListenerBridge(Box<dyn crate::types::DataListener>);
-unsafe impl Send for DataListenerBridge {}
-unsafe impl Sync for DataListenerBridge {}
 
 impl keychat_app_core::DataListener for DataListenerBridge {
     fn on_data_change(&self, change: keychat_app_core::DataChange) {
@@ -139,80 +133,35 @@ pub(crate) fn convert_data_change(c: keychat_app_core::DataChange) -> crate::typ
     }
 }
 
-// ─── Reverse conversion: UniFFI types → app-core types ──────────
-// Needed temporarily while event_loop.rs constructs UniFFI types directly.
-// Will be removed when event construction moves to app-core.
 
-pub(crate) fn uniffi_to_core_client_event(e: crate::types::ClientEvent) -> keychat_app_core::ClientEvent {
-    use crate::types::ClientEvent as UE;
-    use keychat_app_core::ClientEvent as CE;
-    match e {
-        UE::FriendRequestReceived { request_id, sender_pubkey, sender_name, message, created_at } =>
-            CE::FriendRequestReceived { request_id, sender_pubkey, sender_name, message, created_at },
-        UE::FriendRequestAccepted { peer_pubkey, peer_name } =>
-            CE::FriendRequestAccepted { peer_pubkey, peer_name },
-        UE::FriendRequestRejected { peer_pubkey } =>
-            CE::FriendRequestRejected { peer_pubkey },
-        UE::MessageReceived { room_id, sender_pubkey, kind, content, payload, event_id, fallback, reply_to_event_id, group_id, thread_id, nostr_event_json, relay_url } =>
-            CE::MessageReceived { room_id, sender_pubkey, kind: uniffi_to_core_message_kind(kind), content, payload, event_id, fallback, reply_to_event_id, group_id, thread_id, nostr_event_json, relay_url },
-        UE::GroupInviteReceived { room_id, group_type, group_name, inviter_pubkey } =>
-            CE::GroupInviteReceived { room_id, group_type, group_name, inviter_pubkey },
-        UE::GroupMemberChanged { room_id, kind, member_pubkey, new_value } =>
-            CE::GroupMemberChanged { room_id, kind: uniffi_to_core_group_change_kind(kind), member_pubkey, new_value },
-        UE::GroupDissolved { room_id } => CE::GroupDissolved { room_id },
-        UE::EventLoopError { description } => CE::EventLoopError { description },
-        UE::RelayOk { event_id, relay_url, success, message } =>
-            CE::RelayOk { event_id, relay_url, success, message },
+// ─── Shared type conversions (used by messaging.rs + group.rs) ──
+
+pub(crate) fn convert_file_payload(f: crate::types::FilePayload) -> keychat_app_core::FilePayload {
+    keychat_app_core::FilePayload {
+        category: convert_file_category(f.category),
+        url: f.url, mime_type: f.mime_type, suffix: f.suffix, size: f.size,
+        key: f.key, iv: f.iv, hash: f.hash, source_name: f.source_name,
+        audio_duration: f.audio_duration, amplitude_samples: f.amplitude_samples,
     }
 }
 
-fn uniffi_to_core_message_kind(k: crate::types::MessageKind) -> keychat_app_core::MessageKind {
-    use crate::types::MessageKind as UK;
-    use keychat_app_core::MessageKind as MK;
-    match k {
-        UK::Text => MK::Text, UK::Files => MK::Files, UK::Cashu => MK::Cashu,
-        UK::LightningInvoice => MK::LightningInvoice, UK::FriendRequest => MK::FriendRequest,
-        UK::FriendApprove => MK::FriendApprove, UK::FriendReject => MK::FriendReject,
-        UK::ProfileSync => MK::ProfileSync, UK::SignalGroupInvite => MK::SignalGroupInvite,
-        UK::SignalGroupMemberRemoved => MK::SignalGroupMemberRemoved,
-        UK::SignalGroupSelfLeave => MK::SignalGroupSelfLeave,
-        UK::SignalGroupDissolve => MK::SignalGroupDissolve,
-        UK::SignalGroupNameChanged => MK::SignalGroupNameChanged,
-        UK::MlsGroupInvite => MK::MlsGroupInvite, UK::AgentReply => MK::AgentReply,
-        _ => MK::Text,
-    }
-}
-
-fn uniffi_to_core_group_change_kind(k: crate::types::GroupChangeKind) -> keychat_app_core::GroupChangeKind {
-    match k {
-        crate::types::GroupChangeKind::MemberRemoved => keychat_app_core::GroupChangeKind::MemberRemoved,
-        crate::types::GroupChangeKind::SelfLeave => keychat_app_core::GroupChangeKind::SelfLeave,
-        crate::types::GroupChangeKind::NameChanged => keychat_app_core::GroupChangeKind::NameChanged,
-    }
-}
-
-pub(crate) fn uniffi_to_core_data_change(c: crate::types::DataChange) -> keychat_app_core::DataChange {
-    use crate::types::DataChange as UD;
-    use keychat_app_core::DataChange as DC;
+pub(crate) fn convert_file_category(c: crate::types::FileCategory) -> keychat_app_core::FileCategory {
     match c {
-        UD::RoomUpdated { room_id } => DC::RoomUpdated { room_id },
-        UD::RoomDeleted { room_id } => DC::RoomDeleted { room_id },
-        UD::RoomListChanged => DC::RoomListChanged,
-        UD::MessageAdded { room_id, msgid } => DC::MessageAdded { room_id, msgid },
-        UD::MessageUpdated { room_id, msgid } => DC::MessageUpdated { room_id, msgid },
-        UD::ContactUpdated { pubkey } => DC::ContactUpdated { pubkey },
-        UD::ContactListChanged => DC::ContactListChanged,
-        UD::IdentityListChanged => DC::IdentityListChanged,
-        UD::ConnectionStatusChanged { status, message } => DC::ConnectionStatusChanged {
-            status: match status {
-                crate::types::ConnectionStatus::Disconnected => keychat_app_core::ConnectionStatus::Disconnected,
-                crate::types::ConnectionStatus::Connecting => keychat_app_core::ConnectionStatus::Connecting,
-                crate::types::ConnectionStatus::Connected => keychat_app_core::ConnectionStatus::Connected,
-                crate::types::ConnectionStatus::Reconnecting => keychat_app_core::ConnectionStatus::Reconnecting,
-                crate::types::ConnectionStatus::Failed => keychat_app_core::ConnectionStatus::Failed,
-            },
-            message,
-        },
+        crate::types::FileCategory::Image => keychat_app_core::FileCategory::Image,
+        crate::types::FileCategory::Video => keychat_app_core::FileCategory::Video,
+        crate::types::FileCategory::Voice => keychat_app_core::FileCategory::Voice,
+        crate::types::FileCategory::Audio => keychat_app_core::FileCategory::Audio,
+        crate::types::FileCategory::Document => keychat_app_core::FileCategory::Document,
+        crate::types::FileCategory::Text => keychat_app_core::FileCategory::Text,
+        crate::types::FileCategory::Archive => keychat_app_core::FileCategory::Archive,
+        crate::types::FileCategory::Other => keychat_app_core::FileCategory::Other,
+    }
+}
+
+pub(crate) fn convert_reply_to(r: crate::types::ReplyToPayload) -> keychat_app_core::ReplyToPayload {
+    keychat_app_core::ReplyToPayload {
+        target_event_id: r.target_event_id,
+        content: r.content,
     }
 }
 
@@ -220,8 +169,10 @@ pub(crate) fn uniffi_to_core_data_change(c: crate::types::DataChange) -> keychat
 impl KeychatClient {
     #[uniffi::constructor]
     pub fn new(db_path: String, db_key: String) -> Result<Self, KeychatUniError> {
-        let app = AppClient::new(db_path, db_key)
-            .map_err(|e| KeychatUniError::Storage { msg: e.to_string() })?;
+        let app = std::sync::Arc::new(
+            AppClient::new(db_path, db_key)
+                .map_err(|e| KeychatUniError::Storage { msg: e.to_string() })?,
+        );
         Ok(Self { app })
     }
 

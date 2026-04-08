@@ -94,7 +94,7 @@ pub async fn encrypt_and_upload(
     let r = keychat_app_core::media::encrypt_and_upload(plaintext, server_url).await
         .map_err(|e| KeychatUniError::MediaTransfer { msg: e.to_string() })?;
     Ok(FileUploadResult {
-        url: r.url, key: r.key, iv: r.iv, hash: r.hash, size: r.encrypted_size,
+        url: r.url, key: r.key, iv: r.iv, hash: r.hash, size: r.size,
     })
 }
 
@@ -107,7 +107,7 @@ pub async fn encrypt_and_upload_routed(
     let r = keychat_app_core::media::encrypt_and_upload_routed(plaintext, server_url).await
         .map_err(|e| KeychatUniError::MediaTransfer { msg: e.to_string() })?;
     Ok(FileUploadResult {
-        url: r.url, key: r.key, iv: r.iv, hash: r.hash, size: r.encrypted_size,
+        url: r.url, key: r.key, iv: r.iv, hash: r.hash, size: r.size,
     })
 }
 

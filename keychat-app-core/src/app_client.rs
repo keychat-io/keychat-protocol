@@ -1,5 +1,18 @@
 //! AppClient — the shared application client for all UI consumers.
 //!
+//! ## Lock ordering (to prevent deadlock)
+//!
+//! 1. `inner: RwLock<AppClientInner>` — outermost
+//! 2. `inner.protocol.storage: Mutex<SecureStorage>`
+//! 3. `inner.app_storage: Mutex<AppStorage>`
+//! 4. `inner.protocol.sessions[*]: tokio::Mutex<ChatSession>` — per-peer
+//! 5. `relay_tracker: Mutex<RelaySendTracker>`
+//!
+//! Rules:
+//! - Never hold a higher-numbered lock when acquiring a lower-numbered one.
+//! - Drop `RwLock` guards before any `.await` that acquires session mutexes.
+//! - Clone `Arc<Mutex<...>>` out of the `RwLock` guard, drop the guard, then lock.
+//!
 //! Composes `ProtocolClient` (from libkeychat) with `AppStorage` and
 //! `RelaySendTracker` to provide the full Keychat client API.
 //!
@@ -516,7 +529,7 @@ impl AppClient {
                 nostr_pubkey_hex: r.nostr_pubkey_hex,
                 name: r.name,
                 avatar: r.avatar,
-                idx: r.idx,
+                index: r.idx,
                 is_default: r.is_default,
                 created_at: r.created_at,
             })

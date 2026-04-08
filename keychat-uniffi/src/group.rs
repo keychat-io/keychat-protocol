@@ -1,6 +1,6 @@
 //! Signal Group — thin UniFFI delegation to keychat-app-core::AppClient.
 
-use crate::client::KeychatClient;
+use crate::client::{KeychatClient, convert_file_payload, convert_reply_to};
 use crate::error::KeychatUniError;
 use crate::types::*;
 
@@ -125,31 +125,3 @@ fn convert_group_sent_message(m: keychat_app_core::GroupSentMessage) -> GroupSen
     }
 }
 
-fn convert_file_payload(f: FilePayload) -> keychat_app_core::FilePayload {
-    keychat_app_core::FilePayload {
-        category: convert_file_category(f.category),
-        url: f.url,
-        mime_type: f.mime_type,
-        suffix: f.suffix,
-        size: f.size,
-        key: f.key,
-        iv: f.iv,
-        hash: f.hash,
-        source_name: f.source_name,
-        audio_duration: f.audio_duration,
-        amplitude_samples: f.amplitude_samples,
-    }
-}
-
-fn convert_file_category(c: FileCategory) -> keychat_app_core::FileCategory {
-    match c {
-        FileCategory::Image => keychat_app_core::FileCategory::Image,
-        FileCategory::Video => keychat_app_core::FileCategory::Video,
-        FileCategory::Voice => keychat_app_core::FileCategory::Voice,
-        FileCategory::Audio => keychat_app_core::FileCategory::Audio,
-        FileCategory::Document => keychat_app_core::FileCategory::Document,
-        FileCategory::Text => keychat_app_core::FileCategory::Text,
-        FileCategory::Archive => keychat_app_core::FileCategory::Archive,
-        FileCategory::Other => keychat_app_core::FileCategory::Other,
-    }
-}

@@ -102,7 +102,7 @@ impl KeychatClient {
 
 // Type conversions between UniFFI and app-core types
 fn convert_identity_info(i: keychat_app_core::IdentityInfo) -> IdentityInfo {
-    IdentityInfo { npub: i.npub, nostr_pubkey_hex: i.nostr_pubkey_hex, name: i.name, avatar: i.avatar, index: i.idx, is_default: i.is_default, created_at: i.created_at as u64 }
+    IdentityInfo { npub: i.npub, nostr_pubkey_hex: i.nostr_pubkey_hex, name: i.name, avatar: i.avatar, index: i.index, is_default: i.is_default, created_at: i.created_at as u64 }
 }
 fn convert_room_info(r: keychat_app_core::RoomInfo) -> RoomInfo {
     RoomInfo { id: r.id, to_main_pubkey: r.to_main_pubkey, identity_pubkey: r.identity_pubkey, status: RoomStatus::from_i32(r.status.to_i32()), room_type: RoomType::from_i32(r.room_type.to_i32()), name: r.name, avatar: r.avatar, parent_room_id: r.parent_room_id, last_message_content: r.last_message_content, last_message_at: r.last_message_at.map(|t| t as u64), unread_count: r.unread_count, created_at: r.created_at as u64 }

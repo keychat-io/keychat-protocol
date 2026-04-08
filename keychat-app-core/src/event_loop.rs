@@ -11,7 +11,6 @@ use std::sync::Arc;
 use libkeychat::ProtocolClient;
 
 use crate::app_client::{lock_app_storage, npub_from_hex, AppClient, AppError, AppResult};
-use crate::delegate::AppDelegate;
 use crate::types::*;
 
 impl AppClient {

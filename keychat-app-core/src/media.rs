@@ -181,7 +181,7 @@ pub struct FileUploadResult {
     /// SHA-256 hash of ciphertext, hex-encoded.
     pub hash: String,
     /// Size of the encrypted ciphertext in bytes.
-    pub encrypted_size: u64,
+    pub size: u64,
 }
 
 /// Encrypt and upload a file to a Blossom server in one call.
@@ -236,7 +236,7 @@ pub async fn encrypt_and_upload(
         key: key_hex,
         iv: iv_hex,
         hash: hash_hex,
-        encrypted_size,
+        size: encrypted_size,
     })
 }
 
@@ -328,7 +328,7 @@ async fn upload_via_relay(
         key: key_hex,
         iv: iv_hex,
         hash: hash_hex,
-        encrypted_size,
+        size: encrypted_size,
     })
 }
 
