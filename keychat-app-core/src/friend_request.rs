@@ -47,6 +47,14 @@ impl AppClient {
         self.emit_data_change(DataChange::ContactListChanged).await;
         self.emit_data_change(DataChange::MessageAdded { room_id, msgid: request_id.clone() }).await;
 
+        // Re-subscribe to include the new first_inbox address for receiving the approve response
+        {
+            let mut inner = self.inner.write().await;
+            if let Err(e) = inner.protocol.refresh_subscriptions().await {
+                tracing::warn!("refresh_subscriptions after send_friend_request: {e}");
+            }
+        }
+
         Ok(PendingFriendRequest { request_id, peer_nostr_pubkey })
     }
 
@@ -88,6 +96,14 @@ impl AppClient {
         self.emit_data_change(DataChange::RoomUpdated { room_id: room_id.clone() }).await;
         self.emit_data_change(DataChange::ContactListChanged).await;
         self.emit_data_change(DataChange::MessageAdded { room_id, msgid }).await;
+
+        // Re-subscribe to include new ratchet-derived addresses
+        {
+            let mut inner = self.inner.write().await;
+            if let Err(e) = inner.protocol.refresh_subscriptions().await {
+                tracing::warn!("refresh_subscriptions after accept_friend_request: {e}");
+            }
+        }
 
         Ok(ContactInfo { nostr_pubkey_hex: peer_nostr_hex, signal_id_hex: peer_signal_hex, display_name: peer_name })
     }
