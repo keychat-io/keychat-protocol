@@ -363,7 +363,13 @@ fn test_mls_large_group() {
     let ciphertext = alice_mls.encrypt(group_id, plaintext.as_bytes()).unwrap();
 
     // Bob decrypts
-    let (decrypted_bob, sender_bob) = bob_mls.decrypt(group_id, &ciphertext).unwrap();
+    let libkeychat::MlsDecryptResult::Application {
+        plaintext: decrypted_bob,
+        sender_id: sender_bob,
+    } = bob_mls.decrypt(group_id, &ciphertext).unwrap()
+    else {
+        panic!("expected Application message");
+    };
     let dec_msg_bob = KCMessage::try_parse(&String::from_utf8(decrypted_bob).unwrap()).unwrap();
     assert_eq!(
         dec_msg_bob.text.as_ref().unwrap().content,
@@ -372,7 +378,13 @@ fn test_mls_large_group() {
     assert_eq!(sender_bob, "alice_mls");
 
     // Tom decrypts
-    let (decrypted_tom, sender_tom) = tom_mls.decrypt(group_id, &ciphertext).unwrap();
+    let libkeychat::MlsDecryptResult::Application {
+        plaintext: decrypted_tom,
+        sender_id: sender_tom,
+    } = tom_mls.decrypt(group_id, &ciphertext).unwrap()
+    else {
+        panic!("expected Application message");
+    };
     let dec_msg_tom = KCMessage::try_parse(&String::from_utf8(decrypted_tom).unwrap()).unwrap();
     assert_eq!(
         dec_msg_tom.text.as_ref().unwrap().content,
@@ -385,7 +397,13 @@ fn test_mls_large_group() {
     let bob_pt = bob_msg.to_json().unwrap();
     let bob_ct = bob_mls.encrypt(group_id, bob_pt.as_bytes()).unwrap();
 
-    let (dec_alice, sender) = alice_mls.decrypt(group_id, &bob_ct).unwrap();
+    let libkeychat::MlsDecryptResult::Application {
+        plaintext: dec_alice,
+        sender_id: sender,
+    } = alice_mls.decrypt(group_id, &bob_ct).unwrap()
+    else {
+        panic!("expected Application message");
+    };
     let dec_alice_msg = KCMessage::try_parse(&String::from_utf8(dec_alice).unwrap()).unwrap();
     assert_eq!(
         dec_alice_msg.text.as_ref().unwrap().content,
@@ -393,7 +411,13 @@ fn test_mls_large_group() {
     );
     assert_eq!(sender, "bob_mls");
 
-    let (dec_tom2, sender2) = tom_mls.decrypt(group_id, &bob_ct).unwrap();
+    let libkeychat::MlsDecryptResult::Application {
+        plaintext: dec_tom2,
+        sender_id: sender2,
+    } = tom_mls.decrypt(group_id, &bob_ct).unwrap()
+    else {
+        panic!("expected Application message");
+    };
     let dec_tom2_msg = KCMessage::try_parse(&String::from_utf8(dec_tom2).unwrap()).unwrap();
     assert_eq!(
         dec_tom2_msg.text.as_ref().unwrap().content,
@@ -406,7 +430,13 @@ fn test_mls_large_group() {
     let tom_pt = tom_msg.to_json().unwrap();
     let tom_ct = tom_mls.encrypt(group_id, tom_pt.as_bytes()).unwrap();
 
-    let (dec_a3, s3) = alice_mls.decrypt(group_id, &tom_ct).unwrap();
+    let libkeychat::MlsDecryptResult::Application {
+        plaintext: dec_a3,
+        sender_id: s3,
+    } = alice_mls.decrypt(group_id, &tom_ct).unwrap()
+    else {
+        panic!("expected Application message");
+    };
     let dec_a3_msg = KCMessage::try_parse(&String::from_utf8(dec_a3).unwrap()).unwrap();
     assert_eq!(
         dec_a3_msg.text.as_ref().unwrap().content,
@@ -414,7 +444,13 @@ fn test_mls_large_group() {
     );
     assert_eq!(s3, "tom_mls");
 
-    let (dec_b3, s4) = bob_mls.decrypt(group_id, &tom_ct).unwrap();
+    let libkeychat::MlsDecryptResult::Application {
+        plaintext: dec_b3,
+        sender_id: s4,
+    } = bob_mls.decrypt(group_id, &tom_ct).unwrap()
+    else {
+        panic!("expected Application message");
+    };
     let dec_b3_msg = KCMessage::try_parse(&String::from_utf8(dec_b3).unwrap()).unwrap();
     assert_eq!(
         dec_b3_msg.text.as_ref().unwrap().content,
