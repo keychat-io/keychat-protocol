@@ -295,3 +295,422 @@ impl RelaySendTracker {
         serde_json::to_string(&events_json).unwrap_or_else(|_| "[]".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relay(n: u32) -> String {
+        format!("wss://relay{n}.example.com")
+    }
+
+    // ── track + build_json ──────────────────────────────────────────
+
+    #[test]
+    fn track_produces_all_pending() {
+        let mut t = RelaySendTracker::new();
+        let json = t.track(
+            "evt1".into(),
+            "msg1".into(),
+            "room1".into(),
+            vec![relay(1), relay(2)],
+        );
+        let v: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.len(), 1);
+        let relays = v[0]["relays"].as_array().unwrap();
+        assert_eq!(relays.len(), 2);
+        assert_eq!(relays[0]["status"], "pending");
+        assert_eq!(relays[1]["status"], "pending");
+        assert_eq!(relays[0]["url"], relay(1));
+        assert_eq!(relays[1]["url"], relay(2));
+    }
+
+    #[test]
+    fn track_preserves_relay_order() {
+        let mut t = RelaySendTracker::new();
+        let urls = vec![relay(3), relay(1), relay(2)];
+        let json = t.track("e".into(), "m".into(), "r".into(), urls.clone());
+        let v: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let out_urls: Vec<String> = v[0]["relays"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(out_urls, urls);
+    }
+
+    // ── handle_relay_ok ─────────────────────────────────────────────
+
+    #[test]
+    fn relay_ok_success_updates_status() {
+        let mut t = RelaySendTracker::new();
+        t.track("evt1".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+
+        let u = t.handle_relay_ok("evt1", &relay(1), true, "").unwrap();
+        assert_eq!(u.msgid, "msg1");
+        assert_eq!(u.room_id, "room1");
+        assert!(u.all_resolved);
+        assert!(u.has_success);
+
+        let v: Vec<serde_json::Value> = serde_json::from_str(&u.relay_status_json).unwrap();
+        assert_eq!(v[0]["relays"][0]["status"], "success");
+    }
+
+    #[test]
+    fn relay_ok_failure_updates_status_and_error() {
+        let mut t = RelaySendTracker::new();
+        t.track("evt1".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+
+        let u = t
+            .handle_relay_ok("evt1", &relay(1), false, "rate-limited")
+            .unwrap();
+        assert!(u.all_resolved);
+        assert!(!u.has_success);
+
+        let v: Vec<serde_json::Value> = serde_json::from_str(&u.relay_status_json).unwrap();
+        assert_eq!(v[0]["relays"][0]["status"], "failed");
+        assert_eq!(v[0]["relays"][0]["error"], "rate-limited");
+    }
+
+    #[test]
+    fn partial_resolution_not_all_resolved() {
+        let mut t = RelaySendTracker::new();
+        t.track(
+            "evt1".into(),
+            "msg1".into(),
+            "room1".into(),
+            vec![relay(1), relay(2)],
+        );
+
+        let u = t.handle_relay_ok("evt1", &relay(1), true, "").unwrap();
+        assert!(!u.all_resolved, "one relay still pending");
+        assert!(u.has_success);
+
+        let u2 = t.handle_relay_ok("evt1", &relay(2), true, "").unwrap();
+        assert!(u2.all_resolved);
+        assert!(u2.has_success);
+    }
+
+    #[test]
+    fn unknown_event_returns_none() {
+        let mut t = RelaySendTracker::new();
+        assert!(t.handle_relay_ok("unknown", &relay(1), true, "").is_none());
+    }
+
+    #[test]
+    fn unknown_relay_url_is_ignored() {
+        let mut t = RelaySendTracker::new();
+        t.track("evt1".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+
+        let u = t.handle_relay_ok("evt1", &relay(99), true, "").unwrap();
+        // The unknown relay is silently ignored; relay(1) still pending
+        assert!(!u.all_resolved);
+    }
+
+    // ── mixed success/failure ───────────────────────────────────────
+
+    #[test]
+    fn mixed_success_and_failure() {
+        let mut t = RelaySendTracker::new();
+        t.track(
+            "evt1".into(),
+            "msg1".into(),
+            "room1".into(),
+            vec![relay(1), relay(2), relay(3)],
+        );
+
+        t.handle_relay_ok("evt1", &relay(1), true, "");
+        t.handle_relay_ok("evt1", &relay(2), false, "blocked");
+        let u = t.handle_relay_ok("evt1", &relay(3), false, "err").unwrap();
+
+        assert!(u.all_resolved);
+        assert!(u.has_success, "at least one relay succeeded");
+
+        let v: Vec<serde_json::Value> = serde_json::from_str(&u.relay_status_json).unwrap();
+        let statuses: Vec<&str> = v[0]["relays"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, vec!["success", "failed", "failed"]);
+    }
+
+    #[test]
+    fn all_relays_fail() {
+        let mut t = RelaySendTracker::new();
+        t.track(
+            "evt1".into(),
+            "msg1".into(),
+            "room1".into(),
+            vec![relay(1), relay(2)],
+        );
+
+        t.handle_relay_ok("evt1", &relay(1), false, "err1");
+        let u = t.handle_relay_ok("evt1", &relay(2), false, "err2").unwrap();
+
+        assert!(u.all_resolved);
+        assert!(!u.has_success);
+    }
+
+    // ── check_timeouts ──────────────────────────────────────────────
+
+    #[test]
+    fn timeout_marks_pending_relays() {
+        let mut t = RelaySendTracker::new();
+        t.track(
+            "evt1".into(),
+            "msg1".into(),
+            "room1".into(),
+            vec![relay(1), relay(2)],
+        );
+
+        // Respond to relay(1) only
+        t.handle_relay_ok("evt1", &relay(1), true, "");
+
+        // Force entry to look old
+        t.events.get_mut("evt1").unwrap().started_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+
+        let updates = t.check_timeouts(5);
+        assert_eq!(updates.len(), 1);
+        let u = &updates[0];
+        assert!(u.all_resolved);
+        assert!(u.has_success, "relay(1) succeeded before timeout");
+
+        let v: Vec<serde_json::Value> = serde_json::from_str(&u.relay_status_json).unwrap();
+        let statuses: Vec<&str> = v[0]["relays"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, vec!["success", "timeout"]);
+    }
+
+    #[test]
+    fn timeout_does_not_affect_fresh_entries() {
+        let mut t = RelaySendTracker::new();
+        t.track("evt1".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+
+        // Entry is fresh — timeout(5) should not affect it
+        let updates = t.check_timeouts(5);
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn timeout_all_pending_means_no_success() {
+        let mut t = RelaySendTracker::new();
+        t.track("evt1".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+        t.events.get_mut("evt1").unwrap().started_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(10);
+
+        let updates = t.check_timeouts(5);
+        assert_eq!(updates.len(), 1);
+        assert!(!updates[0].has_success);
+        assert!(updates[0].all_resolved);
+    }
+
+    // ── track_group ─────────────────────────────────────────────────
+
+    #[test]
+    fn track_group_creates_multiple_events() {
+        let mut t = RelaySendTracker::new();
+        let json = t.track_group(
+            "gmsg1".into(),
+            "group-room".into(),
+            vec![
+                ("evt-bob".into(), "Bob".into()),
+                ("evt-tom".into(), "Tom".into()),
+            ],
+            vec![relay(1)],
+        );
+
+        let v: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.len(), 2, "two events for two members");
+        assert_eq!(v[0]["member"], "Bob");
+        assert_eq!(v[0]["event_id"], "evt-bob");
+        assert_eq!(v[1]["member"], "Tom");
+        assert_eq!(v[1]["event_id"], "evt-tom");
+    }
+
+    #[test]
+    fn group_resolution_requires_all_events() {
+        let mut t = RelaySendTracker::new();
+        t.track_group(
+            "gmsg1".into(),
+            "group-room".into(),
+            vec![
+                ("evt-bob".into(), "Bob".into()),
+                ("evt-tom".into(), "Tom".into()),
+            ],
+            vec![relay(1)],
+        );
+
+        // Only Bob's event resolved
+        let u = t.handle_relay_ok("evt-bob", &relay(1), true, "").unwrap();
+        assert!(!u.all_resolved, "Tom's event still pending");
+
+        // Now Tom's event
+        let u2 = t.handle_relay_ok("evt-tom", &relay(1), true, "").unwrap();
+        assert!(u2.all_resolved);
+        assert!(u2.has_success);
+    }
+
+    #[test]
+    fn group_has_success_requires_all_events_have_at_least_one_success() {
+        let mut t = RelaySendTracker::new();
+        t.track_group(
+            "gmsg1".into(),
+            "group-room".into(),
+            vec![
+                ("evt-bob".into(), "Bob".into()),
+                ("evt-tom".into(), "Tom".into()),
+            ],
+            vec![relay(1)],
+        );
+
+        // Bob succeeds, Tom fails
+        t.handle_relay_ok("evt-bob", &relay(1), true, "");
+        let u = t
+            .handle_relay_ok("evt-tom", &relay(1), false, "err")
+            .unwrap();
+        assert!(u.all_resolved);
+        assert!(!u.has_success, "Tom's event has no success relay");
+    }
+
+    #[test]
+    fn group_timeout_applies_per_event() {
+        let mut t = RelaySendTracker::new();
+        t.track_group(
+            "gmsg1".into(),
+            "group-room".into(),
+            vec![
+                ("evt-bob".into(), "Bob".into()),
+                ("evt-tom".into(), "Tom".into()),
+            ],
+            vec![relay(1), relay(2)],
+        );
+
+        // Bob: relay(1) succeeds, relay(2) pending
+        t.handle_relay_ok("evt-bob", &relay(1), true, "");
+        // Tom: both pending
+
+        // Age all entries
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        for entry in t.events.values_mut() {
+            entry.started_at = past;
+        }
+
+        let updates = t.check_timeouts(5);
+        assert_eq!(updates.len(), 1); // one msgid
+        let u = &updates[0];
+        assert!(u.all_resolved);
+        // Bob has success (relay1=success, relay2=timeout), Tom has no success (both timeout)
+        assert!(!u.has_success, "Tom's event has 0 success relays");
+    }
+
+    // ── cleanup_resolved ────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_removes_fully_resolved() {
+        let mut t = RelaySendTracker::new();
+        t.track("evt1".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+        t.track("evt2".into(), "msg2".into(), "room2".into(), vec![relay(1)]);
+
+        // Resolve msg1 only
+        t.handle_relay_ok("evt1", &relay(1), true, "");
+
+        t.cleanup_resolved();
+
+        assert!(
+            t.events.get("evt1").is_none(),
+            "resolved event should be removed"
+        );
+        assert!(
+            t.msgid_events.get("msg1").is_none(),
+            "resolved msgid should be removed"
+        );
+        assert!(
+            t.events.get("evt2").is_some(),
+            "unresolved event should remain"
+        );
+        assert!(
+            t.msgid_events.get("msg2").is_some(),
+            "unresolved msgid should remain"
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_partially_resolved_group() {
+        let mut t = RelaySendTracker::new();
+        t.track_group(
+            "gmsg1".into(),
+            "room".into(),
+            vec![("evt-a".into(), "A".into()), ("evt-b".into(), "B".into())],
+            vec![relay(1)],
+        );
+
+        // Only evt-a resolved
+        t.handle_relay_ok("evt-a", &relay(1), true, "");
+
+        t.cleanup_resolved();
+
+        // Both events should still be present (group not fully resolved)
+        assert!(t.events.get("evt-a").is_some());
+        assert!(t.events.get("evt-b").is_some());
+        assert!(t.msgid_events.get("gmsg1").is_some());
+
+        // Now resolve evt-b
+        t.handle_relay_ok("evt-b", &relay(1), true, "");
+        t.cleanup_resolved();
+
+        assert!(t.events.is_empty());
+        assert!(t.msgid_events.is_empty());
+    }
+
+    #[test]
+    fn cleanup_on_empty_tracker_is_noop() {
+        let mut t = RelaySendTracker::new();
+        t.cleanup_resolved(); // should not panic
+        assert!(t.events.is_empty());
+    }
+
+    // ── re-track (re-broadcast) ─────────────────────────────────────
+
+    #[test]
+    fn retrack_same_msgid_adds_event() {
+        let mut t = RelaySendTracker::new();
+        t.track("evt1".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+        t.track("evt2".into(), "msg1".into(), "room1".into(), vec![relay(1)]);
+
+        let eids = t.msgid_events.get("msg1").unwrap();
+        assert_eq!(eids.len(), 2);
+        assert_eq!(eids, &["evt1", "evt2"]);
+    }
+
+    // ── edge: zero relays ───────────────────────────────────────────
+
+    #[test]
+    fn track_with_zero_relays() {
+        let mut t = RelaySendTracker::new();
+        let json = t.track("evt1".into(), "msg1".into(), "room1".into(), vec![]);
+
+        let v: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(v[0]["relays"].as_array().unwrap().len(), 0);
+
+        // Already resolved (no relays to wait for)
+        let u = t.build_update("msg1");
+        assert!(u.all_resolved);
+        // No success either (vacuously true per current logic — depends on impl)
+    }
+
+    #[test]
+    fn track_group_with_zero_members() {
+        let mut t = RelaySendTracker::new();
+        let json = t.track_group("gmsg1".into(), "room".into(), vec![], vec![relay(1)]);
+        let v: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert!(v.is_empty());
+    }
+}

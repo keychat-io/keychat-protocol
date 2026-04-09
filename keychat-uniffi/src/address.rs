@@ -40,7 +40,7 @@ impl KeychatClient {
             let inner = self.app.inner.read().await;
             let storage = inner
                 .protocol
-                .storage
+                .storage()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let cursor = storage.get_min_relay_cursor().unwrap_or(0);
@@ -58,8 +58,7 @@ impl KeychatClient {
         let inner = self.app.inner.read().await;
         let transport = inner
             .protocol
-            .transport
-            .as_ref()
+            .transport()
             .ok_or(KeychatUniError::Transport {
                 msg: "Not connected to any relay. Please check your network.".into(),
             })?;
@@ -83,7 +82,7 @@ impl KeychatClient {
     pub async fn get_all_receiving_addresses(&self) -> Vec<String> {
         let session_arcs: Vec<_> = {
             let inner = self.app.inner.read().await;
-            inner.protocol.sessions.values().cloned().collect()
+            inner.protocol.all_session_arcs()
         };
         let mut addrs = Vec::new();
         for session_mutex in &session_arcs {

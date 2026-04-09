@@ -222,30 +222,18 @@ pub struct SendResult {
 /// All protocol state (sessions, peer indexes, pending friend requests) lives here.
 /// App-layer state (rooms, messages, contacts, settings) is NOT part of this struct.
 pub struct ProtocolClient {
-    /// The user's Nostr identity.
-    pub identity: Option<Identity>,
-    /// Nostr relay transport.
-    pub transport: Option<Transport>,
-    /// Protocol-level encrypted storage (Signal sessions, peers, addresses, dedup).
-    pub storage: Arc<Mutex<SecureStorage>>,
-    /// Per-peer Signal chat sessions, keyed by peer's signal identity hex.
-    pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
-    /// Nostr pubkey → Signal identity mapping.
-    pub peer_nostr_to_signal: HashMap<String, String>,
-    /// Reverse: Signal identity → Nostr pubkey.
-    pub peer_signal_to_nostr: HashMap<String, String>,
-    /// Receiving ratchet address → peer signal ID for O(1) message routing.
-    pub receiving_addr_to_peer: HashMap<String, String>,
-    /// Pending outbound friend requests, keyed by request ID.
-    pub pending_outbound: HashMap<String, FriendRequestState>,
-    /// Signal group manager.
-    pub group_manager: GroupManager,
-    /// Next available Signal device ID.
-    pub next_signal_device_id: u32,
-    /// Active relay subscription IDs.
-    pub subscription_ids: Vec<String>,
-    /// Last known relay URLs.
-    pub last_relay_urls: Vec<String>,
+    identity: Option<Identity>,
+    transport: Option<Transport>,
+    storage: Arc<Mutex<SecureStorage>>,
+    sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
+    peer_nostr_to_signal: HashMap<String, String>,
+    peer_signal_to_nostr: HashMap<String, String>,
+    receiving_addr_to_peer: HashMap<String, String>,
+    pending_outbound: HashMap<String, FriendRequestState>,
+    group_manager: GroupManager,
+    next_signal_device_id: u32,
+    subscription_ids: Vec<String>,
+    last_relay_urls: Vec<String>,
 }
 
 impl ProtocolClient {
@@ -266,6 +254,120 @@ impl ProtocolClient {
             last_relay_urls: Vec::new(),
         }
     }
+
+    // ─── Accessors ───────────────────────────────────────────────
+
+    pub fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
+    }
+    pub fn set_identity(&mut self, identity: Option<Identity>) {
+        self.identity = identity;
+    }
+
+    pub fn transport(&self) -> Option<&Transport> {
+        self.transport.as_ref()
+    }
+    pub fn has_transport(&self) -> bool {
+        self.transport.is_some()
+    }
+    pub fn set_transport(&mut self, transport: Transport) {
+        self.transport = Some(transport);
+    }
+    pub fn take_transport(&mut self) -> Option<Transport> {
+        self.transport.take()
+    }
+
+    pub fn storage(&self) -> &Arc<Mutex<SecureStorage>> {
+        &self.storage
+    }
+
+    pub fn get_session(&self, signal_id: &str) -> Option<Arc<tokio::sync::Mutex<ChatSession>>> {
+        self.sessions.get(signal_id).cloned()
+    }
+    pub fn first_session(&self) -> Option<Arc<tokio::sync::Mutex<ChatSession>>> {
+        self.sessions.values().next().cloned()
+    }
+    pub fn all_session_arcs(&self) -> Vec<Arc<tokio::sync::Mutex<ChatSession>>> {
+        self.sessions.values().cloned().collect()
+    }
+    pub fn sessions_len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn nostr_to_signal(&self, nostr_pk: &str) -> Option<&String> {
+        self.peer_nostr_to_signal.get(nostr_pk)
+    }
+    pub fn signal_to_nostr(&self, signal_id: &str) -> Option<&String> {
+        self.peer_signal_to_nostr.get(signal_id)
+    }
+    pub fn peer_count(&self) -> usize {
+        self.peer_nostr_to_signal.len()
+    }
+    pub fn receiving_addr_count(&self) -> usize {
+        self.receiving_addr_to_peer.len()
+    }
+    pub fn pending_outbound_len(&self) -> usize {
+        self.pending_outbound.len()
+    }
+    pub fn get_pending_outbound(&self, id: &str) -> Option<&FriendRequestState> {
+        self.pending_outbound.get(id)
+    }
+    pub fn remove_pending_outbound(&mut self, id: &str) -> Option<FriendRequestState> {
+        self.pending_outbound.remove(id)
+    }
+
+    pub fn group_manager(&self) -> &GroupManager {
+        &self.group_manager
+    }
+    pub fn group_manager_mut(&mut self) -> &mut GroupManager {
+        &mut self.group_manager
+    }
+
+    pub fn subscription_ids(&self) -> &[String] {
+        &self.subscription_ids
+    }
+    pub fn subscription_ids_mut(&mut self) -> &mut Vec<String> {
+        &mut self.subscription_ids
+    }
+    pub fn last_relay_urls(&self) -> &[String] {
+        &self.last_relay_urls
+    }
+    pub fn set_last_relay_urls(&mut self, urls: Vec<String>) {
+        self.last_relay_urls = urls;
+    }
+
+    /// Remove a peer from all in-memory indexes (sessions, both peer maps, receiving addresses).
+    /// Returns the signal ID if found.
+    pub fn remove_peer(&mut self, nostr_pk: &str) -> Option<String> {
+        if let Some(signal_id) = self.peer_nostr_to_signal.remove(nostr_pk) {
+            self.peer_signal_to_nostr.remove(&signal_id);
+            self.sessions.remove(&signal_id);
+            self.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
+            self.pending_outbound
+                .retain(|_, s| s.peer_nostr_pubkey != nostr_pk);
+            Some(signal_id)
+        } else {
+            None
+        }
+    }
+
+    /// Reset all in-memory state (identity, transport, sessions, peer maps, groups, subscriptions).
+    /// Does NOT clear storage — call storage.delete_all_data() separately.
+    pub fn reset(&mut self) {
+        self.identity = None;
+        self.transport = None;
+        self.sessions.clear();
+        self.peer_nostr_to_signal.clear();
+        self.peer_signal_to_nostr.clear();
+        self.receiving_addr_to_peer.clear();
+        self.pending_outbound.clear();
+        self.group_manager = GroupManager::new();
+        self.next_signal_device_id = 1;
+        self.subscription_ids.clear();
+        self.last_relay_urls.clear();
+    }
+
+    // ─── Session Restore ────────────────────────────────────────
 
     /// Restore all sessions, peer mappings, pending FRs, and groups from storage.
     ///
@@ -729,6 +831,17 @@ impl ProtocolClient {
             .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
         transport.reconnect().await?;
         tracing::info!("reconnected to all relays");
+        Ok(())
+    }
+
+    /// Reconnect a specific relay.
+    pub async fn reconnect_relay(&self, url: &str) -> Result<()> {
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected to any relay.".into()))?;
+        transport.reconnect_relay(url).await?;
+        tracing::info!("reconnected relay: {url}");
         Ok(())
     }
 

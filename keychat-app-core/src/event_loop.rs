@@ -72,7 +72,7 @@ impl AppClient {
     ) {
         let nostr_client = {
             let inner = self.inner.read().await;
-            match inner.protocol.transport.as_ref() {
+            match inner.protocol.transport() {
                 Some(t) => t.client().clone(),
                 None => {
                     self.emit_event(ClientEvent::EventLoopError {
@@ -99,7 +99,7 @@ impl AppClient {
 
                             let deduped = {
                                 let inner = self.inner.read().await;
-                                match inner.protocol.transport.as_ref() {
+                                match inner.protocol.transport() {
                                     Some(t) => t.deduplicate((*event).clone()).await,
                                     None => None,
                                 }
@@ -128,7 +128,7 @@ impl AppClient {
                                     let event_ts = event.created_at.as_u64().min(now);
                                     {
                                         let inner = self.inner.read().await;
-                                        let storage = inner.protocol.storage.clone();
+                                        let storage = inner.protocol.storage().clone();
                                         drop(inner);
                                         let store = storage.lock().unwrap_or_else(|e| e.into_inner());
                                         let _ = store.update_relay_cursor(&relay, event_ts);
@@ -240,10 +240,10 @@ impl AppClient {
                 let inner = self.inner.read().await;
                 let (_, ratchet_pks) = inner.protocol.collect_subscribe_pubkeys().await;
                 if !ratchet_pks.is_empty() {
-                    if let Some(transport) = inner.protocol.transport.as_ref() {
-                        let old_ratchet_id = if inner.protocol.subscription_ids.len() >= 2 {
+                    if let Some(transport) = inner.protocol.transport() {
+                        let old_ratchet_id = if inner.protocol.subscription_ids().len() >= 2 {
                             Some(libkeychat::SubscriptionId::new(
-                                &inner.protocol.subscription_ids[1],
+                                &inner.protocol.subscription_ids()[1],
                             ))
                         } else {
                             None
@@ -254,7 +254,7 @@ impl AppClient {
                         let ratchet_since = {
                             let storage = inner
                                 .protocol
-                                .storage
+                                .storage()
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
                             let cursor = storage.get_min_relay_cursor().unwrap_or(0);
@@ -270,10 +270,13 @@ impl AppClient {
                         {
                             drop(inner);
                             let mut inner = self.inner.write().await;
-                            if inner.protocol.subscription_ids.len() >= 2 {
-                                inner.protocol.subscription_ids[1] = new_id.to_string();
+                            if inner.protocol.subscription_ids().len() >= 2 {
+                                inner.protocol.subscription_ids_mut()[1] = new_id.to_string();
                             } else {
-                                inner.protocol.subscription_ids.push(new_id.to_string());
+                                inner
+                                    .protocol
+                                    .subscription_ids_mut()
+                                    .push(new_id.to_string());
                             }
                         }
                     }
@@ -284,8 +287,7 @@ impl AppClient {
                 let inner = self.inner.read().await;
                 inner
                     .protocol
-                    .peer_signal_to_nostr
-                    .get(&peer_signal_hex)
+                    .signal_to_nostr(&peer_signal_hex)
                     .cloned()
                     .unwrap_or_else(|| peer_signal_hex.clone())
             };
@@ -551,8 +553,7 @@ impl AppClient {
                 let inner = self.inner.read().await;
                 inner
                     .protocol
-                    .pending_outbound
-                    .get(request_id)
+                    .get_pending_outbound(request_id)
                     .map(|s| s.peer_nostr_pubkey.clone())
                     .unwrap_or_default()
             };
@@ -580,7 +581,7 @@ impl AppClient {
 
             // Now remove from pending_outbound (deferred from Step 2)
             let mut inner = self.inner.write().await;
-            inner.protocol.pending_outbound.remove(request_id);
+            inner.protocol.remove_pending_outbound(request_id);
         }
     }
 
@@ -618,9 +619,9 @@ impl AppClient {
                         {
                             let mut inner = self.inner.write().await;
                             let gid = group.group_id.clone();
-                            inner.protocol.group_manager.add_group(group);
-                            if let Ok(store) = inner.protocol.storage.clone().lock() {
-                                let _ = inner.protocol.group_manager.save_group(&gid, &store);
+                            inner.protocol.group_manager_mut().add_group(group);
+                            if let Ok(store) = inner.protocol.storage().clone().lock() {
+                                let _ = inner.protocol.group_manager_mut().save_group(&gid, &store);
                             }
                         }
                         // Persist group room to app storage
@@ -674,11 +675,14 @@ impl AppClient {
                 );
                 if let Some(ref member_id) = removed_member {
                     let mut inner = self.inner.write().await;
-                    if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
+                    if let Some(g) = inner.protocol.group_manager_mut().get_group_mut(&group_id) {
                         g.remove_member(member_id);
                     }
-                    if let Ok(store) = inner.protocol.storage.clone().lock() {
-                        let _ = inner.protocol.group_manager.save_group(&group_id, &store);
+                    if let Ok(store) = inner.protocol.storage().clone().lock() {
+                        let _ = inner
+                            .protocol
+                            .group_manager_mut()
+                            .save_group(&group_id, &store);
                     }
                 }
                 let full_room_id = make_room_id(&group_id, &identity_pubkey);
@@ -711,11 +715,14 @@ impl AppClient {
                 );
                 if let Some(ref member_id) = left_member {
                     let mut inner = self.inner.write().await;
-                    if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
+                    if let Some(g) = inner.protocol.group_manager_mut().get_group_mut(&group_id) {
                         g.remove_member(member_id);
                     }
-                    if let Ok(store) = inner.protocol.storage.clone().lock() {
-                        let _ = inner.protocol.group_manager.save_group(&group_id, &store);
+                    if let Ok(store) = inner.protocol.storage().clone().lock() {
+                        let _ = inner
+                            .protocol
+                            .group_manager_mut()
+                            .save_group(&group_id, &store);
                     }
                 }
                 let full_room_id = make_room_id(&group_id, &identity_pubkey);
@@ -741,16 +748,16 @@ impl AppClient {
                 );
                 let app_storage_clone = {
                     let mut inner = self.inner.write().await;
-                    if let Ok(store) = inner.protocol.storage.clone().lock() {
+                    if let Ok(store) = inner.protocol.storage().clone().lock() {
                         if let Err(e) = inner
                             .protocol
-                            .group_manager
+                            .group_manager_mut()
                             .remove_group_persistent(&group_id, &store)
                         {
                             tracing::warn!("remove_group_persistent: {e}");
                         }
                     } else {
-                        inner.protocol.group_manager.remove_group(&group_id);
+                        inner.protocol.group_manager_mut().remove_group(&group_id);
                     }
                     inner.app_storage.clone()
                 };
@@ -787,11 +794,15 @@ impl AppClient {
                     let app_storage_clone;
                     {
                         let mut inner = self.inner.write().await;
-                        if let Some(g) = inner.protocol.group_manager.get_group_mut(&group_id) {
+                        if let Some(g) = inner.protocol.group_manager_mut().get_group_mut(&group_id)
+                        {
                             g.name = name.clone();
                         }
-                        if let Ok(store) = inner.protocol.storage.clone().lock() {
-                            let _ = inner.protocol.group_manager.save_group(&group_id, &store);
+                        if let Ok(store) = inner.protocol.storage().clone().lock() {
+                            let _ = inner
+                                .protocol
+                                .group_manager_mut()
+                                .save_group(&group_id, &store);
                         }
                         app_storage_clone = inner.app_storage.clone();
                     }

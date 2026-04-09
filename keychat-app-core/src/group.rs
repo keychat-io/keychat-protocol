@@ -23,26 +23,22 @@ impl AppClient {
             let inner = self.inner.read().await;
             let identity = inner
                 .protocol
-                .identity
-                .as_ref()
+                .identity()
                 .ok_or(AppError::NotInitialized("no identity set".into()))?;
             let my_nostr = identity.pubkey_hex();
-            let first_session_arc = inner.protocol.sessions.values().next().cloned();
+            let first_session_arc = inner.protocol.first_session();
             let mut other_members = Vec::new();
             let mut member_sessions = Vec::new();
             for m in &members {
                 let sid = inner
                     .protocol
-                    .peer_nostr_to_signal
-                    .get(&m.nostr_pubkey)
+                    .nostr_to_signal(&m.nostr_pubkey)
                     .ok_or(AppError::PeerNotFound(m.nostr_pubkey.clone()))?
                     .clone();
                 let sarc = inner
                     .protocol
-                    .sessions
-                    .get(&sid)
-                    .ok_or(AppError::PeerNotFound(sid.clone()))?
-                    .clone();
+                    .get_session(&sid)
+                    .ok_or(AppError::PeerNotFound(sid.clone()))?;
                 other_members.push((sid.clone(), m.nostr_pubkey.clone(), m.name.clone()));
                 member_sessions.push((sid, sarc));
             }
@@ -69,7 +65,7 @@ impl AppClient {
                 .await
                 .map_err(|e| AppError::Signal(e.to_string()))?;
             let inner = self.inner.read().await;
-            if let Some(t) = inner.protocol.transport.as_ref() {
+            if let Some(t) = inner.protocol.transport() {
                 let _ = t.publish_event_async(event).await;
             }
         }
@@ -78,9 +74,9 @@ impl AppClient {
         {
             let mut inner = self.inner.write().await;
             let gid = group.group_id.clone();
-            inner.protocol.group_manager.add_group(group);
-            if let Ok(store) = inner.protocol.storage.clone().lock() {
-                let _ = inner.protocol.group_manager.save_group(&gid, &store);
+            inner.protocol.group_manager_mut().add_group(group);
+            if let Ok(store) = inner.protocol.storage().clone().lock() {
+                let _ = inner.protocol.group_manager_mut().save_group(&gid, &store);
             }
         }
 
@@ -107,7 +103,7 @@ impl AppClient {
         let inner = self.inner.read().await;
         let group = inner
             .protocol
-            .group_manager
+            .group_manager()
             .get_group(&group_id)
             .ok_or(AppError::PeerNotFound(group_id))?;
         Ok(group
@@ -244,25 +240,20 @@ impl AppClient {
             let inner = self.inner.read().await;
             let group = inner
                 .protocol
-                .group_manager
+                .group_manager()
                 .get_group(&group_id)
                 .ok_or(AppError::PeerNotFound(group_id.clone()))?
                 .clone();
             let transport = inner
                 .protocol
-                .transport
-                .as_ref()
+                .transport()
                 .ok_or(AppError::Transport("Not connected".into()))?;
             let connected = transport.connected_relays().await;
             let mut sessions = Vec::new();
             for member in group.other_members() {
-                if let Some(sid) = inner
-                    .protocol
-                    .peer_nostr_to_signal
-                    .get(&member.nostr_pubkey)
-                {
-                    if let Some(s) = inner.protocol.sessions.get(sid) {
-                        sessions.push((sid.clone(), s.clone()));
+                if let Some(sid) = inner.protocol.nostr_to_signal(&member.nostr_pubkey) {
+                    if let Some(s) = inner.protocol.get_session(sid) {
+                        sessions.push((sid.clone(), s));
                     }
                 }
             }
@@ -282,7 +273,7 @@ impl AppClient {
                 Ok(event) => {
                     let eid = event.id.to_hex();
                     let inner = self.inner.read().await;
-                    if let Some(t) = inner.protocol.transport.as_ref() {
+                    if let Some(t) = inner.protocol.transport() {
                         let _ = t.publish_event_async(event).await;
                     }
                     event_ids.push(eid);

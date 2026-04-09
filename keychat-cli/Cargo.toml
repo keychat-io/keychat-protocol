@@ -14,20 +14,20 @@ path = "src/main.rs"
 
 [dependencies]
 keychat-app-core = { path = "../keychat-app-core" }
-libkeychat = { path = "../libkeychat", features = ["storage"] }
-tokio = { version = "1", features = ["full"] }
+libkeychat = { path = "../libkeychat" }
+tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 anyhow = "1"
 axum = "0.8"
 rustyline = "14"
 colored = "2"
 chrono = "0.4"
 dirs = "6"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 # keyring crate removed — uses system CLI (security/secret-tool) via keychain.rs instead
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -36,6 +36,7 @@ qrcode = "0.14"
 open = "5"
 
 [dev-dependencies]
+keychat-uniffi = { path = "../keychat-uniffi" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http = "1"

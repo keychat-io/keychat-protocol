@@ -295,7 +295,7 @@ impl AppClient {
         let mnemonic = result.mnemonic.clone();
 
         let mut inner = self.inner.write().await;
-        inner.protocol.identity = Some(result.identity);
+        inner.protocol.set_identity(Some(result.identity));
 
         let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
 
@@ -310,7 +310,7 @@ impl AppClient {
         let pubkey_hex = identity.pubkey_hex();
 
         let mut inner = self.inner.write().await;
-        inner.protocol.identity = Some(identity);
+        inner.protocol.set_identity(Some(identity));
 
         let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
         Ok(pubkey_hex)
@@ -334,7 +334,7 @@ impl AppClient {
         let inner = self.inner.read().await;
         let store = inner
             .protocol
-            .storage
+            .storage()
             .lock()
             .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
         store
@@ -398,6 +398,15 @@ impl AppClient {
     pub async fn reconnect_relays(&self) -> AppResult<()> {
         let inner = self.inner.read().await;
         inner.protocol.reconnect_relays().await.map_err(Into::into)
+    }
+
+    pub async fn reconnect_relay(&self, url: String) -> AppResult<()> {
+        let inner = self.inner.read().await;
+        inner
+            .protocol
+            .reconnect_relay(&url)
+            .await
+            .map_err(Into::into)
     }
 
     // ─── Listeners ──────────────────────────────────────────────
@@ -580,8 +589,8 @@ impl AppClient {
     /// Debug: print subscription state — receiving addresses and subscription IDs.
     pub async fn debug_subscription_state(&self) -> String {
         let inner = self.inner.read().await;
-        let sub_ids = &inner.protocol.subscription_ids;
-        let addr_count = inner.protocol.receiving_addr_to_peer.len();
+        let sub_ids = inner.protocol.subscription_ids();
+        let addr_count = inner.protocol.receiving_addr_count();
         let (identity_pks, ratchet_pks) = inner.protocol.collect_subscribe_pubkeys().await;
         let ratchet_hex: Vec<String> = ratchet_pks
             .iter()
@@ -629,7 +638,7 @@ impl AppClient {
 
     pub async fn check_connection(&self) -> ConnectionStatus {
         let inner = self.inner.read().await;
-        match &inner.protocol.transport {
+        match inner.protocol.transport() {
             Some(t) => {
                 if t.connected_relays().await.is_empty() {
                     ConnectionStatus::Disconnected
@@ -645,20 +654,19 @@ impl AppClient {
 
     pub async fn debug_state_summary(&self) -> AppResult<String> {
         let inner = self.inner.read().await;
-        let sessions = inner.protocol.sessions.len();
-        let peers = inner.protocol.peer_nostr_to_signal.len();
-        let addrs = inner.protocol.receiving_addr_to_peer.len();
-        let pending = inner.protocol.pending_outbound.len();
-        let groups = inner.protocol.group_manager.group_count();
-        let transport = if inner.protocol.transport.is_some() {
+        let sessions = inner.protocol.sessions_len();
+        let peers = inner.protocol.peer_count();
+        let addrs = inner.protocol.receiving_addr_count();
+        let pending = inner.protocol.pending_outbound_len();
+        let groups = inner.protocol.group_manager().group_count();
+        let transport = if inner.protocol.has_transport() {
             "connected"
         } else {
             "none"
         };
         let identity = inner
             .protocol
-            .identity
-            .as_ref()
+            .identity()
             .map(|i| format!("{}…", &i.pubkey_hex()[..16]))
             .unwrap_or("none".into());
         Ok(format!(
@@ -686,27 +694,18 @@ impl AppClient {
         // 2. Disconnect transport
         {
             let mut inner = self.inner.write().await;
-            if let Some(t) = inner.protocol.transport.take() {
+            if let Some(t) = inner.protocol.take_transport() {
                 let _ = t.disconnect().await;
             }
         }
 
         // 3. Clear all in-memory state + DB
-        let storage = self.inner.read().await.protocol.storage.clone();
+        let storage = self.inner.read().await.protocol.storage().clone();
         {
             let mut inner = self.inner.write().await;
-            inner.protocol.sessions.clear();
-            inner.protocol.peer_nostr_to_signal.clear();
-            inner.protocol.peer_signal_to_nostr.clear();
-            inner.protocol.receiving_addr_to_peer.clear();
-            inner.protocol.pending_outbound.clear();
-            inner.protocol.group_manager = libkeychat::GroupManager::new();
-            inner.protocol.identity = None;
-            inner.protocol.next_signal_device_id = 1;
+            inner.protocol.reset();
             inner.event_loop_stop = None;
             inner.reconnect_stop = None;
-            inner.protocol.subscription_ids.clear();
-            inner.protocol.last_relay_urls.clear();
         }
         if let Ok(store) = storage.lock() {
             store
@@ -726,23 +725,13 @@ impl AppClient {
     }
 
     pub async fn remove_room(&self, room_id: String) -> AppResult<()> {
-        let storage = self.inner.read().await.protocol.storage.clone();
+        let storage = self.inner.read().await.protocol.storage().clone();
         let mut found = false;
 
         // Try as 1:1 peer first
         {
             let mut inner = self.inner.write().await;
-            if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&room_id) {
-                inner.protocol.peer_signal_to_nostr.remove(&signal_id);
-                inner.protocol.sessions.remove(&signal_id);
-                inner
-                    .protocol
-                    .receiving_addr_to_peer
-                    .retain(|_, v| v != &signal_id);
-                inner
-                    .protocol
-                    .pending_outbound
-                    .retain(|_, s| s.peer_nostr_pubkey != room_id);
+            if let Some(signal_id) = inner.protocol.remove_peer(&room_id) {
                 drop(inner);
 
                 if let Ok(store) = storage.lock() {
@@ -759,14 +748,14 @@ impl AppClient {
         // Try as Signal group
         if !found {
             let mut inner = self.inner.write().await;
-            if inner.protocol.group_manager.get_group(&room_id).is_some() {
+            if inner.protocol.group_manager().get_group(&room_id).is_some() {
                 if let Ok(store) = storage.lock() {
                     let _ = inner
                         .protocol
-                        .group_manager
+                        .group_manager_mut()
                         .remove_group_persistent(&room_id, &store);
                 } else {
-                    inner.protocol.group_manager.remove_group(&room_id);
+                    inner.protocol.group_manager_mut().remove_group(&room_id);
                 }
                 tracing::info!(
                     "remove_room: removed group {}",
@@ -809,21 +798,11 @@ impl AppClient {
     }
 
     pub async fn remove_session(&self, peer_pubkey: String) -> AppResult<()> {
-        let storage = self.inner.read().await.protocol.storage.clone();
+        let storage = self.inner.read().await.protocol.storage().clone();
 
         {
             let mut inner = self.inner.write().await;
-            if let Some(signal_id) = inner.protocol.peer_nostr_to_signal.remove(&peer_pubkey) {
-                inner.protocol.peer_signal_to_nostr.remove(&signal_id);
-                inner.protocol.sessions.remove(&signal_id);
-                inner
-                    .protocol
-                    .receiving_addr_to_peer
-                    .retain(|_, v| v != &signal_id);
-                inner
-                    .protocol
-                    .pending_outbound
-                    .retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
+            if let Some(signal_id) = inner.protocol.remove_peer(&peer_pubkey) {
                 drop(inner);
 
                 if let Ok(store) = storage.lock() {
@@ -932,8 +911,7 @@ impl AppClient {
         let inner = self.inner.read().await;
         let transport = inner
             .protocol
-            .transport
-            .as_ref()
+            .transport()
             .ok_or(AppError::Transport("Not connected.".into()))?;
         let result = transport.rebroadcast_event(event).await?;
         Ok((result.success_relays, result.failed_relays))
@@ -1136,7 +1114,7 @@ impl AppClient {
         let inner = self.inner.read().await;
         let store = inner
             .protocol
-            .storage
+            .storage()
             .lock()
             .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
         store

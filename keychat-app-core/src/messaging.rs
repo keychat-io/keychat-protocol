@@ -215,8 +215,7 @@ impl AppClient {
             let inner = self.inner.read().await;
             let transport = inner
                 .protocol
-                .transport
-                .as_ref()
+                .transport()
                 .ok_or(AppError::Transport("Not connected to any relay.".into()))?;
             transport.connected_relays().await
         };
@@ -228,8 +227,8 @@ impl AppClient {
             let inner = self.inner.read().await;
             inner
                 .protocol
-                .identity
-                .clone()
+                .identity()
+                .cloned()
                 .ok_or(AppError::NotInitialized("no identity set".into()))?
         };
         let identity_pubkey = identity.pubkey_hex();
@@ -279,8 +278,7 @@ impl AppClient {
             let inner = self.inner.read().await;
             let transport = inner
                 .protocol
-                .transport
-                .as_ref()
+                .transport()
                 .ok_or(AppError::Transport("Not connected to any relay.".into()))?;
             transport.publish_event_async(gift_wrap).await?;
         }
