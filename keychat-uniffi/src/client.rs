@@ -35,6 +35,13 @@ pub struct KeychatClient {
     pub(crate) app: std::sync::Arc<AppClient>,
 }
 
+impl KeychatClient {
+    /// Access the underlying `AppClient` for direct Rust consumers (e.g. CLI).
+    pub fn app_client(&self) -> &std::sync::Arc<AppClient> {
+        &self.app
+    }
+}
+
 // ─── Trait Bridge Adapters ──────────────────────────────────────
 // UniFFI requires its own trait definitions with #[uniffi::export(callback_interface)].
 // AppClientInner uses keychat_app_core's plain traits. These adapters bridge them.

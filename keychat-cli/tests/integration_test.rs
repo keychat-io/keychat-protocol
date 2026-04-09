@@ -91,10 +91,10 @@ async_test!(test_daemon_status_route, {
     let db_path = temp_db(&dir, "daemon.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -130,10 +130,10 @@ async_test!(test_daemon_identity_route_no_identity, {
     let db_path = temp_db(&dir, "daemon2.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -163,10 +163,10 @@ async_test!(test_daemon_create_identity_route, {
     let db_path = temp_db(&dir, "daemon3.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -346,7 +346,7 @@ async_test!(test_blossom_roundtrip_small_file, {
     };
 
     assert!(!result.url.is_empty(), "upload URL should not be empty");
-    assert!(result.encrypted_size > 0, "encrypted size should be > 0");
+    assert!(result.size > 0, "encrypted size should be > 0");
     assert_eq!(result.key.len(), 64, "key should be 64 hex chars");
 
     // Download and decrypt
@@ -392,9 +392,9 @@ async_test!(test_daemon_send_file_missing_paths, {
     let db_path = temp_db(&dir, "sendfile.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Empty file_paths should return 400
     let response = app
@@ -429,9 +429,9 @@ async_test!(test_daemon_send_file_nonexistent_file, {
     let db_path = temp_db(&dir, "sendfile2.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -471,10 +471,10 @@ async_test!(test_daemon_rooms_route_empty, {
     let db_path = temp_db(&dir, "daemon4.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Create identity first so rooms query works
     client.create_identity().await.unwrap();
@@ -2036,6 +2036,7 @@ async_test!(test_file_message_send_receive, {
 
     // Alice sends file message to Bob (using room_id, not pubkey)
     alice
+        .app_client()
         .send_file(alice_room_id.clone(), vec![payload], None, None)
         .await
         .unwrap();
@@ -2131,6 +2132,7 @@ async_test!(test_auto_download_small_file, {
 
     // Send file message (using room_id)
     alice
+        .app_client()
         .send_file(alice_room_id.clone(), vec![payload], None, None)
         .await
         .unwrap();
@@ -2202,9 +2204,9 @@ async_test!(test_daemon_upload_file, {
     let db_path = temp_db(&dir, "upload.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Create a test file
     let test_file = dir.path().join("test_upload.txt");
@@ -2264,9 +2266,9 @@ async_test!(test_daemon_upload_nonexistent_file, {
     let db_path = temp_db(&dir, "upload2.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let req_body = serde_json::json!({
         "file_path": "/nonexistent/file.txt"
@@ -2309,9 +2311,9 @@ async_test!(test_daemon_download_file, {
     let client = Arc::new(KeychatClient::new(db_path, "test-key".into()).unwrap());
     let _files_dir = client.get_files_dir();
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let room_id = "room-http-test".to_string();
 
@@ -2408,9 +2410,9 @@ async_test!(test_daemon_files_list_empty, {
     // Create identity for the client
     let identity = client.create_identity().await.unwrap();
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Create a room
     let room_id = client
