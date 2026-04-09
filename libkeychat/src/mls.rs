@@ -253,6 +253,38 @@ impl MlsParticipant {
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut group = self.load_group(group_id)?;
 
+        // Filter out key packages whose signature key already exists in the group
+        // to avoid "Duplicate signature key in proposals and group" error
+        let existing_sig_keys: std::collections::HashSet<Vec<u8>> =
+            group.members().map(|m| m.signature_key).collect();
+        let total = key_packages.len();
+        let key_packages: Vec<KeyPackage> = key_packages
+            .into_iter()
+            .filter(|kp| {
+                !existing_sig_keys.contains(kp.leaf_node().signature_key().as_slice())
+            })
+            .collect();
+        let skipped = total - key_packages.len();
+        if key_packages.is_empty() {
+            if total == 1 {
+                return Err(KeychatError::Mls(
+                    "The member is already in the group".to_string(),
+                ));
+            } else {
+                return Err(KeychatError::Mls(format!(
+                    "All {} members are already in the group",
+                    total
+                )));
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "Skipped {} already-in-group member(s), adding remaining {}.",
+                skipped,
+                key_packages.len()
+            );
+        }
+
         let (commit, welcome, _group_info) = group
             .add_members(self.provider.inner(), &self.signer, &key_packages)
             .map_err(|e| KeychatError::Mls(format!("add_members error: {e}")))?;
