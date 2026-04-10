@@ -451,6 +451,32 @@ pub struct GroupSentMessage {
     pub relay_status_json: Option<String>,
 }
 
+// ─── MLS Group Types ─────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct MlsGroupInfo {
+    pub group_id: String,
+    pub name: String,
+    pub member_count: u32,
+    pub mls_temp_inbox: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MlsGroupMemberInfo {
+    pub nostr_pubkey: String,
+    pub is_admin: bool,
+    pub is_me: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct MlsGroupSentMessage {
+    pub msgid: String,
+    pub group_id: String,
+    pub event_id: String,
+    pub payload_json: Option<String>,
+    pub relay_status_json: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PublishResultInfo {
     pub event_id: String,

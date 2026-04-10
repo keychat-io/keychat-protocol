@@ -222,6 +222,10 @@ pub struct AppClient {
     pub relay_tracker: Mutex<RelaySendTracker>,
     /// Cached identity pubkey hex — set once in import_identity(), never changes.
     pub identity_pubkey_hex: tokio::sync::OnceCell<String>,
+    /// MLS participant — separate from inner because MlsProvider contains non-Send RefCell.
+    /// Wrapped in std::sync::Mutex for thread safety.
+    #[cfg(feature = "mls")]
+    pub(crate) mls_participant: Mutex<Option<libkeychat::MlsParticipant>>,
 }
 
 impl AppClient {
@@ -279,12 +283,44 @@ impl AppClient {
             files_dir,
             relay_tracker: Mutex::new(RelaySendTracker::new()),
             identity_pubkey_hex: tokio::sync::OnceCell::new(),
+            #[cfg(feature = "mls")]
+            mls_participant: Mutex::new(None),
         })
     }
 
     /// Get the cached identity pubkey hex.
     pub(crate) fn cached_identity_pubkey(&self) -> String {
         self.identity_pubkey_hex.get().cloned().unwrap_or_default()
+    }
+
+    /// Derive the MLS database path from the main database path.
+    #[cfg(feature = "mls")]
+    fn mls_db_path(&self) -> String {
+        if self.db_path.ends_with(".db") {
+            self.db_path.replace(".db", "_mls.db")
+        } else {
+            format!("{}_mls", self.db_path)
+        }
+    }
+
+    /// Initialize the MLS participant.
+    /// Logs a warning on failure — MLS is optional functionality.
+    #[cfg(feature = "mls")]
+    fn init_mls_participant(&self, nostr_id: &str) {
+        let mls_path = self.mls_db_path();
+
+        match libkeychat::MlsProvider::open(&mls_path)
+            .and_then(|provider| libkeychat::MlsParticipant::with_provider(nostr_id, provider))
+        {
+            Ok(participant) => {
+                if let Ok(mut guard) = self.mls_participant.lock() {
+                    *guard = Some(participant);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("MLS initialization failed (non-fatal): {e}");
+            }
+        }
     }
 
     // ─── Identity ───────────────────────────────────────────────
@@ -296,8 +332,12 @@ impl AppClient {
 
         let mut inner = self.inner.write().await;
         inner.protocol.set_identity(Some(result.identity));
+        drop(inner);
 
         let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
+
+        #[cfg(feature = "mls")]
+        self.init_mls_participant(&pubkey_hex);
 
         Ok(CreateIdentityResult {
             pubkey_hex,
@@ -311,8 +351,13 @@ impl AppClient {
 
         let mut inner = self.inner.write().await;
         inner.protocol.set_identity(Some(identity));
+        drop(inner);
 
         let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
+
+        #[cfg(feature = "mls")]
+        self.init_mls_participant(&pubkey_hex);
+
         Ok(pubkey_hex)
     }
 

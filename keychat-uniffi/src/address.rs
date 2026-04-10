@@ -46,14 +46,14 @@ impl KeychatClient {
             let cursor = storage.get_min_relay_cursor().unwrap_or(0);
             if cursor > 0 {
                 let two_days_secs: u64 = 2 * 24 * 60 * 60;
-                Some(libkeychat::Timestamp::from(
+                Some(keychat_app_core::Timestamp::from(
                     cursor.saturating_sub(two_days_secs),
                 ))
             } else {
                 None
             }
         };
-        let ratchet_since = Some(libkeychat::Timestamp::now());
+        let ratchet_since = Some(keychat_app_core::Timestamp::now());
 
         let inner = self.app.inner.read().await;
         let transport = inner

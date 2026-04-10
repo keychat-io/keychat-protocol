@@ -120,6 +120,39 @@ pub struct GroupSentMessage {
     pub relay_status_json: Option<String>,
 }
 
+// ─── MLS Group Records ──────────────────────────────────────────
+
+#[derive(uniffi::Record)]
+pub struct MlsGroupInfo {
+    pub group_id: String,
+    pub name: String,
+    pub member_count: u32,
+    pub mls_temp_inbox: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct MlsGroupMemberInfo {
+    pub nostr_pubkey: String,
+    pub is_admin: bool,
+    pub is_me: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct MlsGroupSentMessage {
+    pub msgid: String,
+    pub group_id: String,
+    pub event_id: String,
+    pub payload_json: Option<String>,
+    pub relay_status_json: Option<String>,
+}
+
+/// Input for creating an MLS group: (nostr_pubkey, serialized KeyPackage bytes).
+#[derive(uniffi::Record)]
+pub struct MlsKeyPackageInput {
+    pub nostr_pubkey: String,
+    pub key_package_bytes: Vec<u8>,
+}
+
 // ─── Enums ───────────────────────────────────────────────────────
 
 #[derive(uniffi::Enum, Clone)]
@@ -183,27 +216,31 @@ pub enum MessageKind {
     GroupAnnouncement,
 }
 
-impl From<libkeychat::KCMessageKind> for MessageKind {
-    fn from(k: libkeychat::KCMessageKind) -> Self {
+impl From<keychat_app_core::KCMessageKind> for MessageKind {
+    fn from(k: keychat_app_core::KCMessageKind) -> Self {
         match k {
-            libkeychat::KCMessageKind::Text => MessageKind::Text,
-            libkeychat::KCMessageKind::Files => MessageKind::Files,
-            libkeychat::KCMessageKind::Cashu => MessageKind::Cashu,
-            libkeychat::KCMessageKind::LightningInvoice => MessageKind::LightningInvoice,
-            libkeychat::KCMessageKind::FriendRequest => MessageKind::FriendRequest,
-            libkeychat::KCMessageKind::FriendApprove => MessageKind::FriendApprove,
-            libkeychat::KCMessageKind::FriendReject => MessageKind::FriendReject,
-            libkeychat::KCMessageKind::SignalGroupInvite => MessageKind::SignalGroupInvite,
-            libkeychat::KCMessageKind::SignalGroupMemberRemoved => {
+            keychat_app_core::KCMessageKind::Text => MessageKind::Text,
+            keychat_app_core::KCMessageKind::Files => MessageKind::Files,
+            keychat_app_core::KCMessageKind::Cashu => MessageKind::Cashu,
+            keychat_app_core::KCMessageKind::LightningInvoice => MessageKind::LightningInvoice,
+            keychat_app_core::KCMessageKind::FriendRequest => MessageKind::FriendRequest,
+            keychat_app_core::KCMessageKind::FriendApprove => MessageKind::FriendApprove,
+            keychat_app_core::KCMessageKind::FriendReject => MessageKind::FriendReject,
+            keychat_app_core::KCMessageKind::SignalGroupInvite => MessageKind::SignalGroupInvite,
+            keychat_app_core::KCMessageKind::SignalGroupMemberRemoved => {
                 MessageKind::SignalGroupMemberRemoved
             }
-            libkeychat::KCMessageKind::SignalGroupSelfLeave => MessageKind::SignalGroupSelfLeave,
-            libkeychat::KCMessageKind::SignalGroupDissolve => MessageKind::SignalGroupDissolve,
-            libkeychat::KCMessageKind::SignalGroupNameChanged => {
+            keychat_app_core::KCMessageKind::SignalGroupSelfLeave => {
+                MessageKind::SignalGroupSelfLeave
+            }
+            keychat_app_core::KCMessageKind::SignalGroupDissolve => {
+                MessageKind::SignalGroupDissolve
+            }
+            keychat_app_core::KCMessageKind::SignalGroupNameChanged => {
                 MessageKind::SignalGroupNameChanged
             }
-            libkeychat::KCMessageKind::MlsGroupInvite => MessageKind::MlsGroupInvite,
-            libkeychat::KCMessageKind::AgentReply => MessageKind::AgentReply,
+            keychat_app_core::KCMessageKind::MlsGroupInvite => MessageKind::MlsGroupInvite,
+            keychat_app_core::KCMessageKind::AgentReply => MessageKind::AgentReply,
             _ => MessageKind::Text, // Unknown kinds fallback to Text
         }
     }

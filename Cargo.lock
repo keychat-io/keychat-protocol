@@ -2453,8 +2453,6 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "keychat-app-core",
- "libkeychat",
- "nostr",
  "reqwest",
  "rusqlite",
  "serde_json",

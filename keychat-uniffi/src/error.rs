@@ -1,4 +1,4 @@
-use libkeychat::KeychatError;
+use keychat_app_core::KeychatError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum KeychatUniError {

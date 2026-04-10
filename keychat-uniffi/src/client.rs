@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use keychat_app_core::AppClient;
-use libkeychat::DeviceId;
+use keychat_app_core::DeviceId;
 
 use crate::error::KeychatUniError;
 use crate::types::*;
@@ -601,7 +601,7 @@ impl KeychatClient {
         &self,
         event_json: String,
     ) -> Result<PublishResultInfo, KeychatUniError> {
-        let event: nostr::Event =
+        let event: keychat_app_core::nostr::Event =
             serde_json::from_str(&event_json).map_err(|e| KeychatUniError::Transport {
                 msg: format!("invalid event JSON: {e}"),
             })?;

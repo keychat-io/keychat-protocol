@@ -16,11 +16,15 @@ use crate::types::*;
 impl AppClient {
     /// Start the event loop: subscribe + spawn protocol loop with AppDelegate.
     pub async fn start_event_loop(self: Arc<Self>) -> AppResult<()> {
-        // Subscribe
+        // Subscribe (Signal identity + ratchet addresses)
         {
             let mut inner = self.inner.write().await;
             inner.protocol.refresh_subscriptions().await?;
         }
+
+        // Subscribe MLS temp inboxes
+        #[cfg(feature = "mls")]
+        self.refresh_mls_subscriptions().await;
 
         // Create stop channel
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -153,6 +157,58 @@ impl AppClient {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Subscribe (or re-subscribe) to MLS temp inbox addresses for all joined groups.
+    /// Called on startup, after joining a group, and after processing Commits (epoch change).
+    #[cfg(feature = "mls")]
+    pub(crate) async fn refresh_mls_subscriptions(&self) {
+        let (mls_pubkeys, _) = self.collect_mls_temp_inbox_pubkeys();
+        if mls_pubkeys.is_empty() {
+            return;
+        }
+
+        let inner = self.inner.read().await;
+        let transport = match inner.protocol.transport() {
+            Some(t) => t,
+            None => return,
+        };
+
+        // MLS subscription is at index 2 (after identity[0] and ratchet[1])
+        let old_mls_id = if inner.protocol.subscription_ids().len() >= 3 {
+            Some(libkeychat::SubscriptionId::new(
+                &inner.protocol.subscription_ids()[2],
+            ))
+        } else {
+            None
+        };
+
+        // MLS messages don't need historical fetch — subscribe from now
+        let since = Some(libkeychat::Timestamp::now());
+
+        match transport.resubscribe(old_mls_id, mls_pubkeys, since).await {
+            Ok(new_id) => {
+                drop(inner);
+                let mut inner = self.inner.write().await;
+                let ids = inner.protocol.subscription_ids_mut();
+                if ids.len() >= 3 {
+                    ids[2] = new_id.to_string();
+                } else {
+                    // Ensure we have at least 3 slots
+                    while ids.len() < 2 {
+                        ids.push(String::new());
+                    }
+                    ids.push(new_id.to_string());
+                }
+                tracing::info!(
+                    "[mls] subscribed to {} temp inbox(es)",
+                    ids.len() // just for log
+                );
+            }
+            Err(e) => {
+                tracing::error!("[mls] subscription failed: {e}");
             }
         }
     }
@@ -304,6 +360,122 @@ impl AppClient {
             )
             .await;
             return;
+        }
+
+        // Step 3.5: Try MLS group message
+        #[cfg(feature = "mls")]
+        {
+            let (_, inbox_to_group) = self.collect_mls_temp_inbox_pubkeys();
+            if !inbox_to_group.is_empty() {
+                if let Some((group_id, msg, metadata)) =
+                    self.try_decrypt_mls_event(event, &inbox_to_group)
+                {
+                    tracing::info!(
+                        "[mls] message received: group={} sender={} is_commit={}",
+                        &group_id[..16.min(group_id.len())],
+                        &metadata.sender_id[..16.min(metadata.sender_id.len())],
+                        metadata.is_commit
+                    );
+
+                    if metadata.is_commit {
+                        // Epoch changed — re-subscribe to new temp inbox
+                        self.refresh_mls_subscriptions().await;
+                    } else {
+                        // Application message — persist to app storage
+                        let identity_pubkey = self.cached_identity_pubkey();
+                        let full_room_id = make_room_id(&group_id, &identity_pubkey);
+                        let event_id = event.id.to_hex();
+                        let content = msg
+                            .text
+                            .as_ref()
+                            .map(|t| t.content.clone())
+                            .unwrap_or_default();
+                        let display = if content.is_empty() {
+                            "[MLS Message]"
+                        } else {
+                            &content
+                        };
+                        let payload_json = msg.to_json().ok();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let msgid = format!("mlsrecv-{}", &event_id[..16.min(event_id.len())]);
+
+                        {
+                            let app_storage = self.inner.read().await.app_storage.clone();
+                            let store = lock_app_storage(&app_storage);
+                            if let Err(e) = store.save_app_message(
+                                &msgid,
+                                Some(&event_id),
+                                &full_room_id,
+                                &identity_pubkey,
+                                &metadata.sender_id,
+                                display,
+                                false,
+                                0,
+                                now,
+                            ) {
+                                tracing::error!("[mls] save_app_message: {e}");
+                            }
+                            if let Some(ref pj) = payload_json {
+                                if let Err(e) = store.update_app_message(
+                                    &msgid,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(pj),
+                                    nostr_event_json.as_deref(),
+                                    None,
+                                    None,
+                                ) {
+                                    tracing::error!("[mls] update_app_message: {e}");
+                                }
+                            }
+                            if let Err(e) = store.update_app_room(
+                                &full_room_id,
+                                None,
+                                None,
+                                Some(display),
+                                Some(now),
+                            ) {
+                                tracing::error!("[mls] update_app_room: {e}");
+                            }
+                        }
+
+                        self.emit_data_change(DataChange::MessageAdded {
+                            room_id: full_room_id.clone(),
+                            msgid: msgid.clone(),
+                        })
+                        .await;
+                        self.emit_data_change(DataChange::RoomUpdated {
+                            room_id: full_room_id,
+                        })
+                        .await;
+
+                        let kind: MessageKind = msg.kind.into();
+                        self.emit_event(ClientEvent::MessageReceived {
+                            room_id: make_room_id(&group_id, &identity_pubkey),
+                            sender_pubkey: metadata.sender_id,
+                            kind,
+                            content: Some(content),
+                            payload: payload_json,
+                            event_id,
+                            fallback: msg.fallback,
+                            reply_to_event_id: msg
+                                .reply_to
+                                .as_ref()
+                                .and_then(|r| r.target_event_id.clone()),
+                            group_id: Some(group_id),
+                            thread_id: msg.thread_id,
+                            nostr_event_json,
+                            relay_url,
+                        })
+                        .await;
+                    }
+                    return;
+                }
+            }
         }
 
         // Step 4: Try NIP-17 DM
@@ -828,6 +1000,75 @@ impl AppClient {
                     new_value: new_name,
                 })
                 .await;
+                return;
+            }
+
+            #[cfg(feature = "mls")]
+            libkeychat::KCMessageKind::MlsGroupInvite => {
+                let invite_json = msg
+                    .text
+                    .as_ref()
+                    .map(|t| t.content.clone())
+                    .unwrap_or_default();
+                match serde_json::from_str::<libkeychat::MlsGroupInvitePayload>(&invite_json) {
+                    Ok(invite) => {
+                        let group_id = invite.group_id.clone();
+                        let group_name = invite.name.clone();
+                        tracing::info!(
+                            "[mls] invite received: id={} name={} from={}",
+                            &group_id[..16.min(group_id.len())],
+                            group_name,
+                            &sender_nostr_pubkey[..16.min(sender_nostr_pubkey.len())]
+                        );
+
+                        // Store invite as a pending room (Requesting status) for UI confirmation.
+                        // The UI calls join_mls_group() after user accepts.
+                        if !identity_pubkey.is_empty() {
+                            let app_storage = self.inner.read().await.app_storage.clone();
+                            let store = lock_app_storage(&app_storage);
+                            if let Err(e) = store.save_app_room(
+                                &group_id,
+                                &identity_pubkey,
+                                RoomStatus::Requesting.to_i32(),
+                                RoomType::MlsGroup.to_i32(),
+                                Some(&group_name),
+                                None,
+                                None,
+                            ) {
+                                tracing::error!("[mls] save pending invite room: {e}");
+                            }
+                            // Store the invite payload in the message table so
+                            // the UI can retrieve welcome_bytes when user accepts
+                            if let Err(e) = store.save_app_message(
+                                &format!("mls-invite-{}", &group_id[..16.min(group_id.len())]),
+                                None,
+                                &make_room_id(&group_id, &identity_pubkey),
+                                &sender_nostr_pubkey,
+                                &sender_nostr_pubkey,
+                                &invite_json,
+                                false,
+                                0,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64,
+                            ) {
+                                tracing::error!("[mls] save invite message: {e}");
+                            }
+                        }
+                        self.emit_data_change(DataChange::RoomListChanged).await;
+                        self.emit_event(ClientEvent::GroupInviteReceived {
+                            room_id: group_id,
+                            group_type: "mls".into(),
+                            group_name,
+                            inviter_pubkey: sender_nostr_pubkey,
+                        })
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::error!("[mls] failed to parse invite payload: {e}");
+                    }
+                }
                 return;
             }
 

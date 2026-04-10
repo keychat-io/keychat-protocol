@@ -10,6 +10,7 @@ mod friend_request;
 mod group;
 pub mod media;
 mod messaging;
+mod mls_group;
 mod relay_tracker;
 mod types;
 
@@ -27,16 +28,17 @@ uniffi::setup_scaffolding!();
 
 // ─── Standalone utility functions exposed to Swift ──────────────────────────
 
-use nostr::nips::nip19::{FromBech32, ToBech32};
+use keychat_app_core::nostr::nips::nip19::{FromBech32, ToBech32};
 
 /// Convert a hex public key to npub (bech32) format.
 ///
 /// Example: "c002c688..." → "npub1cqq..."
 #[uniffi::export]
 pub fn npub_from_hex(hex: String) -> Result<String, KeychatUniError> {
-    let pk = libkeychat::PublicKey::from_hex(&hex).map_err(|e| KeychatUniError::Identity {
-        msg: format!("invalid hex pubkey: {e}"),
-    })?;
+    let pk =
+        keychat_app_core::PublicKey::from_hex(&hex).map_err(|e| KeychatUniError::Identity {
+            msg: format!("invalid hex pubkey: {e}"),
+        })?;
     pk.to_bech32().map_err(|e| KeychatUniError::Identity {
         msg: format!("bech32 encode failed: {e}"),
     })
@@ -47,9 +49,10 @@ pub fn npub_from_hex(hex: String) -> Result<String, KeychatUniError> {
 /// Example: "npub1cqq..." → "c002c688..."
 #[uniffi::export]
 pub fn hex_from_npub(npub: String) -> Result<String, KeychatUniError> {
-    let pk = libkeychat::PublicKey::from_bech32(&npub).map_err(|e| KeychatUniError::Identity {
-        msg: format!("invalid npub: {e}"),
-    })?;
+    let pk =
+        keychat_app_core::PublicKey::from_bech32(&npub).map_err(|e| KeychatUniError::Identity {
+            msg: format!("invalid npub: {e}"),
+        })?;
     Ok(pk.to_hex())
 }
 
@@ -57,15 +60,12 @@ pub fn hex_from_npub(npub: String) -> Result<String, KeychatUniError> {
 /// Returns the hex-encoded public key string.
 #[uniffi::export]
 pub fn normalize_to_hex(input: String) -> Result<String, KeychatUniError> {
-    libkeychat::normalize_pubkey(&input)
+    keychat_app_core::normalize_pubkey(&input)
         .map_err(|e| KeychatUniError::Identity { msg: e.to_string() })
 }
 
-/// Return the default relay URLs from libkeychat.
+/// Return the default relay URLs.
 #[uniffi::export]
 pub fn default_relays() -> Vec<String> {
-    libkeychat::transport::DEFAULT_RELAYS
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    keychat_app_core::default_relays()
 }
