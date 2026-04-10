@@ -418,6 +418,10 @@ pub async fn send_group_invite(
     let remote_address =
         ProtocolAddress::new(invitee_signal_id.to_string(), DeviceId::new(1).unwrap());
     let to_address = address_manager.resolve_send_address(invitee_signal_id)?;
+    tracing::info!(
+        "group invite p-tag: to={}",
+        &to_address[..16.min(to_address.len())]
+    );
     let json = message.to_json()?;
     let ct = signal.encrypt(&remote_address, json.as_bytes())?;
     let ciphertext = ct.bytes;
@@ -596,7 +600,8 @@ pub async fn encrypt_for_group_member(
     address_manager: &AddressManager,
 ) -> Result<Event> {
     let json = message.to_json()?;
-    let remote_address = ProtocolAddress::new(member_signal_id.to_string(), DeviceId::new(1).unwrap());
+    let remote_address =
+        ProtocolAddress::new(member_signal_id.to_string(), DeviceId::new(1).unwrap());
     let to_address = address_manager.resolve_send_address(member_signal_id)?;
     let ct = signal.encrypt(&remote_address, json.as_bytes())?;
     build_mode1_event(&ct.bytes, &to_address).await

@@ -6,7 +6,10 @@ impl KeychatClient {
     /// Called after address rotation or on reconnect.
     /// Uses cursor-based `since` for identity keys, `now()` for ratchet keys.
     pub(crate) async fn refresh_subscriptions(&self) -> Result<(), KeychatUniError> {
-        let (identity_pubkeys, ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
+        let (identity_pubkeys, ratchet_pubkeys) = {
+            let inner = self.app.inner.read().await;
+            inner.protocol.collect_subscribe_pubkeys().await
+        };
         let total = identity_pubkeys.len() + ratchet_pubkeys.len();
         if total == 0 {
             tracing::debug!("📡 SUB: no pubkeys to subscribe");
@@ -34,8 +37,12 @@ impl KeychatClient {
 
         // Read cursor for identity key since parameter
         let identity_since = {
-            let inner = self.inner.read().await;
-            let storage = inner.storage.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = self.app.inner.read().await;
+            let storage = inner
+                .protocol
+                .storage()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let cursor = storage.get_min_relay_cursor().unwrap_or(0);
             if cursor > 0 {
                 let two_days_secs: u64 = 2 * 24 * 60 * 60;
@@ -48,10 +55,13 @@ impl KeychatClient {
         };
         let ratchet_since = Some(libkeychat::Timestamp::now());
 
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let inner = self.app.inner.read().await;
+        let transport = inner
+            .protocol
+            .transport()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
 
         if !identity_pubkeys.is_empty() {
             transport
@@ -59,9 +69,7 @@ impl KeychatClient {
                 .await?;
         }
         if !ratchet_pubkeys.is_empty() {
-            transport
-                .subscribe(ratchet_pubkeys, ratchet_since)
-                .await?;
+            transport.subscribe(ratchet_pubkeys, ratchet_since).await?;
         }
         Ok(())
     }
@@ -73,8 +81,8 @@ impl KeychatClient {
     /// C-FFI1: uses .lock().await to avoid silently skipping busy sessions.
     pub async fn get_all_receiving_addresses(&self) -> Vec<String> {
         let session_arcs: Vec<_> = {
-            let inner = self.inner.read().await;
-            inner.sessions.values().cloned().collect()
+            let inner = self.app.inner.read().await;
+            inner.protocol.all_session_arcs()
         };
         let mut addrs = Vec::new();
         for session_mutex in &session_arcs {

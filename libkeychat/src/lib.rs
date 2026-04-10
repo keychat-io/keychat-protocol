@@ -70,6 +70,7 @@ pub mod mls_extension;
 #[cfg(feature = "mls")]
 pub mod mls_provider;
 pub mod nip44;
+pub mod orchestrator;
 pub mod payment;
 pub mod persistent_signal_store;
 pub mod session;
@@ -77,7 +78,6 @@ pub mod signal_keys;
 pub mod signal_session;
 pub mod signal_store;
 pub mod stamp;
-#[cfg(feature = "storage")]
 pub mod storage;
 pub mod transport;
 
@@ -113,8 +113,8 @@ pub use message::{
 #[cfg(feature = "mls")]
 pub use mls::{
     broadcast_commit, derive_mls_temp_inbox, parse_key_package, publish_key_package,
-    receive_mls_message, send_mls_message, MlsGroupInvitePayload, MlsMessageMetadata,
-    MlsParticipant, MlsProvider, KIND_MLS_KEY_PACKAGE, MLS_CIPHERSUITE,
+    receive_mls_message, send_mls_message, MlsDecryptResult, MlsGroupInvitePayload,
+    MlsMessageMetadata, MlsParticipant, MlsProvider, KIND_MLS_KEY_PACKAGE, MLS_CIPHERSUITE,
 };
 pub use payment::{
     attach_ecash_stamp, build_cashu_message, build_lightning_message, validate_cashu_token,
@@ -139,6 +139,11 @@ pub use libsignal_protocol::{
     DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair, KyberPreKeyId, KyberPreKeyRecord,
     PreKeyId, PreKeyRecord, PreKeySignalMessage, PrivateKey as SignalPrivateKey, ProtocolAddress,
     SignedPreKeyId, SignedPreKeyRecord,
+};
+pub use orchestrator::{
+    FriendApprovedContext, FriendRejectedContext, FriendRequestContext, GroupChangeKind,
+    GroupChangedContext, GroupInviteContext, MessageReceivedContext, Nip17DmContext,
+    OrchestratorDelegate, ProtocolClient, SendResult,
 };
 pub use storage::{
     DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,

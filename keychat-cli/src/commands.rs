@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::TimeZone;
-use keychat_uniffi::{
-    ClientEvent, DataChange, DataListener, EventListener, FileCategory, FilePayload, KeychatClient,
-    KeychatUniError, RoomType,
+use keychat_app_core::{
+    AppClient, AppError, ClientEvent, DataChange, DataListener, EventListener, FileCategory,
+    FilePayload, RoomType,
 };
 use tokio::sync::broadcast;
 
@@ -80,7 +80,7 @@ pub const SETTING_MNEMONIC: &str = "identity_mnemonic";
 
 /// Restore identity from saved mnemonic in DB. Shared by all modes.
 /// Returns the pubkey hex if successful.
-pub async fn restore_identity(client: &Arc<KeychatClient>) -> Option<String> {
+pub async fn restore_identity(client: &Arc<AppClient>) -> Option<String> {
     if let Ok(Some(mnemonic)) = client.get_setting(SETTING_MNEMONIC.to_string()).await {
         match client.import_identity(mnemonic).await {
             Ok(pk) => {
@@ -98,7 +98,7 @@ pub async fn restore_identity(client: &Arc<KeychatClient>) -> Option<String> {
 }
 
 /// Save mnemonic to DB so identity persists across restarts.
-pub async fn save_mnemonic(client: &KeychatClient, mnemonic: &str) {
+pub async fn save_mnemonic(client: &AppClient, mnemonic: &str) {
     if let Err(e) = client
         .set_setting(SETTING_MNEMONIC.to_string(), mnemonic.to_string())
         .await
@@ -108,7 +108,7 @@ pub async fn save_mnemonic(client: &KeychatClient, mnemonic: &str) {
 }
 
 /// Delete saved mnemonic from DB (used on identity reset/delete).
-pub async fn delete_mnemonic(client: &KeychatClient) {
+pub async fn delete_mnemonic(client: &AppClient) {
     if let Err(e) = client.delete_setting(SETTING_MNEMONIC.to_string()).await {
         tracing::warn!("Failed to delete mnemonic: {e}");
     }
@@ -131,10 +131,7 @@ pub enum SendResult {
 
 /// Send a text message to a room, routing to the correct API based on room type.
 /// This is the single source of truth for message routing — all modes must use this.
-pub async fn send_to_room(
-    client: &KeychatClient,
-    room_id: &str,
-) -> Result<RoomType, KeychatUniError> {
+pub async fn send_to_room(client: &AppClient, room_id: &str) -> Result<RoomType, AppError> {
     // Just resolve room type — caller handles sending with the right API
     if let Some(room) = client.get_room(room_id.to_string()).await? {
         Ok(room.room_type)
@@ -146,10 +143,10 @@ pub async fn send_to_room(
 
 /// Send a text message to a room, handling DM vs Signal Group vs MLS routing.
 pub async fn send_message(
-    client: &KeychatClient,
+    client: &AppClient,
     room_id: &str,
     text: &str,
-) -> Result<SendResult, KeychatUniError> {
+) -> Result<SendResult, AppError> {
     if let Some(room) = client.get_room(room_id.to_string()).await? {
         match room.room_type {
             RoomType::SignalGroup => {
@@ -161,7 +158,7 @@ pub async fn send_message(
                     event_count: result.event_ids.len(),
                 });
             }
-            RoomType::MlsGroup => {
+            RoomType::MlsGroup | RoomType::Nip17Dm => {
                 return Ok(SendResult::MlsNotSupported);
             }
             RoomType::Dm => {}
@@ -180,15 +177,15 @@ pub async fn send_message(
 /// Send a file message to a room, handling DM vs Signal Group vs MLS routing.
 /// `files` contains pre-uploaded FilePayload items (already encrypted + uploaded to Blossom).
 pub async fn send_file_message(
-    client: &KeychatClient,
+    client: &AppClient,
     room_id: &str,
     files: Vec<FilePayload>,
     message: Option<String>,
-) -> Result<SendResult, KeychatUniError> {
+) -> Result<SendResult, AppError> {
     if files.is_empty() {
-        return Err(KeychatUniError::InvalidArgument {
-            msg: "files list cannot be empty".into(),
-        });
+        return Err(AppError::InvalidArgument(
+            "files list cannot be empty".into(),
+        ));
     }
 
     if let Some(room) = client.get_room(room_id.to_string()).await? {
@@ -202,7 +199,7 @@ pub async fn send_file_message(
                     event_count: result.event_ids.len(),
                 });
             }
-            RoomType::MlsGroup => {
+            RoomType::MlsGroup | RoomType::Nip17Dm => {
                 return Ok(SendResult::MlsNotSupported);
             }
             RoomType::Dm => {}
@@ -224,21 +221,23 @@ pub async fn send_file_message(
 pub async fn upload_and_prepare_file(
     file_path: &Path,
     server_url: &str,
-) -> Result<FilePayload, KeychatUniError> {
-    let data = fs::read(file_path).map_err(|e| KeychatUniError::InvalidArgument {
-        msg: format!("Failed to read file {}: {e}", file_path.display()),
+) -> Result<FilePayload, AppError> {
+    let data = fs::read(file_path).map_err(|e| {
+        AppError::InvalidArgument(format!("Failed to read file {}: {e}", file_path.display()))
     })?;
 
-    let route = if keychat_uniffi::is_relay_server(server_url.to_string()) {
+    let route = if keychat_app_core::is_relay_server(server_url.to_string()) {
         "relay-presigned"
     } else {
         "blossom"
     };
 
-    let result = keychat_uniffi::encrypt_and_upload_routed(data, server_url.to_string())
+    let result = keychat_app_core::encrypt_and_upload_routed(data, server_url.to_string())
         .await
-        .map_err(|e| KeychatUniError::MediaTransfer {
-            msg: format!("upload route={route}, server={server_url}, error={e}"),
+        .map_err(|e| {
+            AppError::MediaTransfer(format!(
+                "upload route={route}, server={server_url}, error={e}"
+            ))
         })?;
 
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -254,7 +253,7 @@ pub async fn upload_and_prepare_file(
         } else {
             Some(ext.to_string())
         },
-        size: result.encrypted_size,
+        size: result.size,
         key: result.key,
         iv: result.iv,
         hash: result.hash,
@@ -498,15 +497,15 @@ pub fn file_category_icon(category: &FileCategory) -> &'static str {
 /// Create identity with full persistence: save to app storage + save mnemonic.
 /// Returns (pubkey_hex, npub, mnemonic).
 pub async fn create_identity(
-    client: &KeychatClient,
+    client: &AppClient,
     display_name: &str,
-) -> Result<(String, String, String), KeychatUniError> {
+) -> Result<(String, String, String), AppError> {
     let result = client.create_identity().await?;
-    let npub = keychat_uniffi::npub_from_hex(result.pubkey_hex.clone()).unwrap_or_default();
+    let npub = keychat_app_core::npub_from_hex(result.pubkey_hex.clone()).unwrap_or_default();
 
     // Save identity with display name to app storage
     if let Err(e) = client
-        .save_app_identity_ffi(
+        .save_app_identity(
             result.pubkey_hex.clone(),
             npub.clone(),
             display_name.to_string(),
@@ -526,10 +525,7 @@ pub async fn create_identity(
 
 /// Import identity from mnemonic with full persistence.
 /// Returns pubkey_hex.
-pub async fn import_identity(
-    client: &KeychatClient,
-    mnemonic: &str,
-) -> Result<String, KeychatUniError> {
+pub async fn import_identity(client: &AppClient, mnemonic: &str) -> Result<String, AppError> {
     let pubkey = client.import_identity(mnemonic.to_string()).await?;
     save_mnemonic(client, mnemonic).await;
 
@@ -565,7 +561,7 @@ pub fn format_timestamp(ts: u64) -> String {
 
 /// Connect to relays and start event loop in background.
 /// Shared by all modes — the single source of truth for connect + event loop.
-pub fn connect_and_start(client: &Arc<KeychatClient>, relay_urls: Vec<String>) {
+pub fn connect_and_start(client: &Arc<AppClient>, relay_urls: Vec<String>) {
     let client_bg = Arc::clone(client);
     tokio::spawn(async move {
         tracing::info!("Connecting to {} relay(s)", relay_urls.len());
@@ -584,7 +580,7 @@ pub fn connect_and_start(client: &Arc<KeychatClient>, relay_urls: Vec<String>) {
 /// Shared startup sequence for all modes.
 /// Returns the pubkey hex and session count if identity was found.
 pub async fn init_and_connect(
-    client: &Arc<KeychatClient>,
+    client: &Arc<AppClient>,
     relay_urls: Vec<String>,
 ) -> Option<(String, u32)> {
     let pubkey = restore_identity(client).await?;

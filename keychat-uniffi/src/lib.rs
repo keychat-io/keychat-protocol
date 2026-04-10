@@ -16,11 +16,10 @@ mod types;
 pub use client::KeychatClient;
 pub use error::KeychatUniError;
 pub use media::{
-    encrypt_and_upload, encrypt_and_upload_routed, download_and_decrypt,
-    encrypt_file_data, decrypt_file_data, sign_blossom_upload_auth,
-    is_relay_server, local_file_name,
-    built_in_media_server, default_blossom_server, default_auto_download_limit_mb, max_file_size, max_files_per_message,
-    EncryptedFileResult, FileUploadResult,
+    built_in_media_server, decrypt_file_data, default_auto_download_limit_mb,
+    default_blossom_server, download_and_decrypt, encrypt_and_upload, encrypt_and_upload_routed,
+    encrypt_file_data, is_relay_server, local_file_name, max_file_size, max_files_per_message,
+    sign_blossom_upload_auth, EncryptedFileResult, FileUploadResult,
 };
 pub use types::*;
 

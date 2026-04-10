@@ -1,168 +1,301 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use libkeychat::{
-    reconstruct_prekey_material, AddressManager, ChatSession, DeviceId, EphemeralKeypair,
-    FriendRequestState, GroupManager, Identity, SecureStorage, SignalParticipant, Transport,
-};
+use keychat_app_core::AppClient;
+use libkeychat::DeviceId;
 
-/// Default Signal device ID used throughout the FFI layer.
-pub(crate) fn default_device_id() -> DeviceId {
-    DeviceId::new(1).expect("device_id 1 is always valid")
-}
-
-use std::sync::Once;
-
-use crate::app_storage::AppStorage;
 use crate::error::KeychatUniError;
-use crate::relay_tracker::RelaySendTracker;
 use crate::types::*;
 
-static TRACING_INIT: Once = Once::new();
+/// Re-export from keychat-app-core for use in other keychat-uniffi modules.
+pub(crate) fn default_device_id() -> DeviceId {
+    keychat_app_core::default_device_id()
+}
 
-/// Lock app_storage Mutex, recovering from poison and logging if poisoned.
+/// Re-export from keychat-app-core for use in other keychat-uniffi modules.
 pub(crate) fn lock_app_storage(
-    mutex: &std::sync::Mutex<crate::app_storage::AppStorage>,
-) -> std::sync::MutexGuard<'_, crate::app_storage::AppStorage> {
-    mutex.lock().unwrap_or_else(|e| {
-        tracing::error!("app_storage Mutex poisoned, recovering: {e}");
-        e.into_inner()
-    })
+    mutex: &std::sync::Mutex<keychat_app_core::AppStorage>,
+) -> std::sync::MutexGuard<'_, keychat_app_core::AppStorage> {
+    keychat_app_core::lock_app_storage(mutex)
 }
 
-/// Lock app_storage Mutex, returning Result for functions that need error propagation.
+/// Re-export from keychat-app-core for use in other keychat-uniffi modules.
 pub(crate) fn lock_app_storage_result(
-    mutex: &std::sync::Mutex<crate::app_storage::AppStorage>,
-) -> Result<std::sync::MutexGuard<'_, crate::app_storage::AppStorage>, KeychatUniError> {
-    mutex.lock().map_err(|e| KeychatUniError::Storage {
-        msg: format!("app_storage lock: {e}"),
-    })
-}
-
-pub(crate) struct ClientInner {
-    pub identity: Option<Identity>,
-    pub transport: Option<Transport>,
-    pub storage: Arc<std::sync::Mutex<SecureStorage>>,
-    pub app_storage: Arc<std::sync::Mutex<AppStorage>>,
-    pub sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
-    pub peer_nostr_to_signal: HashMap<String, String>,
-    /// Reverse index: signal_id → nostr_pubkey for O(1) reverse lookup.
-    pub peer_signal_to_nostr: HashMap<String, String>,
-    /// Reverse index: receiving_address_hex → peer_signal_id for O(1) message routing.
-    pub receiving_addr_to_peer: HashMap<String, String>,
-    pub pending_outbound: HashMap<String, FriendRequestState>,
-    pub group_manager: GroupManager,
-    pub next_signal_device_id: u32,
-    pub event_listener: Option<Box<dyn EventListener>>,
-    pub data_listener: Option<Box<dyn DataListener>>,
-    pub event_loop_stop: Option<tokio::sync::watch::Sender<bool>>,
-    pub reconnect_stop: Option<tokio::sync::watch::Sender<bool>>,
-    pub last_relay_urls: Vec<String>,
-    /// Active subscription IDs — cleared and replaced on each start_event_loop().
-    pub subscription_ids: Vec<String>,
+    mutex: &std::sync::Mutex<keychat_app_core::AppStorage>,
+) -> Result<std::sync::MutexGuard<'_, keychat_app_core::AppStorage>, KeychatUniError> {
+    keychat_app_core::lock_app_storage_result(mutex)
+        .map_err(|e| KeychatUniError::Storage { msg: e.to_string() })
 }
 
 #[derive(uniffi::Object)]
 pub struct KeychatClient {
-    pub(crate) inner: tokio::sync::RwLock<ClientInner>,
-    pub(crate) runtime: Arc<tokio::runtime::Runtime>,
-    pub(crate) db_path: String,
-    /// Base directory for file storage: {app_support}/files/
-    pub(crate) files_dir: String,
-    pub(crate) relay_tracker: std::sync::Mutex<RelaySendTracker>,
-    /// Cached identity pubkey hex — set once in import_identity(), never changes.
-    pub(crate) identity_pubkey_hex: tokio::sync::OnceCell<String>,
+    /// The shared AppClient that holds all state.
+    /// CLI and other Rust consumers use AppClient directly.
+    /// Swift/Kotlin use KeychatClient (this struct) which adds #[uniffi::export].
+    /// Arc-wrapped so start_event_loop(self: Arc<AppClient>) can be called.
+    pub(crate) app: std::sync::Arc<AppClient>,
+}
+
+impl KeychatClient {
+    /// Access the underlying `AppClient` for direct Rust consumers (e.g. CLI).
+    pub fn app_client(&self) -> &std::sync::Arc<AppClient> {
+        &self.app
+    }
+}
+
+// ─── Trait Bridge Adapters ──────────────────────────────────────
+// UniFFI requires its own trait definitions with #[uniffi::export(callback_interface)].
+// AppClientInner uses keychat_app_core's plain traits. These adapters bridge them.
+
+struct EventListenerBridge(Box<dyn crate::types::EventListener>);
+
+impl keychat_app_core::EventListener for EventListenerBridge {
+    fn on_event(&self, event: keychat_app_core::ClientEvent) {
+        self.0.on_event(convert_client_event(event));
+    }
+}
+
+struct DataListenerBridge(Box<dyn crate::types::DataListener>);
+
+impl keychat_app_core::DataListener for DataListenerBridge {
+    fn on_data_change(&self, change: keychat_app_core::DataChange) {
+        self.0.on_data_change(convert_data_change(change));
+    }
+}
+
+pub(crate) fn convert_client_event(e: keychat_app_core::ClientEvent) -> crate::types::ClientEvent {
+    use crate::types::ClientEvent as UE;
+    use keychat_app_core::ClientEvent as CE;
+    match e {
+        CE::FriendRequestReceived {
+            request_id,
+            sender_pubkey,
+            sender_name,
+            message,
+            created_at,
+        } => UE::FriendRequestReceived {
+            request_id,
+            sender_pubkey,
+            sender_name,
+            message,
+            created_at,
+        },
+        CE::FriendRequestAccepted {
+            peer_pubkey,
+            peer_name,
+        } => UE::FriendRequestAccepted {
+            peer_pubkey,
+            peer_name,
+        },
+        CE::FriendRequestRejected { peer_pubkey } => UE::FriendRequestRejected { peer_pubkey },
+        CE::MessageReceived {
+            room_id,
+            sender_pubkey,
+            kind,
+            content,
+            payload,
+            event_id,
+            fallback,
+            reply_to_event_id,
+            group_id,
+            thread_id,
+            nostr_event_json,
+            relay_url,
+        } => UE::MessageReceived {
+            room_id,
+            sender_pubkey,
+            kind: convert_message_kind(kind),
+            content,
+            payload,
+            event_id,
+            fallback,
+            reply_to_event_id,
+            group_id,
+            thread_id,
+            nostr_event_json,
+            relay_url,
+        },
+        CE::GroupInviteReceived {
+            room_id,
+            group_type,
+            group_name,
+            inviter_pubkey,
+        } => UE::GroupInviteReceived {
+            room_id,
+            group_type,
+            group_name,
+            inviter_pubkey,
+        },
+        CE::GroupMemberChanged {
+            room_id,
+            kind,
+            member_pubkey,
+            new_value,
+        } => UE::GroupMemberChanged {
+            room_id,
+            kind: convert_group_change_kind(kind),
+            member_pubkey,
+            new_value,
+        },
+        CE::GroupDissolved { room_id } => UE::GroupDissolved { room_id },
+        CE::EventLoopError { description } => UE::EventLoopError { description },
+        CE::RelayOk {
+            event_id,
+            relay_url,
+            success,
+            message,
+        } => UE::RelayOk {
+            event_id,
+            relay_url,
+            success,
+            message,
+        },
+    }
+}
+
+pub(crate) fn convert_message_kind(k: keychat_app_core::MessageKind) -> crate::types::MessageKind {
+    use crate::types::MessageKind as UK;
+    use keychat_app_core::MessageKind as MK;
+    match k {
+        MK::Text => UK::Text,
+        MK::Files => UK::Files,
+        MK::Cashu => UK::Cashu,
+        MK::LightningInvoice => UK::LightningInvoice,
+        MK::FriendRequest => UK::FriendRequest,
+        MK::FriendApprove => UK::FriendApprove,
+        MK::FriendReject => UK::FriendReject,
+        MK::ProfileSync => UK::ProfileSync,
+        MK::SignalGroupInvite => UK::SignalGroupInvite,
+        MK::SignalGroupMemberRemoved => UK::SignalGroupMemberRemoved,
+        MK::SignalGroupSelfLeave => UK::SignalGroupSelfLeave,
+        MK::SignalGroupDissolve => UK::SignalGroupDissolve,
+        MK::SignalGroupNameChanged => UK::SignalGroupNameChanged,
+        MK::MlsGroupInvite => UK::MlsGroupInvite,
+        MK::AgentReply => UK::AgentReply,
+        _ => UK::Text,
+    }
+}
+
+pub(crate) fn convert_group_change_kind(
+    k: keychat_app_core::GroupChangeKind,
+) -> crate::types::GroupChangeKind {
+    match k {
+        keychat_app_core::GroupChangeKind::MemberRemoved => {
+            crate::types::GroupChangeKind::MemberRemoved
+        }
+        keychat_app_core::GroupChangeKind::SelfLeave => crate::types::GroupChangeKind::SelfLeave,
+        keychat_app_core::GroupChangeKind::NameChanged => {
+            crate::types::GroupChangeKind::NameChanged
+        }
+    }
+}
+
+pub(crate) fn convert_data_change(c: keychat_app_core::DataChange) -> crate::types::DataChange {
+    use crate::types::DataChange as UD;
+    use keychat_app_core::DataChange as DC;
+    match c {
+        DC::RoomUpdated { room_id } => UD::RoomUpdated { room_id },
+        DC::RoomDeleted { room_id } => UD::RoomDeleted { room_id },
+        DC::RoomListChanged => UD::RoomListChanged,
+        DC::MessageAdded { room_id, msgid } => UD::MessageAdded { room_id, msgid },
+        DC::MessageUpdated { room_id, msgid } => UD::MessageUpdated { room_id, msgid },
+        DC::ContactUpdated { pubkey } => UD::ContactUpdated { pubkey },
+        DC::ContactListChanged => UD::ContactListChanged,
+        DC::IdentityListChanged => UD::IdentityListChanged,
+        DC::ConnectionStatusChanged { status, message } => UD::ConnectionStatusChanged {
+            status: match status {
+                keychat_app_core::ConnectionStatus::Disconnected => {
+                    crate::types::ConnectionStatus::Disconnected
+                }
+                keychat_app_core::ConnectionStatus::Connecting => {
+                    crate::types::ConnectionStatus::Connecting
+                }
+                keychat_app_core::ConnectionStatus::Connected => {
+                    crate::types::ConnectionStatus::Connected
+                }
+                keychat_app_core::ConnectionStatus::Reconnecting => {
+                    crate::types::ConnectionStatus::Reconnecting
+                }
+                keychat_app_core::ConnectionStatus::Failed => {
+                    crate::types::ConnectionStatus::Failed
+                }
+            },
+            message,
+        },
+    }
+}
+
+// ─── Shared type conversions (used by messaging.rs + group.rs) ──
+
+pub(crate) fn convert_file_payload(f: crate::types::FilePayload) -> keychat_app_core::FilePayload {
+    keychat_app_core::FilePayload {
+        category: convert_file_category(f.category),
+        url: f.url,
+        mime_type: f.mime_type,
+        suffix: f.suffix,
+        size: f.size,
+        key: f.key,
+        iv: f.iv,
+        hash: f.hash,
+        source_name: f.source_name,
+        audio_duration: f.audio_duration,
+        amplitude_samples: f.amplitude_samples,
+    }
+}
+
+pub(crate) fn convert_file_category(
+    c: crate::types::FileCategory,
+) -> keychat_app_core::FileCategory {
+    match c {
+        crate::types::FileCategory::Image => keychat_app_core::FileCategory::Image,
+        crate::types::FileCategory::Video => keychat_app_core::FileCategory::Video,
+        crate::types::FileCategory::Voice => keychat_app_core::FileCategory::Voice,
+        crate::types::FileCategory::Audio => keychat_app_core::FileCategory::Audio,
+        crate::types::FileCategory::Document => keychat_app_core::FileCategory::Document,
+        crate::types::FileCategory::Text => keychat_app_core::FileCategory::Text,
+        crate::types::FileCategory::Archive => keychat_app_core::FileCategory::Archive,
+        crate::types::FileCategory::Other => keychat_app_core::FileCategory::Other,
+    }
+}
+
+pub(crate) fn convert_reply_to(
+    r: crate::types::ReplyToPayload,
+) -> keychat_app_core::ReplyToPayload {
+    keychat_app_core::ReplyToPayload {
+        target_event_id: r.target_event_id,
+        content: r.content,
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl KeychatClient {
     #[uniffi::constructor]
     pub fn new(db_path: String, db_key: String) -> Result<Self, KeychatUniError> {
-        // Initialize tracing subscriber once so Rust logs appear in Xcode console
-        TRACING_INIT.call_once(|| {
-            let level = if cfg!(debug_assertions) {
-                tracing::Level::DEBUG
-            } else {
-                tracing::Level::INFO
-            };
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(level)
-                .with_target(true)
-                .with_thread_names(true)
-                .without_time() // os_log already timestamps
-                .try_init();
-        });
+        let app = std::sync::Arc::new(
+            AppClient::new(db_path, db_key)
+                .map_err(|e| KeychatUniError::Storage { msg: e.to_string() })?,
+        );
+        Ok(Self { app })
+    }
 
-        let storage = SecureStorage::open(&db_path, &db_key)?;
-
-        // Derive app database path: protocol.db → protocol_app.db
-        let app_db_path = if db_path.ends_with(".db") {
-            db_path.replace(".db", "_app.db")
-        } else {
-            format!("{}_app", db_path)
-        };
-        let app_storage =
-            AppStorage::open(&app_db_path, &db_key).map_err(|e| KeychatUniError::Storage {
-                msg: format!("open app database: {e}"),
-            })?;
-
-        // Derive files directory: db_path is {app_support}/libkeychat/libkeychat.db
-        // files_dir becomes {app_support}/files/
-        let files_dir = {
-            let db_dir = std::path::Path::new(&db_path)
-                .parent()
-                .unwrap_or(std::path::Path::new("."));
-            let base = db_dir.parent().unwrap_or(db_dir);
-            base.join("files").to_string_lossy().to_string()
-        };
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| KeychatUniError::Transport { msg: e.to_string() })?;
-
-        Ok(Self {
-            inner: tokio::sync::RwLock::new(ClientInner {
-                identity: None,
-                transport: None,
-                storage: Arc::new(std::sync::Mutex::new(storage)),
-                app_storage: Arc::new(std::sync::Mutex::new(app_storage)),
-                sessions: HashMap::new(),
-                peer_nostr_to_signal: HashMap::new(),
-                peer_signal_to_nostr: HashMap::new(),
-                receiving_addr_to_peer: HashMap::new(),
-                pending_outbound: HashMap::new(),
-                group_manager: GroupManager::new(),
-                next_signal_device_id: 1,
-                event_listener: None,
-                data_listener: None,
-                event_loop_stop: None,
-                reconnect_stop: None,
-                last_relay_urls: Vec::new(),
-                subscription_ids: Vec::new(),
-            }),
-            runtime: Arc::new(runtime),
-            db_path,
-            files_dir,
-            relay_tracker: std::sync::Mutex::new(RelaySendTracker::new()),
-            identity_pubkey_hex: tokio::sync::OnceCell::new(),
-        })
+    /// Debug: show subscription state for diagnostics.
+    pub async fn debug_subscription_state(&self) -> String {
+        self.app.debug_subscription_state().await
     }
 
     // ─── File Storage ────────────────────────────────────────────────
 
     /// Get the base files directory path.
     pub fn get_files_dir(&self) -> String {
-        self.files_dir.clone()
+        self.app.files_dir.clone()
     }
 
     /// Resolve a downloaded file's absolute path from the file_attachments table.
     /// Returns None if not downloaded or the file has been deleted from disk.
     pub async fn resolve_local_file(&self, msgid: String, file_hash: String) -> Option<String> {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let store = lock_app_storage(&inner.app_storage);
         let local_path = store.get_attachment_local_path(&msgid, &file_hash).ok()??;
-        let abs_path = std::path::Path::new(&self.files_dir).join(&local_path);
+        let abs_path = std::path::Path::new(&self.app.files_dir).join(&local_path);
         if abs_path.exists() {
             Some(abs_path.to_string_lossy().to_string())
         } else {
@@ -180,7 +313,7 @@ impl KeychatClient {
         local_path: Option<String>,
         transfer_state: u32,
     ) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
         store
             .upsert_attachment(
@@ -201,7 +334,7 @@ impl KeychatClient {
         msgid: String,
         file_hash: String,
     ) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let store = lock_app_storage_result(&inner.app_storage)?;
         store
             .set_audio_played(&msgid, &file_hash)
@@ -212,7 +345,7 @@ impl KeychatClient {
 
     /// Check if a voice attachment has been played.
     pub async fn is_audio_played(&self, msgid: String, file_hash: String) -> bool {
-        let inner = self.inner.read().await;
+        let inner = self.app.inner.read().await;
         let store = lock_app_storage(&inner.app_storage);
         store.is_audio_played(&msgid, &file_hash)
     }
@@ -220,10 +353,8 @@ impl KeychatClient {
     /// Get the files directory for a specific room.
     pub fn get_room_files_dir(&self, room_id: String) -> String {
         // Sanitize room_id to prevent path traversal
-        let sanitized: String = room_id
-            .replace(['/', '\\'], "_")
-            .replace("..", "__");
-        let path = std::path::Path::new(&self.files_dir).join(&sanitized);
+        let sanitized: String = room_id.replace(['/', '\\'], "_").replace("..", "__");
+        let path = std::path::Path::new(&self.app.files_dir).join(&sanitized);
         path.to_string_lossy().to_string()
     }
 
@@ -288,7 +419,7 @@ impl KeychatClient {
         }
 
         let file_name = crate::media::local_file_name(source_name, hash.clone(), suffix);
-        let room_dir = std::path::Path::new(&self.files_dir).join(&room_id);
+        let room_dir = std::path::Path::new(&self.app.files_dir).join(&room_id);
         let file_path = room_dir.join(&file_name);
         let relative_path = format!("{room_id}/{file_name}");
 
@@ -352,7 +483,7 @@ impl KeychatClient {
         file_name: String,
         room_id: String,
     ) -> Result<String, KeychatUniError> {
-        let room_dir = std::path::Path::new(&self.files_dir).join(&room_id);
+        let room_dir = std::path::Path::new(&self.app.files_dir).join(&room_id);
         let file_path = room_dir.join(&file_name);
 
         if file_path.exists() {
@@ -373,91 +504,31 @@ impl KeychatClient {
     // ─── Identity ──
 
     pub async fn create_identity(&self) -> Result<CreateIdentityResult, KeychatUniError> {
-        let result = Identity::generate().map_err(|e| {
-            tracing::error!("create_identity failed: {e}");
-            e
-        })?;
-        let pubkey_hex = result.identity.pubkey_hex();
-        let mnemonic = result.mnemonic.clone();
-
-        let mut inner = self.inner.write().await;
-        inner.identity = Some(result.identity);
-        tracing::info!("identity created: {}", &pubkey_hex[..16]);
-
-        let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
-
+        let result = self.app.create_identity().await?;
+        tracing::info!("identity created: {}", &result.pubkey_hex[..16]);
         Ok(CreateIdentityResult {
-            pubkey_hex,
-            mnemonic,
+            pubkey_hex: result.pubkey_hex,
+            mnemonic: result.mnemonic,
         })
     }
 
     pub async fn import_identity(&self, mnemonic: String) -> Result<String, KeychatUniError> {
-        let identity = Identity::from_mnemonic_str(&mnemonic).map_err(|e| {
-            tracing::error!("import_identity failed: {e}");
-            e
-        })?;
-        let pubkey_hex = identity.pubkey_hex();
-
-        let mut inner = self.inner.write().await;
-        inner.identity = Some(identity);
+        let pubkey_hex = self.app.import_identity(mnemonic).await?;
         tracing::info!("identity imported: {}", &pubkey_hex[..16]);
-
-        // Cache identity pubkey — immutable after import.
-        let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
-
         Ok(pubkey_hex)
     }
 
     /// Return the cached identity pubkey hex, or empty string if not yet imported.
     pub(crate) fn cached_identity_pubkey(&self) -> String {
-        self.identity_pubkey_hex
+        self.app
+            .identity_pubkey_hex
             .get()
             .cloned()
             .unwrap_or_default()
     }
 
-    /// Debug: return a summary of stored state in the database + in-memory.
     pub async fn debug_state_summary(&self) -> Result<String, KeychatUniError> {
-        let inner = self.inner.read().await;
-
-        // In-memory state
-        let mem_sessions = inner.sessions.len();
-        let mem_pending_out = inner.pending_outbound.len();
-        let mem_peer_map = inner.peer_nostr_to_signal.len();
-
-        // DB state
-        let store = inner
-            .storage
-            .lock()
-            .map_err(|e| KeychatUniError::Transport {
-                msg: format!("storage lock: {e}"),
-            })?;
-        let db_participants =
-            store
-                .list_signal_participants()
-                .map_err(|e| KeychatUniError::Storage {
-                    msg: format!("list_signal_participants: {e}"),
-                })?;
-        let db_peers = store.list_peers().map_err(|e| KeychatUniError::Storage {
-            msg: format!("list_peers: {e}"),
-        })?;
-        let db_pending_frs = store
-            .list_pending_frs()
-            .map_err(|e| KeychatUniError::Storage {
-                msg: format!("list_pending_frs: {e}"),
-            })?;
-        let db_inbound_frs = store
-            .list_inbound_frs()
-            .map_err(|e| KeychatUniError::Storage {
-                msg: format!("list_inbound_frs: {e}"),
-            })?;
-
-        Ok(format!(
-            "MEM: sessions={} pending_out={} peer_map={} | DB: participants={} peers={} pending_frs={} inbound_frs={}",
-            mem_sessions, mem_pending_out, mem_peer_map,
-            db_participants.len(), db_peers.len(), db_pending_frs.len(), db_inbound_frs.len()
-        ))
+        self.app.debug_state_summary().await.map_err(Into::into)
     }
 
     /// Restore all persisted sessions and pending friend requests from SQLCipher.
@@ -468,285 +539,17 @@ impl KeychatClient {
     /// (ratchet state, chain keys) are loaded on demand by libsignal's
     /// `PersistentSessionStore::load_session()` — no prekey re-injection needed.
     pub async fn restore_sessions(&self) -> Result<u32, KeychatUniError> {
-        let mut inner = self.inner.write().await;
-        let identity = inner
-            .identity
-            .clone()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "call import_identity first".into(),
-            })?;
-        let storage = inner.storage.clone();
-
-        let store = storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
-        })?;
-
-        let mut restored_count: u32 = 0;
-        let mut max_device_id: u32 = 0;
-
-        // ── Phase 1: Read all data from DB while holding the lock ──
-
-        // Per-peer identity: (peer_signal_id, device_id, id_pub, id_priv, reg_id)
-        type ParticipantRow = (String, u32, Vec<u8>, Vec<u8>, u32);
-        let mut participant_rows: Vec<ParticipantRow> = Vec::new();
-
-        // Pending FR data (needs full prekey material — handshake not complete)
-        type FrRow = (
-            String, u32, Vec<u8>, Vec<u8>, u32,
-            u32, Vec<u8>, u32, Vec<u8>, u32, Vec<u8>,
-            String, String,
-        );
-        let mut fr_rows: Vec<FrRow> = Vec::new();
-
-        let peers = store.list_peers().map_err(|e| {
-            tracing::error!("restore: list_peers failed: {e}");
-            KeychatUniError::Storage { msg: format!("list_peers: {e}") }
-        })?;
-        let peer_ids = store.list_signal_participants().map_err(|e| {
-            tracing::error!("restore: list_signal_participants failed: {e}");
-            KeychatUniError::Storage { msg: format!("list_signal_participants: {e}") }
-        })?;
-        let all_addresses = store.load_all_peer_addresses().map_err(|e| {
-            tracing::error!("restore: load_all_peer_addresses failed: {e}");
-            KeychatUniError::Storage { msg: format!("load_all_peer_addresses: {e}") }
-        })?;
-        let fr_ids = store.list_pending_frs().map_err(|e| {
-            tracing::error!("restore: list_pending_frs failed: {e}");
-            KeychatUniError::Storage { msg: format!("list_pending_frs: {e}") }
-        })?;
-        tracing::info!(
-            "RESTORE: peers={} participants={} addresses={} frs={}",
-            peers.len(), peer_ids.len(), all_addresses.len(), fr_ids.len()
-        );
-
-        for peer_signal_id in &peer_ids {
-            match store.load_signal_participant(peer_signal_id) {
-                Ok(Some((device_id, id_pub, id_priv, reg_id, _spk_id, _spk_rec))) => {
-                    participant_rows.push((peer_signal_id.clone(), device_id, id_pub, id_priv, reg_id));
-                }
-                Ok(None) => {
-                    tracing::warn!("restore: no data for participant {}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                }
-                Err(e) => {
-                    tracing::error!("restore: load participant {} failed: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                }
-            }
-        }
-
-        // Pending FRs need full prekey material (handshake not complete)
-        for fr_id in &fr_ids {
-            match store.load_pending_fr(fr_id) {
-                Ok(Some((device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey))) => {
-                    fr_rows.push((fr_id.clone(), device_id, id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec, first_inbox_secret, peer_nostr_pubkey));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!("restore pending FR {} failed: {e}", &fr_id[..16.min(fr_id.len())]);
-                }
-            }
-        }
-
-        // ── Drop the Mutex guard so restore_persistent can lock it ──
-        drop(store);
-
-        // ── Phase 2: Reconstruct objects (may lock storage internally) ──
-
-        // 1. Restore peer mappings
-        for peer in &peers {
-            inner
-                .peer_nostr_to_signal
-                .insert(peer.nostr_pubkey.clone(), peer.signal_id.clone());
-            inner
-                .peer_signal_to_nostr
-                .insert(peer.signal_id.clone(), peer.nostr_pubkey.clone());
-        }
-        if !peers.is_empty() {
-            tracing::info!("restored {} peer mappings", peers.len());
-        }
-
-        // 2. Restore active sessions with per-peer identity
-        let addr_map: HashMap<String, _> = all_addresses.into_iter().collect();
-
-        for (peer_signal_id, device_id, id_pub, id_priv, reg_id) in participant_rows {
-            if device_id > max_device_id {
-                max_device_id = device_id;
-            }
-
-            let identity_key = match libkeychat::IdentityKey::decode(&id_pub) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!("restore session {}: decode identity: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                    continue;
-                }
-            };
-            let private_key = match libkeychat::SignalPrivateKey::deserialize(&id_priv) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!("restore session {}: decode private key: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                    continue;
-                }
-            };
-            let identity_key_pair = libkeychat::IdentityKeyPair::new(identity_key, private_key);
-
-            let signal = match SignalParticipant::restore_persistent(
-                identity.pubkey_hex(),
-                device_id,
-                identity_key_pair,
-                reg_id,
-                storage.clone(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("restore session {}: create participant failed: {e}", &peer_signal_id[..16.min(peer_signal_id.len())]);
-                    continue;
-                }
-            };
-
-            let addresses = if let Some(addr_state) = addr_map.get(&peer_signal_id) {
-                AddressManager::from_serialized(&peer_signal_id, addr_state.clone())
-            } else {
-                AddressManager::new()
-            };
-
-            // Build reverse index: receiving_address → peer_signal_id
-            for addr in addresses.get_all_receiving_address_strings() {
-                inner.receiving_addr_to_peer.insert(addr, peer_signal_id.clone());
-            }
-
-            let session = ChatSession::new(signal, addresses, identity.clone());
-            inner.sessions.insert(
-                peer_signal_id.clone(),
-                Arc::new(tokio::sync::Mutex::new(session)),
-            );
-            restored_count += 1;
-        }
-
-        // 3. Restore pending outbound friend requests (per-peer identity)
-        for (
-            fr_id,
-            device_id,
-            id_pub,
-            id_priv,
-            reg_id,
-            spk_id,
-            spk_rec,
-            pk_id,
-            pk_rec,
-            kpk_id,
-            kpk_rec,
-            first_inbox_secret,
-            peer_nostr_pubkey,
-        ) in fr_rows
-        {
-            if device_id > max_device_id {
-                max_device_id = device_id;
-            }
-
-            let keys = match reconstruct_prekey_material(
-                &id_pub, &id_priv, reg_id, spk_id, &spk_rec, pk_id, &pk_rec, kpk_id, &kpk_rec,
-            ) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!(
-                        "restore pending FR {}: reconstruct keys failed: {e}",
-                        &fr_id[..16.min(fr_id.len())]
-                    );
-                    continue;
-                }
-            };
-
-            let signal = match SignalParticipant::persistent(
-                identity.pubkey_hex(),
-                device_id,
-                keys,
-                storage.clone(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(
-                        "restore pending FR {}: create participant failed: {e}",
-                        &fr_id[..16.min(fr_id.len())]
-                    );
-                    continue;
-                }
-            };
-
-            let first_inbox_keys = match EphemeralKeypair::from_secret_hex(&first_inbox_secret) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!(
-                        "restore pending FR {}: reconstruct first_inbox failed: {e}",
-                        &fr_id[..16.min(fr_id.len())]
-                    );
-                    continue;
-                }
-            };
-
-            inner.pending_outbound.insert(
-                fr_id.clone(),
-                FriendRequestState {
-                    signal_participant: signal,
-                    first_inbox_keys,
-                    request_id: fr_id.clone(),
-                    peer_nostr_pubkey,
-                },
-            );
-        }
-        if !fr_ids.is_empty() {
-            tracing::info!("restored {} pending friend requests", fr_ids.len());
-        }
-
-        // 4. Restore signal groups
-        {
-            let storage_arc = inner.storage.clone();
-            let store = storage_arc.lock().map_err(|e| KeychatUniError::Storage {
-                msg: format!("storage lock: {e}"),
-            })?;
-            inner.group_manager.load_all(&store).map_err(|e| {
-                tracing::error!("restore: load_all groups failed: {e}");
-                KeychatUniError::Storage {
-                    msg: format!("load_all groups: {e}"),
-                }
-            })?;
-            if inner.group_manager.group_count() > 0 {
-                tracing::info!(
-                    "restored {} signal groups",
-                    inner.group_manager.group_count()
-                );
-            }
-        }
-
-        // Update device_id counter to avoid collisions
-        if max_device_id >= inner.next_signal_device_id {
-            inner.next_signal_device_id = max_device_id + 1;
-        }
-
-        tracing::info!(
-            "restore complete: {} sessions, {} pending FRs, {} groups, next_device_id={}",
-            restored_count,
-            inner.pending_outbound.len(),
-            inner.group_manager.group_count(),
-            inner.next_signal_device_id
-        );
-
-        Ok(restored_count)
+        self.app.restore_sessions().await.map_err(Into::into)
     }
 
-    /// Checkpoint the WAL and close the database cleanly.
     /// Call before dropping the client if another client will reopen the same DB.
     pub async fn close_storage(&self) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
-        let store = inner.storage.lock().map_err(|e| KeychatUniError::Storage {
-            msg: format!("storage lock: {e}"),
-        })?;
-        store.checkpoint().map_err(|e| KeychatUniError::Storage {
-            msg: format!("checkpoint: {e}"),
-        })?;
-        Ok(())
+        self.app.close_storage().await.map_err(Into::into)
     }
 
     pub async fn get_pubkey_hex(&self) -> Result<String, KeychatUniError> {
-        self.identity_pubkey_hex
+        self.app
+            .identity_pubkey_hex
             .get()
             .cloned()
             .ok_or(KeychatUniError::NotInitialized {
@@ -755,165 +558,42 @@ impl KeychatClient {
     }
 
     pub async fn connect(&self, relay_urls: Vec<String>) -> Result<(), KeychatUniError> {
-        // 1. Resolve relay URLs: parameter → DB → defaults
-        let (identity, urls) = {
-            let inner = self.inner.read().await;
-            let identity = inner
-                .identity
-                .clone()
-                .ok_or(KeychatUniError::NotInitialized {
-                    msg: "call create_identity first".into(),
-                })?;
-
-            let urls = if !relay_urls.is_empty() {
-                relay_urls
-            } else {
-                // Try loading from DB
-                let storage = inner.storage.clone();
-                let db_relays = storage
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.list_relays().ok())
-                    .unwrap_or_default();
-                if !db_relays.is_empty() {
-                    db_relays
-                } else {
-                    libkeychat::DEFAULT_RELAYS
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                }
-            };
-            (identity, urls)
-        };
-
-        tracing::info!("connecting to {} relays: {:?}", urls.len(), urls);
-
-        // 2. Create transport, inject storage for persistent dedup, add relays, connect
-        let mut transport = Transport::new(identity.keys()).await?;
-        let storage_for_transport = {
-            let inner = self.inner.read().await;
-            inner.storage.clone()
-        };
-        transport.set_storage(storage_for_transport.clone());
-        // Prune old dedup records on connect
-        if let Ok(store) = storage_for_transport.lock() {
-            let _ = store.prune_processed_events(86400 * 7); // 7 days
-        }
-        drop(storage_for_transport);
-        for url in &urls {
-            transport.add_relay(url).await.map_err(|e| {
-                tracing::error!("add_relay({url}) failed: {e}");
-                e
-            })?;
-        }
-        transport.connect().await;
-        tracing::info!("relay transport connected");
-
-        // 3. Persist the relay list to DB
-        {
-            let storage = self.inner.read().await.storage.clone();
-            let store = storage.lock();
-            if let Ok(store) = store {
-                for url in &urls {
-                    let _ = store.save_relay(url);
-                }
-            }
-        }
-
-        // 4. Re-acquire lock to store transport and relay list
-        let mut inner = self.inner.write().await;
-        inner.transport = Some(transport);
-        inner.last_relay_urls = urls;
-        // Clear any stale subscription IDs from a previous connect session
-        inner.subscription_ids.clear();
-        Ok(())
+        self.app.connect(relay_urls).await.map_err(Into::into)
     }
 
-    /// Add a relay at runtime, connect to it, and persist to DB.
     pub async fn add_relay(&self, url: String) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
-        transport.add_relay_and_connect(&url).await?;
-
-        let storage = inner.storage.clone();
-        if let Ok(store) = storage.lock() {
-            let _ = store.save_relay(&url);
-        }
-        tracing::info!("added relay: {url}");
-        Ok(())
+        self.app.add_relay(url).await.map_err(Into::into)
     }
 
-    /// Remove a relay at runtime and delete from DB.
     pub async fn remove_relay(&self, url: String) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
-        transport.remove_relay(&url).await?;
-
-        let storage = inner.storage.clone();
-        if let Ok(store) = storage.lock() {
-            let _ = store.delete_relay(&url);
-        }
-        tracing::info!("removed relay: {url}");
-        Ok(())
+        self.app.remove_relay(url).await.map_err(Into::into)
     }
 
-    /// Get the current relay URL list.
     pub async fn get_relays(&self) -> Result<Vec<String>, KeychatUniError> {
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
-        Ok(transport.get_relays().await)
+        self.app.get_relays().await.map_err(Into::into)
     }
 
-    /// Get only the currently connected relay URLs.
     pub async fn connected_relays(&self) -> Result<Vec<String>, KeychatUniError> {
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
-        Ok(transport.connected_relays().await)
+        self.app.connected_relays().await.map_err(Into::into)
     }
 
-    /// Get relay URLs with their connection status.
     pub async fn get_relay_statuses(&self) -> Result<Vec<RelayStatusInfo>, KeychatUniError> {
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
-        Ok(transport
-            .get_relay_statuses()
-            .await
+        let statuses = self.app.get_relay_statuses().await?;
+        Ok(statuses
             .into_iter()
-            .map(|(url, status)| RelayStatusInfo { url, status })
+            .map(|s| RelayStatusInfo {
+                url: s.url,
+                status: s.status,
+            })
             .collect())
     }
 
-    /// Reconnect to all relays (re-enables disabled ones).
     pub async fn reconnect_relays(&self) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
-        transport.reconnect().await?;
-        tracing::info!("reconnected to all relays");
-        Ok(())
+        self.app.reconnect_relays().await.map_err(Into::into)
     }
 
-    /// Reconnect a specific relay.
     pub async fn reconnect_relay(&self, url: String) -> Result<(), KeychatUniError> {
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
-        transport.reconnect_relay(&url).await?;
-        tracing::info!("reconnected relay: {url}");
-        Ok(())
+        self.app.reconnect_relay(url).await.map_err(Into::into)
     }
 
     /// Rebroadcast an event (JSON) to all connected relays.
@@ -925,10 +605,13 @@ impl KeychatClient {
             serde_json::from_str(&event_json).map_err(|e| KeychatUniError::Transport {
                 msg: format!("invalid event JSON: {e}"),
             })?;
-        let inner = self.inner.read().await;
-        let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-            msg: "Not connected to any relay. Please check your network.".into(),
-        })?;
+        let inner = self.app.inner.read().await;
+        let transport = inner
+            .protocol
+            .transport()
+            .ok_or(KeychatUniError::Transport {
+                msg: "Not connected to any relay. Please check your network.".into(),
+            })?;
         let result = transport.rebroadcast_event(event).await?;
         Ok(PublishResultInfo {
             event_id: result.event_id.to_hex(),
@@ -942,32 +625,7 @@ impl KeychatClient {
     }
 
     pub async fn disconnect(&self) -> Result<(), KeychatUniError> {
-        tracing::info!("disconnecting from relays");
-        // Stop event loop, reconnect loop, take transport — all under single write lock
-        let (transport, event_loop_tx, reconnect_tx) = {
-            let mut inner = self.inner.write().await;
-            // Clear subscription IDs — they belong to the old transport
-            inner.subscription_ids.clear();
-            (
-                inner.transport.take(),
-                inner.event_loop_stop.take(),
-                inner.reconnect_stop.take(),
-            )
-        };
-        if let Some(tx) = event_loop_tx {
-            let _ = tx.send(true);
-        }
-        if let Some(tx) = reconnect_tx {
-            let _ = tx.send(true);
-        }
-        if let Some(t) = transport {
-            t.disconnect().await.map_err(|e| {
-                tracing::error!("disconnect failed: {e}");
-                e
-            })?;
-        }
-        tracing::info!("disconnected");
-        Ok(())
+        self.app.disconnect().await.map_err(Into::into)
     }
 
     /// Remove the current identity and all associated data.
@@ -975,617 +633,28 @@ impl KeychatClient {
     /// Stops the event loop, disconnects transport, clears all in-memory state,
     /// and deletes all persisted data from SQLCipher (except relay config).
     pub async fn remove_identity(&self) -> Result<(), KeychatUniError> {
-        tracing::info!("remove_identity: clearing all data");
-
-        // 1. Stop event loop and reconnect loop
-        {
-            let inner = self.inner.read().await;
-            if let Some(ref stop_tx) = inner.event_loop_stop {
-                let _ = stop_tx.send(true);
-            }
-            if let Some(ref stop_tx) = inner.reconnect_stop {
-                let _ = stop_tx.send(true);
-            }
-        }
-
-        // 2. Disconnect transport
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(t) = inner.transport.take() {
-                let _ = t.disconnect().await;
-            }
-        }
-
-        // 3. Clear all in-memory state + DB
-        let storage = self.inner.read().await.storage.clone();
-        {
-            let mut inner = self.inner.write().await;
-            inner.sessions.clear();
-            inner.peer_nostr_to_signal.clear();
-            inner.peer_signal_to_nostr.clear();
-            inner.receiving_addr_to_peer.clear();
-            inner.pending_outbound.clear();
-            inner.group_manager = libkeychat::GroupManager::new();
-            inner.identity = None;
-            inner.next_signal_device_id = 1;
-            inner.event_loop_stop = None;
-            inner.reconnect_stop = None;
-            inner.subscription_ids.clear();
-            inner.last_relay_urls.clear();
-        }
-        if let Ok(store) = storage.lock() {
-            store
-                .delete_all_data()
-                .map_err(|e| KeychatUniError::Storage {
-                    msg: format!("delete_all_data: {e}"),
-                })?;
-        }
-        // Also clear application-layer data
-        let app_storage = self.inner.read().await.app_storage.clone();
-        {
-            let store = lock_app_storage(&app_storage);
-            store
-                .delete_all_data()
-                .map_err(|e| KeychatUniError::Storage {
-                    msg: format!("delete_all_app_data: {e}"),
-                })?;
-        }
-
-        tracing::info!("remove_identity: done");
-        Ok(())
+        self.app.remove_identity().await.map_err(Into::into)
     }
 
-    /// Remove a room (1:1 peer or group) and all associated data.
-    ///
-    /// For 1:1: clears session, signal participant, peer mapping, addresses.
-    /// For groups: removes from GroupManager + storage.
     pub async fn remove_room(&self, room_id: String) -> Result<(), KeychatUniError> {
-        let storage = self.inner.read().await.storage.clone();
-        let mut found = false;
-
-        // Try as 1:1 peer first (room_id = nostr pubkey)
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&room_id) {
-                inner.peer_signal_to_nostr.remove(&signal_id);
-                inner.sessions.remove(&signal_id);
-                inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != room_id);
-                drop(inner);
-
-                // Delete from DB (no write lock held)
-                if let Ok(store) = storage.lock() {
-                    let _ = store.delete_peer_data(&signal_id, &room_id);
-                }
-
-                tracing::info!(
-                    "remove_room: removed 1:1 peer {}",
-                    &room_id[..16.min(room_id.len())]
-                );
-                found = true;
-            }
-        }
-
-        // Try as Signal group
-        if !found {
-            let mut inner = self.inner.write().await;
-            if inner.group_manager.get_group(&room_id).is_some() {
-                if let Ok(store) = storage.lock() {
-                    let _ = inner
-                        .group_manager
-                        .remove_group_persistent(&room_id, &store);
-                } else {
-                    inner.group_manager.remove_group(&room_id);
-                }
-                tracing::info!(
-                    "remove_room: removed group {}",
-                    &room_id[..16.min(room_id.len())]
-                );
-                found = true;
-            }
-        }
-
-        // Try as MLS group
-        if !found {
-            if let Ok(store) = storage.lock() {
-                let _ = store.delete_mls_group_id(&room_id);
-            }
-            tracing::warn!(
-                "remove_room: room {} not found",
-                &room_id[..16.min(room_id.len())]
-            );
-        }
-
-        // Clean up app_* tables (in app database)
-        let identity_pubkey = self.cached_identity_pubkey();
-        if !identity_pubkey.is_empty() {
-            let app_room_id = crate::types::make_room_id(&room_id, &identity_pubkey);
-            let app_storage = self.inner.read().await.app_storage.clone();
-            {
-                let store = lock_app_storage(&app_storage);
-                if let Err(e) = store.delete_app_room(&app_room_id) {
-                    tracing::warn!("remove_room: delete_app_room: {e}");
-                }
-                if let Err(e) = store.delete_app_contact(&room_id, &identity_pubkey) {
-                    tracing::warn!("remove_room: delete_app_contact: {e}");
-                }
-            }
-            self.emit_data_change(DataChange::RoomListChanged).await;
-            self.emit_data_change(DataChange::ContactListChanged).await;
-        }
-
-        Ok(())
+        self.app.remove_room(room_id).await.map_err(Into::into)
     }
 
-    /// Remove a specific Signal session for a peer.
-    ///
-    /// Clears session, pending_outbound, peer mapping, and all related data from memory and DB.
-    /// This API is designed for situations where you want to clean up just one peer's session
-    /// without removing the entire room/contact.
     pub async fn remove_session(&self, peer_pubkey: String) -> Result<(), KeychatUniError> {
-        let storage = self.inner.read().await.storage.clone();
-
-        {
-            let mut inner = self.inner.write().await;
-
-            // Remove signal session
-            if let Some(signal_id) = inner.peer_nostr_to_signal.remove(&peer_pubkey) {
-                inner.peer_signal_to_nostr.remove(&signal_id);
-                inner.sessions.remove(&signal_id);
-                inner.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
-                inner.pending_outbound.retain(|_, s| s.peer_nostr_pubkey != peer_pubkey);
-
-                // Clean up in DB (no write lock held during DB operations)
-                drop(inner);
-
-                if let Ok(store) = storage.lock() {
-                    let _ = store.delete_peer_data(&signal_id, &peer_pubkey);
-                }
-
-                tracing::info!(
-                    "remove_session: removed session for peer {}",
-                    &peer_pubkey[..16.min(peer_pubkey.len())]
-                );
-            } else {
-                tracing::warn!(
-                    "remove_session: no session found for peer {}",
-                    &peer_pubkey[..16.min(peer_pubkey.len())]
-                );
-            }
-        }
-
-        // Clean up app_* tables (in app database)
-        let identity_pubkey = self.cached_identity_pubkey();
-
-        if !identity_pubkey.is_empty() {
-            let app_storage = self.inner.read().await.app_storage.clone();
-            {
-                let store = crate::client::lock_app_storage(&app_storage);
-                // Only delete contact data, not the room as the room might still be needed
-                if let Err(e) = store.delete_app_contact(&peer_pubkey, &identity_pubkey) {
-                    tracing::warn!("remove_session: delete_app_contact: {e}");
-                }
-            }
-            // Notify that contact list has changed
-            self.emit_data_change(DataChange::ContactListChanged).await;
-        }
-
-        Ok(())
+        self.app
+            .remove_session(peer_pubkey)
+            .await
+            .map_err(Into::into)
     }
 
     /// Register an event listener for receiving async events from the event loop.
     pub async fn set_event_listener(&self, listener: Box<dyn EventListener>) {
-        let mut inner = self.inner.write().await;
-        inner.event_listener = Some(listener);
+        let mut inner = self.app.inner.write().await;
+        inner.event_listener = Some(Box::new(EventListenerBridge(listener)));
     }
 
     pub async fn set_data_listener(&self, listener: Box<dyn DataListener>) {
-        let mut inner = self.inner.write().await;
-        inner.data_listener = Some(listener);
-    }
-
-    /// Start the event loop: subscribe to relay notifications and dispatch
-    /// incoming events to the registered EventListener.
-    ///
-    /// Uses `Arc<Self>` so the event loop task can hold a reference.
-    pub async fn start_event_loop(self: Arc<Self>) -> Result<(), KeychatUniError> {
-        // Collect pubkeys split by type: identity keys vs ratchet keys
-        let (identity_pubkeys, ratchet_pubkeys) = self.collect_subscribe_pubkeys().await;
-        let total = identity_pubkeys.len() + ratchet_pubkeys.len();
-        tracing::info!(
-            "event loop: subscribing to {} pubkeys ({} identity, {} ratchet)",
-            total,
-            identity_pubkeys.len(),
-            ratchet_pubkeys.len()
-        );
-        if identity_pubkeys.is_empty() && ratchet_pubkeys.is_empty() {
-            tracing::error!("event loop: no pubkeys to subscribe — no identity set");
-            return Err(KeychatUniError::NotInitialized {
-                msg: "no pubkeys to subscribe to — set identity first".into(),
-            });
-        }
-
-        // Read relay subscription cursor for identity key `since` parameter.
-        // NIP-17 gift wrap randomizes outer timestamp by ±2 days. Use 3-day
-        // safety window to cover edge cases near the boundary.
-        // Ratchet keys are newly derived addresses with no history — use now().
-        let identity_since = {
-            let inner = self.inner.read().await;
-            let storage = inner.storage.lock().unwrap_or_else(|e| e.into_inner());
-            let cursor = storage.get_min_relay_cursor().unwrap_or(0);
-            drop(storage);
-            drop(inner);
-
-            if cursor > 0 {
-                let safety_window_secs: u64 = 3 * 24 * 60 * 60;
-                let since_ts = cursor.saturating_sub(safety_window_secs);
-                tracing::info!(
-                    "event loop: identity since = cursor({}) - 3days = {}",
-                    cursor,
-                    since_ts
-                );
-                Some(libkeychat::Timestamp::from(since_ts))
-            } else {
-                // First launch — no cursor yet. Subscribe without `since` to get
-                // initial history. The relay's own retention policy limits the result.
-                // After the first event is processed, the cursor will be set.
-                tracing::info!(
-                    "event loop: no cursor yet, subscribing without since for initial sync"
-                );
-                None
-            }
-        };
-
-        let ratchet_since = Some(libkeychat::Timestamp::now());
-
-        // Log all pubkeys being subscribed to — useful for debugging missing messages
-        tracing::info!(
-            "📡 SUBSCRIBE identity keys ({}): [{}]",
-            identity_pubkeys.len(),
-            identity_pubkeys
-                .iter()
-                .map(|pk| pk.to_hex()[..16].to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        tracing::info!(
-            "📡 SUBSCRIBE ratchet keys ({}): [{}]",
-            ratchet_pubkeys.len(),
-            ratchet_pubkeys
-                .iter()
-                .map(|pk| pk.to_hex()[..16].to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        // Subscribe via Transport — separate subscriptions for identity and ratchet keys.
-        // Use resubscribe() to atomically unsubscribe old IDs and subscribe new ones,
-        // preventing duplicate REQ accumulation.
-        let old_ids: Vec<String> = {
-            let inner = self.inner.read().await;
-            inner.subscription_ids.clone()
-        };
-        let mut old_iter = old_ids.into_iter().map(|s| libkeychat::SubscriptionId::new(s));
-
-        let mut new_sub_ids: Vec<String> = Vec::new();
-
-        {
-            let inner = self.inner.read().await;
-            let transport = inner.transport.as_ref().ok_or(KeychatUniError::Transport {
-                msg: "Not connected to any relay. Please check your network.".into(),
-            })?;
-
-            if !identity_pubkeys.is_empty() {
-                let id = transport
-                    .resubscribe(old_iter.next(), identity_pubkeys, identity_since)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("event loop: identity subscribe failed: {e}");
-                        e
-                    })?;
-                new_sub_ids.push(id.to_string());
-            }
-
-            if !ratchet_pubkeys.is_empty() {
-                let id = transport
-                    .resubscribe(old_iter.next(), ratchet_pubkeys, ratchet_since)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("event loop: ratchet subscribe failed: {e}");
-                        e
-                    })?;
-                new_sub_ids.push(id.to_string());
-            }
-
-            // Unsubscribe any remaining stale IDs (e.g. old session had more slots)
-            for leftover in old_iter {
-                transport.unsubscribe(leftover).await;
-            }
-        } // lock dropped
-
-        // Persist new subscription IDs
-        {
-            let mut inner = self.inner.write().await;
-            inner.subscription_ids = new_sub_ids;
-        }
-
-        // Create stop channel
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        {
-            let mut inner = self.inner.write().await;
-            inner.event_loop_stop = Some(stop_tx);
-        }
-
-        // Spawn the event loop task
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            self_clone.run_event_loop(stop_rx).await;
-        });
-
-        Ok(())
-    }
-
-    /// Stop the event loop.
-    pub async fn stop_event_loop(&self) {
-        let mut inner = self.inner.write().await;
-        if let Some(stop_tx) = inner.event_loop_stop.take() {
-            let _ = stop_tx.send(true);
-        }
-    }
-
-    // ─── Auto-Reconnect ─────────────────────────────────────
-
-    /// Enable automatic reconnection with exponential backoff.
-    /// When connection is lost, the Rust layer will:
-    /// 1. Retry connection with exponential backoff (2s, 4s, 8s, ... up to max_delay_secs)
-    /// 2. Emit DataChange::ConnectionStatusChanged on every state change
-    /// 3. Auto-retry failed messages after successful reconnection
-    ///
-    /// Call this once after initial `connect()` + `start_event_loop()`.
-    /// Call `disable_auto_reconnect()` to stop.
-    pub async fn enable_auto_reconnect(
-        self: Arc<Self>,
-        max_delay_secs: u32,
-    ) -> Result<(), KeychatUniError> {
-        // Stop any existing reconnect task
-        {
-            let mut inner = self.inner.write().await;
-            if let Some(stop_tx) = inner.reconnect_stop.take() {
-                let _ = stop_tx.send(true);
-            }
-        }
-
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        {
-            let mut inner = self.inner.write().await;
-            inner.reconnect_stop = Some(stop_tx);
-        }
-
-        let max_delay = std::cmp::max(max_delay_secs, 2) as u64;
-        let self_clone = self.clone();
-
-        tokio::spawn(async move {
-            self_clone.reconnect_loop(stop_rx, max_delay).await;
-        });
-
-        tracing::info!("auto-reconnect enabled (max_delay={}s)", max_delay);
-        Ok(())
-    }
-
-    /// Disable automatic reconnection.
-    pub async fn disable_auto_reconnect(&self) {
-        let mut inner = self.inner.write().await;
-        if let Some(stop_tx) = inner.reconnect_stop.take() {
-            let _ = stop_tx.send(true);
-        }
-        tracing::info!("auto-reconnect disabled");
-    }
-
-    /// Check connectivity and reconnect if needed. Call on app foreground.
-    /// Returns the current connection status.
-    pub async fn check_connection(self: Arc<Self>) -> ConnectionStatus {
-        let connected = self.connected_relays().await.unwrap_or_default();
-        if !connected.is_empty() {
-            self.notify_connection_status(ConnectionStatus::Connected, None)
-                .await;
-            ConnectionStatus::Connected
-        } else {
-            // Trigger immediate reconnect attempt
-            self.notify_connection_status(ConnectionStatus::Reconnecting, None)
-                .await;
-            match self.try_reconnect().await {
-                Ok(_) => {
-                    self.notify_connection_status(ConnectionStatus::Connected, None)
-                        .await;
-                    // Auto-retry failed messages after reconnect (delayed to let relays stabilize)
-                    let client = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        match client.retry_failed_messages().await {
-                            Ok(count) => {
-                                if count > 0 {
-                                    tracing::info!(
-                                        "auto-retry after reconnect: {count} messages retried"
-                                    );
-                                }
-                            }
-                            Err(e) => tracing::warn!("auto-retry after reconnect failed: {e}"),
-                        }
-                    });
-                    ConnectionStatus::Connected
-                }
-                Err(e) => {
-                    let msg = format!("{e}");
-                    self.notify_connection_status(ConnectionStatus::Failed, Some(msg))
-                        .await;
-                    ConnectionStatus::Failed
-                }
-            }
-        }
+        let mut inner = self.app.inner.write().await;
+        inner.data_listener = Some(Box::new(DataListenerBridge(listener)));
     }
 }
-
-// ─── Private methods (not exported via UniFFI) ───────────────────
-
-impl KeychatClient {
-    /// Internal: reconnect loop with exponential backoff.
-    pub(crate) async fn reconnect_loop(
-        self: Arc<Self>,
-        mut stop_rx: tokio::sync::watch::Receiver<bool>,
-        max_delay_secs: u64,
-    ) {
-        // Monitor loop: check connectivity periodically
-        let check_interval = std::time::Duration::from_secs(10);
-
-        loop {
-            // Wait for check interval or stop signal
-            tokio::select! {
-                _ = tokio::time::sleep(check_interval) => {}
-                _ = stop_rx.changed() => {
-                    tracing::info!("reconnect loop: stop signal received");
-                    return;
-                }
-            }
-
-            if *stop_rx.borrow() {
-                return;
-            }
-
-            // Check if we're still connected
-            let connected = self.connected_relays().await.unwrap_or_default();
-            if !connected.is_empty() {
-                continue; // Still connected, keep monitoring
-            }
-
-            // Lost connection — start reconnect attempts
-            tracing::info!("reconnect loop: connection lost, starting backoff");
-            let mut attempt: u32 = 0;
-
-            loop {
-                if *stop_rx.borrow() {
-                    return;
-                }
-
-                attempt += 1;
-                let delay_secs = std::cmp::min(2u64.saturating_pow(attempt), max_delay_secs);
-
-                self.notify_connection_status(
-                    ConnectionStatus::Reconnecting,
-                    Some(format!("attempt {attempt}, retry in {delay_secs}s")),
-                )
-                .await;
-
-                tracing::info!("reconnect attempt {attempt} in {delay_secs}s…");
-
-                // Wait for delay or stop signal
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
-                    _ = stop_rx.changed() => {
-                        tracing::info!("reconnect loop: stop signal during backoff");
-                        return;
-                    }
-                }
-
-                if *stop_rx.borrow() {
-                    return;
-                }
-
-                match self.try_reconnect().await {
-                    Ok(_) => {
-                        tracing::info!("reconnected on attempt {attempt}");
-                        self.notify_connection_status(ConnectionStatus::Connected, None)
-                            .await;
-
-                        // Check if the event loop is still alive; restart if it has exited.
-                        // The stop sender's receiver_count drops to 0 when the event loop task
-                        // has exited (all stop_rx handles dropped), indicating a dead loop.
-                        let event_loop_dead = {
-                            let inner = self.inner.read().await;
-                            inner
-                                .event_loop_stop
-                                .as_ref()
-                                .map(|tx| tx.receiver_count() == 0)
-                                .unwrap_or(true)
-                        };
-                        if event_loop_dead {
-                            tracing::warn!("reconnect: event loop is dead, restarting");
-                            let client = Arc::clone(&self);
-                            tokio::spawn(async move {
-                                if let Err(e) = client.start_event_loop().await {
-                                    tracing::error!("reconnect: failed to restart event loop: {e}");
-                                } else {
-                                    tracing::info!("reconnect: event loop restarted successfully");
-                                }
-                            });
-                        }
-
-                        // Auto-retry failed messages (delayed to let relay connections stabilize)
-                        let client = Arc::clone(&self);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                            match client.retry_failed_messages().await {
-                                Ok(count) => {
-                                    if count > 0 {
-                                        tracing::info!(
-                                            "auto-retry after reconnect: {count} messages retried"
-                                        );
-                                    }
-                                }
-                                Err(e) => tracing::warn!("auto-retry after reconnect failed: {e}"),
-                            }
-                        });
-
-                        break; // Back to monitoring loop
-                    }
-                    Err(e) => {
-                        tracing::warn!("reconnect attempt {attempt} failed: {e}");
-                        self.notify_connection_status(
-                            ConnectionStatus::Failed,
-                            Some(format!("attempt {attempt}: {e}")),
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Internal: attempt to reconnect using stored relay URLs.
-    pub(crate) async fn try_reconnect(&self) -> Result<(), KeychatUniError> {
-        let relay_urls = {
-            let inner = self.inner.read().await;
-            inner.last_relay_urls.clone()
-        };
-
-        if relay_urls.is_empty() {
-            return Err(KeychatUniError::NotInitialized {
-                msg: "no relay URLs stored".into(),
-            });
-        }
-
-        // Reconnect existing transport if available
-        {
-            let inner = self.inner.read().await;
-            if let Some(ref transport) = inner.transport {
-                transport.reconnect().await?;
-                return Ok(());
-            }
-        }
-
-        // No transport — do a full connect
-        self.connect(relay_urls).await
-    }
-
-    /// Internal: notify DataListener of connection status change.
-    pub(crate) async fn notify_connection_status(
-        &self,
-        status: ConnectionStatus,
-        message: Option<String>,
-    ) {
-        let inner = self.inner.read().await;
-        if let Some(ref listener) = inner.data_listener {
-            listener.on_data_change(DataChange::ConnectionStatusChanged { status, message });
-        }
-    }
-}
-

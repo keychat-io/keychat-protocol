@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use keychat_uniffi::{ClientEvent, DataChange, EventListener, KeychatClient};
-use keychat_uniffi::{RoomStatus, RoomType, MessageStatus, MessageKind};
-use keychat_uniffi::{encrypt_file_data, decrypt_file_data};
 use keychat_cli::commands;
+use keychat_uniffi::{decrypt_file_data, encrypt_file_data};
+use keychat_uniffi::{ClientEvent, DataChange, EventListener, KeychatClient};
+use keychat_uniffi::{MessageKind, MessageStatus, RoomStatus, RoomType};
 use tokio::sync::broadcast;
 
 fn temp_db(dir: &tempfile::TempDir, name: &str) -> String {
@@ -62,7 +62,10 @@ async_test!(test_create_and_get_identity, {
     assert!(!result.mnemonic.is_empty(), "mnemonic should not be empty");
 
     let pubkey = client.get_pubkey_hex().await.unwrap();
-    assert_eq!(pubkey, result.pubkey_hex, "get_pubkey_hex should return created key");
+    assert_eq!(
+        pubkey, result.pubkey_hex,
+        "get_pubkey_hex should return created key"
+    );
 
     // pubkey should be valid hex
     assert_eq!(pubkey.len(), 64, "pubkey should be 64 hex chars");
@@ -88,10 +91,10 @@ async_test!(test_daemon_status_route, {
     let db_path = temp_db(&dir, "daemon.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -127,10 +130,10 @@ async_test!(test_daemon_identity_route_no_identity, {
     let db_path = temp_db(&dir, "daemon2.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -160,10 +163,10 @@ async_test!(test_daemon_create_identity_route, {
     let db_path = temp_db(&dir, "daemon3.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -200,7 +203,10 @@ async_test!(test_encrypt_decrypt_image_roundtrip, {
         0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
     ];
     let enc = encrypt_file_data(png_data.clone());
-    assert_ne!(enc.ciphertext, png_data, "ciphertext must differ from plaintext");
+    assert_ne!(
+        enc.ciphertext, png_data,
+        "ciphertext must differ from plaintext"
+    );
     assert_eq!(enc.key.len(), 64, "key should be 64 hex chars");
     assert_eq!(enc.iv.len(), 32, "iv should be 32 hex chars");
     assert_eq!(enc.hash.len(), 64, "hash should be 64 hex chars");
@@ -235,8 +241,14 @@ async_test!(test_encrypt_same_data_twice_different_keys, {
     let data = vec![0x42; 100];
     let enc1 = encrypt_file_data(data.clone());
     let enc2 = encrypt_file_data(data.clone());
-    assert_ne!(enc1.key, enc2.key, "each encryption should produce a unique key");
-    assert_ne!(enc1.iv, enc2.iv, "each encryption should produce a unique IV");
+    assert_ne!(
+        enc1.key, enc2.key,
+        "each encryption should produce a unique key"
+    );
+    assert_ne!(
+        enc1.iv, enc2.iv,
+        "each encryption should produce a unique IV"
+    );
 });
 
 // ─── Security Edge Cases ────────────────────────────────────────
@@ -271,7 +283,10 @@ async_test!(test_decrypt_with_tampered_ciphertext_fails, {
         bad_ct[0] ^= 0xFF; // flip bits
     }
     let result = decrypt_file_data(bad_ct, enc.key, enc.iv, enc.hash);
-    assert!(result.is_err(), "tampered ciphertext must fail hash verification");
+    assert!(
+        result.is_err(),
+        "tampered ciphertext must fail hash verification"
+    );
 });
 
 async_test!(test_decrypt_with_tampered_hash_fails, {
@@ -292,13 +307,21 @@ fn test_category_from_extension() {
     // Test via commands module helpers (through upload_and_prepare_file indirectly)
     // We test the daemon route sends correct categories
     let cases = vec![
-        ("jpg", "image"), ("png", "image"), ("gif", "image"),
-        ("mp4", "video"), ("mov", "video"),
-        ("mp3", "audio"), ("wav", "audio"),
-        ("pdf", "document"), ("doc", "document"),
-        ("txt", "text"), ("json", "text"),
-        ("zip", "archive"), ("tar", "archive"),
-        ("bin", "other"), ("xyz", "other"),
+        ("jpg", "image"),
+        ("png", "image"),
+        ("gif", "image"),
+        ("mp4", "video"),
+        ("mov", "video"),
+        ("mp3", "audio"),
+        ("wav", "audio"),
+        ("pdf", "document"),
+        ("doc", "document"),
+        ("txt", "text"),
+        ("json", "text"),
+        ("zip", "archive"),
+        ("tar", "archive"),
+        ("bin", "other"),
+        ("xyz", "other"),
     ];
     // Verify category_from_extension is consistent
     // (this tests the commands module function indirectly via daemon file_category_str)
@@ -323,7 +346,7 @@ async_test!(test_blossom_roundtrip_small_file, {
     };
 
     assert!(!result.url.is_empty(), "upload URL should not be empty");
-    assert!(result.encrypted_size > 0, "encrypted size should be > 0");
+    assert!(result.size > 0, "encrypted size should be > 0");
     assert_eq!(result.key.len(), 64, "key should be 64 hex chars");
 
     // Download and decrypt
@@ -352,10 +375,8 @@ async_test!(test_blossom_download_wrong_key_fails, {
     // Tamper with the key
     let mut bad_key = result.key.clone();
     bad_key.replace_range(0..1, if bad_key.starts_with('0') { "f" } else { "0" });
-    let download = keychat_uniffi::download_and_decrypt(
-        result.url, bad_key, result.iv, result.hash,
-    )
-    .await;
+    let download =
+        keychat_uniffi::download_and_decrypt(result.url, bad_key, result.iv, result.hash).await;
     assert!(download.is_err(), "download with wrong key must fail");
 });
 
@@ -371,9 +392,9 @@ async_test!(test_daemon_send_file_missing_paths, {
     let db_path = temp_db(&dir, "sendfile.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Empty file_paths should return 400
     let response = app
@@ -393,7 +414,9 @@ async_test!(test_daemon_send_file_missing_paths, {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["ok"], false);
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(test_daemon_send_file_nonexistent_file, {
@@ -406,9 +429,9 @@ async_test!(test_daemon_send_file_nonexistent_file, {
     let db_path = temp_db(&dir, "sendfile2.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let response = app
         .oneshot(
@@ -416,7 +439,9 @@ async_test!(test_daemon_send_file_nonexistent_file, {
                 .method("POST")
                 .uri("/send-file")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"room_id":"test","file_paths":["/nonexistent/file.png"]}"#))
+                .body(Body::from(
+                    r#"{"room_id":"test","file_paths":["/nonexistent/file.png"]}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -426,9 +451,14 @@ async_test!(test_daemon_send_file_nonexistent_file, {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["ok"], false);
-    assert!(json["error"].as_str().unwrap().contains("not found"), "error should mention file not found");
+    assert!(
+        json["error"].as_str().unwrap().contains("not found"),
+        "error should mention file not found"
+    );
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(test_daemon_rooms_route_empty, {
@@ -441,10 +471,10 @@ async_test!(test_daemon_rooms_route_empty, {
     let db_path = temp_db(&dir, "daemon4.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
 
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Create identity first so rooms query works
     client.create_identity().await.unwrap();
@@ -488,9 +518,9 @@ async_test!(test_file_attachments_send_path, {
     let room_id = "room123".to_string();
     let file_name = "photo_12345.jpg".to_string();
 
-    let abs_path = client.save_file_locally(
-        test_data.clone(), file_name.clone(), room_id.clone()
-    ).unwrap();
+    let abs_path = client
+        .save_file_locally(test_data.clone(), file_name.clone(), room_id.clone())
+        .unwrap();
 
     // Verify file exists on disk
     assert!(std::path::Path::new(&abs_path).exists());
@@ -501,55 +531,100 @@ async_test!(test_file_attachments_send_path, {
     let file_hash = "abc123hash".to_string();
     let relative_path = format!("{room_id}/{file_name}");
 
-    client.upsert_attachment(
-        msgid.clone(), file_hash.clone(), room_id.clone(),
-        Some(relative_path.clone()), 2
-    ).await.unwrap();
+    client
+        .upsert_attachment(
+            msgid.clone(),
+            file_hash.clone(),
+            room_id.clone(),
+            Some(relative_path.clone()),
+            2,
+        )
+        .await
+        .unwrap();
 
     // 3. resolve_local_file — should find it
-    let resolved = client.resolve_local_file(msgid.clone(), file_hash.clone()).await;
-    assert!(resolved.is_some(), "resolve_local_file should find the file");
+    let resolved = client
+        .resolve_local_file(msgid.clone(), file_hash.clone())
+        .await;
+    assert!(
+        resolved.is_some(),
+        "resolve_local_file should find the file"
+    );
     assert_eq!(resolved.unwrap(), abs_path);
 
     // 4. Non-existent hash — should return None
-    let missing = client.resolve_local_file(msgid.clone(), "nonexistent".to_string()).await;
+    let missing = client
+        .resolve_local_file(msgid.clone(), "nonexistent".to_string())
+        .await;
     assert!(missing.is_none());
 
     // 5. Multi-file: same msgid, different hashes
     let file_name_b = "doc_67890.pdf".to_string();
     let test_data_b = b"fake pdf data".to_vec();
-    let abs_path_b = client.save_file_locally(
-        test_data_b.clone(), file_name_b.clone(), room_id.clone()
-    ).unwrap();
+    let abs_path_b = client
+        .save_file_locally(test_data_b.clone(), file_name_b.clone(), room_id.clone())
+        .unwrap();
     let relative_path_b = format!("{room_id}/{file_name_b}");
     let hash_b = "def456hash".to_string();
 
-    client.upsert_attachment(
-        msgid.clone(), hash_b.clone(), room_id.clone(),
-        Some(relative_path_b), 2
-    ).await.unwrap();
+    client
+        .upsert_attachment(
+            msgid.clone(),
+            hash_b.clone(),
+            room_id.clone(),
+            Some(relative_path_b),
+            2,
+        )
+        .await
+        .unwrap();
 
     // Both files should resolve independently
-    let resolved_a = client.resolve_local_file(msgid.clone(), file_hash.clone()).await;
-    let resolved_b = client.resolve_local_file(msgid.clone(), hash_b.clone()).await;
+    let resolved_a = client
+        .resolve_local_file(msgid.clone(), file_hash.clone())
+        .await;
+    let resolved_b = client
+        .resolve_local_file(msgid.clone(), hash_b.clone())
+        .await;
     assert!(resolved_a.is_some());
     assert!(resolved_b.is_some());
     assert_eq!(resolved_a.unwrap(), abs_path);
     assert_eq!(resolved_b.unwrap(), abs_path_b);
 
     // 6. Audio played state
-    assert!(!client.is_audio_played(msgid.clone(), file_hash.clone()).await);
-    client.set_audio_played(msgid.clone(), file_hash.clone()).await.unwrap();
-    assert!(client.is_audio_played(msgid.clone(), file_hash.clone()).await);
+    assert!(
+        !client
+            .is_audio_played(msgid.clone(), file_hash.clone())
+            .await
+    );
+    client
+        .set_audio_played(msgid.clone(), file_hash.clone())
+        .await
+        .unwrap();
+    assert!(
+        client
+            .is_audio_played(msgid.clone(), file_hash.clone())
+            .await
+    );
 
     // 7. Pending state — should NOT resolve
     let pending_hash = "pending123".to_string();
-    client.upsert_attachment(
-        "msg-pending".to_string(), pending_hash.clone(), room_id.clone(),
-        None, 0  // transfer_state = 0 (pending)
-    ).await.unwrap();
-    let pending_resolve = client.resolve_local_file("msg-pending".to_string(), pending_hash).await;
-    assert!(pending_resolve.is_none(), "pending attachment should not resolve");
+    client
+        .upsert_attachment(
+            "msg-pending".to_string(),
+            pending_hash.clone(),
+            room_id.clone(),
+            None,
+            0, // transfer_state = 0 (pending)
+        )
+        .await
+        .unwrap();
+    let pending_resolve = client
+        .resolve_local_file("msg-pending".to_string(), pending_hash)
+        .await;
+    assert!(
+        pending_resolve.is_none(),
+        "pending attachment should not resolve"
+    );
 
     tokio::task::spawn_blocking(move || drop(client))
         .await
@@ -577,10 +652,16 @@ async_test!(test_file_attachments_download_path, {
     let file_path = room_dir.join(file_name);
     std::fs::write(&file_path, b"decrypted image bytes").unwrap();
 
-    client.upsert_attachment(
-        msgid.clone(), hash.clone(), room_id.clone(),
-        Some(relative_path), 2
-    ).await.unwrap();
+    client
+        .upsert_attachment(
+            msgid.clone(),
+            hash.clone(),
+            room_id.clone(),
+            Some(relative_path),
+            2,
+        )
+        .await
+        .unwrap();
 
     // Resolve should return absolute path
     let resolved = client.resolve_local_file(msgid.clone(), hash.clone()).await;
@@ -593,7 +674,10 @@ async_test!(test_file_attachments_download_path, {
     // Delete file from disk — resolve should return None
     std::fs::remove_file(&file_path).unwrap();
     let resolved_after_delete = client.resolve_local_file(msgid.clone(), hash.clone()).await;
-    assert!(resolved_after_delete.is_none(), "should return None after file deleted from disk");
+    assert!(
+        resolved_after_delete.is_none(),
+        "should return None after file deleted from disk"
+    );
 
     tokio::task::spawn_blocking(move || drop(client))
         .await
@@ -644,9 +728,9 @@ where
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Ok(event)) if pred(&event) => return Some(event),
-            Ok(Ok(_)) => continue,        // wrong event, keep waiting
-            Ok(Err(_)) => return None,     // channel closed
-            Err(_) => return None,         // timeout
+            Ok(Ok(_)) => continue,     // wrong event, keep waiting
+            Ok(Err(_)) => return None, // channel closed
+            Err(_) => return None,     // timeout
         }
     }
 }
@@ -709,8 +793,7 @@ async_test!(test_friend_request_db_state, {
             eprintln!("Skipping relay test (network unavailable): {e}");
             return;
         });
-    bob
-        .connect(vec![TEST_RELAY.to_string()])
+    bob.connect(vec![TEST_RELAY.to_string()])
         .await
         .unwrap_or_else(|e| {
             eprintln!("Skipping relay test (network unavailable): {e}");
@@ -719,9 +802,13 @@ async_test!(test_friend_request_db_state, {
 
     // Start event loops
     let alice_clone = alice.clone();
-    tokio::spawn(async move { let _ = alice_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = alice_clone.start_event_loop().await;
+    });
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
 
     // Wait for relay connections to be fully established
     assert!(
@@ -773,10 +860,7 @@ async_test!(test_friend_request_db_state, {
 
     // ── DB Assertions: Alice ──
     let alice_rooms = alice.get_rooms(alice_pubkey.clone()).await.unwrap();
-    assert!(
-        !alice_rooms.is_empty(),
-        "Alice should have at least 1 room"
-    );
+    assert!(!alice_rooms.is_empty(), "Alice should have at least 1 room");
     let alice_room = alice_rooms
         .iter()
         .find(|r| r.to_main_pubkey == bob_pubkey)
@@ -858,8 +942,7 @@ async_test!(test_message_persisted_db, {
             eprintln!("Skipping relay test (network unavailable): {e}");
             return;
         });
-    bob
-        .connect(vec![TEST_RELAY.to_string()])
+    bob.connect(vec![TEST_RELAY.to_string()])
         .await
         .unwrap_or_else(|e| {
             eprintln!("Skipping relay test (network unavailable): {e}");
@@ -867,12 +950,22 @@ async_test!(test_message_persisted_db, {
         });
 
     let alice_clone = alice.clone();
-    tokio::spawn(async move { let _ = alice_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = alice_clone.start_event_loop().await;
+    });
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
 
-    assert!(wait_for_relay_connection(&alice, 15).await, "Alice should connect");
-    assert!(wait_for_relay_connection(&bob, 15).await, "Bob should connect");
+    assert!(
+        wait_for_relay_connection(&alice, 15).await,
+        "Alice should connect"
+    );
+    assert!(
+        wait_for_relay_connection(&bob, 15).await,
+        "Bob should connect"
+    );
 
     // ── Establish friendship ──
     alice
@@ -926,7 +1019,6 @@ async_test!(test_message_persisted_db, {
         .expect("Bob should have a room with Alice after friendship");
     let bob_room_id = bob_dm.id.clone();
 
-
     for (sender, text) in &messages {
         if *sender == "alice" {
             let sent = alice
@@ -935,9 +1027,11 @@ async_test!(test_message_persisted_db, {
                 .unwrap();
             assert!(!sent.event_id.is_empty());
             // Wait for Bob to receive
-            let msg_event = wait_for_event(&mut bob_rx, 30, |e| {
-                matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == text)
-            })
+            let msg_event = wait_for_event(
+                &mut bob_rx,
+                30,
+                |e| matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == text),
+            )
             .await;
             assert!(msg_event.is_some(), "Bob should receive: {}", text);
         } else {
@@ -947,9 +1041,11 @@ async_test!(test_message_persisted_db, {
                 .unwrap();
             assert!(!sent.event_id.is_empty());
             // Wait for Alice to receive
-            let msg_event = wait_for_event(&mut alice_rx, 30, |e| {
-                matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == text)
-            })
+            let msg_event = wait_for_event(
+                &mut alice_rx,
+                30,
+                |e| matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == text),
+            )
             .await;
             assert!(msg_event.is_some(), "Alice should receive: {}", text);
         }
@@ -970,7 +1066,11 @@ async_test!(test_message_persisted_db, {
         .iter()
         .filter(|m| !m.content.starts_with('['))
         .collect();
-    assert_eq!(alice_text_msgs.len(), 3, "Alice should have 3 text messages");
+    assert_eq!(
+        alice_text_msgs.len(),
+        3,
+        "Alice should have 3 text messages"
+    );
 
     // Verify message content and direction
     assert_eq!(alice_text_msgs[0].content, "hello from alice");
@@ -981,7 +1081,11 @@ async_test!(test_message_persisted_db, {
     assert!(alice_text_msgs[2].is_me_send);
 
     // Verify last message on room
-    let alice_room = alice.get_room(alice_room_id.clone()).await.unwrap().unwrap();
+    let alice_room = alice
+        .get_room(alice_room_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         alice_room.last_message_content.as_deref(),
         Some("third message from alice")
@@ -1065,29 +1169,52 @@ async_test!(test_group_db_state, {
     bob.set_event_listener(Box::new(bob_listener)).await;
     charlie.set_event_listener(Box::new(charlie_listener)).await;
 
-    alice.connect(vec![TEST_RELAY.to_string()]).await.unwrap_or_else(|e| {
-        eprintln!("Skipping relay test (network unavailable): {e}");
-        return;
-    });
-    bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap_or_else(|e| {
-        eprintln!("Skipping relay test (network unavailable): {e}");
-        return;
-    });
-    charlie.connect(vec![TEST_RELAY.to_string()]).await.unwrap_or_else(|e| {
-        eprintln!("Skipping relay test (network unavailable): {e}");
-        return;
-    });
+    alice
+        .connect(vec![TEST_RELAY.to_string()])
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Skipping relay test (network unavailable): {e}");
+            return;
+        });
+    bob.connect(vec![TEST_RELAY.to_string()])
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Skipping relay test (network unavailable): {e}");
+            return;
+        });
+    charlie
+        .connect(vec![TEST_RELAY.to_string()])
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Skipping relay test (network unavailable): {e}");
+            return;
+        });
 
     let alice_clone = alice.clone();
-    tokio::spawn(async move { let _ = alice_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = alice_clone.start_event_loop().await;
+    });
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
     let charlie_clone = charlie.clone();
-    tokio::spawn(async move { let _ = charlie_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = charlie_clone.start_event_loop().await;
+    });
 
-    assert!(wait_for_relay_connection(&alice, 15).await, "Alice should connect");
-    assert!(wait_for_relay_connection(&bob, 15).await, "Bob should connect");
-    assert!(wait_for_relay_connection(&charlie, 15).await, "Charlie should connect");
+    assert!(
+        wait_for_relay_connection(&alice, 15).await,
+        "Alice should connect"
+    );
+    assert!(
+        wait_for_relay_connection(&bob, 15).await,
+        "Bob should connect"
+    );
+    assert!(
+        wait_for_relay_connection(&charlie, 15).await,
+        "Charlie should connect"
+    );
 
     // ── Establish friendship: Alice ↔ Bob ──
     alice
@@ -1103,7 +1230,9 @@ async_test!(test_group_db_state, {
         ClientEvent::FriendRequestReceived { request_id, .. } => request_id,
         _ => unreachable!(),
     };
-    bob.accept_friend_request(req_id_ab, "Bob".into()).await.unwrap();
+    bob.accept_friend_request(req_id_ab, "Bob".into())
+        .await
+        .unwrap();
     wait_for_event(&mut alice_rx, 30, |e| {
         matches!(e, ClientEvent::FriendRequestAccepted { .. })
     })
@@ -1126,7 +1255,10 @@ async_test!(test_group_db_state, {
         ClientEvent::FriendRequestReceived { request_id, .. } => request_id,
         _ => unreachable!(),
     };
-    charlie.accept_friend_request(req_id_ac, "Charlie".into()).await.unwrap();
+    charlie
+        .accept_friend_request(req_id_ac, "Charlie".into())
+        .await
+        .unwrap();
     wait_for_event(&mut alice_rx, 30, |e| {
         matches!(e, ClientEvent::FriendRequestAccepted { .. })
     })
@@ -1216,17 +1348,17 @@ async_test!(test_group_db_state, {
         .await
         .unwrap();
     assert!(!group_sent.event_ids.is_empty());
-    assert!(!group_sent.msgid.is_empty(), "GroupSentMessage should have msgid");
+    assert!(
+        !group_sent.msgid.is_empty(),
+        "GroupSentMessage should have msgid"
+    );
 
     // Wait for Bob and Charlie to receive group message
     let bob_group_msg = wait_for_event(&mut bob_rx, 30, |e| {
         matches!(e, ClientEvent::MessageReceived { group_id: Some(_), content: Some(c), .. } if c == "hello group")
     })
     .await;
-    assert!(
-        bob_group_msg.is_some(),
-        "Bob should receive group message"
-    );
+    assert!(bob_group_msg.is_some(), "Bob should receive group message");
 
     let charlie_group_msg = wait_for_event(&mut charlie_rx, 30, |e| {
         matches!(e, ClientEvent::MessageReceived { group_id: Some(_), content: Some(c), .. } if c == "hello group")
@@ -1299,9 +1431,13 @@ async fn create_friends() -> (
     bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
 
     let alice_clone = alice.clone();
-    tokio::spawn(async move { let _ = alice_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = alice_clone.start_event_loop().await;
+    });
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
 
     assert!(wait_for_relay_connection(&alice, 15).await);
     assert!(wait_for_relay_connection(&bob, 15).await);
@@ -1373,8 +1509,7 @@ async_test!(test_message_ordering_rapid_fire, {
 
     // Wait for Bob to receive all messages
     let mut received_count = 0;
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     while received_count < 10 {
         match tokio::time::timeout_at(deadline, bob_rx.recv()).await {
             Ok(Ok(ClientEvent::MessageReceived {
@@ -1392,15 +1527,16 @@ async_test!(test_message_ordering_rapid_fire, {
 
     // DB Assertion: messages should be in correct order
     let bob_room_id = get_dm_room_id(&bob, &bob_pubkey, &alice_pubkey).await;
-    let bob_msgs = bob
-        .get_messages(bob_room_id, 50, 0)
-        .await
-        .unwrap();
+    let bob_msgs = bob.get_messages(bob_room_id, 50, 0).await.unwrap();
     let rapid_msgs: Vec<_> = bob_msgs
         .iter()
         .filter(|m| m.content.starts_with("rapid-"))
         .collect();
-    assert_eq!(rapid_msgs.len(), 10, "Bob DB should have all 10 rapid messages");
+    assert_eq!(
+        rapid_msgs.len(),
+        10,
+        "Bob DB should have all 10 rapid messages"
+    );
 
     // Verify ordering
     for (i, msg) in rapid_msgs.iter().enumerate() {
@@ -1427,8 +1563,7 @@ async_test!(test_message_ordering_rapid_fire, {
 // ─── Reliability: Offline Message Delivery ───────────────────────
 
 async_test!(test_offline_message_delivery, {
-    let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, _bob_rx, _dir) =
-        create_friends().await;
+    let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, _bob_rx, _dir) = create_friends().await;
 
     let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
 
@@ -1455,7 +1590,9 @@ async_test!(test_offline_message_delivery, {
     bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
 
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
 
     assert!(
         wait_for_relay_connection(&bob, 15).await,
@@ -1464,8 +1601,7 @@ async_test!(test_offline_message_delivery, {
 
     // Wait for offline messages to arrive
     let mut received_count = 0;
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while received_count < 3 {
         match tokio::time::timeout_at(deadline, bob_rx2.recv()).await {
             Ok(Ok(ClientEvent::MessageReceived {
@@ -1486,10 +1622,7 @@ async_test!(test_offline_message_delivery, {
 
     // DB Assertion
     let bob_room_id = get_dm_room_id(&bob, &bob_pubkey, &alice_pubkey).await;
-    let bob_msgs = bob
-        .get_messages(bob_room_id, 50, 0)
-        .await
-        .unwrap();
+    let bob_msgs = bob.get_messages(bob_room_id, 50, 0).await.unwrap();
     let offline_msgs: Vec<_> = bob_msgs
         .iter()
         .filter(|m| m.content.starts_with("offline-msg-"))
@@ -1523,7 +1656,13 @@ async_test!(test_reconnect_no_message_loss, {
 
     // Phase 1: send message before disconnect
     alice
-        .send_text(alice_room_id.clone(), "before-disconnect".into(), None, None, None)
+        .send_text(
+            alice_room_id.clone(),
+            "before-disconnect".into(),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     wait_for_event(&mut bob_rx, 30, |e| {
@@ -1542,14 +1681,22 @@ async_test!(test_reconnect_no_message_loss, {
     bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
 
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
     assert!(wait_for_relay_connection(&bob, 15).await);
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Phase 3: send message after reconnect
     alice
-        .send_text(alice_room_id.clone(), "after-reconnect".into(), None, None, None)
+        .send_text(
+            alice_room_id.clone(),
+            "after-reconnect".into(),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let post_msg = wait_for_event(&mut bob_rx2, 30, |e| {
@@ -1564,10 +1711,7 @@ async_test!(test_reconnect_no_message_loss, {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // DB Assertion: both messages should be in DB
-    let bob_msgs = bob
-        .get_messages(bob_room_id, 50, 0)
-        .await
-        .unwrap();
+    let bob_msgs = bob.get_messages(bob_room_id, 50, 0).await.unwrap();
     let text_msgs: Vec<_> = bob_msgs
         .iter()
         .filter(|m| !m.content.starts_with('['))
@@ -1646,7 +1790,9 @@ async_test!(test_concurrent_bidirectional, {
                 content: Some(c), ..
             })) if c.starts_with("alice-concurrent-") => {
                 bob_received.push(c);
-                if bob_received.len() >= 3 { break; }
+                if bob_received.len() >= 3 {
+                    break;
+                }
             }
             Ok(Ok(_)) => continue,
             _ => break,
@@ -1660,7 +1806,9 @@ async_test!(test_concurrent_bidirectional, {
                 content: Some(c), ..
             })) if c.starts_with("bob-concurrent-") => {
                 alice_received.push(c);
-                if alice_received.len() >= 3 { break; }
+                if alice_received.len() >= 3 {
+                    break;
+                }
             }
             Ok(Ok(_)) => continue,
             _ => break,
@@ -1734,9 +1882,11 @@ async_test!(test_disconnect_without_stop_event_loop, {
         .send_text(alice_room_id.clone(), "phase1".into(), None, None, None)
         .await
         .unwrap();
-    wait_for_event(&mut bob_rx, 30, |e| {
-        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "phase1")
-    })
+    wait_for_event(
+        &mut bob_rx,
+        30,
+        |e| matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "phase1"),
+    )
     .await
     .expect("Bob should receive phase1 message");
 
@@ -1750,7 +1900,9 @@ async_test!(test_disconnect_without_stop_event_loop, {
     bob.set_event_listener(Box::new(bob_listener2)).await;
     bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
     assert!(
         wait_for_relay_connection(&bob, 15).await,
         "Bob should reconnect"
@@ -1762,9 +1914,11 @@ async_test!(test_disconnect_without_stop_event_loop, {
         .send_text(alice_room_id.clone(), "phase2".into(), None, None, None)
         .await
         .unwrap();
-    wait_for_event(&mut bob_rx2, 30, |e| {
-        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "phase2")
-    })
+    wait_for_event(
+        &mut bob_rx2,
+        30,
+        |e| matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "phase2"),
+    )
     .await
     .expect("Bob should receive phase2 message after reconnect");
 
@@ -1798,12 +1952,20 @@ async_test!(test_start_event_loop_twice_no_duplicate_delivery, {
     // Call start_event_loop() a second time on Bob (simulates internal restart
     // after auto-reconnect). The new call should unsubscribe the old REQ first.
     let bob_clone = bob.clone();
-    tokio::spawn(async move { let _ = bob_clone.start_event_loop().await; });
+    tokio::spawn(async move {
+        let _ = bob_clone.start_event_loop().await;
+    });
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Alice sends a single message.
     alice
-        .send_text(alice_room_id.clone(), "dedup-check".into(), None, None, None)
+        .send_text(
+            alice_room_id.clone(),
+            "dedup-check".into(),
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1812,14 +1974,19 @@ async_test!(test_start_event_loop_twice_no_duplicate_delivery, {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         match tokio::time::timeout_at(deadline, bob_rx.recv()).await {
-            Ok(Ok(ClientEvent::MessageReceived { content: Some(c), .. })) if c == "dedup-check" => {
+            Ok(Ok(ClientEvent::MessageReceived {
+                content: Some(c), ..
+            })) if c == "dedup-check" => {
                 count += 1;
             }
             Ok(Ok(_)) => continue,
             _ => break,
         }
     }
-    assert_eq!(count, 1, "Message should be received exactly once, got {count}");
+    assert_eq!(
+        count, 1,
+        "Message should be received exactly once, got {count}"
+    );
 
     let _ = alice.stop_event_loop().await;
     let _ = bob.stop_event_loop().await;
@@ -1868,7 +2035,11 @@ async_test!(test_file_message_send_receive, {
     };
 
     // Alice sends file message to Bob (using room_id, not pubkey)
-    alice.send_file(alice_room_id.clone(), vec![payload], None, None).await.unwrap();
+    alice
+        .app_client()
+        .send_file(alice_room_id.clone(), vec![payload], None, None)
+        .await
+        .unwrap();
 
     // Wait for Bob to receive the file message
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1905,9 +2076,10 @@ async_test!(test_file_message_send_receive, {
     // Verify Bob can see the file message in his room
     let bob_msgs = bob.get_messages(bob_room_id.clone(), 10, 0).await.unwrap();
     let file_msg = bob_msgs.iter().find(|m| {
-        m.payload_json.as_ref().and_then(|json| {
-            commands::parse_file_message(json)
-        }).is_some()
+        m.payload_json
+            .as_ref()
+            .and_then(|json| commands::parse_file_message(json))
+            .is_some()
     });
     assert!(file_msg.is_some(), "Bob should have file message in DB");
 
@@ -1934,7 +2106,9 @@ async_test!(test_auto_download_small_file, {
     let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
 
     // Set Bob's auto-download limit to 1MB (default is 20MB)
-    bob.set_setting("autoDownloadLimitMB".into(), "1".into()).await.unwrap();
+    bob.set_setting("autoDownloadLimitMB".into(), "1".into())
+        .await
+        .unwrap();
 
     // Create a small test file (within auto-download limit)
     let test_content = b"Small auto-download test file content";
@@ -1957,7 +2131,11 @@ async_test!(test_auto_download_small_file, {
     };
 
     // Send file message (using room_id)
-    alice.send_file(alice_room_id.clone(), vec![payload], None, None).await.unwrap();
+    alice
+        .app_client()
+        .send_file(alice_room_id.clone(), vec![payload], None, None)
+        .await
+        .unwrap();
 
     // Wait for Bob to receive file message and auto-download to complete
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2026,9 +2204,9 @@ async_test!(test_daemon_upload_file, {
     let db_path = temp_db(&dir, "upload.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Create a test file
     let test_file = dir.path().join("test_upload.txt");
@@ -2067,10 +2245,15 @@ async_test!(test_daemon_upload_file, {
     } else {
         // Upload failed (likely network)
         assert_eq!(json["ok"], false);
-        eprintln!("Upload test skipped (network unavailable): {}", json["error"]);
+        eprintln!(
+            "Upload test skipped (network unavailable): {}",
+            json["error"]
+        );
     }
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(test_daemon_upload_nonexistent_file, {
@@ -2083,9 +2266,9 @@ async_test!(test_daemon_upload_nonexistent_file, {
     let db_path = temp_db(&dir, "upload2.db");
     let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let req_body = serde_json::json!({
         "file_path": "/nonexistent/file.txt"
@@ -2109,7 +2292,9 @@ async_test!(test_daemon_upload_nonexistent_file, {
     assert_eq!(json["ok"], false);
     assert!(json["error"].as_str().unwrap().contains("not found"));
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });
 
 async_test!(test_daemon_download_file, {
@@ -2126,15 +2311,16 @@ async_test!(test_daemon_download_file, {
     let client = Arc::new(KeychatClient::new(db_path, "test-key".into()).unwrap());
     let _files_dir = client.get_files_dir();
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     let room_id = "room-http-test".to_string();
 
     // First, try Blossom upload/download round-trip
     let data = b"test download via HTTP API".to_vec();
-    let upload_result = keychat_uniffi::encrypt_and_upload(data.clone(), "https://blossom.band".to_string()).await;
+    let upload_result =
+        keychat_uniffi::encrypt_and_upload(data.clone(), "https://blossom.band".to_string()).await;
 
     match upload_result {
         Ok(result) => {
@@ -2224,19 +2410,22 @@ async_test!(test_daemon_files_list_empty, {
     // Create identity for the client
     let identity = client.create_identity().await.unwrap();
 
-    let (event_tx, _) = broadcast::channel::<ClientEvent>(16);
-    let (data_tx, _) = broadcast::channel::<DataChange>(16);
-    let app = keychat_cli::daemon::build_router(client.clone(), event_tx, data_tx);
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
 
     // Create a room
-    let room_id = client.save_app_room_ffi(
-        identity.pubkey_hex.clone(),
-        identity.pubkey_hex.clone(),
-        RoomStatus::Enabled,
-        RoomType::Dm,
-        Some("Test Room".to_string()),
-        None,
-    ).await.unwrap();
+    let room_id = client
+        .save_app_room_ffi(
+            identity.pubkey_hex.clone(),
+            identity.pubkey_hex.clone(),
+            RoomStatus::Enabled,
+            RoomType::Dm,
+            Some("Test Room".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
 
     // Query the files endpoint for empty room
     let response = app
@@ -2258,5 +2447,7 @@ async_test!(test_daemon_files_list_empty, {
     let files = json["data"].as_array().unwrap();
     assert_eq!(files.len(), 0, "Empty room should return empty file list");
 
-    tokio::task::spawn_blocking(move || drop(client)).await.unwrap();
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
 });

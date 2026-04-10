@@ -1,6 +1,6 @@
 //! HTTP daemon mode for keychat-cli.
 //!
-//! Provides a REST API + SSE event stream backed by `KeychatClient`.
+//! Provides a REST API + SSE event stream backed by `AppClient`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -15,9 +15,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use keychat_uniffi::{
-    ClientEvent, ConnectionStatus, DataChange, FileCategory, GroupChangeKind, GroupMemberInput,
-    KeychatClient, MessageKind, MessageStatus, RoomStatus, RoomType,
+use keychat_app_core::{
+    AppClient, ClientEvent, ConnectionStatus, DataChange, FileCategory, GroupChangeKind,
+    GroupMemberInput, MessageKind, MessageStatus, RoomStatus, RoomType,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -27,7 +27,7 @@ use tokio_stream::StreamExt;
 
 #[derive(Clone)]
 struct AppState {
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
 }
@@ -39,7 +39,10 @@ pub(crate) fn ok_json<T: Serialize>(data: T) -> (StatusCode, Json<serde_json::Va
     (StatusCode::OK, Json(body))
 }
 
-pub(crate) fn err_json(status: StatusCode, msg: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn err_json(
+    status: StatusCode,
+    msg: impl ToString,
+) -> (StatusCode, Json<serde_json::Value>) {
     let body = serde_json::json!({ "ok": false, "error": msg.to_string() });
     (status, Json(body))
 }
@@ -67,7 +70,7 @@ fn room_type_str(t: &RoomType) -> &'static str {
     match t {
         RoomType::Dm => "dm",
         RoomType::SignalGroup => "signal_group",
-        RoomType::MlsGroup => "mls_group",
+        RoomType::MlsGroup | RoomType::Nip17Dm => "mls_group",
     }
 }
 
@@ -136,7 +139,7 @@ fn group_change_kind_str(k: &GroupChangeKind) -> &'static str {
 /// Build the axum Router with all routes. Extracted so tests can call it
 /// without starting a TCP listener.
 pub fn build_router(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
 ) -> Router {
@@ -187,13 +190,13 @@ pub fn build_router(
 // ─── Entry Point ────────────────────────────────────────────────
 
 pub async fn run(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
     port: u16,
 ) -> anyhow::Result<()> {
     // Shared startup: restore identity → sessions → connect → event loop
-    let relay_urls = keychat_uniffi::default_relays();
+    let relay_urls = keychat_app_core::default_relays();
     crate::commands::init_and_connect(&client, relay_urls).await;
 
     let router = build_router(client, event_tx, data_tx);
@@ -211,9 +214,7 @@ pub async fn run(
 // Identity
 // ═══════════════════════════════════════════════════════════════
 
-async fn get_identity(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn get_identity(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match state.client.get_pubkey_hex().await {
         Ok(pubkey) => {
             let identities = state.client.get_identities().await.unwrap_or_default();
@@ -228,9 +229,7 @@ async fn get_identity(
     }
 }
 
-async fn create_identity(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn create_identity(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match crate::commands::create_identity(&state.client, "CLI User").await {
         Ok((pubkey_hex, npub, mnemonic)) => {
             tracing::warn!("⚠️  Mnemonic returned in HTTP response — save it immediately, it will not be shown again");
@@ -275,25 +274,19 @@ async fn connect_relays(
     Json(req): Json<ConnectReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.client.connect(req.relays).await {
-        Ok(()) => {
-            ok_json(serde_json::json!({ "connected": true }))
-        }
+        Ok(()) => ok_json(serde_json::json!({ "connected": true })),
         Err(e) => internal_err(e),
     }
 }
 
-async fn disconnect_relays(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn disconnect_relays(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match state.client.disconnect().await {
         Ok(()) => ok_json(serde_json::json!({ "disconnected": true })),
         Err(e) => internal_err(e),
     }
 }
 
-async fn get_relays(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn get_relays(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match state.client.get_relay_statuses().await {
         Ok(statuses) => {
             let list: Vec<_> = statuses
@@ -306,12 +299,13 @@ async fn get_relays(
     }
 }
 
-async fn get_status(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn get_status(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let identity = state.client.get_pubkey_hex().await.ok();
     let relay_statuses = state.client.get_relay_statuses().await.unwrap_or_default();
-    let connected_count = relay_statuses.iter().filter(|s| s.status == "connected").count();
+    let connected_count = relay_statuses
+        .iter()
+        .filter(|s| s.status == "connected")
+        .count();
     let connection_status = if identity.is_none() {
         "no_identity"
     } else if connected_count > 0 {
@@ -418,23 +412,20 @@ async fn send_message(
     Json(req): Json<SendMessageReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match crate::commands::send_message(&state.client, &req.room_id, &req.text).await {
-        Ok(crate::commands::SendResult::Dm { event_id, relay_count }) => {
-            ok_json(serde_json::json!({
-                "event_id": event_id,
-                "relay_count": relay_count,
-            }))
-        }
-        Ok(crate::commands::SendResult::Group { event_count }) => {
-            ok_json(serde_json::json!({
-                "type": "group",
-                "event_count": event_count,
-            }))
-        }
-        Ok(crate::commands::SendResult::MlsNotSupported) => {
-            bad_request(keychat_uniffi::KeychatUniError::InvalidArgument {
-                msg: "MLS groups not yet supported".into(),
-            })
-        }
+        Ok(crate::commands::SendResult::Dm {
+            event_id,
+            relay_count,
+        }) => ok_json(serde_json::json!({
+            "event_id": event_id,
+            "relay_count": relay_count,
+        })),
+        Ok(crate::commands::SendResult::Group { event_count }) => ok_json(serde_json::json!({
+            "type": "group",
+            "event_count": event_count,
+        })),
+        Ok(crate::commands::SendResult::MlsNotSupported) => bad_request(
+            keychat_app_core::AppError::InvalidArgument("MLS groups not yet supported".into()),
+        ),
         Err(e) => bad_request(e),
     }
 }
@@ -512,19 +503,15 @@ async fn send_file(
         Ok(crate::commands::SendResult::Dm {
             event_id,
             relay_count,
-        }) => {
-            ok_json(serde_json::json!({
-                "event_id": event_id,
-                "relay_count": relay_count,
-                "files": files_json,
-            }))
-        }
-        Ok(crate::commands::SendResult::Group { event_count }) => {
-            ok_json(serde_json::json!({
-                "type": "group",
-                "event_count": event_count,
-            }))
-        }
+        }) => ok_json(serde_json::json!({
+            "event_id": event_id,
+            "relay_count": relay_count,
+            "files": files_json,
+        })),
+        Ok(crate::commands::SendResult::Group { event_count }) => ok_json(serde_json::json!({
+            "type": "group",
+            "event_count": event_count,
+        })),
         Ok(crate::commands::SendResult::MlsNotSupported) => {
             bad_request("MLS groups not yet supported")
         }
@@ -532,9 +519,7 @@ async fn send_file(
     }
 }
 
-async fn list_rooms(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn list_rooms(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let pubkey = match state.client.get_pubkey_hex().await {
         Ok(pk) => pk,
         Err(e) => return bad_request(e),
@@ -581,7 +566,11 @@ async fn get_messages(
     Path(room_id): Path<String>,
     Query(query): Query<MessageQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.client.get_messages(room_id, query.limit, query.offset).await {
+    match state
+        .client
+        .get_messages(room_id, query.limit, query.offset)
+        .await
+    {
         Ok(messages) => {
             let list: Vec<_> = messages
                 .into_iter()
@@ -606,9 +595,7 @@ async fn get_messages(
     }
 }
 
-async fn retry_failed(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn retry_failed(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match state.client.retry_failed_messages().await {
         Ok(count) => ok_json(serde_json::json!({ "retried": count })),
         Err(e) => internal_err(e),
@@ -719,11 +706,7 @@ async fn kick_member(
     Path(group_id): Path<String>,
     Json(req): Json<KickMemberReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state
-        .client
-        .remove_group_member(group_id, req.pubkey)
-        .await
-    {
+    match state.client.remove_group_member(group_id, req.pubkey).await {
         Ok(()) => ok_json(serde_json::json!({ "kicked": true })),
         Err(e) => bad_request(e),
     }
@@ -735,7 +718,7 @@ async fn kick_member(
 
 /// Handle auto-download for file messages in daemon mode.
 fn spawn_file_auto_download_daemon(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     room_id: String,
     event_id: String,
     payload_json: String,
@@ -750,7 +733,11 @@ fn spawn_file_auto_download_daemon(
         // Process each file item
         for item in &parsed.items {
             // Check if already downloaded
-            if client.resolve_local_file(event_id.clone(), item.hash.clone()).await.is_some() {
+            if client
+                .resolve_local_file(event_id.clone(), item.hash.clone())
+                .await
+                .is_some()
+            {
                 continue;
             }
 
@@ -758,7 +745,11 @@ fn spawn_file_auto_download_daemon(
             match client.should_auto_download(item.size).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    tracing::info!("[daemon] Skipping auto-download for {} (size {} exceeds limit)", item.display_name(), item.size);
+                    tracing::info!(
+                        "[daemon] Skipping auto-download for {} (size {} exceeds limit)",
+                        item.display_name(),
+                        item.size
+                    );
                     continue;
                 }
                 Err(e) => {
@@ -769,21 +760,27 @@ fn spawn_file_auto_download_daemon(
 
             // Download the file
             tracing::info!("[daemon] Auto-downloading file: {}", item.display_name());
-            match client.download_and_save(
-                item.url.clone(),
-                item.key.clone(),
-                item.iv.clone(),
-                item.hash.clone(),
-                item.source_name.clone(),
-                item.suffix.clone(),
-                room_id.clone(),
-                Some(event_id.clone()),
-            ).await {
+            match client
+                .download_and_save(
+                    item.url.clone(),
+                    item.key.clone(),
+                    item.iv.clone(),
+                    item.hash.clone(),
+                    item.source_name.clone(),
+                    item.suffix.clone(),
+                    room_id.clone(),
+                    Some(event_id.clone()),
+                )
+                .await
+            {
                 Ok(path) => {
                     tracing::info!("[daemon] Auto-downloaded file to: {path}");
                 }
                 Err(e) => {
-                    tracing::warn!("[daemon] Failed to auto-download file {}: {e}", item.display_name());
+                    tracing::warn!(
+                        "[daemon] Failed to auto-download file {}: {e}",
+                        item.display_name()
+                    );
                 }
             }
         }
@@ -809,7 +806,8 @@ async fn sse_events(
                 payload: Some(ref payload_json),
                 ref event_id,
                 ..
-            } = event {
+            } = event
+            {
                 spawn_file_auto_download_daemon(
                     Arc::clone(&client),
                     room_id.clone(),
@@ -1056,9 +1054,7 @@ fn serialize_data_change(change: &DataChange) -> String {
 // Contacts
 // ═══════════════════════════════════════════════════════════════
 
-async fn list_contacts(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn list_contacts(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let pubkey = match state.client.get_pubkey_hex().await {
         Ok(pk) => pk,
         Err(e) => return bad_request(e),
@@ -1108,25 +1104,23 @@ async fn upload_file(
     }
 
     // Get server URL
-    let server = req.server.unwrap_or_else(|| {
-        keychat_uniffi::default_blossom_server()
-    });
+    let server = req
+        .server
+        .unwrap_or_else(|| keychat_app_core::default_blossom_server());
 
     // Upload file
     match crate::commands::upload_and_prepare_file(path, &server).await {
-        Ok(payload) => {
-            ok_json(serde_json::json!({
-                "url": payload.url,
-                "key": payload.key,
-                "iv": payload.iv,
-                "hash": payload.hash,
-                "size": payload.size,
-                "category": file_category_str(&payload.category),
-                "mime_type": payload.mime_type,
-                "suffix": payload.suffix,
-                "source_name": payload.source_name,
-            }))
-        }
+        Ok(payload) => ok_json(serde_json::json!({
+            "url": payload.url,
+            "key": payload.key,
+            "iv": payload.iv,
+            "hash": payload.hash,
+            "size": payload.size,
+            "category": file_category_str(&payload.category),
+            "mime_type": payload.mime_type,
+            "suffix": payload.suffix,
+            "source_name": payload.source_name,
+        })),
         Err(e) => bad_request(format!("Upload failed: {e}")),
     }
 }
@@ -1158,16 +1152,20 @@ async fn download_file(
     State(state): State<AppState>,
     Json(req): Json<DownloadFileReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.client.download_and_save(
-        req.url,
-        req.key,
-        req.iv,
-        req.hash,
-        req.source_name,
-        req.suffix,
-        req.room_id,
-        req.event_id,
-    ).await {
+    match state
+        .client
+        .download_and_save(
+            req.url,
+            req.key,
+            req.iv,
+            req.hash,
+            req.source_name,
+            req.suffix,
+            req.room_id,
+            req.event_id,
+        )
+        .await
+    {
         Ok(path) => ok_json(serde_json::json!({ "path": path })),
         Err(e) => bad_request(format!("Download failed: {e}")),
     }
@@ -1183,7 +1181,11 @@ async fn list_files(
     Query(query): Query<ListFilesQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Fetch messages and find file messages
-    match state.client.get_messages(query.room_id.clone(), 100, 0).await {
+    match state
+        .client
+        .get_messages(query.room_id.clone(), 100, 0)
+        .await
+    {
         Ok(messages) => {
             let mut files: Vec<serde_json::Value> = Vec::new();
 
@@ -1192,7 +1194,8 @@ async fn list_files(
                     if let Some(parsed) = crate::commands::parse_file_message(payload_json) {
                         for item in &parsed.items {
                             // Check if downloaded
-                            let is_downloaded = state.client
+                            let is_downloaded = state
+                                .client
                                 .resolve_local_file(msg.msgid.clone(), item.hash.clone())
                                 .await
                                 .is_some();

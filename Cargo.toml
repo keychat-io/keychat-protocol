@@ -1,3 +1,17 @@
 [workspace]
-members = ["libkeychat", "keychat-uniffi", "keychat-cli"]
+members = ["libkeychat", "keychat-app-core", "keychat-uniffi", "keychat-cli"]
 resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nostr = { version = "0.37", features = ["nip44", "nip06"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hex = "0.4"
+base64 = "0.22"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"

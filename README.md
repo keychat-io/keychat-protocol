@@ -14,6 +14,7 @@ Keychat protocol is a sovereign messaging stack that integrates five layers:
 
 - **[libkeychat](libkeychat/)** — Rust implementation of the Keychat protocol
 - **[keychat-uniffi](keychat-uniffi/)** — UniFFI bindings for Swift/Kotlin/Python clients
+- **[Architecture](docs/ARCHITECTURE.md)** — Crate structure, dependency graph, and integration paths
 - **[Keychat Spec](SPEC.md)** — Authoritative protocol specification (v0.4.0-draft)
 - **[Client Guide](libkeychat/docs/client-guide.md)** — KeychatClient API guide and usage examples
 

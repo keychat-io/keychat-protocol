@@ -1,6 +1,6 @@
 /// Build a composite room ID from peer pubkey and identity pubkey.
 pub(crate) fn make_room_id(peer_pubkey: &str, identity_pubkey: &str) -> String {
-    format!("{}:{}", peer_pubkey, identity_pubkey)
+    keychat_app_core::types::make_room_id(peer_pubkey, identity_pubkey)
 }
 
 // ─── Records ─────────────────────────────────────────────────────
@@ -297,10 +297,10 @@ pub struct RelayStatusInfo {
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RoomStatus {
-    Requesting,  // 0
-    Enabled,     // 1
-    Approving,   // 2
-    Rejected,    // -1
+    Requesting, // 0
+    Enabled,    // 1
+    Approving,  // 2
+    Rejected,   // -1
 }
 
 impl RoomStatus {
@@ -326,8 +326,8 @@ impl RoomStatus {
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RoomType {
-    Dm,           // 0 — Signal-encrypted 1:1 DM
-    SignalGroup,  // 1
+    Dm,          // 0 — Signal-encrypted 1:1 DM
+    SignalGroup, // 1
     MlsGroup,    // 2
     Nip17Dm,     // 3 — Standard NIP-17 DM (no Signal session, NIP-44 only)
 }
@@ -355,9 +355,9 @@ impl RoomType {
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MessageStatus {
-    Sending,   // 0
-    Success,   // 1
-    Failed,    // 2
+    Sending, // 0
+    Success, // 1
+    Failed,  // 2
 }
 
 impl MessageStatus {
@@ -449,15 +449,30 @@ pub struct ContactInfoFull {
 
 #[derive(uniffi::Enum, Clone, Debug)]
 pub enum DataChange {
-    RoomUpdated { room_id: String },
-    RoomDeleted { room_id: String },
+    RoomUpdated {
+        room_id: String,
+    },
+    RoomDeleted {
+        room_id: String,
+    },
     RoomListChanged,
-    MessageAdded { room_id: String, msgid: String },
-    MessageUpdated { room_id: String, msgid: String },
-    ContactUpdated { pubkey: String },
+    MessageAdded {
+        room_id: String,
+        msgid: String,
+    },
+    MessageUpdated {
+        room_id: String,
+        msgid: String,
+    },
+    ContactUpdated {
+        pubkey: String,
+    },
     ContactListChanged,
     IdentityListChanged,
-    ConnectionStatusChanged { status: ConnectionStatus, message: Option<String> },
+    ConnectionStatusChanged {
+        status: ConnectionStatus,
+        message: Option<String>,
+    },
 }
 
 // ─── Callback Interfaces ────────────────────────────────────────

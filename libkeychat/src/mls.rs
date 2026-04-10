@@ -36,6 +36,20 @@ const NOSTR_GROUP_EXTENSION_TYPE: u16 = 0xF233;
 /// MLS export secret label for deriving the temp inbox address.
 const MLS_TEMP_INBOX_LABEL: &str = "keychat-mls-temp-inbox";
 
+/// Result of decrypting an MLS message — distinguishes application data from control messages.
+#[derive(Debug, Clone)]
+pub enum MlsDecryptResult {
+    /// Application plaintext + sender identity.
+    Application {
+        plaintext: Vec<u8>,
+        sender_id: String,
+    },
+    /// A Commit was processed (epoch advanced). No application payload.
+    Commit { sender_id: String },
+    /// A Proposal was received. No application payload.
+    Proposal { sender_id: String },
+}
+
 // ─── MlsProvider ────────────────────────────────────────────────────────────
 
 /// Wrapper around OpenMLS provider with in-memory SQLite storage.
@@ -253,6 +267,36 @@ impl MlsParticipant {
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut group = self.load_group(group_id)?;
 
+        // Filter out key packages whose signature key already exists in the group
+        // to avoid "Duplicate signature key in proposals and group" error
+        let existing_sig_keys: std::collections::HashSet<Vec<u8>> =
+            group.members().map(|m| m.signature_key).collect();
+        let total = key_packages.len();
+        let key_packages: Vec<KeyPackage> = key_packages
+            .into_iter()
+            .filter(|kp| !existing_sig_keys.contains(kp.leaf_node().signature_key().as_slice()))
+            .collect();
+        let skipped = total - key_packages.len();
+        if key_packages.is_empty() {
+            if total == 1 {
+                return Err(KeychatError::Mls(
+                    "The member is already in the group".to_string(),
+                ));
+            } else {
+                return Err(KeychatError::Mls(format!(
+                    "All {} members are already in the group",
+                    total
+                )));
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "Skipped {} already-in-group member(s), adding remaining {}.",
+                skipped,
+                key_packages.len()
+            );
+        }
+
         let (commit, welcome, _group_info) = group
             .add_members(self.provider.inner(), &self.signer, &key_packages)
             .map_err(|e| KeychatError::Mls(format!("add_members error: {e}")))?;
@@ -328,9 +372,9 @@ impl MlsParticipant {
         Ok(bytes)
     }
 
-    /// Decrypt an MLS application message for the group.
-    /// Returns the plaintext bytes and sender identity.
-    pub fn decrypt(&self, group_id: &str, ciphertext: &[u8]) -> Result<(Vec<u8>, String)> {
+    /// Decrypt an MLS message for the group.
+    /// Returns a typed [`MlsDecryptResult`] distinguishing application data from control messages.
+    pub fn decrypt(&self, group_id: &str, ciphertext: &[u8]) -> Result<MlsDecryptResult> {
         let mut group = self.load_group(group_id)?;
 
         let msg_in = MlsMessageIn::tls_deserialize_exact(ciphertext).map_err(|e| {
@@ -364,17 +408,20 @@ impl MlsParticipant {
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                Ok((app_msg.into_bytes(), sender_id))
+                Ok(MlsDecryptResult::Application {
+                    plaintext: app_msg.into_bytes(),
+                    sender_id,
+                })
             }
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                // Process the commit to advance the epoch
                 group
                     .merge_staged_commit(self.provider.inner(), *staged_commit)
                     .map_err(|e| KeychatError::Mls(format!("merge staged commit: {e}")))?;
-                // Return empty plaintext for commits (they're control messages)
-                Ok((Vec::new(), sender_id))
+                Ok(MlsDecryptResult::Commit { sender_id })
             }
-            ProcessedMessageContent::ProposalMessage(_) => Ok((Vec::new(), sender_id)),
+            ProcessedMessageContent::ProposalMessage(_) => {
+                Ok(MlsDecryptResult::Proposal { sender_id })
+            }
             _ => Err(KeychatError::Mls(
                 "unexpected message content type".to_string(),
             )),
@@ -690,44 +737,59 @@ pub fn receive_mls_message(
         .map_err(|e| KeychatError::Mls(format!("base64 decode error: {e}")))?;
 
     // MLS decrypt
-    let (plaintext, sender_id) = participant.decrypt(group_id, &ciphertext)?;
+    let result = participant.decrypt(group_id, &ciphertext)?;
 
-    let is_commit = plaintext.is_empty();
-
-    if is_commit {
-        // Commit messages have no application payload
-        let metadata = MlsMessageMetadata {
+    match result {
+        MlsDecryptResult::Application {
+            plaintext,
             sender_id,
-            is_commit: true,
-        };
-        // Return a minimal KCMessage for commits
-        let msg = KCMessage {
-            v: 2,
-            kind: KCMessageKind::Text,
-            text: Some(crate::message::KCTextPayload {
-                content: String::new(),
-                format: None,
-            }),
-            group_id: Some(group_id.to_string()),
-            ..KCMessage::empty()
-        };
-        return Ok((msg, metadata));
+        } => {
+            let json_str = String::from_utf8(plaintext)
+                .map_err(|e| KeychatError::Mls(format!("plaintext not utf8: {e}")))?;
+            let message = KCMessage::try_parse(&json_str).ok_or_else(|| {
+                KeychatError::Mls("failed to parse KCMessage from MLS plaintext".to_string())
+            })?;
+            let metadata = MlsMessageMetadata {
+                sender_id,
+                is_commit: false,
+            };
+            Ok((message, metadata))
+        }
+        MlsDecryptResult::Commit { sender_id } => {
+            let msg = KCMessage {
+                v: 2,
+                kind: KCMessageKind::Text,
+                text: Some(crate::message::KCTextPayload {
+                    content: String::new(),
+                    format: None,
+                }),
+                group_id: Some(group_id.to_string()),
+                ..KCMessage::empty()
+            };
+            let metadata = MlsMessageMetadata {
+                sender_id,
+                is_commit: true,
+            };
+            Ok((msg, metadata))
+        }
+        MlsDecryptResult::Proposal { sender_id } => {
+            let msg = KCMessage {
+                v: 2,
+                kind: KCMessageKind::Text,
+                text: Some(crate::message::KCTextPayload {
+                    content: String::new(),
+                    format: None,
+                }),
+                group_id: Some(group_id.to_string()),
+                ..KCMessage::empty()
+            };
+            let metadata = MlsMessageMetadata {
+                sender_id,
+                is_commit: false,
+            };
+            Ok((msg, metadata))
+        }
     }
-
-    // Parse plaintext as KCMessage
-    let json_str = String::from_utf8(plaintext)
-        .map_err(|e| KeychatError::Mls(format!("plaintext not utf8: {e}")))?;
-
-    let message = KCMessage::try_parse(&json_str).ok_or_else(|| {
-        KeychatError::Mls("failed to parse KCMessage from MLS plaintext".to_string())
-    })?;
-
-    let metadata = MlsMessageMetadata {
-        sender_id,
-        is_commit: false,
-    };
-
-    Ok((message, metadata))
 }
 
 /// Wrap an MLS Commit as a kind:1059 event for broadcast.
@@ -872,13 +934,25 @@ mod tests {
         let ciphertext = alice.encrypt(group_id, plaintext.as_bytes()).unwrap();
 
         // Bob decrypts
-        let (decrypted, sender) = bob.decrypt(group_id, &ciphertext).unwrap();
+        let MlsDecryptResult::Application {
+            plaintext: decrypted,
+            sender_id: sender,
+        } = bob.decrypt(group_id, &ciphertext).unwrap()
+        else {
+            panic!("expected Application message");
+        };
         let decrypted_msg = KCMessage::try_parse(&String::from_utf8(decrypted).unwrap()).unwrap();
         assert_eq!(decrypted_msg.text.unwrap().content, "Hello MLS group!");
         assert_eq!(sender, "alice_nostr_pubkey");
 
         // Charlie decrypts
-        let (decrypted, sender) = charlie.decrypt(group_id, &ciphertext).unwrap();
+        let MlsDecryptResult::Application {
+            plaintext: decrypted,
+            sender_id: sender,
+        } = charlie.decrypt(group_id, &ciphertext).unwrap()
+        else {
+            panic!("expected Application message");
+        };
         let decrypted_msg = KCMessage::try_parse(&String::from_utf8(decrypted).unwrap()).unwrap();
         assert_eq!(decrypted_msg.text.unwrap().content, "Hello MLS group!");
         assert_eq!(sender, "alice_nostr_pubkey");
@@ -952,10 +1026,21 @@ mod tests {
         let plaintext = b"Hello everyone!";
         let ciphertext = alice.encrypt(group_id, plaintext).unwrap();
 
-        let (dec_bob, _) = bob.decrypt(group_id, &ciphertext).unwrap();
+        let MlsDecryptResult::Application {
+            plaintext: dec_bob, ..
+        } = bob.decrypt(group_id, &ciphertext).unwrap()
+        else {
+            panic!("expected Application message");
+        };
         assert_eq!(dec_bob, plaintext);
 
-        let (dec_charlie, _) = charlie.decrypt(group_id, &ciphertext).unwrap();
+        let MlsDecryptResult::Application {
+            plaintext: dec_charlie,
+            ..
+        } = charlie.decrypt(group_id, &ciphertext).unwrap()
+        else {
+            panic!("expected Application message");
+        };
         assert_eq!(dec_charlie, plaintext);
     }
 
@@ -989,7 +1074,11 @@ mod tests {
         let ciphertext = alice.encrypt(group_id, b"Secret after removal").unwrap();
 
         // Bob can decrypt
-        let (dec, _) = bob.decrypt(group_id, &ciphertext).unwrap();
+        let MlsDecryptResult::Application { plaintext: dec, .. } =
+            bob.decrypt(group_id, &ciphertext).unwrap()
+        else {
+            panic!("expected Application message");
+        };
         assert_eq!(dec, b"Secret after removal");
 
         // Charlie should NOT be able to decrypt (still on old epoch)
@@ -1025,6 +1114,7 @@ mod tests {
         let ciphertext = alice.encrypt(group_id, b"After Bob left").unwrap();
 
         // Bob tries to decrypt — should fail after removal
+
         let result = bob.decrypt(group_id, &ciphertext);
         assert!(
             result.is_err(),
@@ -1136,7 +1226,11 @@ mod tests {
             // Send and receive a message
             let plaintext = format!("Message in epoch {}", i + 2);
             let ct = alice.encrypt(group_id, plaintext.as_bytes()).unwrap();
-            let (dec, _) = bob.decrypt(group_id, &ct).unwrap();
+            let MlsDecryptResult::Application { plaintext: dec, .. } =
+                bob.decrypt(group_id, &ct).unwrap()
+            else {
+                panic!("expected Application message");
+            };
             assert_eq!(
                 String::from_utf8(dec).unwrap(),
                 plaintext,

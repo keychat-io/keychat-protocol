@@ -2398,6 +2398,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "keychat-app-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "hex",
+ "libkeychat",
+ "nostr",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "keychat-cli"
 version = "0.2.0"
 dependencies = [
@@ -2410,6 +2429,7 @@ dependencies = [
  "dirs",
  "http",
  "http-body-util",
+ "keychat-app-core",
  "keychat-uniffi",
  "open",
  "qrcode",
@@ -2432,6 +2452,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
+ "keychat-app-core",
  "libkeychat",
  "nostr",
  "reqwest",

@@ -23,8 +23,8 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
-use keychat_uniffi::{
-    ClientEvent, DataChange, GroupMemberInput, KeychatClient, MessageStatus, RoomStatus, RoomType,
+use keychat_app_core::{
+    AppClient, ClientEvent, DataChange, GroupMemberInput, MessageStatus, RoomStatus, RoomType,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -154,7 +154,7 @@ impl Theme {
 // ─── App State ──────────────────────────────────────────────
 
 struct App {
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     data_dir: PathBuf,
     data_tx: broadcast::Sender<DataChange>,
     // Room data
@@ -180,6 +180,8 @@ struct App {
     identity_hex: Option<String>,
     identity_name: Option<String>,
     owner_pubkey: Option<String>,
+    /// Pending inbound friend requests: (request_id, sender_pubkey, sender_name)
+    pending_requests: Vec<(String, String, String)>,
     connected_relays: usize,
     total_relays: usize,
     // Control
@@ -192,7 +194,7 @@ struct App {
 
 impl App {
     fn new(
-        client: Arc<KeychatClient>,
+        client: Arc<AppClient>,
         data_dir: PathBuf,
         data_tx: broadcast::Sender<DataChange>,
     ) -> Self {
@@ -220,6 +222,7 @@ impl App {
             identity_hex: None,
             identity_name: None,
             owner_pubkey: None,
+            pending_requests: Vec::new(),
             connected_relays: 0,
             total_relays: 0,
             should_quit: false,
@@ -334,7 +337,7 @@ impl App {
 // ─── Public entry point ─────────────────────────────────────
 
 pub async fn run(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     event_tx: broadcast::Sender<ClientEvent>,
     data_tx: broadcast::Sender<DataChange>,
     data_dir: String,
@@ -361,7 +364,7 @@ pub async fn run(
     app.theme = load_theme_setting(&client).await;
 
     // Shared startup: restore identity → sessions → connect → event loop
-    let relay_urls = keychat_uniffi::default_relays();
+    let relay_urls = keychat_app_core::default_relays();
     if let Some((pubkey, session_count)) =
         crate::commands::init_and_connect(&client, relay_urls).await
     {
@@ -692,15 +695,17 @@ fn draw_messages(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    if app.messages.is_empty() {
-        // Show command output
+    // Always show command_output (notifications, /requests results, etc.)
+    if !app.command_output.is_empty() {
         for (msg, color) in &app.command_output {
             lines.push(Line::from(Span::styled(
                 format!("  {msg}"),
                 Style::default().fg(*color),
             )));
         }
-    } else {
+    }
+
+    if !app.messages.is_empty() {
         // Render chat messages with bubble layout
         let mut last_date: Option<String> = None;
         let mut last_sender: Option<(bool, String)> = None; // (is_me, pubkey)
@@ -1181,7 +1186,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  /add <pk> [greeting]  /accept <id>  /reject <id>  /contacts",
+            "  /add <pk> [greeting]  /requests  /accept <id>  /reject <id>",
             Style::default().fg(Color::Green),
         )),
         Line::from(Span::styled(
@@ -1259,7 +1264,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
 fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
     // Calculate QR code size first to determine popup width
     let qr_lines = if let Some(ref pk) = app.identity_hex {
-        let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
+        let npub = keychat_app_core::npub_from_hex(pk.clone()).unwrap_or_default();
         render_qr_lines(&npub)
     } else {
         vec![]
@@ -1292,7 +1297,7 @@ fn draw_whoami_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
     ];
 
     if let Some(ref pk) = app.identity_hex {
-        let npub = keychat_uniffi::npub_from_hex(pk.clone()).unwrap_or_default();
+        let npub = keychat_app_core::npub_from_hex(pk.clone()).unwrap_or_default();
         if let Some(ref name) = app.identity_name {
             lines.push(Line::from(vec![
                 Span::styled("  Name:   ", Style::default().fg(Color::DarkGray)),
@@ -1610,6 +1615,7 @@ const COMMANDS: &[&str] = &[
     "/reconnect",
     "/status",
     "/add",
+    "/requests",
     "/accept",
     "/reject",
     "/contacts",
@@ -1746,16 +1752,15 @@ async fn process_command(app: &mut App, input: &str) {
                         Color::Green,
                     );
                     app.push_output(String::new(), Color::White);
-                    app.push_output("Pubkey (hex):".into(), Color::DarkGray);
-                    app.push_output(pubkey_hex, Color::Cyan);
-                    app.push_output(String::new(), Color::White);
-                    app.push_output("npub:".into(), Color::DarkGray);
-                    app.push_output(npub.clone(), Color::Cyan);
-                    app.push_output(String::new(), Color::White);
-
                     for line in render_qr_lines(&npub) {
                         app.push_output(line, Color::White);
                     }
+                    app.push_output(String::new(), Color::White);
+                    app.push_output("Pubkey (hex):".into(), Color::DarkGray);
+                    app.push_output(pubkey_hex, Color::Cyan);
+                    app.push_output(String::new(), Color::White);
+                    app.push_output("npub (share this):".into(), Color::DarkGray);
+                    app.push_output(npub.clone(), Color::Cyan);
                     app.push_output(String::new(), Color::White);
                     app.push_output("Mnemonic (SAVE THIS!):".into(), Color::Yellow);
                     let words: Vec<&str> = mnemonic.split_whitespace().collect();
@@ -1772,7 +1777,7 @@ async fn process_command(app: &mut App, input: &str) {
                     if !app.event_loop_started {
                         crate::commands::connect_and_start(
                             &app.client,
-                            keychat_uniffi::default_relays(),
+                            keychat_app_core::default_relays(),
                         );
                         app.event_loop_started = true;
                     }
@@ -1803,7 +1808,7 @@ async fn process_command(app: &mut App, input: &str) {
                     if !app.event_loop_started {
                         crate::commands::connect_and_start(
                             &app.client,
-                            keychat_uniffi::default_relays(),
+                            keychat_app_core::default_relays(),
                         );
                         app.event_loop_started = true;
                     }
@@ -1868,7 +1873,7 @@ async fn process_command(app: &mut App, input: &str) {
         }
         "/connect" => {
             let relay_urls: Vec<String> = if args.is_empty() {
-                keychat_uniffi::default_relays()
+                keychat_app_core::default_relays()
             } else {
                 args.split_whitespace().map(|s| s.to_string()).collect()
             };
@@ -1958,7 +1963,7 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /add <pubkey> [greeting]".into());
                 return;
             }
-            let peer = match keychat_uniffi::normalize_to_hex(parts[0].to_string()) {
+            let peer = match keychat_app_core::normalize_to_hex(parts[0].to_string()) {
                 Ok(p) => p,
                 Err(e) => {
                     app.notify(format!("Invalid pubkey: {e}"));
@@ -1998,6 +2003,26 @@ async fn process_command(app: &mut App, input: &str) {
                 }
             }
         }
+        "/requests" => {
+            if app.pending_requests.is_empty() {
+                app.push_output("No pending friend requests.".into(), app.theme.muted);
+            } else {
+                app.push_output(
+                    format!("Pending friend requests ({}):", app.pending_requests.len()),
+                    Color::Yellow,
+                );
+                let items: Vec<_> = app
+                    .pending_requests
+                    .iter()
+                    .map(|(rid, pubkey, name)| {
+                        format!("  {} ({}) — /accept {rid}", name, short_key(pubkey))
+                    })
+                    .collect();
+                for line in items {
+                    app.push_output(line, Color::Cyan);
+                }
+            }
+        }
         "/accept" => {
             let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
             if parts.is_empty() || parts[0].is_empty() {
@@ -2007,7 +2032,10 @@ async fn process_command(app: &mut App, input: &str) {
             let name = if parts.len() > 1 {
                 parts[1].to_string()
             } else {
-                "CLI User".to_string()
+                app.identity_name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "CLI User".to_string())
             };
             tracing::info!("Accepting friend request: {}", parts[0]);
             match app
@@ -2018,6 +2046,7 @@ async fn process_command(app: &mut App, input: &str) {
                 Ok(contact) => {
                     tracing::info!("Friend request accepted: {}", contact.display_name);
                     app.push_output(format!("Accepted: {}", contact.display_name), Color::Green);
+                    app.pending_requests.retain(|(rid, _, _)| rid != parts[0]);
                     refresh_rooms(app).await;
                     refresh_contacts(app).await;
                 }
@@ -2037,7 +2066,11 @@ async fn process_command(app: &mut App, input: &str) {
                 .reject_friend_request(args.to_string(), None)
                 .await
             {
-                Ok(_) => app.push_output("Friend request rejected".into(), Color::Yellow),
+                Ok(_) => {
+                    app.push_output("Friend request rejected".into(), Color::Yellow);
+                    app.pending_requests
+                        .retain(|(rid, _, _)| rid != args.trim());
+                }
                 Err(e) => app.show_error(format!("Reject failed: {e}")),
             }
         }
@@ -2117,7 +2150,7 @@ async fn process_command(app: &mut App, input: &str) {
             }
             let server = match app.client.get_active_media_server().await {
                 Ok(url) => url,
-                Err(_) => keychat_uniffi::default_blossom_server(),
+                Err(_) => keychat_app_core::default_blossom_server(),
             };
             app.notify(format!("Uploading to {}...", server));
             match crate::commands::upload_and_prepare_file(path, &server).await {
@@ -2162,7 +2195,7 @@ async fn process_command(app: &mut App, input: &str) {
             let mut payloads = Vec::new();
             let server = match app.client.get_active_media_server().await {
                 Ok(url) => url,
-                Err(_) => keychat_uniffi::default_blossom_server(),
+                Err(_) => keychat_app_core::default_blossom_server(),
             };
             for path_str in paths {
                 let path = std::path::Path::new(path_str);
@@ -2360,7 +2393,7 @@ async fn process_command(app: &mut App, input: &str) {
             let members: Vec<GroupMemberInput> = parts[1..]
                 .iter()
                 .map(|pk| {
-                    let n = keychat_uniffi::normalize_to_hex(pk.to_string())
+                    let n = keychat_app_core::normalize_to_hex(pk.to_string())
                         .unwrap_or_else(|_| pk.to_string());
                     GroupMemberInput {
                         nostr_pubkey: n.clone(),
@@ -2431,7 +2464,7 @@ async fn process_command(app: &mut App, input: &str) {
                 return;
             }
             let gid = resolve_selected_group_id(app).await;
-            let pk = keychat_uniffi::normalize_to_hex(args.trim().to_string())
+            let pk = keychat_app_core::normalize_to_hex(args.trim().to_string())
                 .unwrap_or_else(|_| args.trim().to_string());
             match gid {
                 None => app.notify("Select a group room first".into()),
@@ -2480,7 +2513,7 @@ async fn process_command(app: &mut App, input: &str) {
 /// Handle auto-download for file messages.
 /// Spawns a background task to download files and refresh UI when complete.
 fn spawn_file_auto_download(
-    client: Arc<KeychatClient>,
+    client: Arc<AppClient>,
     data_tx: broadcast::Sender<DataChange>,
     room_id: String,
     event_id: String,
@@ -2571,7 +2604,7 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
             );
 
             // Handle file message auto-download
-            if matches!(kind, keychat_uniffi::MessageKind::Files) {
+            if matches!(kind, keychat_app_core::MessageKind::Files) {
                 if let Some(ref payload_json) = payload {
                     spawn_file_auto_download(
                         Arc::clone(&app.client),
@@ -2608,96 +2641,93 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
                 "Friend request received: name={sender_name}, pubkey={}, request_id={request_id}",
                 &sender_pubkey[..16.min(sender_pubkey.len())]
             );
+
             let is_owner = app.owner_pubkey.as_deref() == Some(sender_pubkey.as_str());
             let should_auto_approve = app.owner_pubkey.is_none() || is_owner;
+
             if should_auto_approve {
+                // Auto-approve: first friend becomes owner, or owner re-adding
                 let reason = if is_owner {
-                    "owner request"
+                    "owner"
                 } else {
                     "first friend → owner"
                 };
                 tracing::info!("Auto-approving ({reason}): {sender_name}");
                 app.push_output(format!("Auto-approving {sender_name}..."), Color::Green);
 
-                // Get display name for accept response
-                let my_name = if let Ok(ids) = app.client.get_identities().await {
-                    ids.first()
-                        .map(|i| i.name.clone())
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| "CLI User".to_string())
-                } else {
-                    "CLI User".to_string()
-                };
+                let my_name = app
+                    .identity_name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "CLI User".to_string());
 
-                // Retry up to 3 times — relay may still be connecting
-                let mut accepted = false;
-                for attempt in 0..3 {
-                    match app
-                        .client
-                        .accept_friend_request(request_id.clone(), my_name.clone())
-                        .await
-                    {
-                        Ok(contact) => {
-                            if app.owner_pubkey.is_none() {
-                                save_owner(&app.client, sender_pubkey).await;
-                                app.owner_pubkey = Some(sender_pubkey.clone());
-                                tracing::info!(
+                match app
+                    .client
+                    .accept_friend_request(request_id.clone(), my_name)
+                    .await
+                {
+                    Ok(contact) => {
+                        if app.owner_pubkey.is_none() {
+                            save_owner(&app.client, sender_pubkey).await;
+                            app.owner_pubkey = Some(sender_pubkey.clone());
+                            app.push_output(
+                                format!(
                                     "Owner set: {} ({})",
                                     contact.display_name,
-                                    &sender_pubkey[..16.min(sender_pubkey.len())]
-                                );
-                                app.push_output(
-                                    format!(
-                                        "Owner set: {} ({})",
-                                        contact.display_name,
-                                        short_key(sender_pubkey)
-                                    ),
-                                    Color::Green,
-                                );
-                            } else {
-                                tracing::info!("Approved owner request: {}", contact.display_name);
-                                app.push_output(
-                                    format!("Approved: {} (owner)", contact.display_name),
-                                    Color::Green,
-                                );
-                            }
-                            app.notify(format!("{} approved", contact.display_name));
-                            refresh_contacts(app).await;
-                            // Refresh rooms and auto-select the new conversation
-                            refresh_rooms(app).await;
-                            if let Some(identity) = &app.identity_hex {
-                                let new_room_id = format!("{}:{}", sender_pubkey, identity);
-                                if let Some(pos) = app.display_rows.iter().position(|r| {
-                                    matches!(&r.kind, DisplayRowKind::Room { room_id, .. } if room_id == &new_room_id)
-                                }) {
-                                    app.room_state.select(Some(pos));
-                                    load_messages(app, &new_room_id).await;
-                                    app.active_panel = Panel::Input;
-                                }
-                            }
-                            accepted = true;
-                            break;
+                                    short_key(sender_pubkey)
+                                ),
+                                Color::Green,
+                            );
                         }
-                        Err(e) => {
-                            tracing::warn!("Auto-approve attempt {} failed: {e}", attempt + 1);
-                            if attempt < 2 {
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        app.notify(format!("{} approved", contact.display_name));
+                        refresh_contacts(app).await;
+                        refresh_rooms(app).await;
+                        // Auto-select the new conversation
+                        if let Some(identity) = &app.identity_hex {
+                            let new_room_id = format!("{}:{}", sender_pubkey, identity);
+                            if let Some(pos) = app.display_rows.iter().position(|r| {
+                                matches!(&r.kind, DisplayRowKind::Room { room_id, .. } if room_id == &new_room_id)
+                            }) {
+                                app.room_state.select(Some(pos));
+                                load_messages(app, &new_room_id).await;
+                                app.active_panel = Panel::Input;
                             }
                         }
                     }
-                }
-                if !accepted {
-                    app.push_output(
-                        format!("Auto-approve failed. Manual: /accept {request_id}"),
-                        Color::Red,
-                    );
+                    Err(e) => {
+                        // Auto-approve failed — fall back to manual
+                        tracing::warn!("Auto-approve failed: {e}");
+                        app.pending_requests.push((
+                            request_id.clone(),
+                            sender_pubkey.clone(),
+                            sender_name.clone(),
+                        ));
+                        app.push_output(
+                            format!("Auto-approve failed. /accept {request_id}"),
+                            Color::Red,
+                        );
+                    }
                 }
             } else {
-                tracing::info!("Owner exists, queuing for manual approval");
+                // Non-owner: queue for manual approval, show request_id clearly
+                app.pending_requests.push((
+                    request_id.clone(),
+                    sender_pubkey.clone(),
+                    sender_name.clone(),
+                ));
+                tracing::info!(
+                    "pending_requests count after push: {}",
+                    app.pending_requests.len()
+                );
                 app.push_output(
-                    format!("Friend request from {sender_name}. /accept {request_id}"),
+                    format!(
+                        "📩 Friend request from: {sender_name} ({})",
+                        short_key(sender_pubkey)
+                    ),
                     Color::Yellow,
                 );
+                app.push_output(format!("   /accept {request_id}"), Color::Cyan);
+                app.push_output(format!("   /reject {request_id}"), Color::DarkGray);
                 app.notify(format!("Friend request from {sender_name}"));
             }
             refresh_rooms(app).await;
@@ -2736,11 +2766,11 @@ async fn handle_client_event(app: &mut App, event: &ClientEvent) {
             kind, new_value, ..
         } => {
             let msg = match kind {
-                keychat_uniffi::GroupChangeKind::NameChanged => {
+                keychat_app_core::GroupChangeKind::NameChanged => {
                     format!("Group renamed to: {}", new_value.as_deref().unwrap_or("?"))
                 }
-                keychat_uniffi::GroupChangeKind::MemberRemoved => "Member removed".to_string(),
-                keychat_uniffi::GroupChangeKind::SelfLeave => "A member left".to_string(),
+                keychat_app_core::GroupChangeKind::MemberRemoved => "Member removed".to_string(),
+                keychat_app_core::GroupChangeKind::SelfLeave => "A member left".to_string(),
             };
             app.notify(msg);
             refresh_rooms(app).await;
@@ -2809,7 +2839,7 @@ async fn refresh_rooms(app: &mut App) {
                 status: r.status,
                 unread_count: r.unread_count as u32,
                 last_message: r.last_message_content,
-                last_message_at: r.last_message_at,
+                last_message_at: r.last_message_at.map(|t| t as u64),
                 to_main_pubkey: r.to_main_pubkey,
                 parent_room_id: r.parent_room_id,
             }
@@ -2854,7 +2884,7 @@ fn build_display_rows(app: &mut App) {
             topics.push(r);
         } else {
             match r.room_type {
-                RoomType::SignalGroup | RoomType::MlsGroup => groups.push(r),
+                RoomType::SignalGroup | RoomType::MlsGroup | RoomType::Nip17Dm => groups.push(r),
                 RoomType::Dm => top_dms.push(r),
             }
         }
@@ -2988,7 +3018,7 @@ fn build_display_rows(app: &mut App) {
             let (icon, icon_color) = room_icon(g, t);
             let tag = match g.room_type {
                 RoomType::SignalGroup => "SG",
-                RoomType::MlsGroup => "MLS",
+                RoomType::MlsGroup | RoomType::Nip17Dm => "MLS",
                 _ => "",
             };
             rows.push(DisplayRow {
@@ -3121,7 +3151,7 @@ async fn load_messages_with_count(app: &mut App, room_id: &str, count: i32, offs
                     content: m.content,
                     is_me: m.is_me_send,
                     status: m.status,
-                    timestamp: m.created_at,
+                    timestamp: m.created_at as u64,
                     reply_to_content: m.reply_to_content,
                     payload_json: m.payload_json,
                     msgid: m.msgid,
@@ -3169,7 +3199,7 @@ fn format_date(ts: u64) -> String {
 const SETTING_OWNER: &str = "owner_pubkey";
 const SETTING_THEME: &str = "theme";
 
-async fn load_owner(client: &KeychatClient) -> Option<String> {
+async fn load_owner(client: &AppClient) -> Option<String> {
     client
         .get_setting(SETTING_OWNER.to_string())
         .await
@@ -3177,7 +3207,7 @@ async fn load_owner(client: &KeychatClient) -> Option<String> {
         .flatten()
 }
 
-async fn save_owner(client: &KeychatClient, pubkey: &str) {
+async fn save_owner(client: &AppClient, pubkey: &str) {
     if let Err(e) = client
         .set_setting(SETTING_OWNER.to_string(), pubkey.to_string())
         .await
@@ -3186,14 +3216,14 @@ async fn save_owner(client: &KeychatClient, pubkey: &str) {
     }
 }
 
-async fn load_theme_setting(client: &KeychatClient) -> Theme {
+async fn load_theme_setting(client: &AppClient) -> Theme {
     match client.get_setting(SETTING_THEME.to_string()).await {
         Ok(Some(s)) if s == "light" => Theme::light(),
         _ => Theme::dark(),
     }
 }
 
-async fn save_theme_setting(client: &KeychatClient, theme: &str) {
+async fn save_theme_setting(client: &AppClient, theme: &str) {
     let _ = client
         .set_setting(SETTING_THEME.to_string(), theme.to_string())
         .await;

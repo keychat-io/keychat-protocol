@@ -8,17 +8,18 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 uniffi = { version = "0.28", features = ["cli", "tokio"] }
-libkeychat = { path = "../libkeychat", features = ["storage", "mls"] }
-nostr = "0.37"
-tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
-serde_json = "1"
-base64 = "0.22"
-hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libkeychat = { path = "../libkeychat", features = ["mls"] }
+keychat-app-core = { path = "../keychat-app-core" }
+nostr = { workspace = true }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
