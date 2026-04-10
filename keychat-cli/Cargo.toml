@@ -14,7 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 keychat-app-core = { path = "../keychat-app-core" }
-libkeychat = { path = "../libkeychat" }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 clap = { version = "4", features = ["derive"] }

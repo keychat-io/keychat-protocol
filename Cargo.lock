@@ -2431,7 +2431,6 @@ dependencies = [
  "http-body-util",
  "keychat-app-core",
  "keychat-uniffi",
- "libkeychat",
  "open",
  "qrcode",
  "ratatui",
