@@ -259,7 +259,7 @@ A sliding window of 2–3 addresses per peer is maintained (see §9.3).
 
 #### Type 4: MLS-derived address (dynamic, per MLS group)
 
-Used only for MLS large groups. Each member derives a shared receiving address (`mlsTempInbox`) from the MLS export secret. All members in the same epoch compute the same address. This address rotates after every MLS Commit (see §11.2).
+Used only for MLS large groups. Each member derives a shared receiving address (`mlsTempInbox`) from the MLS export secret. All members in the same epoch compute the same address. This address rotates after every MLS Commit (see §11.3).
 
 #### Subscription Filter
 
@@ -1190,15 +1190,46 @@ Large groups use MLS (RFC 9420) for scalable encryption.
 - **Epoch**: Each Commit advances the epoch, rotating the group key.
 - **KeyPackage**: A member's public key bundle, published as a kind 10443 Nostr event.
 - **Welcome**: Invitation data for a new member to join the group.
+- **Signer (SignatureKeyPair)**: A long-lived Ed25519 keypair used to sign leaf nodes and Commits. Unlike session keys, it must survive restarts: if a member rotates their signer, existing group state becomes unrecoverable (leaf signatures no longer verify). See §11.2 for persistence requirements.
 
-### 11.2 Receiving Address (mlsTempInbox)
+### 11.2 Signer Persistence
+
+Each identity owns exactly one MLS signer (Ed25519 SignatureKeyPair). The signer is bound to the identity via the MLS BasicCredential, which carries the Nostr pubkey as its identity field:
+
+```
+BasicCredential.identity = nostrId (hex pubkey)
+CredentialWithKey = { credential, signature_key = signer.public_key }
+```
+
+**Persistence requirements:**
+
+- The signer MUST be persisted keyed by `nostrId`, not as a global value.
+- Multiple identities on the same device each have their own signer; storing a single global signer will break the credential-to-key binding for all but one identity.
+- On process start for a given identity:
+  1. Look up the signer by `nostrId`
+  2. If found → restore it
+  3. If not found → generate a fresh SignatureKeyPair and persist it under `nostrId`
+
+**Storage format** (implementation-specific but conceptually):
+
+```
+Table: keychat_mls_identity
+  nostr_id    PRIMARY KEY  -- hex pubkey
+  signer      BLOB         -- serialized Ed25519 SignatureKeyPair
+```
+
+The table should reside in the same database as OpenMLS group state so that signer and ratchet tree state are always consistent on disk.
+
+### 11.3 Receiving Address (mlsTempInbox)
 
 Each MLS group member computes a shared receiving address from the MLS export secret:
 
 ```
 replaceListenPubkey(room):
-  new_inbox = mls.getListenKeyFromExportSecret(nostrId, groupId)
-  // Deterministically derived — all members in the same epoch compute the same value
+  export_secret = mls.exportSecret(groupId, label: "keychat-mls-inbox", len: 32)
+  new_inbox = mls.getListenKeyFromExportSecret(groupId, export_secret)
+  // Deterministically derived — all members in the same epoch compute the same value.
+  // Does NOT depend on nostrId: every member must derive the same address.
 
   if new_inbox == room.mlsTempInbox → no change
   else:
@@ -1209,11 +1240,15 @@ replaceListenPubkey(room):
 
 This address **rotates after every Commit** (add/remove member, key update, etc.). After processing a Commit, all members must call `replaceListenPubkey()`.
 
-### 11.3 Joining a Group
+### 11.4 Joining a Group
+
+**Prerequisite**: Every user who wishes to be added to an MLS group MUST first publish their KeyPackage to relays as a kind 10443 event. The admin fetches each invitee's KeyPackage via an author-filtered subscription on kind 10443 before calling `addMembers`.
 
 ```
 Admin                                          New Member
   |                                                |
+  |                                                +-- publish KeyPackage (kind 10443)
+  | <-- fetch kind 10443 by author ----------------|
   +-- mls.addMembers(keyPackages)                  |
   +-- mls.selfCommit()                             |
   +-- replaceListenPubkey()                        |
@@ -1226,7 +1261,7 @@ Admin                                          New Member
   +-- process update, replaceListenPubkey()        |
 ```
 
-### 11.4 Sending Messages
+### 11.5 Sending Messages
 
 ```
 1. Construct KCMessage:
@@ -1239,7 +1274,7 @@ Admin                                          New Member
 4. Publish kind 1059 to room.mlsTempInbox (Mode 1)
 ```
 
-### 11.5 MLS vs. KCMessage for Management
+### 11.6 MLS vs. KCMessage for Management
 
 MLS has native management via Commits. These are **not** expressed as KCMessage kinds:
 
