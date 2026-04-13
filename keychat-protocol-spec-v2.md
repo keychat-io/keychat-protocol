@@ -1222,15 +1222,29 @@ The table should reside in the same database as OpenMLS group state so that sign
 
 ### 11.3 Receiving Address (mlsTempInbox)
 
-Each MLS group member computes a shared receiving address from the MLS export secret:
+Each MLS group member computes a shared receiving address from the MLS export
+secret. MLS `exportSecret` already domain-separates by `(group_id, epoch, label)`,
+so the 32-byte output is interpreted **directly** as a secp256k1 secret key — no
+additional hashing is needed.
+
+```
+deriveMlsTempInbox(groupId):
+  export_secret = MLS.exportSecret(
+    groupId,
+    label   = "keychat-mls-inbox",
+    context = <empty>,
+    length  = 32
+  )
+  sk           = secp256k1_secret_key(export_secret)   // interpret 32 bytes as SK
+  mlsTempInbox = x_only_public_key(sk).hex()           // 64 hex chars
+```
+
+All members in the same epoch derive the same `mlsTempInbox`. The derivation
+does **not** depend on `nostrId`.
 
 ```
 replaceListenPubkey(room):
-  export_secret = mls.exportSecret(groupId, label: "keychat-mls-inbox", len: 32)
-  new_inbox = mls.getListenKeyFromExportSecret(groupId, export_secret)
-  // Deterministically derived — all members in the same epoch compute the same value.
-  // Does NOT depend on nostrId: every member must derive the same address.
-
+  new_inbox = deriveMlsTempInbox(room.groupId)
   if new_inbox == room.mlsTempInbox → no change
   else:
     unsubscribe(old mlsTempInbox)

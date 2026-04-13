@@ -33,8 +33,8 @@ pub const MLS_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 /// Extension type for Nostr group data.
 const NOSTR_GROUP_EXTENSION_TYPE: u16 = 0xF233;
 
-/// MLS export secret label for deriving the temp inbox address.
-const MLS_TEMP_INBOX_LABEL: &str = "keychat-mls-temp-inbox";
+/// MLS export secret label for deriving the temp inbox address (spec §11.3).
+const MLS_TEMP_INBOX_LABEL: &str = "keychat-mls-inbox";
 
 /// Result of decrypting an MLS message — distinguishes application data from control messages.
 #[derive(Debug, Clone)]
@@ -587,10 +587,10 @@ impl MlsParticipant {
             .map_err(|e| KeychatError::Mls(format!("export_secret error: {e}")))
     }
 
-    /// Derive the MLS temp inbox address for a group (§11.2).
+    /// Derive the MLS temp inbox address for a group (§11.3).
     pub fn derive_temp_inbox(&self, group_id: &str) -> Result<String> {
         let export_secret = self.export_secret(group_id, MLS_TEMP_INBOX_LABEL, &[], 32)?;
-        Ok(derive_mls_temp_inbox(group_id, &export_secret))
+        Ok(derive_mls_temp_inbox(&export_secret))
     }
 
     /// Get the list of members' credential identities in the group.
@@ -713,26 +713,26 @@ impl MlsParticipant {
     }
 }
 
-// ─── mlsTempInbox derivation (§11.2) ────────────────────────────────────────
+// ─── mlsTempInbox derivation (§11.3) ────────────────────────────────────────
 
 /// Derive the shared MLS receiving address from the export secret.
 ///
+/// MLS `export_secret` already domain-separates by `(group_id, epoch, label)`,
+/// so the 32-byte output is interpreted directly as a secp256k1 secret key.
 /// All members in the same epoch compute the same value.
-/// Returns a hex-encoded secp256k1 x-only pubkey string.
-pub fn derive_mls_temp_inbox(group_id: &str, export_secret: &[u8]) -> String {
-    // Deterministic derivation: SHA256(export_secret || "keychat-mls-inbox" || group_id)
-    let mut hasher = Sha256::new();
-    hasher.update(export_secret);
-    hasher.update(b"keychat-mls-inbox");
-    hasher.update(group_id.as_bytes());
-    let hash = hasher.finalize();
-
-    // Interpret the hash as a secp256k1 secret key and derive the x-only pubkey
+///
+/// Returns a hex-encoded secp256k1 x-only pubkey (64 hex chars).
+pub fn derive_mls_temp_inbox(export_secret: &[u8]) -> String {
+    assert_eq!(
+        export_secret.len(),
+        32,
+        "export_secret must be 32 bytes (MLS exportSecret len=32)"
+    );
     let secp = secp256k1::Secp256k1::new();
-    let secret_key = secp256k1::SecretKey::from_slice(&hash)
-        .expect("SHA256 output should be valid secp256k1 secret key");
-    let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret_key);
-    let (x_only, _parity) = keypair.x_only_public_key();
+    let secret_key = secp256k1::SecretKey::from_slice(export_secret)
+        .expect("32-byte MLS export_secret is a valid secp256k1 secret key");
+    let (x_only, _parity) =
+        secp256k1::Keypair::from_secret_key(&secp, &secret_key).x_only_public_key();
     hex::encode(x_only.serialize())
 }
 
@@ -1243,25 +1243,38 @@ mod tests {
     #[test]
     fn test_mls_temp_inbox_deterministic() {
         let export_secret = [42u8; 32];
-        let group_id = "test-group";
 
-        // Different nostr_ids but same export_secret and group_id
-        // should produce the same result (nostr_id is NOT used in derivation)
-        let inbox1 = derive_mls_temp_inbox(group_id, &export_secret);
-        let inbox2 = derive_mls_temp_inbox(group_id, &export_secret);
-        let inbox3 = derive_mls_temp_inbox(group_id, &export_secret);
+        let inbox1 = derive_mls_temp_inbox(&export_secret);
+        let inbox2 = derive_mls_temp_inbox(&export_secret);
 
         assert_eq!(inbox1, inbox2);
-        assert_eq!(inbox2, inbox3);
 
         // Different export_secret should produce different result
         let export_secret2 = [43u8; 32];
-        let inbox4 = derive_mls_temp_inbox(group_id, &export_secret2);
-        assert_ne!(inbox1, inbox4);
+        let inbox3 = derive_mls_temp_inbox(&export_secret2);
+        assert_ne!(inbox1, inbox3);
 
         // The result should be a valid 64-char hex string (secp256k1 x-only pubkey)
         assert_eq!(inbox1.len(), 64);
         assert!(inbox1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_mls_temp_inbox_known_answer() {
+        // Known-answer test: lock the derivation so accidental changes get caught.
+        // export_secret = [0x42; 32] interpreted as secp256k1 secret key.
+        let export_secret = [0x42u8; 32];
+        let inbox = derive_mls_temp_inbox(&export_secret);
+        assert_eq!(
+            inbox,
+            "24653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "export_secret must be 32 bytes")]
+    fn test_mls_temp_inbox_rejects_wrong_length() {
+        let _ = derive_mls_temp_inbox(&[0u8; 31]);
     }
 
     // ─── Test 9: Multiple epochs ───────────────────────────────────────────
