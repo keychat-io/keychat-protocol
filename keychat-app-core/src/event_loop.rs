@@ -280,14 +280,26 @@ impl AppClient {
             inner.protocol.try_decrypt_session_message(event).await
         };
         if let Some((peer_signal_hex, msg, metadata, addr_update, session_mutex)) = step3 {
-            // Update address state + reverse index (write lock)
-            {
+            // Update address state + reverse index, and observe dual p-tag
+            // upgrade (spec §3.6 端 B: if we're a Public Agent and this peer
+            // just addressed us via dual p-tag, they no longer need ratchet
+            // fallback subscription).
+            let peer_upgraded = {
                 let mut inner = self.inner.write().await;
                 inner
                     .protocol
                     .update_addresses_after_decrypt(&peer_signal_hex, &session_mutex, &addr_update)
                     .await;
-            } // write lock dropped
+                inner
+                    .protocol
+                    .mark_peer_upgraded_if_dual_tag(&peer_signal_hex, &metadata.p_tags)
+            }; // write lock dropped
+            if peer_upgraded {
+                let mut inner = self.inner.write().await;
+                if let Err(e) = inner.protocol.refresh_subscriptions().await {
+                    tracing::warn!("refresh_subscriptions after dual-p-tag upgrade failed: {e}");
+                }
+            }
 
             // Re-subscribe with ALL ratchet keys.
             // Read lock is OK here — we just need to call transport.resubscribe()

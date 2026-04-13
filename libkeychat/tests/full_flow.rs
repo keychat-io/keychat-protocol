@@ -127,6 +127,7 @@ async fn do_friend_request(sender: &mut TestUser, receiver: &mut TestUser) -> (S
         accept_keys,
         receiver.storage.clone(),
         1,
+        false,
     )
     .await
     .unwrap();

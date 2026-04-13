@@ -17,6 +17,9 @@ use crate::session::ChatSession;
 use crate::storage::SecureStorage;
 use crate::transport::Transport;
 
+/// `protocol_settings` key for the self Public Agent flag (spec §3.6).
+const SELF_PUBLIC_AGENT_KEY: &str = "self_is_public_agent";
+
 // ─── Delegate Trait ─────────────────────────────────────────────
 
 /// Callback interface for the protocol orchestrator.
@@ -229,6 +232,21 @@ pub struct ProtocolClient {
     peer_nostr_to_signal: HashMap<String, String>,
     peer_signal_to_nostr: HashMap<String, String>,
     receiving_addr_to_peer: HashMap<String, String>,
+    /// In-memory index of peers flagged as Public Agents (spec §3.6).
+    /// Keyed by peer signal identity hex for O(1) lookup on the send path.
+    /// Kept in sync with `peer_mappings.is_public_agent` in storage.
+    peer_is_public_agent: HashMap<String, bool>,
+    /// Whether this client runs in Public Agent mode (spec §3.6). When `true`:
+    /// - relay subscription collapses to own npub (plus legacy peer fallback),
+    /// - `friendApprove` messages carry `publicAgent: true`,
+    /// - peers observed sending dual p-tag events get marked as upgraded.
+    /// Persisted in `protocol_settings["self_is_public_agent"]`.
+    self_is_public_agent: bool,
+    /// In-memory index of peers that have sent us dual p-tag events (spec
+    /// §3.6 backward compatibility). Keyed by signal identity hex. Only
+    /// consulted when `self_is_public_agent == true` to skip upgraded peers'
+    /// ratchet addresses in the subscription filter.
+    peer_uses_dual_p_tag: HashMap<String, bool>,
     pending_outbound: HashMap<String, FriendRequestState>,
     group_manager: GroupManager,
     next_signal_device_id: u32,
@@ -247,6 +265,9 @@ impl ProtocolClient {
             peer_nostr_to_signal: HashMap::new(),
             peer_signal_to_nostr: HashMap::new(),
             receiving_addr_to_peer: HashMap::new(),
+            peer_is_public_agent: HashMap::new(),
+            self_is_public_agent: false,
+            peer_uses_dual_p_tag: HashMap::new(),
             pending_outbound: HashMap::new(),
             group_manager: GroupManager::new(),
             next_signal_device_id: 1,
@@ -343,6 +364,8 @@ impl ProtocolClient {
             self.peer_signal_to_nostr.remove(&signal_id);
             self.sessions.remove(&signal_id);
             self.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
+            self.peer_is_public_agent.remove(&signal_id);
+            self.peer_uses_dual_p_tag.remove(&signal_id);
             self.pending_outbound
                 .retain(|_, s| s.peer_nostr_pubkey != nostr_pk);
             Some(signal_id)
@@ -360,6 +383,9 @@ impl ProtocolClient {
         self.peer_nostr_to_signal.clear();
         self.peer_signal_to_nostr.clear();
         self.receiving_addr_to_peer.clear();
+        self.peer_is_public_agent.clear();
+        self.self_is_public_agent = false;
+        self.peer_uses_dual_p_tag.clear();
         self.pending_outbound.clear();
         self.group_manager = GroupManager::new();
         self.next_signal_device_id = 1;
@@ -497,6 +523,14 @@ impl ProtocolClient {
             }
         }
 
+        // Snapshot self Public Agent mode while we still hold the lock.
+        let self_is_public_agent = store
+            .get_setting(SELF_PUBLIC_AGENT_KEY)
+            .ok()
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         // Drop the Mutex guard so restore_persistent can lock it
         drop(store);
 
@@ -508,9 +542,30 @@ impl ProtocolClient {
                 .insert(peer.nostr_pubkey.clone(), peer.signal_id.clone());
             self.peer_signal_to_nostr
                 .insert(peer.signal_id.clone(), peer.nostr_pubkey.clone());
+            if peer.is_public_agent {
+                self.peer_is_public_agent
+                    .insert(peer.signal_id.clone(), true);
+            }
+            if peer.peer_uses_dual_p_tag {
+                self.peer_uses_dual_p_tag
+                    .insert(peer.signal_id.clone(), true);
+            }
         }
         if !peers.is_empty() {
-            tracing::info!("restored {} peer mappings", peers.len());
+            tracing::info!(
+                "restored {} peer mappings ({} Public Agent peers, {} upgraded for dual p-tag)",
+                peers.len(),
+                self.peer_is_public_agent.len(),
+                self.peer_uses_dual_p_tag.len()
+            );
+        }
+
+        // Restore self Public Agent mode flag (spec §3.6).
+        self.self_is_public_agent = self_is_public_agent;
+        if self.self_is_public_agent {
+            tracing::info!(
+                "restored self_is_public_agent = true; relay subscription will collapse to own npub"
+            );
         }
 
         // 2. Restore active sessions with per-peer identity
@@ -870,9 +925,19 @@ impl ProtocolClient {
             }
         }
 
-        // Ratchet keys: newly derived Signal addresses, no historical messages
+        // Ratchet keys: newly derived Signal addresses, no historical messages.
+        //
+        // Public Agent mode (spec §3.6): when we run as an agent, peers that
+        // have upgraded to dual p-tag no longer need a ratchet-address
+        // fallback subscription (they'll reach us via our own npub). Legacy
+        // peers keep their ratchet addresses until they upgrade.
         let mut ratchet_pubkeys = Vec::new();
-        for session_mutex in self.sessions.values() {
+        for (signal_hex, session_mutex) in &self.sessions {
+            if self.self_is_public_agent
+                && *self.peer_uses_dual_p_tag.get(signal_hex).unwrap_or(&false)
+            {
+                continue;
+            }
             let session = session_mutex.lock().await;
             for addr_str in session.addresses.get_all_receiving_address_strings() {
                 if let Ok(pk) = nostr::PublicKey::from_hex(&addr_str) {
@@ -942,6 +1007,107 @@ impl ProtocolClient {
         self.subscription_ids = new_sub_ids;
 
         Ok(())
+    }
+
+    // ─── Public Agent Mode (spec §3.6) ───────────────────────────
+
+    /// Whether this client is running in Public Agent mode.
+    pub fn is_self_public_agent(&self) -> bool {
+        self.self_is_public_agent
+    }
+
+    /// Whether the given peer is flagged as a Public Agent (learned from
+    /// `friendApprove.publicAgent`). Allows callers to observe the flag
+    /// without going through the send path.
+    pub fn is_peer_public_agent(&self, peer_nostr_pk: &str) -> bool {
+        match self.peer_nostr_to_signal.get(peer_nostr_pk) {
+            Some(sig) => *self.peer_is_public_agent.get(sig).unwrap_or(&false),
+            None => false,
+        }
+    }
+
+    /// Whether the given peer has been observed sending dual p-tag events.
+    /// Only meaningful when this client runs in Public Agent mode.
+    pub fn is_peer_upgraded_to_dual_tag(&self, peer_nostr_pk: &str) -> bool {
+        match self.peer_nostr_to_signal.get(peer_nostr_pk) {
+            Some(sig) => *self.peer_uses_dual_p_tag.get(sig).unwrap_or(&false),
+            None => false,
+        }
+    }
+
+    /// Enable or disable Public Agent mode for this client (spec §3.6).
+    ///
+    /// When enabled:
+    /// - Subsequent `friendApprove` messages carry `publicAgent: true`.
+    /// - Relay subscription drops ratchet addresses of peers that have
+    ///   upgraded to dual p-tag (see `mark_peer_upgraded_if_dual_tag`).
+    /// - Legacy peers keep their ratchet-address fallback subscription.
+    ///
+    /// Persisted in `protocol_settings`. Callers SHOULD invoke
+    /// `refresh_subscriptions()` after toggling to apply the change to the
+    /// live relay filter.
+    pub fn set_self_public_agent(&mut self, flag: bool) -> Result<()> {
+        if let Ok(store) = self.storage.lock() {
+            store.set_setting(SELF_PUBLIC_AGENT_KEY, if flag { "1" } else { "0" })?;
+        }
+        self.self_is_public_agent = flag;
+        tracing::info!(
+            "self_is_public_agent set to {}; call refresh_subscriptions() to update the filter",
+            flag
+        );
+        Ok(())
+    }
+
+    /// Mark a peer as having upgraded to dual p-tag (spec §3.6).
+    ///
+    /// Called by the event loop after decrypting a session message. The peer
+    /// is considered "upgraded" if the event carried two or more `p`-tags AND
+    /// one of them matches our own identity pubkey — i.e., the peer is
+    /// addressing us as a Public Agent.
+    ///
+    /// Only has an effect when `self_is_public_agent == true`, because the
+    /// flag is only used to shrink the relay subscription in that mode.
+    /// Returns `true` if the state transitioned from false to true (caller
+    /// should refresh subscriptions in that case).
+    pub fn mark_peer_upgraded_if_dual_tag(
+        &mut self,
+        peer_signal_hex: &str,
+        p_tags: &[String],
+    ) -> bool {
+        if !self.self_is_public_agent {
+            return false;
+        }
+        let identity_hex = match self.identity.as_ref() {
+            Some(id) => id.pubkey_hex(),
+            None => return false,
+        };
+        let is_dual = p_tags.len() >= 2 && p_tags.iter().any(|t| t == &identity_hex);
+        if !is_dual {
+            return false;
+        }
+        if *self
+            .peer_uses_dual_p_tag
+            .get(peer_signal_hex)
+            .unwrap_or(&false)
+        {
+            return false; // already marked
+        }
+
+        // Persist (best-effort) keyed by nostr pubkey.
+        if let Some(nostr_pk) = self.peer_signal_to_nostr.get(peer_signal_hex).cloned() {
+            if let Ok(store) = self.storage.lock() {
+                if let Err(e) = store.set_peer_uses_dual_p_tag(&nostr_pk, true) {
+                    tracing::warn!("mark_peer_upgraded: persist failed: {e}");
+                }
+            }
+        }
+        self.peer_uses_dual_p_tag
+            .insert(peer_signal_hex.to_string(), true);
+        tracing::info!(
+            "peer {} upgraded to dual p-tag; ratchet fallback subscription will be dropped on next refresh",
+            &peer_signal_hex[..16.min(peer_signal_hex.len())]
+        );
+        true
     }
 
     /// Get all receiving addresses across all sessions (for debugging).
@@ -1039,9 +1205,21 @@ impl ProtocolClient {
         let device_id = crate::DeviceId::new(1).expect("device_id 1 is valid");
         let remote_addr = crate::ProtocolAddress::new(signal_hex.clone(), device_id);
         let payload_json = msg.to_json().ok();
+
+        // Public Agent routing (spec §3.6): when the peer is flagged as a
+        // Public Agent, emit a second p-tag carrying the peer's Nostr npub so
+        // the agent can subscribe only to its own identity address.
+        let agent_npub = if *self.peer_is_public_agent.get(&signal_hex).unwrap_or(&false) {
+            Some(peer_pubkey.to_string())
+        } else {
+            None
+        };
+
         let (event, addr_update) = {
             let mut session = session_mutex.lock().await;
-            session.send_message(&signal_hex, &remote_addr, msg).await?
+            session
+                .send_message(&signal_hex, &remote_addr, msg, agent_npub.as_deref())
+                .await?
         };
 
         // 4. Serialize for resend support
@@ -1369,6 +1547,7 @@ impl ProtocolClient {
             keys,
             self.storage.clone(),
             signal_device_id,
+            self.self_is_public_agent,
         )
         .await?;
 
@@ -1834,6 +2013,28 @@ impl ProtocolClient {
             let _ = store.delete_pending_fr(request_id);
         }
 
+        // Public Agent flag from friendApprove (spec §3.6). When set, future
+        // outbound Mode 1 messages to this peer use dual p-tag routing.
+        let peer_is_public_agent = msg
+            .friend_approve
+            .as_ref()
+            .and_then(|p| p.public_agent)
+            .unwrap_or(false);
+
+        if peer_is_public_agent {
+            if let Ok(store) = self.storage.lock() {
+                if let Err(e) = store.set_peer_public_agent(&peer_nostr_id, true) {
+                    tracing::warn!(
+                        "complete_friend_approve: persist public_agent flag failed: {e}"
+                    );
+                }
+            }
+            tracing::info!(
+                "[complete_friend_approve] peer is Public Agent; future sends will use dual p-tag: nostr={}",
+                &peer_nostr_id[..16.min(peer_nostr_id.len())]
+            );
+        }
+
         // Update in-memory state
         self.sessions.insert(
             peer_signal_hex.clone(),
@@ -1843,6 +2044,10 @@ impl ProtocolClient {
             .insert(peer_nostr_id.clone(), peer_signal_hex.clone());
         self.peer_signal_to_nostr
             .insert(peer_signal_hex.clone(), peer_nostr_id.clone());
+        if peer_is_public_agent {
+            self.peer_is_public_agent
+                .insert(peer_signal_hex.clone(), true);
+        }
         for addr in &recv_addrs {
             self.receiving_addr_to_peer
                 .insert(addr.clone(), peer_signal_hex.clone());
@@ -1994,12 +2199,25 @@ impl ProtocolClient {
                                     };
                                     if let Some((peer_signal_hex, msg, metadata, addr_update, session_mutex)) = step3_result
                                     {
-                                        // Update addresses
-                                        {
+                                        // Update addresses + observe dual p-tag upgrade (§3.6).
+                                        let peer_upgraded = {
                                             let mut inner_w = client.write().await;
                                             inner_w.update_addresses_after_decrypt(
                                                 &peer_signal_hex, &session_mutex, &addr_update,
                                             ).await;
+                                            inner_w.mark_peer_upgraded_if_dual_tag(
+                                                &peer_signal_hex,
+                                                &metadata.p_tags,
+                                            )
+                                        };
+                                        if peer_upgraded {
+                                            // Drop this peer's ratchet addresses from the filter.
+                                            let mut inner_w = client.write().await;
+                                            if let Err(e) = inner_w.refresh_subscriptions().await {
+                                                tracing::warn!(
+                                                    "refresh_subscriptions after dual-p-tag upgrade failed: {e}"
+                                                );
+                                            }
                                         }
 
                                             // Resolve sender nostr pubkey
@@ -2073,5 +2291,142 @@ impl ProtocolClient {
             }
         }
         tracing::info!("protocol event loop exited");
+    }
+}
+
+// ─── Tests (Public Agent mode, spec §3.6) ────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    fn make_client() -> ProtocolClient {
+        let storage = Arc::new(Mutex::new(
+            SecureStorage::open_in_memory("test-key").unwrap(),
+        ));
+        let mut c = ProtocolClient::new(storage);
+        c.set_identity(Some(Identity::generate().unwrap().identity));
+        c
+    }
+
+    #[test]
+    fn self_public_agent_mode_persists_and_restores() {
+        let storage = Arc::new(Mutex::new(
+            SecureStorage::open_in_memory("test-key").unwrap(),
+        ));
+
+        // Enable in one client, then "restart" into another using the same storage.
+        {
+            let mut c = ProtocolClient::new(storage.clone());
+            c.set_identity(Some(Identity::generate().unwrap().identity));
+            assert!(!c.is_self_public_agent());
+            c.set_self_public_agent(true).unwrap();
+            assert!(c.is_self_public_agent());
+        }
+
+        // New ProtocolClient over same storage — restore_sessions should
+        // rehydrate the flag from protocol_settings.
+        let mut c2 = ProtocolClient::new(storage);
+        c2.set_identity(Some(Identity::generate().unwrap().identity));
+        let _ = c2.restore_sessions();
+        assert!(
+            c2.is_self_public_agent(),
+            "self_is_public_agent must survive restart via protocol_settings"
+        );
+    }
+
+    #[test]
+    fn mark_peer_upgraded_noop_when_not_agent_mode() {
+        let mut c = make_client();
+        // Not an agent — flag should not flip regardless of p-tags.
+        let me = c.identity().unwrap().pubkey_hex();
+        let other = "deadbeef".repeat(8);
+        let tags = vec![other.clone(), me.clone()];
+        assert!(!c.mark_peer_upgraded_if_dual_tag("peer-sig", &tags));
+        assert!(c.peer_uses_dual_p_tag.is_empty());
+    }
+
+    #[test]
+    fn mark_peer_upgraded_requires_own_npub_in_p_tags() {
+        let mut c = make_client();
+        c.set_self_public_agent(true).unwrap();
+
+        // Single p-tag — no upgrade.
+        assert!(!c.mark_peer_upgraded_if_dual_tag("peer-sig", &["x".into()]));
+        // Dual p-tag but neither is own npub — not addressing us as agent.
+        assert!(!c.mark_peer_upgraded_if_dual_tag("peer-sig", &["x".into(), "y".into()]));
+        assert!(c.peer_uses_dual_p_tag.is_empty());
+    }
+
+    #[test]
+    fn mark_peer_upgraded_flips_once_and_persists() {
+        let mut c = make_client();
+        c.set_self_public_agent(true).unwrap();
+        let me = c.identity().unwrap().pubkey_hex();
+
+        // Seed peer mapping so persist keyed-by-nostr works.
+        {
+            let store = c.storage.lock().unwrap();
+            store
+                .save_peer_mapping("npub-peer", "sig-peer", "Peer")
+                .unwrap();
+        }
+        c.peer_signal_to_nostr
+            .insert("sig-peer".into(), "npub-peer".into());
+
+        let tags = vec!["ratchet-addr".into(), me.clone()];
+        assert!(c.mark_peer_upgraded_if_dual_tag("sig-peer", &tags));
+        assert_eq!(c.peer_uses_dual_p_tag.get("sig-peer"), Some(&true));
+
+        // Second call is a no-op — already marked.
+        assert!(!c.mark_peer_upgraded_if_dual_tag("sig-peer", &tags));
+
+        // Persisted to storage.
+        let row = c
+            .storage
+            .lock()
+            .unwrap()
+            .load_peer_by_nostr("npub-peer")
+            .unwrap()
+            .unwrap();
+        assert!(row.peer_uses_dual_p_tag);
+    }
+
+    #[tokio::test]
+    async fn agent_mode_collects_own_npub_and_respects_upgrade_flag() {
+        use crate::address::AddressManager;
+        use crate::session::ChatSession;
+        use crate::signal_session::SignalParticipant;
+
+        let mut c = make_client();
+        c.set_self_public_agent(true).unwrap();
+
+        // Build a minimal session with an EMPTY address manager so we can
+        // deterministically assert how the collect-path handles it (empty
+        // receiving address list regardless of upgrade status).
+        fn build_session() -> Arc<tokio::sync::Mutex<ChatSession>> {
+            let id = Identity::generate().unwrap().identity;
+            let signal = SignalParticipant::new("peer", 1).unwrap();
+            let s = ChatSession::new(signal, AddressManager::new(), id);
+            Arc::new(tokio::sync::Mutex::new(s))
+        }
+        c.sessions.insert("sig-upgraded".into(), build_session());
+        c.peer_uses_dual_p_tag.insert("sig-upgraded".into(), true);
+
+        let (identity_pks, ratchet_pks) = c.collect_subscribe_pubkeys().await;
+
+        // Identity list always includes our own pubkey; agent mode does not
+        // add anything else beyond it (and any pending firstInboxes we'd have
+        // if this client had issued outbound friend requests — none here).
+        assert_eq!(
+            identity_pks.len(),
+            1,
+            "agent mode: only own npub in identity list"
+        );
+        assert!(
+            ratchet_pks.is_empty(),
+            "upgraded peer contributes no ratchet addresses in agent mode"
+        );
     }
 }

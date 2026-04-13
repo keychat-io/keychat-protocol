@@ -65,12 +65,16 @@ impl ChatSession {
     /// - Resolves the sending address via AddressManager (§9.4)
     /// - Encrypts with Signal Protocol
     /// - Updates address rotation state
+    /// - When `agent_npub` is `Some`, emits a second p-tag (spec §3.6 Public
+    ///   Agent routing). Callers MUST pass `Some(peer_nostr_pubkey)` when the
+    ///   peer is known to be a Public Agent, `None` otherwise.
     /// - Returns the Nostr event + address update info
     pub async fn send_message(
         &mut self,
         peer_id: &str,
         remote_address: &ProtocolAddress,
         message: &KCMessage,
+        agent_npub: Option<&str>,
     ) -> Result<(Event, AddressUpdate)> {
         // Resolve where to send
         let to_address = self.addresses.resolve_send_address(peer_id)?;
@@ -84,8 +88,13 @@ impl ChatSession {
             .addresses
             .on_encrypt(peer_id, enc.sender_address.as_deref())?;
 
-        // Build kind:1059 event
-        let event = build_mode1_event(&enc.bytes, &to_address).await?;
+        // Build kind:1059 event (single or dual p-tag per §3.3 / §3.6).
+        let event = match agent_npub {
+            Some(npub) => {
+                build_mode1_event_with_routing(&enc.bytes, &to_address, Some(npub)).await?
+            }
+            None => build_mode1_event(&enc.bytes, &to_address).await?,
+        };
 
         tracing::info!(
             "ChatSession sent message to peer={}",
@@ -176,7 +185,7 @@ impl ChatSession {
     }
 }
 
-use crate::chat::build_mode1_event;
+use crate::chat::{build_mode1_event, build_mode1_event_with_routing};
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -234,7 +243,7 @@ mod tests {
         // Alice sends (PrekeyMessage)
         let msg = KCMessage::text("Hello from ChatSession!");
         let (event, update) = alice
-            .send_message(&alice_peer_id, &bob_addr, &msg)
+            .send_message(&alice_peer_id, &bob_addr, &msg, None)
             .await
             .unwrap();
 
@@ -255,7 +264,7 @@ mod tests {
         // Bob replies
         let reply = KCMessage::text("Hi back!");
         let (reply_event, reply_update) = bob
-            .send_message(&bob_peer_id, &alice_addr, &reply)
+            .send_message(&bob_peer_id, &alice_addr, &reply, None)
             .await
             .unwrap();
 
@@ -284,7 +293,7 @@ mod tests {
         // msg1: Alice → Bob (PrekeyMessage)
         let msg1 = KCMessage::text("m1");
         let (ev1, au1) = alice
-            .send_message(&alice_peer_id, &bob_addr, &msg1)
+            .send_message(&alice_peer_id, &bob_addr, &msg1, None)
             .await
             .unwrap();
         let (_, _, bu1) = bob
@@ -300,7 +309,7 @@ mod tests {
         // msg2: Bob → Alice (direction change)
         let msg2 = KCMessage::text("m2");
         let (ev2, bu2) = bob
-            .send_message(&bob_peer_id, &alice_addr, &msg2)
+            .send_message(&bob_peer_id, &alice_addr, &msg2, None)
             .await
             .unwrap();
         let (_, _, au2) = alice
@@ -315,7 +324,7 @@ mod tests {
         // msg3: Alice → Bob (direction change)
         let msg3 = KCMessage::text("m3");
         let (ev3, au3) = alice
-            .send_message(&alice_peer_id, &bob_addr, &msg3)
+            .send_message(&alice_peer_id, &bob_addr, &msg3, None)
             .await
             .unwrap();
         let (_, _, bu3) = bob
@@ -354,7 +363,7 @@ mod tests {
         for i in 1..=3 {
             let msg = KCMessage::text(&format!("msg{i}"));
             let (ev, _) = alice
-                .send_message(&alice_peer_id, &bob_addr, &msg)
+                .send_message(&alice_peer_id, &bob_addr, &msg, None)
                 .await
                 .unwrap();
             let (received, _, _) = bob.receive_message(&bob_peer_id, &alice_addr, &ev).unwrap();
@@ -393,7 +402,7 @@ mod tests {
 
         // msg1: Alice → Bob
         let (ev1, _) = alice
-            .send_message(&alice_peer_id, &bob_addr, &KCMessage::text("m1"))
+            .send_message(&alice_peer_id, &bob_addr, &KCMessage::text("m1"), None)
             .await
             .unwrap();
         let (_, _, bu1) = bob
@@ -402,7 +411,7 @@ mod tests {
 
         // msg2: Bob → Alice (ratchet takes over)
         let (ev2, _) = bob
-            .send_message(&bob_peer_id, &alice_addr, &KCMessage::text("m2"))
+            .send_message(&bob_peer_id, &alice_addr, &KCMessage::text("m2"), None)
             .await
             .unwrap();
         let (_, _, au2) = alice
@@ -432,5 +441,67 @@ mod tests {
         let session = ChatSession::new(signal, AddressManager::new(), identity);
         let debug = format!("{:?}", session);
         assert!(debug.contains("ChatSession"));
+    }
+
+    /// Helper to read all p-tag values from an Event.
+    fn p_tags_of(event: &Event) -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let s = t.as_slice();
+                if s.first().map(|v| v.as_str()) == Some("p") {
+                    s.get(1).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_message_none_agent_npub_emits_single_p_tag() {
+        let (mut alice, _bob, _alice_addr, bob_addr) = setup_chat_sessions();
+        let alice_peer_id = bob_addr.name().to_string();
+        let bob_inbox = EphemeralKeypair::generate();
+        alice.add_peer(&alice_peer_id, Some(bob_inbox.pubkey_hex()), None);
+
+        let msg = KCMessage::text("hello");
+        let (event, _) = alice
+            .send_message(&alice_peer_id, &bob_addr, &msg, None)
+            .await
+            .unwrap();
+
+        let tags = p_tags_of(&event);
+        assert_eq!(tags.len(), 1, "regular peer must have single p-tag");
+    }
+
+    #[tokio::test]
+    async fn send_message_with_agent_npub_emits_dual_p_tag() {
+        let (mut alice, _bob, _alice_addr, bob_addr) = setup_chat_sessions();
+        let alice_peer_id = bob_addr.name().to_string();
+        let bob_inbox = EphemeralKeypair::generate();
+        alice.add_peer(&alice_peer_id, Some(bob_inbox.pubkey_hex()), None);
+
+        // Simulate Bob being a Public Agent — his Nostr npub is the second p-tag.
+        let agent_npub = EphemeralKeypair::generate().pubkey_hex();
+
+        let msg = KCMessage::text("hello agent");
+        let (event, _) = alice
+            .send_message(&alice_peer_id, &bob_addr, &msg, Some(&agent_npub))
+            .await
+            .unwrap();
+
+        let tags = p_tags_of(&event);
+        assert_eq!(tags.len(), 2, "Public Agent peer must have dual p-tag");
+        assert_eq!(
+            tags[1], agent_npub,
+            "second p-tag must be the agent's npub (spec §3.6)"
+        );
+        // First p-tag is the ratchet-derived / firstInbox address used for routing.
+        assert_ne!(
+            tags[0], agent_npub,
+            "first p-tag must be the delivery address, not the npub"
+        );
     }
 }

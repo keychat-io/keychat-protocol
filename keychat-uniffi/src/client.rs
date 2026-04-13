@@ -628,6 +628,34 @@ impl KeychatClient {
         self.app.disconnect().await.map_err(Into::into)
     }
 
+    // ─── Public Agent Mode (spec §3.6) ───────────────────────────
+
+    /// Enable or disable Public Agent mode on this client. See
+    /// `AppClient::set_self_public_agent` for semantics.
+    pub async fn set_self_public_agent(&self, flag: bool) -> Result<(), KeychatUniError> {
+        self.app
+            .set_self_public_agent(flag)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Whether this client runs in Public Agent mode.
+    pub async fn is_self_public_agent(&self) -> bool {
+        self.app.is_self_public_agent().await
+    }
+
+    /// Whether the given peer is flagged as a Public Agent (learned from
+    /// `friendApprove.publicAgent`). Primarily for tests / debugging.
+    pub async fn is_peer_public_agent(&self, peer_nostr_pk: String) -> bool {
+        self.app.is_peer_public_agent(peer_nostr_pk).await
+    }
+
+    /// Whether the given peer has been observed sending dual p-tag events
+    /// (meaningful only when self is a Public Agent).
+    pub async fn is_peer_upgraded_to_dual_tag(&self, peer_nostr_pk: String) -> bool {
+        self.app.is_peer_upgraded_to_dual_tag(peer_nostr_pk).await
+    }
+
     /// Remove the current identity and all associated data.
     ///
     /// Stops the event loop, disconnects transport, clears all in-memory state,

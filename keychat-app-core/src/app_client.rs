@@ -666,6 +666,51 @@ impl AppClient {
         }
     }
 
+    // ─── Public Agent Mode (spec §3.6) ───────────────────────────
+
+    /// Enable or disable Public Agent mode on this client.
+    ///
+    /// When enabled:
+    /// - Subsequent `friendApprove` messages carry `publicAgent: true`.
+    /// - Relay subscription shrinks to only our own npub (plus ratchet
+    ///   addresses of peers still on single-tag routing).
+    /// - Peers observed sending dual p-tag events are marked as upgraded.
+    ///
+    /// Persisted in `protocol_settings`. Automatically triggers a
+    /// `refresh_subscriptions()` so the live relay filter follows.
+    pub async fn set_self_public_agent(&self, flag: bool) -> AppResult<()> {
+        let mut inner = self.inner.write().await;
+        inner.protocol.set_self_public_agent(flag)?;
+        if let Err(e) = inner.protocol.refresh_subscriptions().await {
+            tracing::warn!("refresh_subscriptions after set_self_public_agent({flag}) failed: {e}");
+        }
+        Ok(())
+    }
+
+    /// Whether this client runs in Public Agent mode.
+    pub async fn is_self_public_agent(&self) -> bool {
+        self.inner.read().await.protocol.is_self_public_agent()
+    }
+
+    /// Whether the given peer is flagged as a Public Agent.
+    pub async fn is_peer_public_agent(&self, peer_nostr_pk: String) -> bool {
+        self.inner
+            .read()
+            .await
+            .protocol
+            .is_peer_public_agent(&peer_nostr_pk)
+    }
+
+    /// Whether the given peer has been observed sending dual p-tag events
+    /// to us. Meaningful only when we run in Public Agent mode.
+    pub async fn is_peer_upgraded_to_dual_tag(&self, peer_nostr_pk: String) -> bool {
+        self.inner
+            .read()
+            .await
+            .protocol
+            .is_peer_upgraded_to_dual_tag(&peer_nostr_pk)
+    }
+
     // ─── Auto-Reconnect ──────────────────────────────────────────
 
     pub async fn enable_auto_reconnect(&self, _max_delay_secs: u32) -> AppResult<()> {

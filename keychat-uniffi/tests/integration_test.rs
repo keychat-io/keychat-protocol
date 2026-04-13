@@ -3316,3 +3316,218 @@ fn mls_multi_identity_multi_group_persistence() {
     .join()
     .unwrap();
 }
+
+// ─── Public Agent (spec §3.6) e2e ────────────────────────────────────────────
+
+/// Full round-trip of the Public Agent protocol over a real relay:
+///
+/// - Bob enables Public Agent mode (端 B).
+/// - Alice sends friendRequest; Bob auto-accepts → `friendApprove` carries
+///   `publicAgent: true`.
+/// - Alice persists the flag on her peer record (端 A closes loop on sender side).
+/// - Alice sends a follow-up text → event includes dual p-tag.
+/// - Bob receives it, marks Alice as upgraded → subscription shrinks.
+/// - Bob restarts → agent mode survives via `protocol_settings`.
+/// - After restart, a second exchange confirms state fully rehydrated.
+#[test]
+#[ignore = "requires network: wss://backup.keychat.io"]
+fn network_public_agent_full_round_trip() {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let alice = Arc::new(make_client(&dir, "alice_pa.db"));
+            let bob = Arc::new(make_client(&dir, "bob_pa.db"));
+
+            let alice_id = alice.create_identity().await.unwrap();
+            let bob_id = bob.create_identity().await.unwrap();
+            let alice_pubkey = alice_id.pubkey_hex.clone();
+            let bob_pubkey = bob_id.pubkey_hex.clone();
+
+            // Bob enables Public Agent mode BEFORE accepting the friend request.
+            assert!(!bob.is_self_public_agent().await);
+            bob.set_self_public_agent(true).await.unwrap();
+            assert!(bob.is_self_public_agent().await);
+
+            alice.connect(vec![TEST_RELAY.into()]).await.unwrap();
+            bob.connect(vec![TEST_RELAY.into()]).await.unwrap();
+
+            let alice_notify = Arc::new(tokio::sync::Notify::new());
+            let bob_notify = Arc::new(tokio::sync::Notify::new());
+            let (alice_listener, alice_events) = CapturingEventListener::new(alice_notify.clone());
+            let (bob_listener, bob_events) = CapturingEventListener::new(bob_notify.clone());
+            alice.set_event_listener(Box::new(alice_listener)).await;
+            bob.set_event_listener(Box::new(bob_listener)).await;
+
+            Arc::clone(&alice).start_event_loop().await.unwrap();
+            Arc::clone(&bob).start_event_loop().await.unwrap();
+
+            establish_friendship(
+                &alice,
+                "Alice",
+                &bob,
+                "Bob",
+                &bob_events,
+                &bob_notify,
+                &alice_events,
+                &alice_notify,
+            )
+            .await;
+
+            // Allow DB writes to settle after approve.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // ── 端 A assertion: Alice learned Bob is a Public Agent ──────────
+            assert!(
+                alice.is_peer_public_agent(bob_pubkey.clone()).await,
+                "Alice must persist publicAgent flag from Bob's friendApprove"
+            );
+            assert!(
+                !alice.is_peer_public_agent(alice_pubkey.clone()).await,
+                "own pubkey is not a peer"
+            );
+            // A peer we've never seen returns false, not an error.
+            assert!(
+                !alice
+                    .is_peer_public_agent(
+                        "0000000000000000000000000000000000000000000000000000000000000000".into()
+                    )
+                    .await
+            );
+
+            // ── 端 B + 端 A round-trip: Alice → Bob message should use dual p-tag ─
+            // Find the Alice→Bob DM room so we can send a text.
+            let alice_rooms = alice.get_rooms(alice_pubkey.clone()).await.unwrap();
+            let alice_bob_room = alice_rooms
+                .iter()
+                .find(|r| r.to_main_pubkey == bob_pubkey)
+                .expect("Alice must have DM room with Bob");
+
+            bob_events.lock().unwrap().clear();
+            alice
+                .send_text(
+                    alice_bob_room.id.clone(),
+                    "hello agent".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Bob must receive it via his own-npub-only subscription.
+            let got = wait_for_event(&bob_events, &bob_notify, 30, |e| {
+                matches!(e, ClientEvent::MessageReceived { .. })
+            })
+            .await;
+            assert!(
+                got,
+                "Bob (agent) did not receive Alice's dual-p-tag message via npub subscription"
+            );
+
+            // 端 B assertion: Bob marks Alice as upgraded.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert!(
+                bob.is_peer_upgraded_to_dual_tag(alice_pubkey.clone()).await,
+                "Bob must mark Alice as having upgraded to dual p-tag after receiving her message"
+            );
+
+            // ── Restart Bob: agent mode + upgraded peer must survive ─────────
+            alice.stop_event_loop().await;
+            bob.stop_event_loop().await;
+            drop_client(Arc::try_unwrap(alice).ok().unwrap()).await;
+            drop_client(Arc::try_unwrap(bob).ok().unwrap()).await;
+
+            let bob2 = Arc::new(make_client(&dir, "bob_pa.db"));
+            bob2.import_identity(bob_id.mnemonic.clone()).await.unwrap();
+            bob2.restore_sessions().await.unwrap();
+
+            assert!(
+                bob2.is_self_public_agent().await,
+                "self_is_public_agent must survive restart"
+            );
+            assert!(
+                bob2.is_peer_upgraded_to_dual_tag(alice_pubkey.clone())
+                    .await,
+                "peer_uses_dual_p_tag must survive restart"
+            );
+
+            drop_client(Arc::try_unwrap(bob2).ok().unwrap()).await;
+        });
+    })
+    .join()
+    .unwrap();
+}
+
+/// Control test: when Bob does NOT enable agent mode, friendApprove does NOT
+/// carry `publicAgent`, and Alice does NOT mark Bob as an agent. This guards
+/// against accidental default-true regressions.
+#[test]
+#[ignore = "requires network: wss://backup.keychat.io"]
+fn network_non_agent_peer_has_no_public_agent_flag() {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let alice = Arc::new(make_client(&dir, "alice_pa2.db"));
+            let bob = Arc::new(make_client(&dir, "bob_pa2.db"));
+
+            let _ = alice.create_identity().await.unwrap();
+            let bob_id = bob.create_identity().await.unwrap();
+            let alice_pubkey = alice.get_pubkey_hex().await.unwrap();
+            let bob_pubkey = bob_id.pubkey_hex.clone();
+
+            // Bob stays in NORMAL mode.
+            assert!(!bob.is_self_public_agent().await);
+
+            alice.connect(vec![TEST_RELAY.into()]).await.unwrap();
+            bob.connect(vec![TEST_RELAY.into()]).await.unwrap();
+
+            let alice_notify = Arc::new(tokio::sync::Notify::new());
+            let bob_notify = Arc::new(tokio::sync::Notify::new());
+            let (alice_listener, alice_events) = CapturingEventListener::new(alice_notify.clone());
+            let (bob_listener, bob_events) = CapturingEventListener::new(bob_notify.clone());
+            alice.set_event_listener(Box::new(alice_listener)).await;
+            bob.set_event_listener(Box::new(bob_listener)).await;
+
+            Arc::clone(&alice).start_event_loop().await.unwrap();
+            Arc::clone(&bob).start_event_loop().await.unwrap();
+
+            establish_friendship(
+                &alice,
+                "Alice",
+                &bob,
+                "Bob",
+                &bob_events,
+                &bob_notify,
+                &alice_events,
+                &alice_notify,
+            )
+            .await;
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            assert!(
+                !alice.is_peer_public_agent(bob_pubkey.clone()).await,
+                "non-agent Bob must NOT be flagged as Public Agent on Alice's side"
+            );
+            assert!(
+                !bob.is_peer_upgraded_to_dual_tag(alice_pubkey.clone()).await,
+                "non-agent Bob has no reason to mark Alice as upgraded"
+            );
+
+            alice.stop_event_loop().await;
+            bob.stop_event_loop().await;
+            drop_client(Arc::try_unwrap(alice).ok().unwrap()).await;
+            drop_client(Arc::try_unwrap(bob).ok().unwrap()).await;
+        });
+    })
+    .join()
+    .unwrap();
+}

@@ -184,11 +184,16 @@ fn build_prekey_bundle_from_payload(
 }
 
 /// Build the accept event: process bundle, encrypt approval, wrap as kind:1059.
+///
+/// `self_is_public_agent` controls whether the emitted `friendApprove` carries
+/// `publicAgent: true` (spec §3.6). When `true`, the peer is expected to use
+/// dual p-tag routing for all future messages to us.
 async fn build_accept_event(
     my_identity: &Identity,
     my_signal: &mut SignalParticipant,
     friend_request: &FriendRequestReceived,
     display_name: &str,
+    self_is_public_agent: bool,
 ) -> Result<FriendRequestAccepted> {
     let payload = &friend_request.payload;
     let (prekey_bundle, remote_address) = build_prekey_bundle_from_payload(payload)?;
@@ -210,7 +215,11 @@ async fn build_accept_event(
         time,
     )?;
 
-    let mut approve_msg = KCMessage::friend_approve(request_id, None);
+    let mut approve_msg = if self_is_public_agent {
+        KCMessage::friend_approve_public_agent(request_id, None)
+    } else {
+        KCMessage::friend_approve(request_id, None)
+    };
     approve_msg.signal_prekey_auth = Some(SignalPrekeyAuth {
         nostr_id: my_identity.pubkey_hex(),
         signal_id: my_signal_id_hex,
@@ -336,17 +345,29 @@ pub fn receive_friend_request(
 }
 
 /// Accept a friend request (§7.3, §7.4).
+///
+/// `self_is_public_agent` (spec §3.6): pass `true` when the local client runs
+/// in Public Agent mode; the emitted `friendApprove` will carry
+/// `publicAgent: true` so the peer adopts dual p-tag routing for us.
 pub async fn accept_friend_request(
     my_identity: &Identity,
     friend_request: &FriendRequestReceived,
     display_name: &str,
+    self_is_public_agent: bool,
 ) -> Result<FriendRequestAccepted> {
     tracing::info!(
         "accepting friend request from {}",
         &friend_request.sender_pubkey_hex[..16.min(friend_request.sender_pubkey_hex.len())]
     );
     let mut my_signal = SignalParticipant::new(my_identity.pubkey_hex(), 1)?;
-    build_accept_event(my_identity, &mut my_signal, friend_request, display_name).await
+    build_accept_event(
+        my_identity,
+        &mut my_signal,
+        friend_request,
+        display_name,
+        self_is_public_agent,
+    )
+    .await
 }
 
 /// Send a friend request with persistent Signal participant (§6.2).
@@ -405,6 +426,7 @@ pub async fn accept_friend_request_persistent(
     keys: crate::signal_session::SignalPreKeyMaterial,
     storage: Arc<Mutex<SecureStorage>>,
     signal_device_id: u32,
+    self_is_public_agent: bool,
 ) -> Result<FriendRequestAccepted> {
     tracing::info!(
         "accepting friend request (persistent) from {}",
@@ -412,7 +434,14 @@ pub async fn accept_friend_request_persistent(
     );
     let mut my_signal =
         SignalParticipant::persistent(my_identity.pubkey_hex(), signal_device_id, keys, storage)?;
-    build_accept_event(my_identity, &mut my_signal, friend_request, display_name).await
+    build_accept_event(
+        my_identity,
+        &mut my_signal,
+        friend_request,
+        display_name,
+        self_is_public_agent,
+    )
+    .await
 }
 
 /// Send a Signal-encrypted KCMessage as kind:1059 Mode 1 (§8.1).
@@ -477,7 +506,7 @@ mod tests {
         assert_eq!(received.message.kind, KCMessageKind::FriendRequest);
 
         // Step 3: Bob accepts
-        let accepted = accept_friend_request(&bob_id, &received, "Bob")
+        let accepted = accept_friend_request(&bob_id, &received, "Bob", false)
             .await
             .unwrap();
         assert_eq!(accepted.event.kind, Kind::GiftWrap);
@@ -601,7 +630,7 @@ mod tests {
             .unwrap();
 
         let received = receive_friend_request(&bob_id, &gift_wrap).unwrap();
-        let accepted = accept_friend_request(&bob_id, &received, "Bob")
+        let accepted = accept_friend_request(&bob_id, &received, "Bob", false)
             .await
             .unwrap();
 
