@@ -290,6 +290,12 @@ impl AppClient {
                     .protocol
                     .update_addresses_after_decrypt(&peer_signal_hex, &session_mutex, &addr_update)
                     .await;
+                // Spec §8.3: drop our first_inbox once the peer's ratchet is
+                // live (i.e. we received on something other than first_inbox).
+                inner.protocol.clear_pending_first_inbox_on_ratchet(
+                    &peer_signal_hex,
+                    &metadata.received_on_address,
+                );
                 inner
                     .protocol
                     .mark_peer_upgraded_if_dual_tag(&peer_signal_hex, &metadata.p_tags)

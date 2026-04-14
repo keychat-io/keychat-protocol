@@ -108,6 +108,13 @@ pub struct ProtocolClient {
     /// ratchet addresses in the subscription filter.
     peer_uses_dual_p_tag: HashMap<String, bool>,
     pending_outbound: HashMap<String, FriendRequestState>,
+    /// Per-peer first_inbox pubkeys that must remain subscribed and
+    /// routable after friend-approve completes (spec §8.3 / line 250).
+    /// After `complete_friend_approve` removes `pending_outbound` entry,
+    /// the peer may still send follow-up messages to our first_inbox
+    /// until their ratchet advances. Keyed by peer_signal_hex → our
+    /// first_inbox pubkey hex. Cleared on first successful session decrypt.
+    peer_pending_first_inbox: HashMap<String, String>,
     group_manager: GroupManager,
     next_signal_device_id: u32,
     subscription_ids: Vec<String>,
@@ -129,6 +136,7 @@ impl ProtocolClient {
             self_is_public_agent: false,
             peer_uses_dual_p_tag: HashMap::new(),
             pending_outbound: HashMap::new(),
+            peer_pending_first_inbox: HashMap::new(),
             group_manager: GroupManager::new(),
             next_signal_device_id: 1,
             subscription_ids: Vec::new(),
@@ -784,6 +792,14 @@ impl ProtocolClient {
                 identity_pubkeys.push(pk);
             }
         }
+        // Spec §8.3: after friend-approve, keep our first_inbox subscribed
+        // so the peer's follow-up messages arrive until their ratchet takes
+        // over. Cleared on first session decrypt.
+        for fi_hex in self.peer_pending_first_inbox.values() {
+            if let Ok(pk) = nostr::PublicKey::from_hex(fi_hex) {
+                identity_pubkeys.push(pk);
+            }
+        }
 
         // Ratchet keys: newly derived Signal addresses, no historical messages.
         //
@@ -1011,6 +1027,31 @@ impl ProtocolClient {
             }
             for addr in &addr_update.dropped_receiving {
                 self.receiving_addr_to_peer.remove(addr);
+            }
+        }
+    }
+
+    /// Spec §8.3: once we receive on a ratchet-derived address, the peer's
+    /// ratchet is live and our first_inbox is no longer needed. Drops both
+    /// the `peer_pending_first_inbox` entry and its receiving_addr_to_peer
+    /// mapping. No-op if the message was received on our first_inbox itself
+    /// (peer hasn't seen a ratchet-derived addr from us yet).
+    pub fn clear_pending_first_inbox_on_ratchet(
+        &mut self,
+        peer_signal_hex: &str,
+        received_on_addr: &str,
+    ) {
+        let should_clear = match self.peer_pending_first_inbox.get(peer_signal_hex) {
+            Some(fi) => fi != received_on_addr,
+            None => false,
+        };
+        if should_clear {
+            if let Some(fi) = self.peer_pending_first_inbox.remove(peer_signal_hex) {
+                self.receiving_addr_to_peer.remove(&fi);
+                tracing::debug!(
+                    "cleared pending first_inbox for peer={} (ratchet active)",
+                    &peer_signal_hex[..16.min(peer_signal_hex.len())]
+                );
             }
         }
     }
@@ -1795,6 +1836,12 @@ impl ProtocolClient {
             KeychatError::FriendRequest(format!("pending state not found for {request_id}"))
         })?;
 
+        // Spec §8.3 line 250: the peer may send follow-up messages to our
+        // first_inbox until their ratchet catches up. Keep the pubkey alive
+        // so we stay subscribed and can route it to this session. Cleared
+        // on first ratchet-derived decrypt (see try_decrypt_session_message).
+        let own_first_inbox_hex = state.first_inbox_keys.pubkey_hex();
+
         let identity = self
             .identity
             .clone()
@@ -1912,6 +1959,12 @@ impl ProtocolClient {
             self.receiving_addr_to_peer
                 .insert(addr.clone(), peer_signal_hex.clone());
         }
+
+        // Spec §8.3: keep our first_inbox routable until peer's ratchet takes over.
+        self.receiving_addr_to_peer
+            .insert(own_first_inbox_hex.clone(), peer_signal_hex.clone());
+        self.peer_pending_first_inbox
+            .insert(peer_signal_hex.clone(), own_first_inbox_hex);
 
         tracing::info!(
             "[complete_friend_approve] session created: signal={} nostr={}",
