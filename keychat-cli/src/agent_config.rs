@@ -328,6 +328,17 @@ mod tests {
 
     #[test]
     fn test_resolve_mnemonic_from_file() {
+        // NOTE: resolve_mnemonic / save_mnemonic both operate on the system
+        // keychain (key = "mnemonic"), NOT on a file despite the historical
+        // test name. The keychain is shared across test runs and with the
+        // real application, so we must explicitly clean up on entry and
+        // exit to avoid cross-run contamination — and to avoid touching
+        // KEYCHAT_MNEMONIC env var left over from another test.
+        let prev_env = std::env::var("KEYCHAT_MNEMONIC").ok();
+        // SAFETY: single-threaded unit test; no other code is reading the var.
+        unsafe { std::env::remove_var("KEYCHAT_MNEMONIC") };
+        let _ = crate::secrets::delete("mnemonic");
+
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap();
 
@@ -338,6 +349,12 @@ mod tests {
         save_mnemonic(data_dir, "word1 word2 word3").unwrap();
         let m = resolve_mnemonic(data_dir).unwrap();
         assert_eq!(m, Some("word1 word2 word3".to_string()));
+
+        // Cleanup so the next run starts empty.
+        let _ = crate::secrets::delete("mnemonic");
+        if let Some(v) = prev_env {
+            unsafe { std::env::set_var("KEYCHAT_MNEMONIC", v) };
+        }
     }
 
     #[test]

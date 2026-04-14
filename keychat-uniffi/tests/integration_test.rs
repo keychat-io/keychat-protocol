@@ -951,6 +951,29 @@ fn network_message_persisted_after_send_and_receive() {
             // Wait for Signal session to stabilize after ratchet exchange
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
+            // Resolve each side's DM room ID. send_text persists messages
+            // keyed by the full room_id ("peer:identity"), not just the
+            // peer pubkey — using the peer pubkey would split sent/received
+            // across two different room_ids in the app DB.
+            let alice_to_bob_room = {
+                let rooms = alice.get_rooms(alice_pubkey.clone()).await.unwrap();
+                rooms
+                    .iter()
+                    .find(|r| r.to_main_pubkey == bob_pubkey)
+                    .expect("Alice must have DM room with Bob")
+                    .id
+                    .clone()
+            };
+            let bob_to_alice_room = {
+                let rooms = bob.get_rooms(bob_pubkey.clone()).await.unwrap();
+                rooms
+                    .iter()
+                    .find(|r| r.to_main_pubkey == alice_pubkey)
+                    .expect("Bob must have DM room with Alice")
+                    .id
+                    .clone()
+            };
+
             // Helper: wait until a MessageReceived event with matching content appears
             let wait_msg = |events: Arc<Mutex<Vec<ClientEvent>>>,
                              notify: Arc<tokio::sync::Notify>,
@@ -964,21 +987,21 @@ fn network_message_persisted_after_send_and_receive() {
 
             // Round 1: Alice → Bob
             alice
-                .send_text(bob_pubkey.clone(), "msg1".into(), None, None, None)
+                .send_text(alice_to_bob_room.clone(), "msg1".into(), None, None, None)
                 .await
                 .unwrap();
             wait_msg(bob_events.clone(), bob_notify.clone(), "msg1".into()).await;
 
             // Round 2: Bob → Alice
             bob
-                .send_text(alice_pubkey.clone(), "msg2".into(), None, None, None)
+                .send_text(bob_to_alice_room.clone(), "msg2".into(), None, None, None)
                 .await
                 .unwrap();
             wait_msg(alice_events.clone(), alice_notify.clone(), "msg2".into()).await;
 
             // Round 3: Alice → Bob
             alice
-                .send_text(bob_pubkey.clone(), "msg3".into(), None, None, None)
+                .send_text(alice_to_bob_room.clone(), "msg3".into(), None, None, None)
                 .await
                 .unwrap();
             wait_msg(bob_events.clone(), bob_notify.clone(), "msg3".into()).await;
@@ -1143,9 +1166,14 @@ fn network_group_db_state_after_create() {
 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-            // Alice: group room exists with type=SignalGroup
+            // Alice: group room exists with type=SignalGroup.
+            // Rooms are stored keyed by "to_main_pubkey:identity_pubkey", so
+            // look up by to_main_pubkey == group_id (the SignalGroupInfo
+            // `group_id` is the group pubkey only, without the identity suffix).
             let alice_rooms = alice.get_rooms(alice_pubkey.clone()).await.unwrap();
-            let group_room = alice_rooms.iter().find(|r| r.id == group_info.group_id);
+            let group_room = alice_rooms
+                .iter()
+                .find(|r| r.to_main_pubkey == group_info.group_id);
             assert!(group_room.is_some(), "Alice should have the group room");
             assert_eq!(group_room.unwrap().room_type, RoomType::SignalGroup);
 
@@ -1268,7 +1296,19 @@ fn network_group_message_persisted() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             // ── DB assertions ──
-            let alice_msgs = alice.get_messages(group_id.clone(), 50, 0).await.unwrap();
+            // Messages are persisted under the full room_id ("group_pubkey:identity_pubkey"),
+            // not the raw group_id. Resolve each side's room first.
+            let alice_rooms = alice.get_rooms(alice_pubkey.clone()).await.unwrap();
+            let alice_group_room = alice_rooms
+                .iter()
+                .find(|r| r.to_main_pubkey == group_id)
+                .expect("Alice must have group room")
+                .id
+                .clone();
+            let alice_msgs = alice
+                .get_messages(alice_group_room, 50, 0)
+                .await
+                .unwrap();
             let alice_group_text: Vec<_> =
                 alice_msgs.iter().filter(|m| !m.content.starts_with('[')).collect();
             assert_eq!(alice_group_text.len(), 3, "Alice should see 3 group messages");
@@ -2584,6 +2624,7 @@ async_test!(mls_participant_persists_across_restart, {
 ///   Phase 7: Post-restart Signal DM + Signal group + MLS group messaging
 ///   Phase 8: MLS group management — remove member, verify isolation
 #[test]
+#[ignore = "requires network: wss://backup.keychat.io"]
 fn mls_e2e_full_lifecycle_with_restart() {
     std::thread::spawn(|| {
         let rt = tokio::runtime::Builder::new_multi_thread()
