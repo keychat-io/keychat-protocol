@@ -238,6 +238,21 @@ macro_rules! async_test {
             .unwrap();
         }
     };
+    (#[ignore = $reason:literal] $name:ident, $body:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            std::thread::spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async { $body });
+            })
+            .join()
+            .unwrap();
+        }
+    };
 }
 
 async_test!(create_client_and_identity, {
@@ -1438,7 +1453,7 @@ async_test!(restore_sessions_fails_without_identity, {
 /// Alice sends a standard NIP-17 DM (no keychat protocol) to Bob.
 /// Bob's event loop should receive it via Step 4 fallback and persist
 /// it as a Nip17Dm room.
-async_test!(nip17_dm_receive_creates_room_and_message, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] nip17_dm_receive_creates_room_and_message, {
     let dir = tempfile::tempdir().unwrap();
     let alice = Arc::new(make_client(&dir, "alice.db"));
     let bob = Arc::new(make_client(&dir, "bob.db"));
@@ -1509,7 +1524,7 @@ async_test!(nip17_dm_receive_creates_room_and_message, {
 });
 
 /// Alice sends NIP-17 DM, Bob replies with NIP-17 DM — full round-trip.
-async_test!(nip17_dm_send_and_receive_roundtrip, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] nip17_dm_send_and_receive_roundtrip, {
     let dir = tempfile::tempdir().unwrap();
     let alice = Arc::new(make_client(&dir, "alice.db"));
     let bob = Arc::new(make_client(&dir, "bob.db"));

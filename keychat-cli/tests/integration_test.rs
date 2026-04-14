@@ -29,6 +29,21 @@ macro_rules! async_test {
             .unwrap();
         }
     };
+    (#[ignore = $reason:literal] $name:ident, $body:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            std::thread::spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async { $body });
+            })
+            .join()
+            .unwrap();
+        }
+    };
 }
 
 // ─── Client Creation ────────────────────────────────────────────
@@ -753,7 +768,7 @@ async fn wait_for_relay_connection(client: &KeychatClient, timeout_secs: u64) ->
 
 // ─── Relay Integration: Friend Request + DB State ────────────────
 
-async_test!(test_friend_request_db_state, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_friend_request_db_state, {
     let dir = tempfile::tempdir().unwrap();
     let db_dir = dir.path().join("libkeychat");
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -905,7 +920,7 @@ async_test!(test_friend_request_db_state, {
 
 // ─── Relay Integration: Message Persistence + DB State ───────────
 
-async_test!(test_message_persisted_db, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_message_persisted_db, {
     let dir = tempfile::tempdir().unwrap();
     let db_dir = dir.path().join("libkeychat");
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -1128,7 +1143,7 @@ async_test!(test_message_persisted_db, {
 
 // ─── Relay Integration: Signal Group DB State ────────────────────
 
-async_test!(test_group_db_state, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_group_db_state, {
     let dir = tempfile::tempdir().unwrap();
     let db_dir = dir.path().join("libkeychat");
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -1488,7 +1503,7 @@ async fn get_dm_room_id(client: &KeychatClient, my_pubkey: &str, peer_pubkey: &s
 
 // ─── Reliability: Message Ordering (rapid-fire) ──────────────────
 
-async_test!(test_message_ordering_rapid_fire, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_message_ordering_rapid_fire, {
     let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
@@ -1562,7 +1577,7 @@ async_test!(test_message_ordering_rapid_fire, {
 
 // ─── Reliability: Offline Message Delivery ───────────────────────
 
-async_test!(test_offline_message_delivery, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_offline_message_delivery, {
     let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, _bob_rx, _dir) = create_friends().await;
 
     let alice_room_id = get_dm_room_id(&alice, &alice_pubkey, &bob_pubkey).await;
@@ -1647,7 +1662,7 @@ async_test!(test_offline_message_delivery, {
 
 // ─── Reliability: Reconnect After Disconnect ─────────────────────
 
-async_test!(test_reconnect_no_message_loss, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_reconnect_no_message_loss, {
     let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
@@ -1739,7 +1754,7 @@ async_test!(test_reconnect_no_message_loss, {
 
 // ─── Reliability: Concurrent Bidirectional Send ──────────────────
 
-async_test!(test_concurrent_bidirectional, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io; flaky — see follow-up issue on concurrent bidirectional delivery"] test_concurrent_bidirectional, {
     let (alice, bob, alice_pubkey, bob_pubkey, mut alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
@@ -1871,7 +1886,7 @@ async_test!(test_concurrent_bidirectional, {
 // task. After the fix, calling disconnect() without explicit stop_event_loop()
 // and then reconnecting should work correctly — no zombie event loops.
 
-async_test!(test_disconnect_without_stop_event_loop, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_disconnect_without_stop_event_loop, {
     let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
@@ -1943,7 +1958,7 @@ async_test!(test_disconnect_without_stop_event_loop, {
 // before a new subscription is created, so each message is delivered exactly
 // once even when start_event_loop() is called repeatedly.
 
-async_test!(test_start_event_loop_twice_no_duplicate_delivery, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_start_event_loop_twice_no_duplicate_delivery, {
     let (alice, bob, alice_pubkey, bob_pubkey, _alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
@@ -2007,7 +2022,7 @@ async_test!(test_start_event_loop_twice_no_duplicate_delivery, {
 /// Test file message sending and receiving between two clients.
 /// Alice uploads a file and sends file message to Bob.
 /// Bob receives the file message and verifies the file info.
-async_test!(test_file_message_send_receive, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_file_message_send_receive, {
     let (alice, bob, alice_pubkey, bob_pubkey, mut alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
@@ -2098,7 +2113,7 @@ async_test!(test_file_message_send_receive, {
 
 /// Test that file messages trigger auto-download when size is within limit.
 /// Alice sends a small file message to Bob, Bob's auto-download should trigger.
-async_test!(test_auto_download_small_file, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io + blossom.band"] test_auto_download_small_file, {
     let (alice, bob, alice_pubkey, bob_pubkey, mut alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
