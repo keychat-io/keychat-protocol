@@ -1,8 +1,9 @@
 //! Protocol orchestration layer.
 //!
-//! Provides `ProtocolClient` for multi-session management and event routing,
-//! plus the `OrchestratorDelegate` trait for notifying upper layers (app persistence, UI)
-//! without depending on them.
+//! Provides `ProtocolClient` for multi-session management, session decryption,
+//! and address routing. Callers (currently `keychat-app-core`) drive the event
+//! loop themselves and use the `try_decrypt_*` methods plus per-event context
+//! structs to integrate with their own persistence layer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,6 @@ use crate::error::{KeychatError, Result};
 use crate::friend_request::FriendRequestState;
 use crate::group::GroupManager;
 use crate::identity::Identity;
-use crate::message::KCMessageKind;
 use crate::session::ChatSession;
 use crate::storage::SecureStorage;
 use crate::transport::Transport;
@@ -20,63 +20,9 @@ use crate::transport::Transport;
 /// `protocol_settings` key for the self Public Agent flag (spec §3.6).
 const SELF_PUBLIC_AGENT_KEY: &str = "self_is_public_agent";
 
-// ─── Delegate Trait ─────────────────────────────────────────────
-
-/// Callback interface for the protocol orchestrator.
-///
-/// The orchestrator calls these methods after protocol-level processing is complete
-/// (decryption, session creation, address rotation, SecureStorage persistence).
-/// Implementations handle app-layer concerns: UI persistence, notifications, etc.
-///
-/// **Lock contract**: The orchestrator drops its own `RwLock` before calling any
-/// delegate method, so implementations may freely acquire their own locks.
-#[async_trait::async_trait]
-pub trait OrchestratorDelegate: Send + Sync {
-    /// An inbound friend request was received and protocol-persisted.
-    /// App should: create room (status=Approving), save contact, save message, notify UI.
-    async fn on_friend_request_received(&self, ctx: FriendRequestContext);
-
-    /// A pending outbound friend request was approved by the peer.
-    /// Session is created and protocol-persisted.
-    /// App should: update room (status=Enabled), save contact, save message, notify UI.
-    async fn on_friend_approved(&self, ctx: FriendApprovedContext);
-
-    /// A pending outbound friend request was rejected by the peer.
-    /// App should: update room (status=Rejected), notify UI.
-    async fn on_friend_rejected(&self, ctx: FriendRejectedContext);
-
-    /// A decrypted session message was received (Text, Files, Cashu, etc.).
-    /// App should: create/update room, save message, increment unread, notify UI.
-    async fn on_message_received(&self, ctx: MessageReceivedContext);
-
-    /// A Signal group invite was received and stored in GroupManager.
-    /// App should: create group room, notify UI.
-    async fn on_group_invite_received(&self, ctx: GroupInviteContext);
-
-    /// A group change event occurred (member removed, self-leave, dissolve, rename).
-    /// App should: update/delete room, notify UI.
-    async fn on_group_changed(&self, ctx: GroupChangedContext);
-
-    /// A NIP-17 DM (non-keychat) was received.
-    /// App should: create/update room (type=Nip17Dm), save message, notify UI.
-    async fn on_nip17_dm_received(&self, ctx: Nip17DmContext);
-
-    /// A relay responded OK to one of our published events (NIP-01).
-    /// App should: update relay status tracking, update message status.
-    async fn on_relay_ok(
-        &self,
-        event_id: String,
-        relay_url: String,
-        success: bool,
-        message: String,
-    );
-
-    /// The event loop encountered an error.
-    async fn on_error(&self, description: String);
-}
-
 // ─── Context Structs ────────────────────────────────────────────
-// Pure data — no app_storage, no UI types, no UniFFI annotations.
+// Pure data returned by the `try_decrypt_*` methods. No app_storage,
+// no UI types, no UniFFI annotations.
 
 /// Context for an inbound friend request.
 #[derive(Debug, Clone)]
@@ -97,92 +43,6 @@ pub struct FriendRequestContext {
     pub message_json: Option<String>,
     /// Serialized KCFriendRequestPayload JSON.
     pub payload_json: Option<String>,
-}
-
-/// Context for a friend request that was approved.
-#[derive(Debug, Clone)]
-pub struct FriendApprovedContext {
-    /// The original request ID.
-    pub request_id: String,
-    /// Peer's Nostr pubkey (hex).
-    pub peer_nostr_pubkey: String,
-    /// Peer's display name.
-    pub peer_name: String,
-    /// Peer's Signal identity key (hex) — used for room association.
-    pub peer_signal_id_hex: String,
-    /// Nostr event ID (hex) of the GiftWrap event.
-    pub event_id: String,
-}
-
-/// Context for a friend request that was rejected.
-#[derive(Debug, Clone)]
-pub struct FriendRejectedContext {
-    /// The original request ID.
-    pub request_id: String,
-    /// Peer's Nostr pubkey (hex).
-    pub peer_pubkey: String,
-}
-
-/// Context for a decrypted incoming message.
-#[derive(Debug, Clone)]
-pub struct MessageReceivedContext {
-    /// Nostr event ID (hex).
-    pub event_id: String,
-    /// Sender's Nostr pubkey (hex).
-    pub sender_pubkey: String,
-    /// KCMessage kind.
-    pub kind: KCMessageKind,
-    /// Text content (if text message).
-    pub content: Option<String>,
-    /// Serialized full KCMessage payload (JSON).
-    pub payload_json: Option<String>,
-    /// Serialized Nostr event JSON (for resend support).
-    pub nostr_event_json: Option<String>,
-    /// Fallback text for unknown kinds.
-    pub fallback: Option<String>,
-    /// Event ID of the message being replied to.
-    pub reply_to_event_id: Option<String>,
-    /// Group ID if this is a group message.
-    pub group_id: Option<String>,
-    /// Thread ID for threaded conversations.
-    pub thread_id: Option<String>,
-    /// Relay URL that delivered this event.
-    pub relay_url: Option<String>,
-    /// Event created_at timestamp.
-    pub created_at: u64,
-}
-
-/// Context for a group invite.
-#[derive(Debug, Clone)]
-pub struct GroupInviteContext {
-    /// The group ID (Nostr pubkey of the group).
-    pub group_id: String,
-    /// Group name.
-    pub group_name: String,
-    /// Group type identifier (e.g. "signal").
-    pub group_type: String,
-    /// Pubkey of the member who sent the invite.
-    pub inviter_pubkey: String,
-}
-
-/// The kind of group change event.
-#[derive(Debug, Clone)]
-pub enum GroupChangeKind {
-    MemberRemoved { member_pubkey: Option<String> },
-    SelfLeave { group_id: String },
-    Dissolve { group_id: String },
-    NameChanged { new_name: Option<String> },
-}
-
-/// Context for a group change event.
-#[derive(Debug, Clone)]
-pub struct GroupChangedContext {
-    /// The group ID.
-    pub group_id: String,
-    /// What changed.
-    pub change: GroupChangeKind,
-    /// Nostr event ID (hex) of the event.
-    pub event_id: String,
 }
 
 /// Context for a NIP-17 DM.
@@ -2076,222 +1936,8 @@ impl ProtocolClient {
         Ok(sender)
     }
 
-    // ─── Event Loop Core ────────────────────────────────────────
-
-    /// Run the protocol event loop.
-    ///
-    /// Receives GiftWrap events from relay, deduplicates, attempts decryption
-    /// in priority order (friend request → approve → session → NIP-17 DM),
-    /// and notifies the delegate for app-layer persistence.
-    ///
-    /// Pure protocol: does NOT touch app_storage. All persistence happens
-    /// through the `OrchestratorDelegate` callbacks.
-    pub async fn run_event_loop(
-        client: Arc<tokio::sync::RwLock<Self>>,
-        delegate: Arc<dyn OrchestratorDelegate>,
-        mut stop_rx: tokio::sync::watch::Receiver<bool>,
-    ) {
-        // Get nostr client handle
-        let nostr_client = {
-            let inner = client.read().await;
-            match inner.transport.as_ref() {
-                Some(t) => t.client().clone(),
-                None => {
-                    delegate.on_error("transport not initialized".into()).await;
-                    return;
-                }
-            }
-        };
-
-        let mut notifications = nostr_client.notifications();
-
-        loop {
-            tokio::select! {
-                _ = stop_rx.changed() => {
-                    tracing::info!("protocol event loop: stop signal received");
-                    break;
-                }
-                result = notifications.recv() => {
-                    match result {
-                        Ok(crate::RelayPoolNotification::Event { relay_url, event, .. }) => {
-                            let eid = event.id.to_hex();
-
-                            // Deduplicate
-                            let deduped = {
-                                let inner = client.read().await;
-                                match inner.transport.as_ref() {
-                                    Some(t) => t.deduplicate((*event).clone()).await,
-                                    None => None,
-                                }
-                            };
-
-                            if let Some(event) = deduped {
-                                if event.kind == crate::Kind::GiftWrap {
-                                    tracing::info!(
-                                        "⬇️ RECV kind={} id={} from={}",
-                                        event.kind.as_u16(),
-                                        &eid[..16.min(eid.len())],
-                                        relay_url
-                                    );
-                                    let relay = relay_url.to_string();
-                                    let nostr_event_json = serde_json::to_string(&event).ok();
-
-                                    // Update relay cursor
-                                    let event_ts = event.created_at.as_u64();
-                                    let cursor_storage = client.read().await.storage.clone();
-                                    if let Ok(store) = cursor_storage.lock() {
-                                        let _ = store.update_relay_cursor(&relay, event_ts);
-                                    }
-
-                                    // Step 1: Try friend request
-                                    {
-                                        let inner = client.read().await;
-                                        if let Some(ctx) = inner.try_decrypt_friend_request(&event) {
-                                            delegate.on_friend_request_received(ctx).await;
-                                            continue;
-                                        }
-                                    }
-
-                                    // Step 2: Try friend approve/reject
-                                    {
-                                        let mut inner = client.write().await;
-                                        if let Some((request_id, msg, decrypt_result)) = inner.try_decrypt_pending_outbound(&event) {
-                                            if msg.kind == crate::KCMessageKind::FriendApprove {
-                                                // Create session + update mappings + persist
-                                                match inner.complete_friend_approve(&request_id, &msg, &decrypt_result).await {
-                                                    Ok((peer_signal_hex, peer_nostr_id, peer_name)) => {
-                                                        // Re-subscribe to new ratchet addresses
-                                                        let _ = inner.refresh_subscriptions().await;
-                                                        drop(inner);
-                                                        delegate.on_friend_approved(FriendApprovedContext {
-                                                            request_id,
-                                                            peer_nostr_pubkey: peer_nostr_id,
-                                                            peer_name,
-                                                            peer_signal_id_hex: peer_signal_hex,
-                                                            event_id: event.id.to_hex(),
-                                                        }).await;
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::error!("complete_friend_approve failed: {e}");
-                                                        drop(inner);
-                                                    }
-                                                }
-                                            } else if msg.kind == crate::KCMessageKind::FriendReject {
-                                                let peer_pubkey = inner.pending_outbound.get(&request_id)
-                                                    .map(|s| s.peer_nostr_pubkey.clone())
-                                                    .unwrap_or_default();
-                                                inner.pending_outbound.remove(&request_id);
-                                                drop(inner);
-                                                delegate.on_friend_rejected(FriendRejectedContext {
-                                                    request_id,
-                                                    peer_pubkey,
-                                                }).await;
-                                            }
-                                            continue;
-                                        }
-                                    }
-
-                                    // Step 3: Try session message
-                                    // Need to drop read lock before async session decrypt
-                                    let step3_result = {
-                                        let inner = client.read().await;
-                                        inner.try_decrypt_session_message(&event).await
-                                    };
-                                    if let Some((peer_signal_hex, msg, metadata, addr_update, session_mutex)) = step3_result
-                                    {
-                                        // Update addresses + observe dual p-tag upgrade (§3.6).
-                                        let peer_upgraded = {
-                                            let mut inner_w = client.write().await;
-                                            inner_w.update_addresses_after_decrypt(
-                                                &peer_signal_hex, &session_mutex, &addr_update,
-                                            ).await;
-                                            inner_w.mark_peer_upgraded_if_dual_tag(
-                                                &peer_signal_hex,
-                                                &metadata.p_tags,
-                                            )
-                                        };
-                                        if peer_upgraded {
-                                            // Drop this peer's ratchet addresses from the filter.
-                                            let mut inner_w = client.write().await;
-                                            if let Err(e) = inner_w.refresh_subscriptions().await {
-                                                tracing::warn!(
-                                                    "refresh_subscriptions after dual-p-tag upgrade failed: {e}"
-                                                );
-                                            }
-                                        }
-
-                                            // Resolve sender nostr pubkey
-                                            let sender_nostr_pubkey = {
-                                                let inner = client.read().await;
-                                                inner.peer_signal_to_nostr
-                                                    .get(&peer_signal_hex)
-                                                    .cloned()
-                                                    .unwrap_or_else(|| peer_signal_hex.clone())
-                                            };
-
-                                            let kind = msg.kind.clone();
-                                            let content = msg.text.as_ref().map(|t| t.content.clone());
-                                            let payload_json = msg.to_json().ok();
-                                            let group_id = msg.group_id.clone();
-                                            let thread_id = msg.thread_id.clone();
-                                            let fallback = msg.fallback.clone();
-                                            let reply_to_event_id = msg.reply_to.as_ref()
-                                                .and_then(|r| r.target_event_id.clone());
-
-                                            delegate.on_message_received(MessageReceivedContext {
-                                                event_id: metadata.event_id.to_hex(),
-                                                sender_pubkey: sender_nostr_pubkey,
-                                                kind,
-                                                content,
-                                                payload_json,
-                                                nostr_event_json: nostr_event_json.clone(),
-                                                fallback,
-                                                reply_to_event_id,
-                                                group_id,
-                                                thread_id,
-                                                relay_url: Some(relay.clone()),
-                                                created_at: event.created_at.as_u64(),
-                                            }).await;
-                                            continue;
-                                        }
-
-                                    // Step 4: Try NIP-17 DM fallback
-                                    {
-                                        let inner = client.read().await;
-                                        if let Some(mut ctx) = inner.try_decrypt_nip17_dm(&event) {
-                                            ctx.nostr_event_json = nostr_event_json;
-                                            ctx.relay_url = Some(relay);
-                                            delegate.on_nip17_dm_received(ctx).await;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            } else {
-                                tracing::debug!("⬇️ DUP id={}", &eid[..16.min(eid.len())]);
-                            }
-                        }
-                        Ok(crate::RelayPoolNotification::Message { relay_url, message }) => {
-                            if let crate::RelayMessage::Ok { event_id, status, message: msg } = message {
-                                delegate.on_relay_ok(
-                                    event_id.to_hex(),
-                                    relay_url.to_string(),
-                                    status,
-                                    msg,
-                                ).await;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!("event loop notification error: {e}");
-                            delegate.on_error(format!("notification error: {e}")).await;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        tracing::info!("protocol event loop exited");
-    }
+    // (The event-loop driver lives in `keychat-app-core::event_loop`,
+    // which calls the `try_decrypt_*` methods above directly.)
 }
 
 // ─── Tests (Public Agent mode, spec §3.6) ────────────────────────────────────
