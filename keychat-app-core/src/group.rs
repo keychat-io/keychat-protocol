@@ -291,7 +291,27 @@ impl AppClient {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let msgid = format!("gsend-{}-{}", &group_id[..16.min(group_id.len())], now);
+        // Use the first per-member event id as the local msgid so each outbound
+        // group message has a unique DB primary key. Falls back to a
+        // nanosecond-timestamped synthetic id if no member send succeeded
+        // (e.g. all members failed to encrypt). A previous version used
+        // `gsend-<group>-<seconds>` which collided when two messages were
+        // sent in the same second, causing the second INSERT to overwrite
+        // the first via UPSERT.
+        let msgid = match event_ids.first() {
+            Some(eid) => eid.clone(),
+            None => {
+                let now_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                format!(
+                    "gsend-{}-{}",
+                    &group_id[..16.min(group_id.len())],
+                    now_nanos
+                )
+            }
+        };
 
         {
             let app_storage = self.inner.read().await.app_storage.clone();
