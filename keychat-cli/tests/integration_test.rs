@@ -1754,7 +1754,7 @@ async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_reconne
 
 // ─── Reliability: Concurrent Bidirectional Send ──────────────────
 
-async_test!(#[ignore = "requires network: wss://backup.keychat.io; flaky — see follow-up issue on concurrent bidirectional delivery"] test_concurrent_bidirectional, {
+async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_concurrent_bidirectional, {
     let (alice, bob, alice_pubkey, bob_pubkey, mut alice_rx, mut bob_rx, _dir) =
         create_friends().await;
 
