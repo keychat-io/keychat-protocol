@@ -163,6 +163,8 @@ pub fn build_router(
         .route("/friend-request", post(send_friend_request))
         .route("/friend-request/accept", post(accept_friend_request))
         .route("/friend-request/reject", post(reject_friend_request))
+        .route("/bundle/export", post(export_bundle))
+        .route("/bundle/add", post(add_bundle))
         // Messaging
         .route("/send", post(send_message))
         .route("/send-file", post(send_file))
@@ -393,6 +395,53 @@ async fn reject_friend_request(
         .await
     {
         Ok(()) => ok_json(serde_json::json!({ "rejected": true })),
+        Err(e) => bad_request(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExportBundleReq {
+    #[serde(default = "default_cli_name")]
+    name: String,
+    #[serde(default = "default_cli_device")]
+    device_id: String,
+}
+
+fn default_cli_name() -> String {
+    "CLI User".to_string()
+}
+fn default_cli_device() -> String {
+    "cli-device".to_string()
+}
+
+async fn export_bundle(
+    State(state): State<AppState>,
+    Json(req): Json<ExportBundleReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.client.export_contact_bundle(req.name, req.device_id).await {
+        Ok(json) => ok_json(serde_json::json!({ "bundle": json })),
+        Err(e) => bad_request(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddBundleReq {
+    /// Raw JSON bundle string. Callers that have base64 should decode first.
+    bundle: String,
+    #[serde(default = "default_cli_name")]
+    name: String,
+}
+
+async fn add_bundle(
+    State(state): State<AppState>,
+    Json(req): Json<AddBundleReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.client.add_contact_via_bundle(req.bundle, req.name).await {
+        Ok(info) => ok_json(serde_json::json!({
+            "nostr_pubkey_hex": info.nostr_pubkey_hex,
+            "signal_id_hex": info.signal_id_hex,
+            "display_name": info.display_name,
+        })),
         Err(e) => bad_request(e),
     }
 }

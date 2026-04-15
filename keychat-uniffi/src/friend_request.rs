@@ -52,4 +52,35 @@ impl KeychatClient {
             .await
             .map_err(KeychatUniError::from)
     }
+
+    /// Export my contact bundle as a JSON string (spec §6.5).
+    pub async fn export_contact_bundle(
+        &self,
+        my_name: String,
+        device_id: String,
+    ) -> Result<String, KeychatUniError> {
+        self.app
+            .export_contact_bundle(my_name, device_id)
+            .await
+            .map_err(KeychatUniError::from)
+    }
+
+    /// Add a contact by consuming a peer-supplied bundle (spec §6.5).
+    pub async fn add_contact_via_bundle(
+        &self,
+        bundle_json: String,
+        my_name: String,
+    ) -> Result<ContactInfo, KeychatUniError> {
+        let result: keychat_app_core::ContactInfo = self
+            .app
+            .add_contact_via_bundle(bundle_json, my_name)
+            .await
+            .map_err(KeychatUniError::from)?;
+
+        Ok(ContactInfo {
+            nostr_pubkey_hex: result.nostr_pubkey_hex,
+            signal_id_hex: result.signal_id_hex,
+            display_name: result.display_name,
+        })
+    }
 }

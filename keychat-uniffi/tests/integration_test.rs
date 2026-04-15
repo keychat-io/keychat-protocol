@@ -837,6 +837,162 @@ async_test!(npub_hex_conversion, {
 //
 // Marked #[ignore] so normal `cargo test` skips them; CI can opt-in explicitly.
 
+/// Offline bundle (§6.5) flow: Bob exports bundle → Alice consumes → Alice's
+/// PreKey approve arrives at Bob's firstInbox → Bob's Step 2 completes session.
+/// Both sides end with an Enabled DM room and can exchange messages.
+#[test]
+#[ignore = "requires network: wss://backup.keychat.io"]
+fn network_bundle_flow_establishes_session() {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let alice = Arc::new(make_client(&dir, "alice.db"));
+            let bob = Arc::new(make_client(&dir, "bob.db"));
+
+            let alice_pk = alice.create_identity().await.unwrap().pubkey_hex;
+            let bob_pk = bob.create_identity().await.unwrap().pubkey_hex;
+
+            alice.connect(vec![TEST_RELAY.into()]).await.unwrap();
+            bob.connect(vec![TEST_RELAY.into()]).await.unwrap();
+
+            let alice_notify = Arc::new(tokio::sync::Notify::new());
+            let bob_notify = Arc::new(tokio::sync::Notify::new());
+            let (alice_listener, alice_events) = CapturingEventListener::new(alice_notify.clone());
+            let (bob_listener, bob_events) = CapturingEventListener::new(bob_notify.clone());
+            alice.set_event_listener(Box::new(alice_listener)).await;
+            bob.set_event_listener(Box::new(bob_listener)).await;
+
+            Arc::clone(&alice).start_event_loop().await.unwrap();
+            Arc::clone(&bob).start_event_loop().await.unwrap();
+
+            // Let subscriptions settle
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Bob exports a bundle out-of-band.
+            let bundle_json = bob
+                .export_contact_bundle("Bob".into(), "device-1".into())
+                .await
+                .unwrap();
+            assert!(!bundle_json.is_empty());
+            assert!(
+                bundle_json.contains(&bob_pk),
+                "bundle must carry Bob's nostr pubkey"
+            );
+
+            // Give Bob time to refresh subscriptions to include his firstInbox.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // Alice consumes the bundle. Publishes PreKey approve to Bob's firstInbox.
+            let contact = alice
+                .add_contact_via_bundle(bundle_json, "Alice".into())
+                .await
+                .unwrap();
+            assert_eq!(contact.nostr_pubkey_hex, bob_pk);
+
+            // Bob's Step 2 should fire and emit FriendRequestAccepted.
+            let bob_got_prekey = wait_for_event(&bob_events, &bob_notify, 30, |e| {
+                matches!(e, ClientEvent::FriendRequestAccepted { .. })
+            })
+            .await;
+            assert!(
+                bob_got_prekey,
+                "Bob did not complete session from Alice's bundle PreKey in time"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // Both sides should have an enabled DM room.
+            let alice_rooms = alice.get_rooms(alice_pk.clone()).await.unwrap();
+            let alice_dm = alice_rooms.iter().find(|r| r.to_main_pubkey == bob_pk);
+            assert!(alice_dm.is_some(), "Alice should have a room with Bob");
+            assert_eq!(alice_dm.unwrap().status, RoomStatus::Enabled);
+
+            let bob_rooms = bob.get_rooms(bob_pk.clone()).await.unwrap();
+            let bob_dm = bob_rooms.iter().find(|r| r.to_main_pubkey == alice_pk);
+            assert!(bob_dm.is_some(), "Bob should have a room with Alice");
+            assert_eq!(bob_dm.unwrap().status, RoomStatus::Enabled);
+
+            // Both sides should have each other as a contact.
+            let alice_contacts = alice.get_contacts(alice_pk.clone()).await.unwrap();
+            assert!(alice_contacts.iter().any(|c| c.pubkey == bob_pk));
+            let bob_contacts = bob.get_contacts(bob_pk.clone()).await.unwrap();
+            assert!(bob_contacts.iter().any(|c| c.pubkey == alice_pk));
+
+            // Verify bidirectional messaging works over the new session.
+            let alice_room_id = alice_dm.unwrap().id.clone();
+            alice
+                .send_text(alice_room_id.clone(), "hi bob".into(), None, None, None)
+                .await
+                .unwrap();
+            let bob_got_msg = wait_for_event(&bob_events, &bob_notify, 30, |e| {
+                matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "hi bob")
+            })
+            .await;
+            assert!(bob_got_msg, "Bob did not receive Alice's first DM");
+
+            let bob_room_id = bob_dm.unwrap().id.clone();
+            bob.send_text(bob_room_id, "hi alice".into(), None, None, None)
+                .await
+                .unwrap();
+            let alice_got_msg = wait_for_event(&alice_events, &alice_notify, 30, |e| {
+                matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "hi alice")
+            })
+            .await;
+            assert!(alice_got_msg, "Alice did not receive Bob's reply");
+
+            alice.stop_event_loop().await;
+            bob.stop_event_loop().await;
+            drop_client(Arc::try_unwrap(alice).ok().unwrap()).await;
+            drop_client(Arc::try_unwrap(bob).ok().unwrap()).await;
+        });
+    })
+    .join()
+    .unwrap();
+}
+
+/// Bundle with tampered signal_identity_key is rejected (globalSign fails).
+#[test]
+fn bundle_tampered_rejected_via_app_api() {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let bob = Arc::new(make_client(&dir, "bob.db"));
+            let alice = Arc::new(make_client(&dir, "alice.db"));
+            bob.create_identity().await.unwrap();
+            alice.create_identity().await.unwrap();
+
+            // Bob can export without relay (no publish happens).
+            let bundle_json = bob
+                .export_contact_bundle("Bob".into(), "device-1".into())
+                .await
+                .unwrap();
+
+            // Tamper: swap signalIdentityKey to a bogus value.
+            let mut payload: serde_json::Value = serde_json::from_str(&bundle_json).unwrap();
+            payload["signalIdentityKey"] = serde_json::json!(
+                "05deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00"
+            );
+            let tampered = serde_json::to_string(&payload).unwrap();
+
+            let result = alice.add_contact_via_bundle(tampered, "Alice".into()).await;
+            assert!(result.is_err(), "tampered bundle must be rejected");
+
+            drop_client(Arc::try_unwrap(alice).ok().unwrap()).await;
+            drop_client(Arc::try_unwrap(bob).ok().unwrap()).await;
+        });
+    })
+    .join()
+    .unwrap();
+}
+
 /// Friend request → accept → verify both sides have enabled DM room + contact in DB.
 #[test]
 #[ignore = "requires network: wss://backup.keychat.io"]

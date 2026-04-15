@@ -1398,6 +1398,238 @@ impl ProtocolClient {
         Ok((request_id, event_id_hex))
     }
 
+    // ─── Bundle (offline / QR) flow (spec §6.5) ──────────────────
+    //
+    // Protocol-equivalent to the Gift Wrap path, but the FR payload is
+    // carried out-of-band (QR code, shared string, etc) instead of via
+    // NIP-17. The initiator prepares the payload + firstInbox and waits on
+    // the same `pending_outbound` state as the online FR path; the receiver
+    // runs the same `accept_friend_request_persistent` logic.
+    //
+    // Unlike the Gift Wrap path, `export_bundle` does NOT publish anything
+    // to relays — the returned JSON must be conveyed out-of-band by the
+    // caller. Nothing else about the session model differs.
+
+    /// Prepare a bundle to share out-of-band, and persist the matching
+    /// `pending_outbound` state so the eventual PreKey reply decrypts.
+    ///
+    /// Returns the JSON bundle string. Caller is responsible for the
+    /// out-of-band transfer (QR encode, copy-paste, etc.).
+    pub async fn export_bundle_protocol(
+        &mut self,
+        my_name: &str,
+        device_id_str: &str,
+    ) -> Result<String> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+
+        let signal_device_id = self.next_signal_device_id;
+        self.next_signal_device_id += 1;
+
+        let keys = crate::generate_prekey_material()?;
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+            crate::serialize_prekey_material(&keys)?;
+
+        // Build a persistent SignalParticipant so OPK/SPK/Kyber are written
+        // to SecureStorage and libsignal can find them when Alice's PreKey
+        // arrives.
+        let signal_participant = crate::SignalParticipant::persistent(
+            identity.pubkey_hex(),
+            signal_device_id,
+            keys,
+            self.storage.clone(),
+        )?;
+
+        let first_inbox_keys = crate::EphemeralKeypair::generate();
+        let first_inbox_hex = first_inbox_keys.pubkey_hex();
+
+        let payload = crate::friend_request::build_friend_request_payload(
+            &identity,
+            my_name,
+            device_id_str,
+            &signal_participant,
+            &first_inbox_hex,
+        )?;
+
+        // The request_id mirrors `parse_bundle_as_friend_request`'s naming so
+        // a bundle exported here and consumed by the peer share the same id.
+        let time = payload.time.unwrap_or_default();
+        let request_id = format!("bundle-{}", time);
+        let first_inbox_secret = first_inbox_keys.secret_hex();
+        let peer_nostr_placeholder = String::new(); // filled when PreKey arrives
+
+        // Persist pending FR to SecureStorage so that a restart can still
+        // decrypt the eventual reply (same contract as send_friend_request_protocol).
+        if let Ok(store) = self.storage.lock() {
+            store.save_pending_fr(
+                &request_id,
+                signal_device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+                pk_id,
+                &pk_rec,
+                kpk_id,
+                &kpk_rec,
+                &first_inbox_secret,
+                &peer_nostr_placeholder,
+            )?;
+        }
+
+        // In-memory pending state — identical shape to online FR path so the
+        // Step 2 decrypt loop treats it the same way.
+        self.pending_outbound.insert(
+            request_id.clone(),
+            crate::FriendRequestState {
+                signal_participant,
+                first_inbox_keys,
+                request_id: request_id.clone(),
+                peer_nostr_pubkey: peer_nostr_placeholder,
+            },
+        );
+
+        // Refresh subscriptions so firstInbox is actually listened on before
+        // the peer (Alice) could send us anything. If not yet connected, skip
+        // silently — `collect_subscribe_pubkeys` will pick up the pending
+        // firstInbox at connect time via the shared pending_outbound map.
+        if self.transport.is_some() {
+            self.refresh_subscriptions().await?;
+        }
+
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| KeychatError::Signal(format!("bundle serialize: {e}")))?;
+        tracing::info!(
+            "[bundle] exported request_id={} firstInbox={}",
+            &request_id,
+            &first_inbox_hex[..16.min(first_inbox_hex.len())]
+        );
+        Ok(json)
+    }
+
+    /// Consume a peer's bundle (offline-delivered `KCFriendRequestPayload`)
+    /// and establish a session: runs the same accept path as an online FR.
+    /// Returns (peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex).
+    pub async fn add_contact_via_bundle_protocol(
+        &mut self,
+        bundle_json: &str,
+        my_name: &str,
+    ) -> Result<(String, String, String, String)> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+
+        let received = crate::friend_request::parse_bundle_as_friend_request(bundle_json)?;
+
+        // Reject a bundle that claims to be from ourselves.
+        if received.sender_pubkey_hex == identity.pubkey_hex() {
+            return Err(KeychatError::FriendRequest(
+                "bundle belongs to self".into(),
+            ));
+        }
+        // Reject a bundle from a peer we already have a session with.
+        if self
+            .peer_nostr_to_signal
+            .contains_key(&received.sender_pubkey_hex)
+        {
+            return Err(KeychatError::FriendRequest(format!(
+                "already connected to peer {}",
+                &received.sender_pubkey_hex[..16.min(received.sender_pubkey_hex.len())]
+            )));
+        }
+
+        let signal_device_id = self.next_signal_device_id;
+        self.next_signal_device_id += 1;
+
+        let keys = crate::generate_prekey_material()?;
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
+            crate::serialize_prekey_material(&keys)?;
+
+        // Reuse the existing accept path wholesale.
+        let accepted = crate::accept_friend_request_persistent(
+            &identity,
+            &received,
+            my_name,
+            keys,
+            self.storage.clone(),
+            signal_device_id,
+            self.self_is_public_agent,
+        )
+        .await?;
+
+        let payload = &received.payload;
+        let peer_signal_hex = payload.signal_identity_key.clone();
+        let peer_nostr_hex = received.sender_pubkey_hex.clone();
+        let peer_name = payload.name.clone();
+
+        // Publish the PreKey message to peer's firstInbox.
+        let event_id_hex = accepted.event.id.to_hex();
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
+        transport.publish_event_async(accepted.event).await?;
+
+        // AddressManager initialization — mirrors accept_friend_request_protocol.
+        let mut addresses = crate::AddressManager::new();
+        addresses.add_peer(
+            &peer_signal_hex,
+            Some(payload.first_inbox.clone()),
+            Some(peer_nostr_hex.clone()),
+        );
+        if accepted.sender_address.is_some() {
+            let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
+        }
+        let recv_addrs = addresses.get_all_receiving_address_strings();
+        let session = crate::ChatSession::new(accepted.signal_participant, addresses, identity);
+
+        // Persist.
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.save_signal_participant(
+                &peer_signal_hex,
+                signal_device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+            );
+            if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
+                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+            }
+            let _ = store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name);
+        }
+
+        // In-memory state.
+        self.sessions.insert(
+            peer_signal_hex.clone(),
+            Arc::new(tokio::sync::Mutex::new(session)),
+        );
+        self.peer_nostr_to_signal
+            .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
+        self.peer_signal_to_nostr
+            .insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
+        for addr in &recv_addrs {
+            self.receiving_addr_to_peer
+                .insert(addr.clone(), peer_signal_hex.clone());
+        }
+
+        // Subscribe to our new ratchet address.
+        self.refresh_subscriptions().await?;
+
+        tracing::info!(
+            "[bundle] added contact via bundle: signal={} nostr={}",
+            &peer_signal_hex[..16.min(peer_signal_hex.len())],
+            &peer_nostr_hex[..16.min(peer_nostr_hex.len())]
+        );
+
+        Ok((peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex))
+    }
+
     /// Accept a friend request: load FR → generate keys → accept → create session → persist.
     /// Returns (peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex).
     pub async fn accept_friend_request_protocol(

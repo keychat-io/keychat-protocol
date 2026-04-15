@@ -159,6 +159,113 @@ impl AppClient {
         })
     }
 
+    /// Export my contact bundle (§6.5 offline/QR mode).
+    ///
+    /// Returns a JSON string encoding a `KCFriendRequestPayload`. The caller
+    /// shares this out-of-band (QR code, copy-paste, etc); the receiver feeds
+    /// it into `add_contact_via_bundle` to establish a session.
+    ///
+    /// No relay event is published here. A `pending_outbound` entry is saved
+    /// so the eventual PreKey reply decrypts (same contract as the online FR
+    /// path). `firstInbox` is added to the identity-key subscription filter.
+    pub async fn export_contact_bundle(
+        &self,
+        my_name: String,
+        device_id: String,
+    ) -> AppResult<String> {
+        let mut inner = self.inner.write().await;
+        let bundle = inner
+            .protocol
+            .export_bundle_protocol(&my_name, &device_id)
+            .await?;
+        Ok(bundle)
+    }
+
+    /// Add a contact from a peer-supplied bundle (§6.5 offline/QR mode).
+    ///
+    /// Consumes the bundle (a JSON `KCFriendRequestPayload` from the peer,
+    /// delivered out-of-band), runs the standard accept path end-to-end:
+    /// process X3DH, encrypt a `friendApprove` PreKey message, publish to
+    /// peer's `firstInbox`, establish session, persist everything.
+    ///
+    /// The app-layer persistence mirrors `accept_friend_request`: a new
+    /// room is created (status=Enabled), a contact row written, an
+    /// "[Friend Added via Bundle]" marker message saved.
+    pub async fn add_contact_via_bundle(
+        &self,
+        bundle_json: String,
+        my_name: String,
+    ) -> AppResult<ContactInfo> {
+        // 1. Protocol: parse, X3DH, publish PreKey, create session, persist.
+        let (peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex) = {
+            let mut inner = self.inner.write().await;
+            inner
+                .protocol
+                .add_contact_via_bundle_protocol(&bundle_json, &my_name)
+                .await?
+        };
+
+        // 2. App: create room as already-enabled, save contact + marker message.
+        let identity_pubkey = self.cached_identity_pubkey();
+        let peer_npub = npub_from_hex(peer_nostr_hex.clone()).unwrap_or_default();
+        let room_id = make_room_id(&peer_nostr_hex, &identity_pubkey);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let msgid = format!("bundle-add-{}", event_id_hex);
+        {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let _ = store.transaction(|_| {
+                store.save_app_room(
+                    &peer_nostr_hex,
+                    &identity_pubkey,
+                    RoomStatus::Enabled.to_i32(),
+                    RoomType::Dm.to_i32(),
+                    None,
+                    None,
+                    None,
+                )?;
+                store.save_app_contact(&peer_nostr_hex, &peer_npub, &identity_pubkey, None)?;
+                store.update_contact_name(&peer_nostr_hex, &identity_pubkey, &peer_name)?;
+                store.save_app_message(
+                    &msgid,
+                    Some(&event_id_hex),
+                    &room_id,
+                    &identity_pubkey,
+                    &identity_pubkey,
+                    "[Friend Added via Bundle]",
+                    true,
+                    MessageStatus::Success.to_i32(),
+                    now,
+                )?;
+                store.update_app_room(
+                    &room_id,
+                    None,
+                    None,
+                    Some("[Friend Added via Bundle]"),
+                    Some(now),
+                )?;
+                Ok(())
+            });
+        }
+
+        self.emit_data_change(DataChange::RoomListChanged).await;
+        self.emit_data_change(DataChange::ContactListChanged).await;
+        self.emit_data_change(DataChange::MessageAdded {
+            room_id: room_id.clone(),
+            msgid,
+        })
+        .await;
+
+        Ok(ContactInfo {
+            nostr_pubkey_hex: peer_nostr_hex,
+            signal_id_hex: peer_signal_hex,
+            display_name: peer_name,
+        })
+    }
+
     pub async fn reject_friend_request(
         &self,
         request_id: String,

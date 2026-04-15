@@ -136,6 +136,8 @@ async fn dispatch(
         "/accept" => cmd_accept(&client, args).await?,
         "/reject" => cmd_reject(&client, args).await?,
         "/contacts" => cmd_contacts(&client).await?,
+        "/bundle" => cmd_export_bundle(&client, args).await?,
+        "/add-bundle" => cmd_add_bundle(&client, args).await?,
 
         // ── Messaging ──
         "/chat" => cmd_chat(&client, args, active_room_id).await?,
@@ -434,6 +436,72 @@ async fn cmd_reject(client: &AppClient, args: &str) -> anyhow::Result<()> {
     }
     client.reject_friend_request(args.to_string(), None).await?;
     print_ok("Friend request rejected");
+    Ok(())
+}
+
+// ─── Bundle commands (spec §6.5 — offline/QR friend add) ───────
+
+async fn cmd_export_bundle(client: &AppClient, args: &str) -> anyhow::Result<()> {
+    let my_name = if args.trim().is_empty() {
+        "CLI User".to_string()
+    } else {
+        args.trim().to_string()
+    };
+
+    let json = client
+        .export_contact_bundle(my_name, "cli-device".to_string())
+        .await?;
+
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+
+    print_ok("Contact bundle generated. Share out-of-band (QR/copy-paste):");
+    println!();
+    println!("  {}", "─── Bundle (base64) ───".dimmed());
+    println!("{}", b64);
+    println!("  {}", "─── or JSON ───".dimmed());
+    println!("{}", json);
+    println!();
+    print_sys("Peer can consume with: /add-bundle <base64-or-json>");
+    Ok(())
+}
+
+async fn cmd_add_bundle(client: &AppClient, args: &str) -> anyhow::Result<()> {
+    let args = args.trim();
+    if args.is_empty() {
+        print_err("Usage: /add-bundle <base64-or-json> [--name <my_name>]");
+        return Ok(());
+    }
+
+    // Extract optional --name suffix before trying to decode the blob.
+    let (blob, my_name) = if let Some(idx) = args.find("--name ") {
+        let (b, rest) = args.split_at(idx);
+        let name = rest.trim_start_matches("--name ").trim().to_string();
+        (b.trim().to_string(), name)
+    } else {
+        (args.to_string(), "CLI User".to_string())
+    };
+
+    // Accept either raw JSON (starts with '{') or base64.
+    let bundle_json = if blob.starts_with('{') {
+        blob
+    } else {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(blob.as_bytes())
+            .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
+        String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("bundle not UTF-8: {e}"))?
+    };
+
+    print_sys("Consuming bundle...");
+    let contact = client
+        .add_contact_via_bundle(bundle_json, my_name)
+        .await?;
+    print_ok(&format!(
+        "Bundle accepted. Contact: {} ({})",
+        contact.display_name.green(),
+        short_key(&contact.nostr_pubkey_hex).cyan()
+    ));
     Ok(())
 }
 
@@ -1694,6 +1762,14 @@ fn print_help() {
     );
     println!("    {}  Reject request", "/reject <request_id>".green());
     println!("    {}  List contacts", "/contacts".green());
+    println!(
+        "    {}  Export contact bundle (offline/QR add)",
+        "/bundle [my_name]".green()
+    );
+    println!(
+        "    {}  Add contact from bundle",
+        "/add-bundle <base64-or-json> [--name my_name]".green()
+    );
     println!();
     println!("  {}", "Messaging:".bold());
     println!(
