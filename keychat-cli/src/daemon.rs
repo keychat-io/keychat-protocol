@@ -418,7 +418,11 @@ async fn export_bundle(
     State(state): State<AppState>,
     Json(req): Json<ExportBundleReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.client.export_contact_bundle(req.name, req.device_id).await {
+    match state
+        .client
+        .export_contact_bundle(req.name, req.device_id)
+        .await
+    {
         Ok(json) => ok_json(serde_json::json!({ "bundle": json })),
         Err(e) => bad_request(e),
     }
@@ -436,7 +440,11 @@ async fn add_bundle(
     State(state): State<AppState>,
     Json(req): Json<AddBundleReq>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.client.add_contact_via_bundle(req.bundle, req.name).await {
+    match state
+        .client
+        .add_contact_via_bundle(req.bundle, req.name)
+        .await
+    {
         Ok(info) => ok_json(serde_json::json!({
             "nostr_pubkey_hex": info.nostr_pubkey_hex,
             "signal_id_hex": info.signal_id_hex,

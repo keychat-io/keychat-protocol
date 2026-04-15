@@ -494,9 +494,7 @@ async fn cmd_add_bundle(client: &AppClient, args: &str) -> anyhow::Result<()> {
     };
 
     print_sys("Consuming bundle...");
-    let contact = client
-        .add_contact_via_bundle(bundle_json, my_name)
-        .await?;
+    let contact = client.add_contact_via_bundle(bundle_json, my_name).await?;
     print_ok(&format!(
         "Bundle accepted. Contact: {} ({})",
         contact.display_name.green(),

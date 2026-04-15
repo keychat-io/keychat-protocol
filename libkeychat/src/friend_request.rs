@@ -372,9 +372,7 @@ pub fn receive_friend_request(
 /// itself (the Gift Wrap seal check is unavailable offline) — `globalSign`
 /// binds the Nostr identity to the Signal identity, so payload tampering is
 /// rejected even without the outer seal.
-pub fn parse_bundle_as_friend_request(
-    bundle_json: &str,
-) -> Result<FriendRequestReceived> {
+pub fn parse_bundle_as_friend_request(bundle_json: &str) -> Result<FriendRequestReceived> {
     let payload: KCFriendRequestPayload = serde_json::from_str(bundle_json)
         .map_err(|e| KeychatError::Signal(format!("bundle parse failed: {e}")))?;
 
@@ -702,12 +700,7 @@ mod tests {
         );
         assert_eq!(received.payload.first_inbox, bob_first_inbox.pubkey_hex());
         assert_eq!(received.message.kind, KCMessageKind::FriendRequest);
-        assert!(received
-            .message
-            .id
-            .as_ref()
-            .unwrap()
-            .starts_with("bundle-"));
+        assert!(received.message.id.as_ref().unwrap().starts_with("bundle-"));
     }
 
     #[tokio::test]

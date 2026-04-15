@@ -1527,9 +1527,7 @@ impl ProtocolClient {
 
         // Reject a bundle that claims to be from ourselves.
         if received.sender_pubkey_hex == identity.pubkey_hex() {
-            return Err(KeychatError::FriendRequest(
-                "bundle belongs to self".into(),
-            ));
+            return Err(KeychatError::FriendRequest("bundle belongs to self".into()));
         }
         // Reject a bundle from a peer we already have a session with.
         if self
