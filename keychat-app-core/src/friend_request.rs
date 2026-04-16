@@ -73,13 +73,8 @@ impl AppClient {
         })
         .await;
 
-        // Re-subscribe to include the new first_inbox address for receiving the approve response
-        {
-            let mut inner = self.inner.write().await;
-            if let Err(e) = inner.protocol.refresh_subscriptions().await {
-                tracing::warn!("refresh_subscriptions after send_friend_request: {e}");
-            }
-        }
+        // Note: firstInbox subscription is now handled inside
+        // send_friend_request_protocol (before publish, spec §6.3).
 
         Ok(PendingFriendRequest {
             request_id,

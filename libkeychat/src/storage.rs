@@ -232,6 +232,11 @@ impl SecureStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_inbound_fr_sender ON inbound_friend_requests(sender_pubkey_hex);
 
+            CREATE TABLE IF NOT EXISTS pending_first_inbox (
+                peer_signal_hex TEXT PRIMARY KEY,
+                first_inbox_pubkey TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS signal_groups (
                 group_id TEXT PRIMARY KEY,
                 data_json TEXT NOT NULL,
@@ -1087,6 +1092,58 @@ impl SecureStorage {
         for row in rows {
             results
                 .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
+        }
+        Ok(results)
+    }
+
+    // ─── Pending First Inbox (spec §8.3) ──────────────────
+
+    pub fn save_pending_first_inbox(
+        &self,
+        peer_signal_hex: &str,
+        first_inbox_pubkey: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO pending_first_inbox (peer_signal_hex, first_inbox_pubkey) \
+                 VALUES (?1, ?2)",
+                rusqlite::params![peer_signal_hex, first_inbox_pubkey],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("save pending_first_inbox: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub fn delete_pending_first_inbox(&self, peer_signal_hex: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_first_inbox WHERE peer_signal_hex = ?1",
+                rusqlite::params![peer_signal_hex],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("delete pending_first_inbox: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub fn load_all_pending_first_inboxes(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer_signal_hex, first_inbox_pubkey FROM pending_first_inbox")
+            .map_err(|e| {
+                KeychatError::Storage(format!("prepare pending_first_inbox: {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| {
+                KeychatError::Storage(format!("query pending_first_inbox: {e}"))
+            })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(
+                row.map_err(|e| KeychatError::Storage(format!("read row: {e}")))?,
+            );
         }
         Ok(results)
     }

@@ -612,7 +612,7 @@ The prekey bundle for establishing a Signal session with PQXDH. Sent via NIP-17 
 | `signalKyberPrekey` | `string` | Yes | Kyber KEM public key (ML-KEM 1024, hex) |
 | `signalKyberPrekeySignature` | `string` | Yes | XEdDSA signature over the Kyber prekey |
 | `globalSign` | `string` | Yes | Schnorr signature: `sign("Keychat-{nostrIdentityKey}-{signalIdentityKey}-{time}")` |
-| `time` | `int?` | No | Unix timestamp |
+| `time` | `int?` | No | Unix timestamp in milliseconds |
 | `version` | `int` | Yes | Protocol version, must be `2` |
 | `relay` | `string?` | No | Preferred relay URL |
 | `avatar` | `string?` | No | Avatar URL |
@@ -679,7 +679,7 @@ Identity binding carried on the first Signal PrekeyMessage after session establi
 |-------|------|-------------|
 | `nostrId` | `string` | Sender's secp256k1 Nostr pubkey |
 | `signalId` | `string` | Sender's Curve25519 Signal pubkey |
-| `time` | `int` | Unix timestamp (anti-replay) |
+| `time` | `int` | Unix timestamp in milliseconds (anti-replay) |
 | `name` | `string` | Display name |
 | `sig` | `string` | Schnorr signature over `"Keychat-{nostrId}-{signalId}-{time}"` |
 | `avatar` | `string?` | Avatar URL |
@@ -834,7 +834,7 @@ Implementations MUST normalize to hex internally. This applies to:
      "signalKyberPrekey": "<hex(kyberPublic)>",
      "signalKyberPrekeySignature": "<hex(kyberSignature)>",
      "globalSign": "<schnorr_sig>",
-     "time": <unix_timestamp>,
+     "time": <unix_timestamp_ms>,
      "version": 2
    }
 

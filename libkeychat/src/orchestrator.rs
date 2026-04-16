@@ -503,6 +503,27 @@ impl ProtocolClient {
             restored_count += 1;
         }
 
+        // 2.5. Restore peer_pending_first_inbox (spec §8.3)
+        {
+            let store = storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("storage lock: {e}")))?;
+            if let Ok(entries) = store.load_all_pending_first_inboxes() {
+                for (peer_signal_hex, fi_pubkey) in entries {
+                    self.receiving_addr_to_peer
+                        .insert(fi_pubkey.clone(), peer_signal_hex.clone());
+                    self.peer_pending_first_inbox
+                        .insert(peer_signal_hex, fi_pubkey);
+                }
+                if !self.peer_pending_first_inbox.is_empty() {
+                    tracing::info!(
+                        "restored {} pending first_inbox entries",
+                        self.peer_pending_first_inbox.len()
+                    );
+                }
+            }
+        }
+
         // 3. Restore pending outbound friend requests (per-peer identity)
         for (
             fr_id,
@@ -1048,6 +1069,9 @@ impl ProtocolClient {
         if should_clear {
             if let Some(fi) = self.peer_pending_first_inbox.remove(peer_signal_hex) {
                 self.receiving_addr_to_peer.remove(&fi);
+                if let Ok(store) = self.storage.lock() {
+                    let _ = store.delete_pending_first_inbox(peer_signal_hex);
+                }
                 tracing::debug!(
                     "cleared pending first_inbox for peer={} (ratchet active)",
                     &peer_signal_hex[..16.min(peer_signal_hex.len())]
@@ -1383,6 +1407,17 @@ impl ProtocolClient {
             )?;
         }
 
+        // Store in memory BEFORE publish so that the firstInbox is available
+        // for subscription refresh and the eventual reply can be decrypted
+        // even if we crash right after publishing.
+        self.pending_outbound.insert(request_id.clone(), state);
+
+        // Subscribe to firstInbox BEFORE publishing the FR event (spec §6.3).
+        // If we crash between subscribe and publish, the subscription is
+        // harmless; but crashing between publish and subscribe would lose
+        // the peer's approval.
+        self.refresh_subscriptions().await?;
+
         // Publish
         let transport = self
             .transport
@@ -1391,9 +1426,6 @@ impl ProtocolClient {
         transport.publish_event_async(event.clone()).await?;
 
         let event_id_hex = event.id.to_hex();
-
-        // Store in memory
-        self.pending_outbound.insert(request_id.clone(), state);
 
         Ok((request_id, event_id_hex))
     }
@@ -2194,7 +2226,10 @@ impl ProtocolClient {
         self.receiving_addr_to_peer
             .insert(own_first_inbox_hex.clone(), peer_signal_hex.clone());
         self.peer_pending_first_inbox
-            .insert(peer_signal_hex.clone(), own_first_inbox_hex);
+            .insert(peer_signal_hex.clone(), own_first_inbox_hex.clone());
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.save_pending_first_inbox(&peer_signal_hex, &own_first_inbox_hex);
+        }
 
         tracing::info!(
             "[complete_friend_approve] session created: signal={} nostr={}",

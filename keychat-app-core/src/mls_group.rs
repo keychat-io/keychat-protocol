@@ -482,6 +482,10 @@ impl AppClient {
         if let Some(t) = inner.protocol.transport() {
             let _ = t.publish_event_async(event).await;
         }
+        drop(inner);
+
+        // Epoch changed after remove — re-subscribe to new mlsTempInbox (spec §11.3).
+        self.refresh_mls_subscriptions().await;
 
         Ok(())
     }
