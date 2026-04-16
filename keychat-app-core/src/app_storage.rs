@@ -1324,6 +1324,9 @@ impl AppStorage {
         Ok(())
     }
 
+    /// Set the parent/predecessor room for a room.
+    /// For rebuilt MLS groups, the new room's parent points to the archived old room
+    /// so the UI can show a 'view history' link.
     pub fn set_app_room_parent(&self, room_id: &str, parent_room_id: &str) -> Result<()> {
         self.conn
             .execute(

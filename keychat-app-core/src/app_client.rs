@@ -226,6 +226,8 @@ pub struct AppClient {
     pub mls_participant: Mutex<Option<libkeychat::MlsParticipant>>,
     /// Path to the MLS storage database (file-backed OpenMLS provider).
     pub mls_db_path: String,
+    /// Cached MLS signer public key (hex) — avoids try_read() race in mls_participant_guard.
+    pub mls_signer_pk: Mutex<Option<String>>,
     /// MLS temp_inbox → group_id routing map (O(1) lookup on receive).
     pub mls_inbox_map: Mutex<HashMap<String, String>>,
 }
@@ -311,6 +313,7 @@ impl AppClient {
             identity_pubkey_hex: tokio::sync::OnceCell::new(),
             mls_participant: Mutex::new(None),
             mls_db_path,
+            mls_signer_pk: Mutex::new(None),
             mls_inbox_map: Mutex::new(HashMap::new()),
         })
     }

@@ -26,6 +26,18 @@ impl AppClient {
         // via the transport.subscribe() filter (kinds: [GiftWrap, 4]).
         // No separate kind:4 subscription needed.
 
+        // Pre-load MLS signer pk cache from app_settings so mls_participant_guard()
+        // can restore the same signing identity without needing try_read().
+        {
+            let inner = self.inner.read().await;
+            let store = lock_app_storage(&inner.app_storage);
+            if let Ok(Some(pk_hex)) = store.get_setting("mls_signer_pk") {
+                if let Ok(mut cached) = self.mls_signer_pk.lock() {
+                    *cached = Some(pk_hex);
+                }
+            }
+        }
+
         // Restore MLS inbox routing map and subscribe to all MLS temp_inboxes
         match self.restore_mls_inbox_map().await {
             Ok(inboxes) if !inboxes.is_empty() => {
@@ -878,8 +890,7 @@ impl AppClient {
                 let invite_result: Option<libkeychat::MlsGroupInvitePayload> = msg
                     .extra
                     .get("mlsGroupInvite")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_str(s).ok());
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
 
                 if let Some(invite_payload) = invite_result {
                     let group_name = invite_payload.name.clone();

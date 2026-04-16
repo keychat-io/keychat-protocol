@@ -36,16 +36,14 @@ impl AppClient {
             // Open file-backed MLS provider (state persists across restarts)
             let provider = libkeychat::MlsProvider::open(&self.mls_db_path)?;
 
-            // Try to restore the saved signer public key from app_settings
-            let saved_signer_pk: Option<Vec<u8>> =
-                self.inner.try_read().ok().and_then(|inner| {
-                    let store = lock_app_storage(&inner.app_storage);
-                    store
-                        .get_setting("mls_signer_pk")
-                        .ok()
-                        .flatten()
-                        .and_then(|hex_str| hex::decode(&hex_str).ok())
-                });
+            // Try to restore the saved signer public key from the in-memory cache
+            // (avoids try_read() race when a write lock is held on self.inner)
+            let saved_signer_pk: Option<Vec<u8>> = self
+                .mls_signer_pk
+                .lock()
+                .ok()
+                .and_then(|cached| cached.clone())
+                .and_then(|hex_str| hex::decode(&hex_str).ok());
 
             let participant = libkeychat::MlsParticipant::with_provider_and_signer(
                 &identity_pubkey,
@@ -53,8 +51,12 @@ impl AppClient {
                 saved_signer_pk.as_deref(),
             )?;
 
-            // Persist the signer public key so it can be restored after restart
+            // Update the in-memory cache with the actual signer public key
             let signer_pk_hex = hex::encode(participant.signer_public_key());
+            if let Ok(mut cached) = self.mls_signer_pk.lock() {
+                *cached = Some(signer_pk_hex.clone());
+            }
+            // Best-effort persist to app_settings for cross-restart durability
             if let Ok(inner) = self.inner.try_read() {
                 let store = lock_app_storage(&inner.app_storage);
                 let _ = store.set_setting("mls_signer_pk", &signer_pk_hex);
@@ -87,17 +89,11 @@ impl AppClient {
             participant.create_group(&group_id, &name)?;
         }
 
-        // Fetch KeyPackages, add members, broadcast commit, send Welcome
-        self.mls_fetch_add_and_invite(&group_id, &name, &identity_pubkey, &members)
-            .await?;
-
-        // Register temp_inbox → group_id in the routing map
-        self.register_mls_inbox(&group_id)?;
-
         let member_count = 1 + members.len() as u32; // creator + invited
         let room_id = make_room_id(&group_id, &identity_pubkey);
 
-        // Persist room and members
+        // Persist room and members before sending invites so a crash after
+        // invite delivery cannot leave a group with no local record.
         {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
@@ -127,6 +123,13 @@ impl AppClient {
                 );
             }
         }
+
+        // Register temp_inbox → group_id in the routing map
+        self.register_mls_inbox(&group_id)?;
+
+        // Fetch KeyPackages, add members, broadcast commit, send Welcome
+        self.mls_fetch_add_and_invite(&group_id, &name, &identity_pubkey, &members)
+            .await?;
 
         self.emit_data_change(DataChange::RoomListChanged).await;
 
@@ -220,16 +223,17 @@ impl AppClient {
     pub async fn leave_mls_group(&self, group_id: String) -> AppResult<()> {
         let identity_pubkey = self.cached_identity_pubkey();
 
-        // Generate self-remove proposal and broadcast to temp_inbox.
-        // leave_group() returns an MLS Proposal (not a Commit) — other
-        // members (typically the admin) will commit it on receipt.
-        // broadcast_commit wraps arbitrary MLS bytes as kind:1059.
+        // Generate a self-remove Commit (not a Proposal) so the removal
+        // takes effect immediately without relying on an admin to commit it.
         let event = {
             let guard = self.mls_participant_guard()?;
             let participant = guard.as_ref().unwrap();
+            let self_leaf_index =
+                participant.find_member_index(&group_id, &identity_pubkey)?;
+            let commit_bytes =
+                participant.remove_members(&group_id, &[self_leaf_index])?;
             let mls_temp_inbox = participant.derive_temp_inbox(&group_id)?;
-            let proposal_bytes = participant.leave_group(&group_id)?;
-            libkeychat::broadcast_commit(&proposal_bytes, &mls_temp_inbox)?
+            libkeychat::broadcast_commit(&commit_bytes, &mls_temp_inbox)?
         };
 
         {
@@ -410,7 +414,8 @@ impl AppClient {
                 None,
                 None,
             );
-            let _ = store.set_app_room_parent(&archived_room_id, &info.room_id);
+            let _ = store.set_app_room_parent(&info.room_id, &archived_room_id);
+            // 新群.parent_room_id = 老群.room_id (predecessor / 前身群)
         }
 
         self.emit_data_change(DataChange::RoomUpdated {
@@ -964,9 +969,6 @@ impl AppClient {
             &welcome_bytes,
             vec![identity_pubkey.to_string()],
         );
-        let invite_json = serde_json::to_string(&invite_payload)
-            .map_err(|e| AppError::Serialization(format!("serialize MLS invite: {e}")))?;
-
         let mut invite_msg = KCMessage {
             v: 2,
             id: Some(format!("mls-invite-{}", &group_id[..16.min(group_id.len())])),
@@ -976,7 +978,7 @@ impl AppClient {
         };
         invite_msg
             .extra
-            .insert("mlsGroupInvite".to_string(), serde_json::json!(invite_json));
+            .insert("mlsGroupInvite".to_string(), serde_json::to_value(&invite_payload).unwrap());
 
         // Collect Signal session arcs under read lock, then drop
         let member_sessions: Vec<(
