@@ -2,3 +2,7 @@
 module_name = "KeychatFFI"
 ffi_module_name = "keychat_uniffiFFI"
 generate_immutable_records = true
+
+[bindings.kotlin]
+package_name = "com.keychat.ffi"
+generate_immutable_records = true
