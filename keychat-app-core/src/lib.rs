@@ -10,9 +10,12 @@ pub mod event_loop;
 pub mod friend_request;
 pub mod group;
 pub mod media;
+pub mod mls_group;
 pub mod messaging;
 pub mod relay_tracker;
 pub mod types;
+pub mod v1_compat;
+pub mod v1_migration;
 
 pub use app_client::{
     default_device_id, hex_from_npub, lock_app_storage, lock_app_storage_result, normalize_to_hex,

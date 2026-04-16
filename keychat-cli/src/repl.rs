@@ -596,6 +596,7 @@ async fn cmd_rooms(client: &AppClient) -> anyhow::Result<()> {
             RoomStatus::Requesting => "◐".yellow(),
             RoomStatus::Approving => "◑".yellow(),
             RoomStatus::Rejected => "○".red(),
+            RoomStatus::Archived => "◌".dimmed(),
         };
         let unread = if r.unread_count > 0 {
             format!(" ({})", r.unread_count).red().to_string()

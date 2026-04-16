@@ -334,6 +334,8 @@ fn convert_room_info(r: keychat_app_core::RoomInfo) -> RoomInfo {
         last_message_at: r.last_message_at.map(|t| t as u64),
         unread_count: r.unread_count,
         created_at: r.created_at as u64,
+        peer_version: r.peer_version,
+        session_type: r.session_type,
     }
 }
 fn convert_message_info(m: keychat_app_core::MessageInfo) -> MessageInfo {

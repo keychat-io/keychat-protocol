@@ -415,6 +415,10 @@ pub struct RoomInfo {
     pub last_message_at: Option<u64>,
     pub unread_count: i32,
     pub created_at: u64,
+    /// Peer's client protocol version: None/1 = v1, 2 = v2.
+    pub peer_version: Option<i32>,
+    /// Session key agreement type: "x3dh" or "pqxdh".
+    pub session_type: Option<String>,
 }
 
 #[derive(uniffi::Record)]

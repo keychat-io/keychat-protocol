@@ -63,6 +63,7 @@ fn room_status_str(s: &RoomStatus) -> &'static str {
         RoomStatus::Enabled => "enabled",
         RoomStatus::Approving => "approving",
         RoomStatus::Rejected => "rejected",
+        RoomStatus::Archived => "archived",
     }
 }
 

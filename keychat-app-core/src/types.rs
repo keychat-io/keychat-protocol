@@ -16,6 +16,7 @@ pub enum RoomStatus {
     Enabled,    // 1
     Approving,  // 2
     Rejected,   // -1
+    Archived,   // 3
 }
 
 impl RoomStatus {
@@ -24,6 +25,7 @@ impl RoomStatus {
             0 => RoomStatus::Requesting,
             1 => RoomStatus::Enabled,
             2 => RoomStatus::Approving,
+            3 => RoomStatus::Archived,
             -1 => RoomStatus::Rejected,
             _ => RoomStatus::Requesting,
         }
@@ -34,7 +36,37 @@ impl RoomStatus {
             RoomStatus::Requesting => 0,
             RoomStatus::Enabled => 1,
             RoomStatus::Approving => 2,
+            RoomStatus::Archived => 3,
             RoomStatus::Rejected => -1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemberStatus {
+    Inviting, // 0
+    Invited,  // 1 — normal/active
+    Blocked,  // 2
+    Removed,  // 3
+}
+
+impl MemberStatus {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => MemberStatus::Inviting,
+            1 => MemberStatus::Invited,
+            2 => MemberStatus::Blocked,
+            3 => MemberStatus::Removed,
+            _ => MemberStatus::Inviting,
+        }
+    }
+
+    pub fn to_i32(self) -> i32 {
+        match self {
+            MemberStatus::Inviting => 0,
+            MemberStatus::Invited => 1,
+            MemberStatus::Blocked => 2,
+            MemberStatus::Removed => 3,
         }
     }
 }
@@ -132,6 +164,10 @@ pub struct RoomInfo {
     pub last_message_at: Option<i64>,
     pub unread_count: i32,
     pub created_at: i64,
+    /// Peer's client protocol version: None/1 = v1, 2 = v2.
+    pub peer_version: Option<i32>,
+    /// Session key agreement type: "x3dh" or "pqxdh".
+    pub session_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +199,19 @@ pub struct ContactInfoFull {
     pub petname: Option<String>,
     pub name: Option<String>,
     pub avatar: Option<String>,
+}
+
+// ─── Room Member Info ───────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct RoomMemberInfo {
+    pub id: i64,
+    pub room_id: String,
+    pub pubkey: String,
+    pub name: Option<String>,
+    pub is_admin: bool,
+    pub status: MemberStatus,
+    pub created_at: i64,
 }
 
 // ─── Data Change Notifications ──────────────────────────────────
@@ -468,4 +517,21 @@ pub struct FailedRelayInfo {
 pub struct RelayStatusInfo {
     pub url: String,
     pub status: String,
+}
+
+// ─── MLS Group Types ───────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct MlsGroupCreatedInfo {
+    pub room_id: String,
+    pub group_id: String,
+    pub name: String,
+    pub member_count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MlsSentMessage {
+    pub msgid: String,
+    pub group_id: String,
+    pub event_id: Option<String>,
 }
