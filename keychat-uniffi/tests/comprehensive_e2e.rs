@@ -735,6 +735,296 @@ fn comprehensive_e2e_full_protocol() {
             }
 
             // ═══════════════════════════════════════════════════════
+            // Phase 11b: Signal Group 3 — Charlie creates "Project"
+            // ═══════════════════════════════════════════════════════
+            tracing::info!("═══ Phase 11b: Signal Group 3 — Project");
+
+            clear_events(&alice_ev);
+            clear_events(&bob_ev);
+            clear_events(&dave_ev);
+
+            let sg3_info = charlie
+                .create_signal_group(
+                    "Project".into(),
+                    vec![
+                        GroupMemberInput { nostr_pubkey: alice_pk.clone(), name: "Alice".into() },
+                        GroupMemberInput { nostr_pubkey: bob_pk.clone(), name: "Bob".into() },
+                        GroupMemberInput { nostr_pubkey: dave_pk.clone(), name: "Dave".into() },
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(sg3_info.name, "Project");
+            let sg_project_id = sg3_info.group_id.clone();
+
+            for (name, ev, n) in &[
+                ("Alice", &alice_ev, &alice_n),
+                ("Bob", &bob_ev, &bob_n),
+                ("Dave", &dave_ev, &dave_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::GroupInviteReceived { .. })
+                    })
+                    .await,
+                    "{name} did not receive Project invite"
+                );
+            }
+
+            // Charlie sends a message in Project group
+            clear_events(&alice_ev);
+            clear_events(&bob_ev);
+            clear_events(&dave_ev);
+
+            charlie
+                .send_group_text(sg_project_id.clone(), "project kickoff".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[
+                ("Alice", &alice_ev, &alice_n),
+                ("Bob", &bob_ev, &bob_n),
+                ("Dave", &dave_ev, &dave_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), group_id: Some(_), .. } if c == "project kickoff")
+                    })
+                    .await,
+                    "{name} did not receive 'project kickoff'"
+                );
+            }
+
+            // Dave replies in Project group
+            clear_events(&alice_ev);
+            clear_events(&bob_ev);
+            clear_events(&charlie_ev);
+
+            dave.send_group_text(sg_project_id.clone(), "dave reporting in".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[
+                ("Alice", &alice_ev, &alice_n),
+                ("Bob", &bob_ev, &bob_n),
+                ("Charlie", &charlie_ev, &charlie_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), group_id: Some(_), .. } if c == "dave reporting in")
+                    })
+                    .await,
+                    "{name} did not receive 'dave reporting in'"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            // ═══════════════════════════════════════════════════════
+            // Phase 11c: MLS Group 2 — Bob creates "MLS-Dev"
+            // ═══════════════════════════════════════════════════════
+            tracing::info!("═══ Phase 11c: MLS Group 2 — MLS-Dev");
+
+            let alice_kp2 = alice.generate_mls_key_package().await.unwrap();
+            let dave_kp = dave.generate_mls_key_package().await.unwrap();
+            let eve_kp2 = eve.generate_mls_key_package().await.unwrap();
+
+            clear_events(&alice_ev);
+            clear_events(&dave_ev);
+            clear_events(&eve_ev);
+
+            let mls2_info = bob
+                .create_mls_group(
+                    "MLS-Dev".into(),
+                    vec![
+                        MlsKeyPackageInput { nostr_pubkey: alice_pk.clone(), key_package_bytes: alice_kp2 },
+                        MlsKeyPackageInput { nostr_pubkey: dave_pk.clone(), key_package_bytes: dave_kp },
+                        MlsKeyPackageInput { nostr_pubkey: eve_pk.clone(), key_package_bytes: eve_kp2 },
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(mls2_info.name, "MLS-Dev");
+            let mls_dev_id = mls2_info.group_id.clone();
+
+            // Members join MLS-Dev
+            for (name, client, pk, ev, n) in &[
+                ("Alice", &alice, &alice_pk, &alice_ev, &alice_n),
+                ("Dave", &dave, &dave_pk, &dave_ev, &dave_n),
+                ("Eve", &eve, &eve_pk, &eve_ev, &eve_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::GroupInviteReceived { group_type, .. } if group_type == "mls")
+                    })
+                    .await,
+                    "{name} did not receive MLS-Dev invite"
+                );
+
+                let rooms = client.get_rooms(pk.to_string()).await.unwrap();
+                let mls_room = rooms
+                    .iter()
+                    .find(|r| r.to_main_pubkey == mls_dev_id)
+                    .expect(&format!("{name} should have MLS-Dev room"));
+                let msgs = client.get_messages(mls_room.id.clone(), 10, 0).await.unwrap();
+                let invite_msg = msgs
+                    .iter()
+                    .find(|m| m.content.contains("welcome"))
+                    .expect(&format!("{name} should have MLS-Dev invite message"));
+                let invite: serde_json::Value =
+                    serde_json::from_str(&invite_msg.content).unwrap();
+                let welcome_b64 = invite["welcome"].as_str().unwrap();
+                let welcome_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(welcome_b64)
+                    .unwrap();
+                let admin_pubkeys = invite["adminPubkeys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+
+                client
+                    .join_mls_group(welcome_bytes, "MLS-Dev".into(), admin_pubkeys)
+                    .await
+                    .unwrap();
+                tracing::info!("{name} joined MLS-Dev");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Bob sends in MLS-Dev
+            clear_events(&alice_ev);
+            clear_events(&dave_ev);
+            clear_events(&eve_ev);
+
+            bob.send_mls_text(mls_dev_id.clone(), "dev standup".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[
+                ("Alice", &alice_ev, &alice_n),
+                ("Dave", &dave_ev, &dave_n),
+                ("Eve", &eve_ev, &eve_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "dev standup")
+                    })
+                    .await,
+                    "{name} did not receive 'dev standup'"
+                );
+            }
+
+            // Alice replies in MLS-Dev
+            clear_events(&bob_ev);
+            clear_events(&dave_ev);
+            clear_events(&eve_ev);
+
+            alice
+                .send_mls_text(mls_dev_id.clone(), "alice dev update".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[
+                ("Bob", &bob_ev, &bob_n),
+                ("Dave", &dave_ev, &dave_n),
+                ("Eve", &eve_ev, &eve_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "alice dev update")
+                    })
+                    .await,
+                    "{name} did not receive 'alice dev update'"
+                );
+            }
+
+            // ═══════════════════════════════════════════════════════
+            // Phase 11d: MLS Group 3 — Alice creates "MLS-Tiny" (2 person)
+            // ═══════════════════════════════════════════════════════
+            tracing::info!("═══ Phase 11d: MLS Group 3 — MLS-Tiny (2 person)");
+
+            let bob_kp3 = bob.generate_mls_key_package().await.unwrap();
+
+            clear_events(&bob_ev);
+
+            let mls3_info = alice
+                .create_mls_group(
+                    "MLS-Tiny".into(),
+                    vec![
+                        MlsKeyPackageInput { nostr_pubkey: bob_pk.clone(), key_package_bytes: bob_kp3 },
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(mls3_info.name, "MLS-Tiny");
+            assert_eq!(mls3_info.member_count, 2);
+            let mls_tiny_id = mls3_info.group_id.clone();
+
+            // Bob joins MLS-Tiny
+            assert!(
+                wait_event(&bob_ev, &bob_n, 30, |e| {
+                    matches!(e, ClientEvent::GroupInviteReceived { group_type, .. } if group_type == "mls")
+                })
+                .await,
+                "Bob did not receive MLS-Tiny invite"
+            );
+            {
+                let rooms = bob.get_rooms(bob_pk.clone()).await.unwrap();
+                let mls_room = rooms
+                    .iter()
+                    .find(|r| r.to_main_pubkey == mls_tiny_id)
+                    .expect("Bob should have MLS-Tiny room");
+                let msgs = bob.get_messages(mls_room.id.clone(), 10, 0).await.unwrap();
+                let invite_msg = msgs
+                    .iter()
+                    .find(|m| m.content.contains("welcome"))
+                    .expect("Bob should have MLS-Tiny invite message");
+                let invite: serde_json::Value =
+                    serde_json::from_str(&invite_msg.content).unwrap();
+                let welcome_b64 = invite["welcome"].as_str().unwrap();
+                let welcome_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(welcome_b64)
+                    .unwrap();
+                let admin_pubkeys = invite["adminPubkeys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+                bob.join_mls_group(welcome_bytes, "MLS-Tiny".into(), admin_pubkeys)
+                    .await
+                    .unwrap();
+                tracing::info!("Bob joined MLS-Tiny");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Bidirectional MLS-Tiny messages
+            clear_events(&bob_ev);
+            alice
+                .send_mls_text(mls_tiny_id.clone(), "tiny hello".into(), None)
+                .await
+                .unwrap();
+            assert!(
+                wait_event(&bob_ev, &bob_n, 30, |e| {
+                    matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "tiny hello")
+                })
+                .await,
+                "Bob did not receive 'tiny hello' in MLS-Tiny"
+            );
+
+            clear_events(&alice_ev);
+            bob.send_mls_text(mls_tiny_id.clone(), "tiny reply".into(), None)
+                .await
+                .unwrap();
+            assert!(
+                wait_event(&alice_ev, &alice_n, 30, |e| {
+                    matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "tiny reply")
+                })
+                .await,
+                "Alice did not receive 'tiny reply' in MLS-Tiny"
+            );
+
+            // ═══════════════════════════════════════════════════════
             // Phase 12: Simulated restart — Alice
             // ═══════════════════════════════════════════════════════
             tracing::info!("═══ Phase 12: Simulated restart — Alice");
@@ -779,10 +1069,11 @@ fn comprehensive_e2e_full_protocol() {
             ).await;
 
             // ═══════════════════════════════════════════════════════
-            // Phase 14: Post-restart Signal Group message
+            // Phase 14: Post-restart Signal Group messages
             // ═══════════════════════════════════════════════════════
-            tracing::info!("═══ Phase 14: Post-restart Signal Group message");
+            tracing::info!("═══ Phase 14: Post-restart Signal Group messages");
 
+            // Team-v2 (Alice is admin, members: Alice+Bob+Charlie)
             clear_events(&bob_ev);
             clear_events(&charlie_ev);
 
@@ -791,7 +1082,6 @@ fn comprehensive_e2e_full_protocol() {
                 .await
                 .unwrap();
 
-            // Bob and Charlie should receive (Dave was kicked in phase 7)
             for (name, ev, n) in &[("Bob", &bob_ev, &bob_n), ("Charlie", &charlie_ev, &charlie_n)]
             {
                 assert!(
@@ -803,28 +1093,93 @@ fn comprehensive_e2e_full_protocol() {
                 );
             }
 
-            // ═══════════════════════════════════════════════════════
-            // Phase 15: Post-restart MLS Group message
-            // ═══════════════════════════════════════════════════════
-            tracing::info!("═══ Phase 15: Post-restart MLS Group message");
+            // Project (Charlie is admin, members: Charlie+Alice+Bob+Dave)
+            clear_events(&alice_ev);
+            clear_events(&bob_ev);
+            clear_events(&dave_ev);
 
+            charlie
+                .send_group_text(sg_project_id.clone(), "project after alice restart".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[
+                ("Alice", &alice_ev, &alice_n),
+                ("Bob", &bob_ev, &bob_n),
+                ("Dave", &dave_ev, &dave_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), group_id: Some(_), .. } if c == "project after alice restart")
+                    })
+                    .await,
+                    "{name} did not receive 'project after alice restart'"
+                );
+            }
+
+            // ═══════════════════════════════════════════════════════
+            // Phase 15: Post-restart MLS Group messages
+            // ═══════════════════════════════════════════════════════
+            tracing::info!("═══ Phase 15: Post-restart MLS Group messages");
+
+            // MLS-Main (Alice admin, members: Alice+Bob+Eve — Charlie removed)
             clear_events(&bob_ev);
             clear_events(&eve_ev);
 
             alice
-                .send_mls_text(mls_group_id.clone(), "mls after restart".into(), None)
+                .send_mls_text(mls_group_id.clone(), "mls-main after restart".into(), None)
                 .await
                 .unwrap();
 
             for (name, ev, n) in &[("Bob", &bob_ev, &bob_n), ("Eve", &eve_ev, &eve_n)] {
                 assert!(
                     wait_event(ev, n, 30, |e| {
-                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "mls after restart")
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "mls-main after restart")
                     })
                     .await,
-                    "{name} did not receive 'mls after restart'"
+                    "{name} did not receive 'mls-main after restart'"
                 );
             }
+
+            // MLS-Dev (Bob admin, members: Bob+Alice+Dave+Eve)
+            clear_events(&bob_ev);
+            clear_events(&dave_ev);
+            clear_events(&eve_ev);
+
+            alice
+                .send_mls_text(mls_dev_id.clone(), "mls-dev after restart".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[
+                ("Bob", &bob_ev, &bob_n),
+                ("Dave", &dave_ev, &dave_n),
+                ("Eve", &eve_ev, &eve_n),
+            ] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "mls-dev after restart")
+                    })
+                    .await,
+                    "{name} did not receive 'mls-dev after restart'"
+                );
+            }
+
+            // MLS-Tiny (Alice admin, members: Alice+Bob)
+            clear_events(&bob_ev);
+
+            alice
+                .send_mls_text(mls_tiny_id.clone(), "tiny after restart".into(), None)
+                .await
+                .unwrap();
+
+            assert!(
+                wait_event(&bob_ev, &bob_n, 30, |e| {
+                    matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "tiny after restart")
+                })
+                .await,
+                "Bob did not receive 'tiny after restart' in MLS-Tiny"
+            );
 
             // ═══════════════════════════════════════════════════════
             // Phase 16: Bob dissolves "Side Chat"
