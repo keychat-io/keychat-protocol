@@ -39,6 +39,10 @@ pub struct RoomRow {
     pub last_message_at: Option<i64>,
     pub unread_count: i32,
     pub created_at: i64,
+    /// Peer's client protocol version: None/1 = v1, 2 = v2.
+    pub peer_version: Option<i32>,
+    /// Session key agreement type: "x3dh" or "pqxdh".
+    pub session_type: Option<String>,
 }
 
 /// Message row.
@@ -60,6 +64,18 @@ pub struct MessageRow {
     pub relay_status_json: Option<String>,
     pub local_file_path: Option<String>,
     pub local_meta: Option<String>,
+    pub created_at: i64,
+}
+
+/// Room member row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoomMemberRow {
+    pub id: i64,
+    pub room_id: String,
+    pub pubkey: String,
+    pub name: Option<String>,
+    pub is_admin: bool,
+    pub status: i32,
     pub created_at: i64,
 }
 
@@ -140,7 +156,7 @@ impl AppStorage {
 
     // ─── Migrations ──────────────────────────────────────
 
-    const SCHEMA_VERSION: u32 = 3;
+    const SCHEMA_VERSION: u32 = 5;
 
     fn run_migrations(conn: &Connection) -> Result<()> {
         let current: u32 = conn
@@ -160,6 +176,12 @@ impl AppStorage {
         }
         if current < 3 {
             Self::migrate_v2_to_v3(conn)?;
+        }
+        if current < 4 {
+            Self::migrate_v3_to_v4(conn)?;
+        }
+        if current < 5 {
+            Self::migrate_v4_to_v5(conn)?;
         }
         Ok(())
     }
@@ -297,6 +319,48 @@ impl AppStorage {
         .map_err(|e| KeychatError::Storage(format!("app migration v2→v3 failed: {e}")))?;
 
         tracing::info!("app migration v2 → v3 complete");
+        Ok(())
+    }
+
+    fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+        tracing::info!("running app migration v3 → v4: add peer_version and session_type to app_rooms");
+        conn.execute_batch(
+            "BEGIN;
+            ALTER TABLE app_rooms ADD COLUMN peer_version INTEGER;
+            ALTER TABLE app_rooms ADD COLUMN session_type TEXT;
+            PRAGMA user_version = 4;
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("app migration v3→v4 failed: {e}")))?;
+
+        tracing::info!("app migration v3 → v4 complete");
+        Ok(())
+    }
+
+    fn migrate_v4_to_v5(conn: &Connection) -> Result<()> {
+        tracing::info!("running app migration v4 → v5: add app_room_members table");
+        conn.execute_batch(
+            "BEGIN;
+
+            CREATE TABLE IF NOT EXISTS app_room_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id TEXT NOT NULL REFERENCES app_rooms(id),
+                pubkey TEXT NOT NULL,
+                name TEXT,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                UNIQUE(room_id, pubkey)
+            );
+            CREATE INDEX IF NOT EXISTS idx_room_members_room ON app_room_members(room_id);
+
+            PRAGMA user_version = 5;
+
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("app migration v4→v5 failed: {e}")))?;
+
+        tracing::info!("app migration v4 → v5 complete");
         Ok(())
     }
 
@@ -487,7 +551,7 @@ impl AppStorage {
             .prepare(
                 "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
                         peer_signal_identity_key, parent_room_id, last_message_content,
-                        last_message_at, unread_count, created_at
+                        last_message_at, unread_count, created_at, peer_version, session_type
                  FROM app_rooms WHERE identity_pubkey = ?1
                  ORDER BY COALESCE(last_message_at, created_at) DESC, id ASC",
             )
@@ -517,6 +581,8 @@ impl AppStorage {
             last_message_at: row.get(10)?,
             unread_count: row.get(11)?,
             created_at: row.get(12)?,
+            peer_version: row.get(13)?,
+            session_type: row.get(14)?,
         })
     }
 
@@ -525,7 +591,7 @@ impl AppStorage {
             .query_row(
                 "SELECT id, to_main_pubkey, identity_pubkey, status, type, name, avatar,
                         peer_signal_identity_key, parent_room_id, last_message_content,
-                        last_message_at, unread_count, created_at
+                        last_message_at, unread_count, created_at, peer_version, session_type
                  FROM app_rooms WHERE id = ?1",
                 rusqlite::params![room_id],
                 Self::map_room_row,
@@ -609,11 +675,17 @@ impl AppStorage {
     pub fn delete_app_room(&self, room_id: &str) -> Result<()> {
         self.transaction(|conn| {
             conn.execute(
+                "DELETE FROM app_room_members WHERE room_id IN (SELECT id FROM app_rooms WHERE parent_room_id = ?1)",
+                rusqlite::params![room_id],
+            ).map_err(|e| KeychatError::Storage(format!("delete_app_room child members: {e}")))?;
+            conn.execute(
                 "DELETE FROM app_messages WHERE room_id IN (SELECT id FROM app_rooms WHERE parent_room_id = ?1)",
                 rusqlite::params![room_id],
             ).map_err(|e| KeychatError::Storage(format!("delete_app_room child messages: {e}")))?;
             conn.execute("DELETE FROM app_rooms WHERE parent_room_id = ?1", rusqlite::params![room_id])
                 .map_err(|e| KeychatError::Storage(format!("delete_app_room children: {e}")))?;
+            conn.execute("DELETE FROM app_room_members WHERE room_id = ?1", rusqlite::params![room_id])
+                .map_err(|e| KeychatError::Storage(format!("delete_app_room members: {e}")))?;
             conn.execute("DELETE FROM app_messages WHERE room_id = ?1", rusqlite::params![room_id])
                 .map_err(|e| KeychatError::Storage(format!("delete_app_room messages: {e}")))?;
             conn.execute("DELETE FROM app_rooms WHERE id = ?1", rusqlite::params![room_id])
@@ -1120,6 +1192,188 @@ impl AppStorage {
         Ok(())
     }
 
+    // ─── Room Member CRUD ─────────────────────────────────
+
+    pub fn save_room_member(
+        &self,
+        room_id: &str,
+        pubkey: &str,
+        name: Option<&str>,
+        is_admin: bool,
+        status: i32,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO app_room_members (room_id, pubkey, name, is_admin, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(room_id, pubkey) DO UPDATE SET
+                   name = COALESCE(excluded.name, name),
+                   is_admin = excluded.is_admin,
+                   status = excluded.status",
+                rusqlite::params![room_id, pubkey, name, is_admin as i32, status],
+            )
+            .map_err(|e| KeychatError::Storage(format!("save_room_member: {e}")))?;
+        Ok(())
+    }
+
+    pub fn get_room_members(&self, room_id: &str) -> Result<Vec<RoomMemberRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, room_id, pubkey, name, is_admin, status, created_at
+                 FROM app_room_members WHERE room_id = ?1
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|e| KeychatError::Storage(format!("get_room_members prepare: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![room_id], Self::map_room_member_row)
+            .map_err(|e| KeychatError::Storage(format!("get_room_members query: {e}")))?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(
+                r.map_err(|e| KeychatError::Storage(format!("get_room_members row: {e}")))?,
+            );
+        }
+        Ok(result)
+    }
+
+    pub fn get_room_member(
+        &self,
+        room_id: &str,
+        pubkey: &str,
+    ) -> Result<Option<RoomMemberRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, room_id, pubkey, name, is_admin, status, created_at
+                 FROM app_room_members WHERE room_id = ?1 AND pubkey = ?2",
+                rusqlite::params![room_id, pubkey],
+                Self::map_room_member_row,
+            )
+            .optional()
+            .map_err(|e| KeychatError::Storage(format!("get_room_member: {e}")))
+    }
+
+    fn map_room_member_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoomMemberRow> {
+        Ok(RoomMemberRow {
+            id: row.get(0)?,
+            room_id: row.get(1)?,
+            pubkey: row.get(2)?,
+            name: row.get(3)?,
+            is_admin: row.get::<_, i32>(4)? != 0,
+            status: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    }
+
+    pub fn update_room_member(
+        &self,
+        room_id: &str,
+        pubkey: &str,
+        name: Option<&str>,
+        is_admin: Option<bool>,
+        status: Option<i32>,
+    ) -> Result<()> {
+        let mut sets = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut idx = 1;
+
+        if let Some(n) = name {
+            sets.push(format!("name = ?{idx}"));
+            params.push(Box::new(n.to_string()));
+            idx += 1;
+        }
+        if let Some(a) = is_admin {
+            sets.push(format!("is_admin = ?{idx}"));
+            params.push(Box::new(a as i32));
+            idx += 1;
+        }
+        if let Some(s) = status {
+            sets.push(format!("status = ?{idx}"));
+            params.push(Box::new(s));
+            idx += 1;
+        }
+
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "UPDATE app_room_members SET {} WHERE room_id = ?{} AND pubkey = ?{}",
+            sets.join(", "),
+            idx,
+            idx + 1
+        );
+        params.push(Box::new(room_id.to_string()));
+        params.push(Box::new(pubkey.to_string()));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        self.conn
+            .execute(&sql, param_refs.as_slice())
+            .map_err(|e| KeychatError::Storage(format!("update_room_member: {e}")))?;
+        Ok(())
+    }
+
+    pub fn delete_room_member(&self, room_id: &str, pubkey: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM app_room_members WHERE room_id = ?1 AND pubkey = ?2",
+                rusqlite::params![room_id, pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_room_member: {e}")))?;
+        Ok(())
+    }
+
+    /// Set the parent/predecessor room for a room.
+    /// For rebuilt MLS groups, the new room's parent points to the archived old room
+    /// so the UI can show a 'view history' link.
+    pub fn set_app_room_parent(&self, room_id: &str, parent_room_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE app_rooms SET parent_room_id = ?1 WHERE id = ?2",
+                rusqlite::params![parent_room_id, room_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("set_app_room_parent: {e}")))?;
+        Ok(())
+    }
+
+    pub fn delete_all_room_members(&self, room_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM app_room_members WHERE room_id = ?1",
+                rusqlite::params![room_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_all_room_members: {e}")))?;
+        Ok(())
+    }
+
+    // ─── MLS Group Queries ────────────────────────────────
+
+    /// Return group IDs for all active (Enabled) MLS groups.
+    /// `to_main_pubkey` is the group_id for MLS rooms (type = 2).
+    pub fn get_active_mls_group_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT to_main_pubkey FROM app_rooms WHERE type = 2 AND status = 1")
+            .map_err(|e| {
+                KeychatError::Storage(format!("get_active_mls_group_ids prepare: {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| {
+                KeychatError::Storage(format!("get_active_mls_group_ids query: {e}"))
+            })?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(
+                r.map_err(|e| {
+                    KeychatError::Storage(format!("get_active_mls_group_ids row: {e}"))
+                })?,
+            );
+        }
+        Ok(result)
+    }
+
     // ─── Composite Operations ─────────────────────────────
 
     /// Persist an incoming message atomically: ensure room exists, save message,
@@ -1181,6 +1435,7 @@ impl AppStorage {
         self.transaction(|conn| {
             conn.execute_batch(
                 "DELETE FROM file_attachments;
+                 DELETE FROM app_room_members;
                  DELETE FROM app_messages;
                  DELETE FROM app_rooms;
                  DELETE FROM app_contacts;

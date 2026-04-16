@@ -16,10 +16,49 @@ use crate::types::*;
 impl AppClient {
     /// Start the event loop: subscribe + spawn protocol loop with AppDelegate.
     pub async fn start_event_loop(self: Arc<Self>) -> AppResult<()> {
-        // Subscribe
+        // Subscribe to v2 (kind:1059) events
         {
             let mut inner = self.inner.write().await;
             inner.protocol.refresh_subscriptions().await?;
+        }
+
+        // v1 kind:4 subscription is now included in refresh_subscriptions()
+        // via the transport.subscribe() filter (kinds: [GiftWrap, 4]).
+        // No separate kind:4 subscription needed.
+
+        // Pre-load MLS signer pk cache from app_settings so mls_participant_guard()
+        // can restore the same signing identity without needing try_read().
+        {
+            let inner = self.inner.read().await;
+            let store = lock_app_storage(&inner.app_storage);
+            if let Ok(Some(pk_hex)) = store.get_setting("mls_signer_pk") {
+                if let Ok(mut cached) = self.mls_signer_pk.lock() {
+                    *cached = Some(pk_hex);
+                }
+            }
+        }
+
+        // Restore MLS inbox routing map and subscribe to each MLS temp_inbox individually
+        // so we can track per-group SubscriptionIds for clean unsubscribe on epoch rotation.
+        match self.restore_mls_inbox_map().await {
+            Ok(inboxes) if !inboxes.is_empty() => {
+                let inner = self.inner.read().await;
+                if let Some(t) = inner.protocol.transport() {
+                    for inbox in &inboxes {
+                        if let Ok(pk) = nostr::PublicKey::from_hex(inbox) {
+                            if let Ok(sub_id) = t.subscribe(vec![pk], None).await {
+                                if let Some(group_id) = self.resolve_mls_group(inbox) {
+                                    if let Ok(mut subs) = self.mls_sub_ids.lock() {
+                                        subs.insert(group_id, sub_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(_) => {} // no active MLS groups
+            Err(e) => tracing::warn!("restore_mls_inbox_map failed: {e}"),
         }
 
         // Create stop channel
@@ -106,12 +145,20 @@ impl AppClient {
                             };
 
                             if let Some(event) = deduped {
-                                if event.kind == libkeychat::Kind::GiftWrap {
+                                // Accept both kind:1059 (v2 GiftWrap) and kind:4 (v1 Signal messages)
+                                let is_giftwrap = event.kind == libkeychat::Kind::GiftWrap;
+                                let is_v1_signal = event.kind == libkeychat::Kind::from(4);
+
+                                if is_giftwrap || is_v1_signal {
+                                    // Check for clientv tag (v1 compat: detect v2 peers)
+                                    let is_v2_peer = crate::v1_compat::is_v2_event(&event);
+
                                     tracing::info!(
-                                        "⬇️ RECV kind={} id={} from={}",
+                                        "⬇️ RECV kind={} id={} from={} v2_peer={}",
                                         event.kind.as_u16(),
                                         &eid[..16.min(eid.len())],
-                                        relay_url
+                                        relay_url,
+                                        is_v2_peer
                                     );
                                     let relay = relay_url.to_string();
                                     let event_json = serde_json::to_string(&event).ok();
@@ -158,6 +205,10 @@ impl AppClient {
     }
 
     /// Handle an incoming GiftWrap event — try 4-step decryption.
+    ///
+    /// Also handles kind:4 events for v1 compatibility — v1 Signal messages
+    /// use kind:4 with the same content format (base64 Signal ciphertext)
+    /// as v2's kind:1059 Mode 1.
     pub async fn handle_incoming_event(
         &self,
         event: &libkeychat::Event,
@@ -303,6 +354,14 @@ impl AppClient {
                 nostr_event_json,
             )
             .await;
+            return;
+        }
+
+        // Step 3.5: Try MLS group message
+        if self
+            .handle_mls_event(event, nostr_event_json.clone(), relay_url.clone())
+            .await
+        {
             return;
         }
 
@@ -828,6 +887,83 @@ impl AppClient {
                     new_value: new_name,
                 })
                 .await;
+                return;
+            }
+
+            libkeychat::KCMessageKind::MlsGroupInvite => {
+                // Parse MlsGroupInvitePayload from extra["mlsGroupInvite"]
+                let invite_result: Option<libkeychat::MlsGroupInvitePayload> = msg
+                    .extra
+                    .get("mlsGroupInvite")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+                if let Some(invite_payload) = invite_result {
+                    let group_name = invite_payload.name.clone();
+                    let group_id = invite_payload.group_id.clone();
+                    tracing::info!(
+                        "[MLS] group invite received: id={} name={} from={}",
+                        &group_id[..16.min(group_id.len())],
+                        group_name,
+                        &sender_nostr_pubkey[..16.min(sender_nostr_pubkey.len())]
+                    );
+
+                    match self.join_mls_group(invite_payload).await {
+                        Ok(room_id) => {
+                            // Save a system message noting the join
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let sys_msgid = format!(
+                                "mls-join-{}-{}",
+                                &group_id[..16.min(group_id.len())],
+                                now
+                            );
+                            let sys_content =
+                                format!("Joined MLS group \"{}\"", group_name);
+                            {
+                                let app_storage =
+                                    self.inner.read().await.app_storage.clone();
+                                let store = lock_app_storage(&app_storage);
+                                let _ = store.save_app_message(
+                                    &sys_msgid,
+                                    None,
+                                    &room_id,
+                                    &identity_pubkey,
+                                    &sender_nostr_pubkey,
+                                    &sys_content,
+                                    false,
+                                    MessageStatus::Success.to_i32(),
+                                    now,
+                                );
+                                let _ = store.update_app_room(
+                                    &room_id,
+                                    None,
+                                    None,
+                                    Some(&sys_content),
+                                    Some(now),
+                                );
+                            }
+                            self.emit_data_change(DataChange::MessageAdded {
+                                room_id: room_id.clone(),
+                                msgid: sys_msgid,
+                            })
+                            .await;
+                            self.emit_event(ClientEvent::GroupInviteReceived {
+                                room_id,
+                                group_type: "mls".into(),
+                                group_name,
+                                inviter_pubkey: sender_nostr_pubkey,
+                            })
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("join_mls_group failed: {e}");
+                        }
+                    }
+                } else {
+                    tracing::error!("MlsGroupInvite: missing or invalid mlsGroupInvite payload");
+                }
                 return;
             }
 

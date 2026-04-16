@@ -212,6 +212,8 @@ pub(crate) fn room_row_to_info(r: RoomRow) -> RoomInfo {
         last_message_at: r.last_message_at,
         unread_count: r.unread_count,
         created_at: r.created_at,
+        peer_version: r.peer_version,
+        session_type: r.session_type,
     }
 }
 

@@ -222,23 +222,50 @@ pub struct AppClient {
     pub relay_tracker: Mutex<RelaySendTracker>,
     /// Cached identity pubkey hex — set once in import_identity(), never changes.
     pub identity_pubkey_hex: tokio::sync::OnceCell<String>,
+    /// MLS participant for large group operations (lazy-initialized).
+    pub mls_participant: Mutex<Option<libkeychat::MlsParticipant>>,
+    /// Path to the MLS storage database (file-backed OpenMLS provider).
+    pub mls_db_path: String,
+    /// Cached MLS signer public key (hex) — avoids try_read() race in mls_participant_guard.
+    pub mls_signer_pk: Mutex<Option<String>>,
+    /// MLS temp_inbox → group_id routing map (O(1) lookup on receive).
+    pub mls_inbox_map: Mutex<HashMap<String, String>>,
+    /// MLS group_id → current Nostr SubscriptionId (for clean unsubscribe on epoch rotation).
+    pub mls_sub_ids: Mutex<HashMap<String, nostr::SubscriptionId>>,
 }
 
 impl AppClient {
     /// Create a new AppClient with encrypted storage at the given path.
     pub fn new(db_path: String, db_key: String) -> AppResult<Self> {
         TRACING_INIT.call_once(|| {
-            let level = if cfg!(debug_assertions) {
-                tracing::Level::DEBUG
-            } else {
-                tracing::Level::INFO
+            let level = tracing::Level::DEBUG;
+            // Write tracing logs to a file so they are visible on iOS
+            let log_path = {
+                let mut p = std::path::PathBuf::from(&db_path);
+                p.pop(); // remove db filename
+                p.push("keychat_trace.log");
+                p
             };
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(level)
-                .with_target(true)
-                .with_thread_names(true)
-                .without_time()
-                .try_init();
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = tracing_subscriber::fmt()
+                    .with_max_level(level)
+                    .with_target(true)
+                    .with_thread_names(true)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .try_init();
+            } else {
+                let _ = tracing_subscriber::fmt()
+                    .with_max_level(level)
+                    .with_target(true)
+                    .with_thread_names(true)
+                    .without_time()
+                    .try_init();
+            }
         });
 
         let storage = SecureStorage::open(&db_path, &db_key)?;
@@ -264,6 +291,13 @@ impl AppClient {
             .build()
             .map_err(|e| AppError::Transport(e.to_string()))?;
 
+        let mls_db_path = {
+            let db_dir = std::path::Path::new(&db_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            db_dir.join("mls_storage.db").to_string_lossy().to_string()
+        };
+
         let protocol_storage = Arc::new(Mutex::new(storage));
         Ok(Self {
             inner: tokio::sync::RwLock::new(AppClientInner {
@@ -279,6 +313,11 @@ impl AppClient {
             files_dir,
             relay_tracker: Mutex::new(RelaySendTracker::new()),
             identity_pubkey_hex: tokio::sync::OnceCell::new(),
+            mls_participant: Mutex::new(None),
+            mls_db_path,
+            mls_signer_pk: Mutex::new(None),
+            mls_inbox_map: Mutex::new(HashMap::new()),
+            mls_sub_ids: Mutex::new(HashMap::new()),
         })
     }
 
@@ -472,6 +511,8 @@ impl AppClient {
                 last_message_at: r.last_message_at,
                 unread_count: r.unread_count,
                 created_at: r.created_at,
+                peer_version: r.peer_version,
+                session_type: r.session_type,
             })
             .collect())
     }
@@ -964,6 +1005,8 @@ impl AppClient {
                 last_message_at: r.last_message_at,
                 unread_count: r.unread_count,
                 created_at: r.created_at,
+                peer_version: r.peer_version,
+                session_type: r.session_type,
             })),
             None => Ok(None),
         }

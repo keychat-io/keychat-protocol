@@ -3064,6 +3064,7 @@ fn room_icon<'a>(room: &RoomEntry, t: &Theme) -> (&'a str, Color) {
         RoomStatus::Requesting => ("◐", t.warning),
         RoomStatus::Approving => ("◑", t.warning),
         RoomStatus::Rejected => ("○", t.error),
+        RoomStatus::Archived => ("◌", t.muted),
     }
 }
 
