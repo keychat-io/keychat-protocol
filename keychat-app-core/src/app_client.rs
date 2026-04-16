@@ -230,6 +230,8 @@ pub struct AppClient {
     pub mls_signer_pk: Mutex<Option<String>>,
     /// MLS temp_inbox → group_id routing map (O(1) lookup on receive).
     pub mls_inbox_map: Mutex<HashMap<String, String>>,
+    /// MLS group_id → current Nostr SubscriptionId (for clean unsubscribe on epoch rotation).
+    pub mls_sub_ids: Mutex<HashMap<String, nostr::SubscriptionId>>,
 }
 
 impl AppClient {
@@ -315,6 +317,7 @@ impl AppClient {
             mls_db_path,
             mls_signer_pk: Mutex::new(None),
             mls_inbox_map: Mutex::new(HashMap::new()),
+            mls_sub_ids: Mutex::new(HashMap::new()),
         })
     }
 

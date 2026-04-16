@@ -38,17 +38,22 @@ impl AppClient {
             }
         }
 
-        // Restore MLS inbox routing map and subscribe to all MLS temp_inboxes
+        // Restore MLS inbox routing map and subscribe to each MLS temp_inbox individually
+        // so we can track per-group SubscriptionIds for clean unsubscribe on epoch rotation.
         match self.restore_mls_inbox_map().await {
             Ok(inboxes) if !inboxes.is_empty() => {
                 let inner = self.inner.read().await;
                 if let Some(t) = inner.protocol.transport() {
-                    let pks: Vec<nostr::PublicKey> = inboxes
-                        .iter()
-                        .filter_map(|hex| nostr::PublicKey::from_hex(hex).ok())
-                        .collect();
-                    if !pks.is_empty() {
-                        let _ = t.subscribe(pks, None).await;
+                    for inbox in &inboxes {
+                        if let Ok(pk) = nostr::PublicKey::from_hex(inbox) {
+                            if let Ok(sub_id) = t.subscribe(vec![pk], None).await {
+                                if let Some(group_id) = self.resolve_mls_group(inbox) {
+                                    if let Ok(mut subs) = self.mls_sub_ids.lock() {
+                                        subs.insert(group_id, sub_id);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

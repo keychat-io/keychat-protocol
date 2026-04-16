@@ -128,8 +128,15 @@ impl AppClient {
         self.register_mls_inbox(&group_id)?;
 
         // Fetch KeyPackages, add members, broadcast commit, send Welcome
-        self.mls_fetch_add_and_invite(&group_id, &name, &identity_pubkey, &members)
+        let invited = self
+            .mls_fetch_add_and_invite(&group_id, &name, &identity_pubkey, &members)
             .await?;
+        if invited == 0 {
+            tracing::warn!(
+                "MLS group created but no members could be invited (group_id: {})",
+                &group_id[..16.min(group_id.len())]
+            );
+        }
 
         self.emit_data_change(DataChange::RoomListChanged).await;
 
@@ -228,11 +235,11 @@ impl AppClient {
         let event = {
             let guard = self.mls_participant_guard()?;
             let participant = guard.as_ref().unwrap();
+            let mls_temp_inbox = participant.derive_temp_inbox(&group_id)?;
             let self_leaf_index =
                 participant.find_member_index(&group_id, &identity_pubkey)?;
             let commit_bytes =
                 participant.remove_members(&group_id, &[self_leaf_index])?;
-            let mls_temp_inbox = participant.derive_temp_inbox(&group_id)?;
             libkeychat::broadcast_commit(&commit_bytes, &mls_temp_inbox)?
         };
 
@@ -250,6 +257,21 @@ impl AppClient {
                 .lock()
                 .map_err(|e| AppError::Mls(format!("mls_inbox_map lock: {e}")))?;
             map.retain(|_, gid| gid != &group_id);
+        }
+
+        // Remove and unsubscribe the tracked subscription for this group
+        let old_sub_id = self
+            .mls_sub_ids
+            .lock()
+            .ok()
+            .and_then(|mut subs| subs.remove(&group_id));
+        {
+            let inner = self.inner.read().await;
+            if let Some(t) = inner.protocol.transport() {
+                if let Some(sub_id) = old_sub_id {
+                    t.unsubscribe(sub_id).await;
+                }
+            }
         }
 
         // Archive room locally
@@ -287,11 +309,7 @@ impl AppClient {
             ext.name()
         };
 
-        // Fetch KeyPackages, add members, broadcast commit, send Welcome
-        self.mls_fetch_add_and_invite(&group_id, &group_name, &identity_pubkey, &members)
-            .await?;
-
-        // Save members to app_storage with Inviting status
+        // Save members to app_storage with Inviting status before sending invites
         let room_id = make_room_id(&group_id, &identity_pubkey);
         {
             let app_storage = self.inner.read().await.app_storage.clone();
@@ -305,6 +323,17 @@ impl AppClient {
                     MemberStatus::Inviting.to_i32(),
                 );
             }
+        }
+
+        // Fetch KeyPackages, add members, broadcast commit, send Welcome
+        let invited = self
+            .mls_fetch_add_and_invite(&group_id, &group_name, &identity_pubkey, &members)
+            .await?;
+        if invited == 0 {
+            tracing::warn!(
+                "add_mls_members: no members could be invited (group_id: {})",
+                &group_id[..16.min(group_id.len())]
+            );
         }
 
         self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
@@ -461,11 +490,12 @@ impl AppClient {
 
     /// After an epoch change (Commit), rotate the inbox mapping:
     /// remove old temp_inbox, derive and register the new one.
-    /// Returns (old_inbox, new_inbox).
+    /// Returns (old_inbox, new_inbox, old_sub_id) where old_sub_id is the
+    /// Nostr SubscriptionId to unsubscribe (if any was tracked).
     pub(crate) fn rotate_mls_inbox(
         &self,
         group_id: &str,
-    ) -> AppResult<(String, String)> {
+    ) -> AppResult<(String, String, Option<nostr::SubscriptionId>)> {
         // Remove old entry for this group_id
         let old_inbox = {
             let mut map = self
@@ -482,6 +512,13 @@ impl AppClient {
             old.unwrap_or_default()
         };
 
+        // Extract and remove old subscription ID
+        let old_sub_id = self
+            .mls_sub_ids
+            .lock()
+            .ok()
+            .and_then(|mut subs| subs.remove(group_id));
+
         // Derive and register new temp_inbox
         let new_inbox = self.register_mls_inbox(group_id)?;
 
@@ -495,7 +532,7 @@ impl AppClient {
             },
             &new_inbox[..16.min(new_inbox.len())]
         );
-        Ok((old_inbox, new_inbox))
+        Ok((old_inbox, new_inbox, old_sub_id))
     }
 
     /// Restore the mls_inbox_map from all active MLS groups in app_storage.
@@ -590,13 +627,21 @@ impl AppClient {
 
             // Rotate inbox mapping (old temp_inbox → new temp_inbox)
             match self.rotate_mls_inbox(&group_id) {
-                Ok((_old_inbox, new_inbox)) => {
-                    // Subscribe to the new temp_inbox
-                    // (old inbox will be ignored on next resubscribe cycle)
+                Ok((_old_inbox, new_inbox, old_sub_id)) => {
+                    // Unsubscribe old inbox, subscribe to new — atomically via resubscribe()
                     let inner = self.inner.read().await;
                     if let Some(t) = inner.protocol.transport() {
                         if let Ok(new_pk) = nostr::PublicKey::from_hex(&new_inbox) {
-                            let _ = t.subscribe(vec![new_pk], None).await;
+                            match t.resubscribe(old_sub_id, vec![new_pk], None).await {
+                                Ok(new_sub_id) => {
+                                    if let Ok(mut subs) = self.mls_sub_ids.lock() {
+                                        subs.insert(group_id.clone(), new_sub_id);
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    "[MLS] resubscribe after epoch rotate failed: {e}"
+                                ),
+                            }
                         }
                     }
                 }
@@ -787,29 +832,34 @@ impl AppClient {
         let event_id = event.id.to_hex();
 
         // Publish (async, no mls lock held)
-        {
+        let publish_ok = {
             let inner = self.inner.read().await;
             if let Some(t) = inner.protocol.transport() {
-                let _ = t.publish_event_async(event).await;
+                t.publish_event_async(event).await.is_ok()
+            } else {
+                false
             }
-        }
+        };
 
         // App persistence
         let room_id = make_room_id(&group_id, &identity_pubkey);
-        let now = std::time::SystemTime::now()
+        let duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
+            .unwrap_or_default();
+        let now = duration.as_secs() as i64;
+        let nanos = duration.subsec_nanos();
         let msgid = format!(
             "mls-{}-{}-{:08x}",
             &group_id[..16.min(group_id.len())],
             now,
             nanos
         );
+
+        let msg_status = if publish_ok {
+            MessageStatus::Success.to_i32()
+        } else {
+            MessageStatus::Failed.to_i32()
+        };
 
         {
             let app_storage = self.inner.read().await.app_storage.clone();
@@ -822,7 +872,7 @@ impl AppClient {
                 &identity_pubkey,
                 display_text,
                 true,
-                MessageStatus::Sending.to_i32(),
+                msg_status,
                 now,
             );
             let _ = store.update_app_message(
@@ -867,7 +917,7 @@ impl AppClient {
         group_name: &str,
         identity_pubkey: &str,
         members: &[GroupMemberInput],
-    ) -> AppResult<()> {
+    ) -> AppResult<usize> {
         // Step 1: Fetch KeyPackages from relays
         // We collect raw nostr Events and parse them together with the MLS
         // participant lock to avoid exposing openmls types in our signature.
@@ -917,7 +967,7 @@ impl AppClient {
                 "mls_fetch_add_and_invite: no valid KeyPackages found for {} members",
                 members.len()
             );
-            return Ok(());
+            return Ok(0);
         }
 
         // Step 2: Parse KeyPackages + add_members (sync, holding mls_participant lock)
@@ -943,7 +993,7 @@ impl AppClient {
             }
 
             if key_packages.is_empty() {
-                return Ok(());
+                return Ok(0);
             }
 
             let (commit_bytes, welcome_bytes) =
@@ -1041,11 +1091,15 @@ impl AppClient {
                     nostr::PublicKey::from_hex(&mls_temp_inbox).map_err(|e| {
                         AppError::Crypto(format!("invalid mls temp inbox pubkey: {e}"))
                     })?;
-                let _ = t.subscribe(vec![inbox_pk], None).await;
+                if let Ok(sub_id) = t.subscribe(vec![inbox_pk], None).await {
+                    if let Ok(mut subs) = self.mls_sub_ids.lock() {
+                        subs.insert(group_id.to_string(), sub_id);
+                    }
+                }
             }
         }
 
-        Ok(())
+        Ok(members_with_kp.len())
     }
 
     // ─── Join MLS Group (invited by another user) ───────────
@@ -1129,7 +1183,11 @@ impl AppClient {
             let inner = self.inner.read().await;
             if let Some(t) = inner.protocol.transport() {
                 if let Ok(inbox_pk) = nostr::PublicKey::from_hex(&mls_temp_inbox) {
-                    let _ = t.subscribe(vec![inbox_pk], None).await;
+                    if let Ok(sub_id) = t.subscribe(vec![inbox_pk], None).await {
+                        if let Ok(mut subs) = self.mls_sub_ids.lock() {
+                            subs.insert(group_id.clone(), sub_id);
+                        }
+                    }
                 }
             }
         }
