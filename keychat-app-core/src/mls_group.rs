@@ -461,30 +461,41 @@ impl AppClient {
     }
 
     /// Remove a member from an MLS group. Admin only.
+    ///
+    /// Two-phase commit: broadcast Commit to the **current** mlsTempInbox
+    /// (so members on the old epoch can receive it), then merge locally
+    /// and re-subscribe to the new-epoch mlsTempInbox.
     pub async fn remove_mls_member(
         &self,
         group_id: String,
         member_nostr_pubkey: String,
     ) -> AppResult<()> {
-        // MLS operations
-        let (commit_bytes, mls_temp_inbox) = {
+        // Phase 1: create Commit + derive CURRENT inbox (before merge)
+        let (commit_bytes, old_mls_temp_inbox) = {
             let guard = self.lock_mls()?;
             let participant = guard.as_ref().unwrap();
             let leaf_index = participant.find_member_index(&group_id, &member_nostr_pubkey)?;
+            let old_inbox = participant.derive_temp_inbox(&group_id)?;
             let commit_bytes = participant.remove_members(&group_id, &[leaf_index])?;
-            let mls_temp_inbox = participant.derive_temp_inbox(&group_id)?;
-            (commit_bytes, mls_temp_inbox)
+            (commit_bytes, old_inbox)
         };
 
-        // Broadcast
-        let event = broadcast_commit(&commit_bytes, &mls_temp_inbox)?;
+        // Phase 2: broadcast to OLD inbox (members are still on old epoch)
+        let event = broadcast_commit(&commit_bytes, &old_mls_temp_inbox)?;
         let inner = self.inner.read().await;
         if let Some(t) = inner.protocol.transport() {
             let _ = t.publish_event_async(event).await;
         }
         drop(inner);
 
-        // Epoch changed after remove — re-subscribe to new mlsTempInbox (spec §11.3).
+        // Phase 3: merge locally → advance to new epoch
+        {
+            let guard = self.lock_mls()?;
+            let participant = guard.as_ref().unwrap();
+            participant.self_commit(&group_id)?;
+        }
+
+        // Phase 4: re-subscribe to new-epoch mlsTempInbox (spec §11.3)
         self.refresh_mls_subscriptions().await;
 
         Ok(())

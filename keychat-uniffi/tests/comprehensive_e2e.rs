@@ -23,9 +23,7 @@ struct CapturingListener {
 }
 
 impl CapturingListener {
-    fn new(
-        notify: Arc<tokio::sync::Notify>,
-    ) -> (Self, Arc<Mutex<Vec<ClientEvent>>>) {
+    fn new(notify: Arc<tokio::sync::Notify>) -> (Self, Arc<Mutex<Vec<ClientEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
@@ -60,8 +58,7 @@ async fn wait_event<F>(
 where
     F: Fn(&ClientEvent) -> bool,
 {
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         {
             let guard = events.lock().unwrap();
@@ -130,8 +127,7 @@ async fn start_participant(
     Arc::clone(&client).start_event_loop().await.unwrap();
 
     // Wait for relay to be ready
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         if let Ok(relays) = client.connected_relays().await {
             if !relays.is_empty() {
@@ -165,11 +161,7 @@ async fn make_friends(
     clear_events(receiver_events);
 
     sender
-        .send_friend_request(
-            receiver_pk.to_string(),
-            sender_name.into(),
-            "dev".into(),
-        )
+        .send_friend_request(receiver_pk.to_string(), sender_name.into(), "dev".into())
         .await
         .unwrap();
 
@@ -182,9 +174,7 @@ async fn make_friends(
     );
 
     let request_id = extract_event(receiver_events, |e| match e {
-        ClientEvent::FriendRequestReceived { request_id, .. } => {
-            Some(request_id.clone())
-        }
+        ClientEvent::FriendRequestReceived { request_id, .. } => Some(request_id.clone()),
         _ => None,
     })
     .unwrap();
@@ -698,17 +688,51 @@ fn comprehensive_e2e_full_protocol() {
             // ═══════════════════════════════════════════════════════
             // Phase 11: MLS Group management — remove Charlie
             // ═══════════════════════════════════════════════════════
-            tracing::info!("═══ Phase 11: MLS Group — remove Charlie (skipped: epoch sync issue under investigation)");
+            tracing::info!("═══ Phase 11: MLS Group — remove Charlie");
 
-            // NOTE: MLS remove_member + post-remove messaging has a known
-            // epoch synchronization issue — the admin's encrypt still uses
-            // epoch N while other members have advanced to epoch N+1 after
-            // processing the Commit. This needs investigation in
-            // MlsParticipant::remove_members / merge_pending_commit.
-            // Dedicated coverage exists in mls_e2e_full_lifecycle_with_restart.
-            //
-            // Skipping the remove + post-remove assertions for now so the
-            // rest of the comprehensive test can proceed.
+            clear_events(&bob_ev);
+            clear_events(&charlie_ev);
+            clear_events(&eve_ev);
+
+            alice
+                .remove_mls_member(mls_group_id.clone(), charlie_pk.clone())
+                .await
+                .unwrap();
+
+            // The Commit must be delivered and processed by Bob/Eve BEFORE
+            // Alice sends any new-epoch messages. Relay doesn't guarantee
+            // ordering, so we give generous time for the Commit to propagate
+            // and the event_loop to advance their epoch.
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+            // After removing Charlie, Alice sends another MLS message.
+            clear_events(&bob_ev);
+            clear_events(&charlie_ev);
+            clear_events(&eve_ev);
+
+            alice
+                .send_mls_text(mls_group_id.clone(), "post-remove msg".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[("Bob", &bob_ev, &bob_n), ("Eve", &eve_ev, &eve_n)] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "post-remove msg")
+                    })
+                    .await,
+                    "{name} did not receive 'post-remove msg'"
+                );
+            }
+            // Charlie should NOT receive it
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            {
+                let guard = charlie_ev.lock().unwrap();
+                let got = guard.iter().any(|e| {
+                    matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "post-remove msg")
+                });
+                assert!(!got, "Charlie should NOT receive post-remove MLS message");
+            }
 
             // ═══════════════════════════════════════════════════════
             // Phase 12: Simulated restart — Alice

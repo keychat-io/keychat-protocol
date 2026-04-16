@@ -3444,10 +3444,11 @@ fn mls_multi_identity_multi_group_persistence() {
                 )
                 .unwrap();
 
-                // Remove Charlie from group_a
+                // Remove Charlie from group_a (two-phase)
                 let charlie_idx = alice.find_member_index(group_a, charlie_id).unwrap();
                 let rm_commit = alice.remove_members(group_a, &[charlie_idx]).unwrap();
                 bob.process_commit(group_a, &rm_commit).unwrap();
+                alice.self_commit(group_a).unwrap();
 
                 // Alice → Bob works, Charlie fails
                 let ct = alice.encrypt(group_a, b"no-more-charlie").unwrap();

@@ -2527,8 +2527,7 @@ async_test!(test_daemon_bundle_add_rejects_tampered, {
 
     let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
     let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
-    let app =
-        keychat_cli::daemon::build_router(alice.app_client().clone(), event_tx, data_tx);
+    let app = keychat_cli::daemon::build_router(alice.app_client().clone(), event_tx, data_tx);
 
     // Feed in a structurally valid but integrity-broken bundle: all globalSign
     // checks inside must fail before any relay work happens.
@@ -2577,202 +2576,208 @@ async_test!(test_daemon_bundle_add_rejects_tampered, {
 
 // ─── Relay: Daemon /bundle roundtrip via HTTP (spec §6.5) ───────
 
-async_test!(#[ignore = "requires network: wss://backup.keychat.io"] test_daemon_bundle_roundtrip, {
-    use axum::body::Body;
-    use http::Request;
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
+async_test!(
+    #[ignore = "requires network: wss://backup.keychat.io"]
+    test_daemon_bundle_roundtrip,
+    {
+        use axum::body::Body;
+        use http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
 
-    let dir = tempfile::tempdir().unwrap();
-    let db_dir = dir.path().join("libkeychat");
-    std::fs::create_dir_all(&db_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("libkeychat");
+        std::fs::create_dir_all(&db_dir).unwrap();
 
-    let alice = Arc::new(
-        KeychatClient::new(
-            db_dir.join("alice.db").to_str().unwrap().to_string(),
-            "test-key".into(),
-        )
-        .unwrap(),
-    );
-    let bob = Arc::new(
-        KeychatClient::new(
-            db_dir.join("bob.db").to_str().unwrap().to_string(),
-            "test-key".into(),
-        )
-        .unwrap(),
-    );
+        let alice = Arc::new(
+            KeychatClient::new(
+                db_dir.join("alice.db").to_str().unwrap().to_string(),
+                "test-key".into(),
+            )
+            .unwrap(),
+        );
+        let bob = Arc::new(
+            KeychatClient::new(
+                db_dir.join("bob.db").to_str().unwrap().to_string(),
+                "test-key".into(),
+            )
+            .unwrap(),
+        );
 
-    let alice_id = alice.create_identity().await.unwrap();
-    let bob_id = bob.create_identity().await.unwrap();
-    let alice_pk = alice_id.pubkey_hex.clone();
-    let bob_pk = bob_id.pubkey_hex.clone();
+        let alice_id = alice.create_identity().await.unwrap();
+        let bob_id = bob.create_identity().await.unwrap();
+        let alice_pk = alice_id.pubkey_hex.clone();
+        let bob_pk = bob_id.pubkey_hex.clone();
 
-    let (alice_listener, mut alice_rx) = TestListener::new();
-    let (bob_listener, mut bob_rx) = TestListener::new();
-    alice.set_event_listener(Box::new(alice_listener)).await;
-    bob.set_event_listener(Box::new(bob_listener)).await;
+        let (alice_listener, mut alice_rx) = TestListener::new();
+        let (bob_listener, mut bob_rx) = TestListener::new();
+        alice.set_event_listener(Box::new(alice_listener)).await;
+        bob.set_event_listener(Box::new(bob_listener)).await;
 
-    alice.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
-    bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
+        alice.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
+        bob.connect(vec![TEST_RELAY.to_string()]).await.unwrap();
 
-    let alice_clone = alice.clone();
-    tokio::spawn(async move {
-        let _ = alice_clone.start_event_loop().await;
-    });
-    let bob_clone = bob.clone();
-    tokio::spawn(async move {
-        let _ = bob_clone.start_event_loop().await;
-    });
+        let alice_clone = alice.clone();
+        tokio::spawn(async move {
+            let _ = alice_clone.start_event_loop().await;
+        });
+        let bob_clone = bob.clone();
+        tokio::spawn(async move {
+            let _ = bob_clone.start_event_loop().await;
+        });
 
-    assert!(wait_for_relay_connection(&alice, 15).await);
-    assert!(wait_for_relay_connection(&bob, 15).await);
+        assert!(wait_for_relay_connection(&alice, 15).await);
+        assert!(wait_for_relay_connection(&bob, 15).await);
 
-    // Build an HTTP router per client to exercise the CLI-specific daemon layer.
-    let (alice_event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
-    let (alice_data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
-    let alice_router = keychat_cli::daemon::build_router(
-        alice.app_client().clone(),
-        alice_event_tx,
-        alice_data_tx,
-    );
+        // Build an HTTP router per client to exercise the CLI-specific daemon layer.
+        let (alice_event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+        let (alice_data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+        let alice_router = keychat_cli::daemon::build_router(
+            alice.app_client().clone(),
+            alice_event_tx,
+            alice_data_tx,
+        );
 
-    let (bob_event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
-    let (bob_data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
-    let bob_router =
-        keychat_cli::daemon::build_router(bob.app_client().clone(), bob_event_tx, bob_data_tx);
+        let (bob_event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+        let (bob_data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+        let bob_router =
+            keychat_cli::daemon::build_router(bob.app_client().clone(), bob_event_tx, bob_data_tx);
 
-    // Give event loops a beat to subscribe.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Give event loops a beat to subscribe.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // 1. Bob: POST /bundle/export
-    let export_req = serde_json::json!({ "name": "Bob", "device_id": "dev-bob" });
-    let response = bob_router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/bundle/export")
-                .header("content-type", "application/json")
-                .body(Body::from(export_req.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["ok"], true);
-    let bundle_json = json["data"]["bundle"].as_str().unwrap().to_string();
-    assert!(
-        bundle_json.contains(&bob_pk),
-        "bundle must contain Bob's nostr pubkey"
-    );
+        // 1. Bob: POST /bundle/export
+        let export_req = serde_json::json!({ "name": "Bob", "device_id": "dev-bob" });
+        let response = bob_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bundle/export")
+                    .header("content-type", "application/json")
+                    .body(Body::from(export_req.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        let bundle_json = json["data"]["bundle"].as_str().unwrap().to_string();
+        assert!(
+            bundle_json.contains(&bob_pk),
+            "bundle must contain Bob's nostr pubkey"
+        );
 
-    // Let Bob refresh subscriptions to include the new firstInbox.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Let Bob refresh subscriptions to include the new firstInbox.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    // 2. Alice: POST /bundle/add
-    let add_req = serde_json::json!({ "bundle": bundle_json, "name": "Alice" });
-    let response = alice_router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/bundle/add")
-                .header("content-type", "application/json")
-                .body(Body::from(add_req.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["data"]["nostr_pubkey_hex"].as_str().unwrap(), bob_pk);
+        // 2. Alice: POST /bundle/add
+        let add_req = serde_json::json!({ "bundle": bundle_json, "name": "Alice" });
+        let response = alice_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bundle/add")
+                    .header("content-type", "application/json")
+                    .body(Body::from(add_req.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["data"]["nostr_pubkey_hex"].as_str().unwrap(), bob_pk);
 
-    // 3. Bob should see the session established via Step 2 (FriendRequestAccepted).
-    let got = wait_for_event(&mut bob_rx, 30, |e| {
-        matches!(e, ClientEvent::FriendRequestAccepted { .. })
-    })
-    .await;
-    assert!(
-        got.is_some(),
-        "Bob should receive FriendRequestAccepted after Alice consumes his bundle"
-    );
+        // 3. Bob should see the session established via Step 2 (FriendRequestAccepted).
+        let got = wait_for_event(&mut bob_rx, 30, |e| {
+            matches!(e, ClientEvent::FriendRequestAccepted { .. })
+        })
+        .await;
+        assert!(
+            got.is_some(),
+            "Bob should receive FriendRequestAccepted after Alice consumes his bundle"
+        );
 
-    // Let app-layer persistence settle.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Let app-layer persistence settle.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    // 4. Both sides: enabled DM room + contact present in DB.
-    let alice_rooms = alice.get_rooms(alice_pk.clone()).await.unwrap();
-    let alice_dm = alice_rooms
-        .iter()
-        .find(|r| r.to_main_pubkey == bob_pk)
-        .expect("Alice should have a DM room with Bob");
-    assert_eq!(alice_dm.status, RoomStatus::Enabled);
-    assert_eq!(alice_dm.room_type, RoomType::Dm);
-    let alice_room_id = alice_dm.id.clone();
+        // 4. Both sides: enabled DM room + contact present in DB.
+        let alice_rooms = alice.get_rooms(alice_pk.clone()).await.unwrap();
+        let alice_dm = alice_rooms
+            .iter()
+            .find(|r| r.to_main_pubkey == bob_pk)
+            .expect("Alice should have a DM room with Bob");
+        assert_eq!(alice_dm.status, RoomStatus::Enabled);
+        assert_eq!(alice_dm.room_type, RoomType::Dm);
+        let alice_room_id = alice_dm.id.clone();
 
-    let bob_rooms = bob.get_rooms(bob_pk.clone()).await.unwrap();
-    let bob_dm = bob_rooms
-        .iter()
-        .find(|r| r.to_main_pubkey == alice_pk)
-        .expect("Bob should have a DM room with Alice");
-    assert_eq!(bob_dm.status, RoomStatus::Enabled);
-    assert_eq!(bob_dm.room_type, RoomType::Dm);
-    let bob_room_id = bob_dm.id.clone();
+        let bob_rooms = bob.get_rooms(bob_pk.clone()).await.unwrap();
+        let bob_dm = bob_rooms
+            .iter()
+            .find(|r| r.to_main_pubkey == alice_pk)
+            .expect("Bob should have a DM room with Alice");
+        assert_eq!(bob_dm.status, RoomStatus::Enabled);
+        assert_eq!(bob_dm.room_type, RoomType::Dm);
+        let bob_room_id = bob_dm.id.clone();
 
-    // 5. Bidirectional messaging via daemon /send to confirm session works.
-    let send_alice = serde_json::json!({ "room_id": alice_room_id, "text": "hi bob (via bundle)" });
-    let response = alice_router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/send")
-                .header("content-type", "application/json")
-                .body(Body::from(send_alice.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
+        // 5. Bidirectional messaging via daemon /send to confirm session works.
+        let send_alice =
+            serde_json::json!({ "room_id": alice_room_id, "text": "hi bob (via bundle)" });
+        let response = alice_router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(send_alice.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
 
-    let got_msg = wait_for_event(&mut bob_rx, 30, |e| {
+        let got_msg = wait_for_event(&mut bob_rx, 30, |e| {
         matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "hi bob (via bundle)")
     })
     .await;
-    assert!(got_msg.is_some(), "Bob should receive Alice's DM");
+        assert!(got_msg.is_some(), "Bob should receive Alice's DM");
 
-    let send_bob = serde_json::json!({ "room_id": bob_room_id, "text": "hi alice (via bundle)" });
-    let response = bob_router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/send")
-                .header("content-type", "application/json")
-                .body(Body::from(send_bob.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
+        let send_bob =
+            serde_json::json!({ "room_id": bob_room_id, "text": "hi alice (via bundle)" });
+        let response = bob_router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(send_bob.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
 
-    let got_reply = wait_for_event(&mut alice_rx, 30, |e| {
+        let got_reply = wait_for_event(&mut alice_rx, 30, |e| {
         matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "hi alice (via bundle)")
     })
     .await;
-    assert!(got_reply.is_some(), "Alice should receive Bob's reply");
+        assert!(got_reply.is_some(), "Alice should receive Bob's reply");
 
-    // Cleanup
-    let _ = alice.stop_event_loop().await;
-    let _ = bob.stop_event_loop().await;
-    let _ = alice.disconnect().await;
-    let _ = bob.disconnect().await;
-    tokio::task::spawn_blocking(move || {
-        drop(alice);
-        drop(bob);
-    })
-    .await
-    .unwrap();
-});
+        // Cleanup
+        let _ = alice.stop_event_loop().await;
+        let _ = bob.stop_event_loop().await;
+        let _ = alice.disconnect().await;
+        let _ = bob.disconnect().await;
+        tokio::task::spawn_blocking(move || {
+            drop(alice);
+            drop(bob);
+        })
+        .await
+        .unwrap();
+    }
+);

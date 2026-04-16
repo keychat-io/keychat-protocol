@@ -1109,9 +1109,7 @@ impl SecureStorage {
                  VALUES (?1, ?2)",
                 rusqlite::params![peer_signal_hex, first_inbox_pubkey],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("save pending_first_inbox: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("save pending_first_inbox: {e}")))?;
         Ok(())
     }
 
@@ -1121,9 +1119,7 @@ impl SecureStorage {
                 "DELETE FROM pending_first_inbox WHERE peer_signal_hex = ?1",
                 rusqlite::params![peer_signal_hex],
             )
-            .map_err(|e| {
-                KeychatError::Storage(format!("delete pending_first_inbox: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("delete pending_first_inbox: {e}")))?;
         Ok(())
     }
 
@@ -1131,19 +1127,13 @@ impl SecureStorage {
         let mut stmt = self
             .conn
             .prepare("SELECT peer_signal_hex, first_inbox_pubkey FROM pending_first_inbox")
-            .map_err(|e| {
-                KeychatError::Storage(format!("prepare pending_first_inbox: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("prepare pending_first_inbox: {e}")))?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| {
-                KeychatError::Storage(format!("query pending_first_inbox: {e}"))
-            })?;
+            .map_err(|e| KeychatError::Storage(format!("query pending_first_inbox: {e}")))?;
         let mut results = Vec::new();
         for row in rows {
-            results.push(
-                row.map_err(|e| KeychatError::Storage(format!("read row: {e}")))?,
-            );
+            results.push(row.map_err(|e| KeychatError::Storage(format!("read row: {e}")))?);
         }
         Ok(results)
     }

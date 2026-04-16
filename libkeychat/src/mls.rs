@@ -489,6 +489,12 @@ impl MlsParticipant {
 
     /// Remove members from the group by their leaf indices.
     /// Returns the serialized Commit.
+    ///
+    /// **Does NOT merge** the pending commit — the caller must broadcast
+    /// the Commit to the old-epoch mlsTempInbox first, then call
+    /// `self_commit()` to advance to the new epoch. This matches the
+    /// production app's two-phase pattern and avoids the Commit being
+    /// sent to an inbox that only the admin has advanced to.
     pub fn remove_members(
         &self,
         group_id: &str,
@@ -500,15 +506,24 @@ impl MlsParticipant {
             .remove_members(self.provider.inner(), &self.signer, members_to_remove)
             .map_err(|e| KeychatError::Mls(format!("remove_members error: {e}")))?;
 
-        group
-            .merge_pending_commit(self.provider.inner())
-            .map_err(|e| KeychatError::Mls(format!("merge commit error: {e}")))?;
-
         let bytes = commit
             .tls_serialize_detached()
             .map_err(|e| KeychatError::Mls(format!("serialize commit: {e}")))?;
 
         Ok(bytes)
+    }
+
+    /// Merge the pending commit for a group (advance to new epoch).
+    ///
+    /// Call this AFTER broadcasting the Commit to the old-epoch
+    /// mlsTempInbox. After this returns, `derive_temp_inbox` will
+    /// produce the new-epoch address.
+    pub fn self_commit(&self, group_id: &str) -> Result<()> {
+        let mut group = self.load_group(group_id)?;
+        group
+            .merge_pending_commit(self.provider.inner())
+            .map_err(|e| KeychatError::Mls(format!("self_commit merge error: {e}")))?;
+        Ok(())
     }
 
     /// Self-update (key rotation). Returns the serialized Commit.
@@ -1129,14 +1144,13 @@ mod tests {
         bob.join_group(&welcome).unwrap();
         charlie.join_group(&welcome).unwrap();
 
-        // Find Charlie's leaf index and remove
+        // Find Charlie's leaf index and remove (two-phase)
         let charlie_idx = alice.find_member_index(group_id, "charlie").unwrap();
         let commit = alice.remove_members(group_id, &[charlie_idx]).unwrap();
-
-        // Bob processes the removal
         bob.process_commit(group_id, &commit).unwrap();
+        alice.self_commit(group_id).unwrap();
 
-        // Alice sends a message
+        // Alice sends a message (both at new epoch)
         let ciphertext = alice.encrypt(group_id, b"Secret after removal").unwrap();
 
         // Bob can decrypt
@@ -1175,6 +1189,7 @@ mod tests {
         // For simplicity, Alice removes Bob
         let bob_idx = alice.find_member_index(group_id, "bob").unwrap();
         let commit = alice.remove_members(group_id, &[bob_idx]).unwrap();
+        alice.self_commit(group_id).unwrap();
 
         // Alice can still send messages
         let ciphertext = alice.encrypt(group_id, b"After Bob left").unwrap();
@@ -1608,10 +1623,11 @@ mod tests {
             let bob = open_participant(&bob_db, bob_id);
             let charlie = open_participant(&charlie_db, charlie_id);
 
-            // ── Remove Charlie from group_a ──
+            // ── Remove Charlie from group_a (two-phase) ──
             let charlie_idx = alice.find_member_index(group_a, charlie_id).unwrap();
             let rm_commit = alice.remove_members(group_a, &[charlie_idx]).unwrap();
             bob.process_commit(group_a, &rm_commit).unwrap();
+            alice.self_commit(group_a).unwrap();
 
             // Alice sends — Bob can decrypt, Charlie cannot
             let ct = alice.encrypt(group_a, b"alpha-no-charlie").unwrap();
@@ -1664,5 +1680,77 @@ mod tests {
             assert_eq!(plaintext, b"final-check");
             assert_eq!(sender_id, bob_id);
         }
+    }
+
+    /// Verify that after remove_members (which calls merge_pending_commit
+    /// on a local variable), the subsequent encrypt produces messages at
+    /// the new epoch. This is the exact scenario that fails in the
+    /// comprehensive E2E test (Phase 11).
+    #[test]
+    fn test_remove_member_epoch_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice_db = dir.path().join("alice_mls.db").to_str().unwrap().to_string();
+        let bob_db = dir.path().join("bob_mls.db").to_str().unwrap().to_string();
+        let charlie_db = dir.path().join("charlie_mls.db").to_str().unwrap().to_string();
+
+        let alice_id = "alice_epoch_test";
+        let bob_id = "bob_epoch_test";
+        let charlie_id = "charlie_epoch_test";
+
+        let alice = open_participant(&alice_db, alice_id);
+        let bob = open_participant(&bob_db, bob_id);
+        let charlie = open_participant(&charlie_db, charlie_id);
+
+        let group_id = "epoch-test-group";
+        alice.create_group(group_id, "EpochTest").unwrap();
+
+        let bob_kp = bob.generate_key_package().unwrap();
+        let charlie_kp = charlie.generate_key_package().unwrap();
+
+        let (_commit, welcome) = alice.add_members(group_id, vec![bob_kp, charlie_kp]).unwrap();
+        bob.join_group(&welcome).unwrap();
+        charlie.join_group(&welcome).unwrap();
+
+        // Pre-remove: messaging works (Alice + Bob + Charlie all at same epoch)
+        let ct0 = alice.encrypt(group_id, b"before-remove").unwrap();
+        let MlsDecryptResult::Application { plaintext, .. } =
+            bob.decrypt(group_id, &ct0).unwrap()
+        else {
+            panic!("pre-remove decrypt failed");
+        };
+        assert_eq!(plaintext, b"before-remove");
+
+        // Remove Charlie — two-phase: remove → self_commit
+        let charlie_idx = alice.find_member_index(group_id, charlie_id).unwrap();
+        let rm_commit = alice.remove_members(group_id, &[charlie_idx]).unwrap();
+
+        // Bob processes the remove commit BEFORE Alice merges
+        bob.process_commit(group_id, &rm_commit).unwrap();
+
+        // Alice merges (advancing to new epoch)
+        alice.self_commit(group_id).unwrap();
+
+        // Now Alice encrypts at new epoch — Bob is already there
+        let ct1 = alice.encrypt(group_id, b"post-remove").unwrap();
+
+        // Bob decrypts
+        match bob.decrypt(group_id, &ct1) {
+            Ok(MlsDecryptResult::Application { plaintext, .. }) => {
+                assert_eq!(plaintext, b"post-remove");
+            }
+            Ok(_) => panic!("expected Application message"),
+            Err(e) => panic!(
+                "EPOCH SYNC BUG: Bob cannot decrypt post-remove message: {e}\n\
+                 This means remove_members + merge_pending_commit did not persist \
+                 the new epoch to SQLite storage, so the subsequent encrypt() \
+                 loaded the old epoch via load_group()."
+            ),
+        }
+
+        // Charlie must NOT decrypt
+        assert!(
+            charlie.decrypt(group_id, &ct1).is_err(),
+            "Removed member must not decrypt"
+        );
     }
 }
