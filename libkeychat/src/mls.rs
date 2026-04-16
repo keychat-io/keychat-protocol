@@ -1689,9 +1689,19 @@ mod tests {
     #[test]
     fn test_remove_member_epoch_sync() {
         let dir = tempfile::tempdir().unwrap();
-        let alice_db = dir.path().join("alice_mls.db").to_str().unwrap().to_string();
+        let alice_db = dir
+            .path()
+            .join("alice_mls.db")
+            .to_str()
+            .unwrap()
+            .to_string();
         let bob_db = dir.path().join("bob_mls.db").to_str().unwrap().to_string();
-        let charlie_db = dir.path().join("charlie_mls.db").to_str().unwrap().to_string();
+        let charlie_db = dir
+            .path()
+            .join("charlie_mls.db")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let alice_id = "alice_epoch_test";
         let bob_id = "bob_epoch_test";
@@ -1707,14 +1717,15 @@ mod tests {
         let bob_kp = bob.generate_key_package().unwrap();
         let charlie_kp = charlie.generate_key_package().unwrap();
 
-        let (_commit, welcome) = alice.add_members(group_id, vec![bob_kp, charlie_kp]).unwrap();
+        let (_commit, welcome) = alice
+            .add_members(group_id, vec![bob_kp, charlie_kp])
+            .unwrap();
         bob.join_group(&welcome).unwrap();
         charlie.join_group(&welcome).unwrap();
 
         // Pre-remove: messaging works (Alice + Bob + Charlie all at same epoch)
         let ct0 = alice.encrypt(group_id, b"before-remove").unwrap();
-        let MlsDecryptResult::Application { plaintext, .. } =
-            bob.decrypt(group_id, &ct0).unwrap()
+        let MlsDecryptResult::Application { plaintext, .. } = bob.decrypt(group_id, &ct0).unwrap()
         else {
             panic!("pre-remove decrypt failed");
         };
