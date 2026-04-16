@@ -44,10 +44,11 @@ impl RoomStatus {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemberStatus {
-    Inviting, // 0
-    Invited,  // 1 — normal/active
-    Blocked,  // 2
-    Removed,  // 3
+    Inviting,     // 0
+    Invited,      // 1 — normal/active
+    Blocked,      // 2
+    Removed,      // 3
+    InviteFailed, // 4 — KeyPackage fetch or send failed; eligible for retry
 }
 
 impl MemberStatus {
@@ -57,6 +58,7 @@ impl MemberStatus {
             1 => MemberStatus::Invited,
             2 => MemberStatus::Blocked,
             3 => MemberStatus::Removed,
+            4 => MemberStatus::InviteFailed,
             _ => MemberStatus::Inviting,
         }
     }
@@ -67,6 +69,7 @@ impl MemberStatus {
             MemberStatus::Invited => 1,
             MemberStatus::Blocked => 2,
             MemberStatus::Removed => 3,
+            MemberStatus::InviteFailed => 4,
         }
     }
 }

@@ -10,6 +10,7 @@ mod friend_request;
 mod group;
 pub mod media;
 mod messaging;
+mod mls_group;
 mod relay_tracker;
 mod types;
 

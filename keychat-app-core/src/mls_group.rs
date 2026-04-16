@@ -67,6 +67,53 @@ impl AppClient {
         Ok(guard)
     }
 
+    // ─── Publish KeyPackage ────────────────────────────────────
+
+    /// Generate a fresh MLS KeyPackage and publish it as a kind:10443 Nostr event.
+    ///
+    /// Other clients fetch this event to add us to MLS groups.  Must be called
+    /// once after identity import and each time the app starts (KeyPackages are
+    /// single-use in OpenMLS, so publishing fresh ones periodically is expected).
+    pub async fn publish_mls_key_package(&self) -> AppResult<()> {
+        // Step 1: generate KeyPackage (sync, holding mls_participant lock only briefly)
+        let key_package = {
+            let guard = self.mls_participant_guard()?;
+            let participant = guard.as_ref().unwrap();
+            participant.generate_key_package()?
+        };
+
+        // Step 2: get identity keys (needs async inner read, taken after mls lock dropped)
+        let inner = self.inner.read().await;
+        let identity = inner
+            .protocol
+            .identity()
+            .ok_or_else(|| AppError::NotInitialized("no identity set".into()))?;
+        let keys = identity.keys().clone();
+
+        // Step 3: build kind:10443 Nostr event
+        let event = libkeychat::publish_key_package(&key_package, &keys)
+            .map_err(|e| AppError::Mls(format!("build key package event: {e}")))?;
+
+        // Step 4: publish to relay (fire-and-forget)
+        if let Some(t) = inner.protocol.transport() {
+            match t.publish_event_async(event).await {
+                Ok(event_id) => {
+                    tracing::info!(
+                        "[MLS] published KeyPackage event_id={}",
+                        &event_id.to_hex()[..16]
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("[MLS] failed to publish KeyPackage: {e}");
+                }
+            }
+        } else {
+            tracing::warn!("[MLS] publish_mls_key_package: no transport, skipping publish");
+        }
+
+        Ok(())
+    }
+
     // ─── Create ─────────────────────────────────────────────
 
     pub async fn create_mls_group(
@@ -223,6 +270,174 @@ impl AppClient {
         };
         self.send_mls_message_internal(group_id, msg, display, &reply_to)
             .await
+    }
+
+    // ─── Update Group Name ──────────────────────────────────
+
+    pub async fn update_mls_group_name(
+        &self,
+        group_id: String,
+        new_name: String,
+    ) -> AppResult<()> {
+        let identity_pubkey = self.cached_identity_pubkey();
+
+        // Produce GroupContextExtensions commit with the updated name
+        let event = {
+            let guard = self.mls_participant_guard()?;
+            let participant = guard.as_ref().unwrap();
+            let commit_bytes = participant.update_group_context_extensions(
+                &group_id,
+                Some(&new_name),
+                None,
+                None,
+            )?;
+            let mls_temp_inbox = participant.derive_temp_inbox(&group_id)?;
+            libkeychat::broadcast_commit(&commit_bytes, &mls_temp_inbox)?
+        };
+
+        // Publish the commit event
+        {
+            let inner = self.inner.read().await;
+            if let Some(t) = inner.protocol.transport() {
+                let _ = t.publish_event_async(event).await;
+            }
+        }
+
+        // Update local room name
+        let room_id = make_room_id(&group_id, &identity_pubkey);
+        {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            let _ = store.update_app_room(&room_id, None, Some(&new_name), None, None);
+        }
+
+        // Rotate inbox mapping (epoch changed after GroupContextExtensions commit)
+        match self.rotate_mls_inbox(&group_id) {
+            Ok((_old_inbox, new_inbox, old_sub_id)) => {
+                let inner = self.inner.read().await;
+                if let Some(t) = inner.protocol.transport() {
+                    if let Ok(new_pk) = nostr::PublicKey::from_hex(&new_inbox) {
+                        match t.resubscribe(old_sub_id, vec![new_pk], None).await {
+                            Ok(new_sub_id) => {
+                                if let Ok(mut subs) = self.mls_sub_ids.lock() {
+                                    subs.insert(group_id.clone(), new_sub_id);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("[MLS] resubscribe after name-update rotate failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[MLS] rotate_mls_inbox after name update failed for group {}: {e}",
+                    &group_id[..16.min(group_id.len())]
+                );
+            }
+        }
+
+        tracing::info!(
+            "[MLS] updated group name: id={} new_name={}",
+            &group_id[..16.min(group_id.len())],
+            new_name
+        );
+
+        self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+        Ok(())
+    }
+
+    // ─── Self Update (Key Rotation) ─────────────────────────
+
+    /// Perform an MLS self_update for a single group, rotating our leaf node keys
+    /// for forward secrecy.  Produces a Commit, broadcasts it to the group's
+    /// temp_inbox, then rotates the inbox mapping to reflect the new epoch.
+    pub async fn mls_self_update(&self, group_id: String) -> AppResult<()> {
+        // Produce self_update Commit (sync, holding mls_participant lock)
+        let event = {
+            let guard = self.mls_participant_guard()?;
+            let participant = guard.as_ref().unwrap();
+            let commit_bytes = participant.self_update(&group_id)?;
+            let mls_temp_inbox = participant.derive_temp_inbox(&group_id)?;
+            libkeychat::broadcast_commit(&commit_bytes, &mls_temp_inbox)?
+        };
+
+        // Publish the commit event
+        {
+            let inner = self.inner.read().await;
+            if let Some(t) = inner.protocol.transport() {
+                let _ = t.publish_event_async(event).await;
+            }
+        }
+
+        // Rotate inbox mapping (epoch changed after self_update commit)
+        match self.rotate_mls_inbox(&group_id) {
+            Ok((_old_inbox, new_inbox, old_sub_id)) => {
+                let inner = self.inner.read().await;
+                if let Some(t) = inner.protocol.transport() {
+                    if let Ok(new_pk) = nostr::PublicKey::from_hex(&new_inbox) {
+                        match t.resubscribe(old_sub_id, vec![new_pk], None).await {
+                            Ok(new_sub_id) => {
+                                if let Ok(mut subs) = self.mls_sub_ids.lock() {
+                                    subs.insert(group_id.clone(), new_sub_id);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("[MLS] resubscribe after self_update rotate failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[MLS] rotate_mls_inbox after self_update failed for group {}: {e}",
+                    &group_id[..16.min(group_id.len())]
+                );
+            }
+        }
+
+        tracing::info!(
+            "[MLS] self_update completed: group={}",
+            &group_id[..16.min(group_id.len())]
+        );
+
+        Ok(())
+    }
+
+    /// Perform `mls_self_update` for every active group in the inbox map.
+    ///
+    /// Errors for individual groups are logged as warnings but do not abort
+    /// processing of the remaining groups.  Returns the number of groups that
+    /// were successfully updated.
+    ///
+    /// Intended to be called periodically by the Swift UI to rotate all group
+    /// keys in one shot.
+    pub async fn mls_self_update_all_groups(&self) -> AppResult<usize> {
+        let group_ids: Vec<String> = self
+            .mls_inbox_map
+            .lock()
+            .map_err(|e| AppError::Mls(format!("mls_inbox_map lock: {e}")))?
+            .values()
+            .cloned()
+            .collect();
+
+        let mut success = 0usize;
+        for group_id in group_ids {
+            match self.mls_self_update(group_id.clone()).await {
+                Ok(()) => success += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        "[MLS] self_update_all: failed for group {}: {e}",
+                        &group_id[..16.min(group_id.len())]
+                    );
+                }
+            }
+        }
+
+        tracing::info!("[MLS] self_update_all: {success} group(s) updated");
+        Ok(success)
     }
 
     // ─── Leave ──────────────────────────────────────────────
@@ -921,7 +1136,9 @@ impl AppClient {
         // Step 1: Fetch KeyPackages from relays
         // We collect raw nostr Events and parse them together with the MLS
         // participant lock to avoid exposing openmls types in our signature.
+        let room_id = make_room_id(group_id, identity_pubkey);
         let mut kp_events: Vec<(GroupMemberInput, libkeychat::Event)> = Vec::new();
+        let mut failed_pubkeys: Vec<String> = Vec::new();
         {
             let inner = self.inner.read().await;
             let transport = inner
@@ -950,6 +1167,7 @@ impl AppClient {
                                 "no MLS key package for member {} (not upgraded?)",
                                 &m.nostr_pubkey[..16.min(m.nostr_pubkey.len())]
                             );
+                            failed_pubkeys.push(m.nostr_pubkey.clone());
                         }
                     }
                     Err(e) => {
@@ -957,10 +1175,26 @@ impl AppClient {
                             "fetch key package for {} failed: {e}",
                             &m.nostr_pubkey[..16.min(m.nostr_pubkey.len())]
                         );
+                        failed_pubkeys.push(m.nostr_pubkey.clone());
                     }
                 }
             }
         } // read lock dropped
+
+        // Mark members whose KeyPackage could not be fetched as InviteFailed
+        if !failed_pubkeys.is_empty() {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            for pk in &failed_pubkeys {
+                let _ = store.update_room_member(
+                    &room_id,
+                    pk,
+                    None,
+                    None,
+                    Some(MemberStatus::InviteFailed.to_i32()),
+                );
+            }
+        }
 
         if kp_events.is_empty() {
             tracing::warn!(
@@ -1099,7 +1333,86 @@ impl AppClient {
             }
         }
 
+        // Mark successfully invited members as Invited
+        {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            for m in &members_with_kp {
+                let _ = store.update_room_member(
+                    &room_id,
+                    &m.nostr_pubkey,
+                    None,
+                    None,
+                    Some(MemberStatus::Invited.to_i32()),
+                );
+            }
+        }
+
         Ok(members_with_kp.len())
+    }
+
+    // ─── Retry Invite ────────────────────────────────────────
+
+    /// Retry inviting members whose previous invite failed (InviteFailed status).
+    ///
+    /// Fetches fresh KeyPackages for the given pubkeys and re-runs the full
+    /// add-members + send-Welcome flow. Returns the number of members successfully
+    /// invited this time.
+    pub async fn retry_mls_invite(
+        &self,
+        group_id: String,
+        member_pubkeys: Vec<String>,
+    ) -> AppResult<usize> {
+        let identity_pubkey = self.cached_identity_pubkey();
+        if identity_pubkey.is_empty() {
+            return Err(AppError::NotInitialized("no identity set".into()));
+        }
+
+        if member_pubkeys.is_empty() {
+            return Ok(0);
+        }
+
+        let room_id = make_room_id(&group_id, &identity_pubkey);
+
+        // Build GroupMemberInput list, fetching names from the DB
+        let members: Vec<GroupMemberInput> = {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            member_pubkeys
+                .iter()
+                .map(|pk| {
+                    let name = store
+                        .get_room_member(&room_id, pk)
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.name)
+                        .unwrap_or_default();
+                    GroupMemberInput {
+                        nostr_pubkey: pk.clone(),
+                        name,
+                    }
+                })
+                .collect()
+        };
+
+        // Get current group name from MLS state
+        let group_name = {
+            let guard = self.mls_participant_guard()?;
+            let participant = guard.as_ref().unwrap();
+            participant.group_extension(&group_id)?.name()
+        };
+
+        // Delegate to the shared fetch + add + invite flow.
+        // Failed members will be re-marked InviteFailed; successful ones will become Invited.
+        let invited = self
+            .mls_fetch_add_and_invite(&group_id, &group_name, &identity_pubkey, &members)
+            .await?;
+
+        if invited > 0 {
+            self.emit_data_change(DataChange::RoomUpdated { room_id }).await;
+        }
+
+        Ok(invited)
     }
 
     // ─── Join MLS Group (invited by another user) ───────────
@@ -1201,5 +1514,154 @@ impl AppClient {
         );
 
         Ok(room_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine as _;
+
+    /// Verify that `publish_key_package` builds a well-formed kind:10443 event whose
+    /// content is valid base64 (TLS-serialised KeyPackage bytes).
+    ///
+    /// This test exercises the libkeychat layer only — no relay connection is needed.
+    #[test]
+    fn key_package_event_format() {
+        // MlsProvider requires a temp dir for its file-backed key store.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mls.db");
+
+        // Identity keypair used to sign the event.
+        let identity_keys = nostr::Keys::generate();
+        let identity_pubkey_hex = identity_keys.public_key().to_hex();
+
+        let provider =
+            libkeychat::MlsProvider::open(db_path.to_str().unwrap()).expect("MlsProvider::open");
+        let participant =
+            libkeychat::MlsParticipant::with_provider_and_signer(&identity_pubkey_hex, provider, None)
+                .expect("MlsParticipant");
+
+        // Generate a KeyPackage.
+        let kp = participant.generate_key_package().expect("generate_key_package");
+
+        // Build the Nostr event.
+        let event = libkeychat::publish_key_package(&kp, &identity_keys)
+            .expect("publish_key_package");
+
+        // kind must be 10443
+        assert_eq!(
+            event.kind,
+            nostr::Kind::from(libkeychat::KIND_MLS_KEY_PACKAGE),
+            "event kind must be KIND_MLS_KEY_PACKAGE (10443)"
+        );
+
+        // content must be valid standard base64
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(event.content.as_bytes())
+            .expect("content is not valid base64");
+
+        // decoded bytes must be non-empty (TLS-serialised KeyPackage)
+        assert!(!decoded.is_empty(), "decoded key package must be non-empty");
+
+        // pubkey must match the identity key
+        assert_eq!(
+            event.pubkey,
+            identity_keys.public_key(),
+            "event pubkey must match identity key"
+        );
+    }
+
+    /// Verify that `self_update` produces non-empty commit bytes and that
+    /// `broadcast_commit` wraps them into a valid kind:1059 event with a p-tag.
+    #[test]
+    fn self_update_produces_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mls.db");
+
+        let identity_keys = nostr::Keys::generate();
+        let identity_pubkey_hex = identity_keys.public_key().to_hex();
+
+        let provider =
+            libkeychat::MlsProvider::open(db_path.to_str().unwrap()).expect("MlsProvider::open");
+        let participant =
+            libkeychat::MlsParticipant::with_provider_and_signer(&identity_pubkey_hex, provider, None)
+                .expect("MlsParticipant");
+
+        let group_id = nostr::Keys::generate().public_key().to_hex();
+        participant.create_group(&group_id, "Test Group").expect("create_group");
+
+        // Record temp_inbox before self_update (epoch N)
+        let temp_inbox_before = participant.derive_temp_inbox(&group_id).expect("derive_temp_inbox before");
+
+        let commit_bytes = participant
+            .self_update(&group_id)
+            .expect("self_update");
+
+        assert!(!commit_bytes.is_empty(), "self_update commit_bytes must be non-empty");
+
+        // broadcast_commit uses the pre-commit temp_inbox as the p-tag destination
+        let event =
+            libkeychat::broadcast_commit(&commit_bytes, &temp_inbox_before).expect("broadcast_commit");
+
+        assert_eq!(
+            event.kind,
+            nostr::Kind::from(1059u16),
+            "commit event must be kind:1059"
+        );
+
+        let has_p_tag = event.tags.iter().any(|t| {
+            matches!(t.kind(), nostr::TagKind::SingleLetter(nostr::SingleLetterTag { character: nostr::Alphabet::P, .. }))
+        });
+        assert!(has_p_tag, "commit event must have a p-tag pointing to mls_temp_inbox");
+
+        // After self_update the epoch advanced, so temp_inbox must differ
+        let temp_inbox_after = participant.derive_temp_inbox(&group_id).expect("derive_temp_inbox after");
+        assert_ne!(
+            temp_inbox_before, temp_inbox_after,
+            "temp_inbox must rotate after self_update (epoch advanced)"
+        );
+    }
+
+    /// Verify that `update_group_context_extensions` produces non-empty commit bytes
+    /// and `broadcast_commit` wraps them into a valid kind:1059 event.
+    #[test]
+    fn update_group_name_produces_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mls.db");
+
+        let identity_keys = nostr::Keys::generate();
+        let identity_pubkey_hex = identity_keys.public_key().to_hex();
+
+        let provider =
+            libkeychat::MlsProvider::open(db_path.to_str().unwrap()).expect("MlsProvider::open");
+        let participant =
+            libkeychat::MlsParticipant::with_provider_and_signer(&identity_pubkey_hex, provider, None)
+                .expect("MlsParticipant");
+
+        let group_id = nostr::Keys::generate().public_key().to_hex();
+        participant.create_group(&group_id, "Original Name").expect("create_group");
+
+        let commit_bytes = participant
+            .update_group_context_extensions(&group_id, Some("New Name"), None, None)
+            .expect("update_group_context_extensions");
+
+        assert!(!commit_bytes.is_empty(), "commit_bytes must be non-empty");
+
+        let temp_inbox = participant.derive_temp_inbox(&group_id).expect("derive_temp_inbox");
+        let event =
+            libkeychat::broadcast_commit(&commit_bytes, &temp_inbox).expect("broadcast_commit");
+
+        // broadcast_commit wraps as kind:1059
+        assert_eq!(
+            event.kind,
+            nostr::Kind::from(1059u16),
+            "commit event must be kind:1059"
+        );
+
+        // p-tag must be present (the temp_inbox)
+        let has_p_tag = event.tags.iter().any(|t| {
+            matches!(t.kind(), nostr::TagKind::SingleLetter(nostr::SingleLetterTag { character: nostr::Alphabet::P, .. }))
+        });
+        assert!(has_p_tag, "commit event must have a p-tag pointing to mls_temp_inbox");
     }
 }
