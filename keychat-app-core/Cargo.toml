@@ -3,6 +3,10 @@ name = "keychat-app-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["mls"]
+mls = ["libkeychat/mls"]
+
 [dependencies]
 libkeychat = { path = "../libkeychat" }
 rusqlite = { workspace = true }

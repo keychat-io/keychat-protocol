@@ -1,8 +1,9 @@
 //! Protocol orchestration layer.
 //!
-//! Provides `ProtocolClient` for multi-session management and event routing,
-//! plus the `OrchestratorDelegate` trait for notifying upper layers (app persistence, UI)
-//! without depending on them.
+//! Provides `ProtocolClient` for multi-session management, session decryption,
+//! and address routing. Callers (currently `keychat-app-core`) drive the event
+//! loop themselves and use the `try_decrypt_*` methods plus per-event context
+//! structs to integrate with their own persistence layer.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,68 +13,16 @@ use crate::error::{KeychatError, Result};
 use crate::friend_request::FriendRequestState;
 use crate::group::GroupManager;
 use crate::identity::Identity;
-use crate::message::KCMessageKind;
 use crate::session::ChatSession;
 use crate::storage::SecureStorage;
 use crate::transport::Transport;
 
-// ─── Delegate Trait ─────────────────────────────────────────────
-
-/// Callback interface for the protocol orchestrator.
-///
-/// The orchestrator calls these methods after protocol-level processing is complete
-/// (decryption, session creation, address rotation, SecureStorage persistence).
-/// Implementations handle app-layer concerns: UI persistence, notifications, etc.
-///
-/// **Lock contract**: The orchestrator drops its own `RwLock` before calling any
-/// delegate method, so implementations may freely acquire their own locks.
-#[async_trait::async_trait]
-pub trait OrchestratorDelegate: Send + Sync {
-    /// An inbound friend request was received and protocol-persisted.
-    /// App should: create room (status=Approving), save contact, save message, notify UI.
-    async fn on_friend_request_received(&self, ctx: FriendRequestContext);
-
-    /// A pending outbound friend request was approved by the peer.
-    /// Session is created and protocol-persisted.
-    /// App should: update room (status=Enabled), save contact, save message, notify UI.
-    async fn on_friend_approved(&self, ctx: FriendApprovedContext);
-
-    /// A pending outbound friend request was rejected by the peer.
-    /// App should: update room (status=Rejected), notify UI.
-    async fn on_friend_rejected(&self, ctx: FriendRejectedContext);
-
-    /// A decrypted session message was received (Text, Files, Cashu, etc.).
-    /// App should: create/update room, save message, increment unread, notify UI.
-    async fn on_message_received(&self, ctx: MessageReceivedContext);
-
-    /// A Signal group invite was received and stored in GroupManager.
-    /// App should: create group room, notify UI.
-    async fn on_group_invite_received(&self, ctx: GroupInviteContext);
-
-    /// A group change event occurred (member removed, self-leave, dissolve, rename).
-    /// App should: update/delete room, notify UI.
-    async fn on_group_changed(&self, ctx: GroupChangedContext);
-
-    /// A NIP-17 DM (non-keychat) was received.
-    /// App should: create/update room (type=Nip17Dm), save message, notify UI.
-    async fn on_nip17_dm_received(&self, ctx: Nip17DmContext);
-
-    /// A relay responded OK to one of our published events (NIP-01).
-    /// App should: update relay status tracking, update message status.
-    async fn on_relay_ok(
-        &self,
-        event_id: String,
-        relay_url: String,
-        success: bool,
-        message: String,
-    );
-
-    /// The event loop encountered an error.
-    async fn on_error(&self, description: String);
-}
+/// `protocol_settings` key for the self Public Agent flag (spec §3.6).
+const SELF_PUBLIC_AGENT_KEY: &str = "self_is_public_agent";
 
 // ─── Context Structs ────────────────────────────────────────────
-// Pure data — no app_storage, no UI types, no UniFFI annotations.
+// Pure data returned by the `try_decrypt_*` methods. No app_storage,
+// no UI types, no UniFFI annotations.
 
 /// Context for an inbound friend request.
 #[derive(Debug, Clone)]
@@ -94,92 +43,6 @@ pub struct FriendRequestContext {
     pub message_json: Option<String>,
     /// Serialized KCFriendRequestPayload JSON.
     pub payload_json: Option<String>,
-}
-
-/// Context for a friend request that was approved.
-#[derive(Debug, Clone)]
-pub struct FriendApprovedContext {
-    /// The original request ID.
-    pub request_id: String,
-    /// Peer's Nostr pubkey (hex).
-    pub peer_nostr_pubkey: String,
-    /// Peer's display name.
-    pub peer_name: String,
-    /// Peer's Signal identity key (hex) — used for room association.
-    pub peer_signal_id_hex: String,
-    /// Nostr event ID (hex) of the GiftWrap event.
-    pub event_id: String,
-}
-
-/// Context for a friend request that was rejected.
-#[derive(Debug, Clone)]
-pub struct FriendRejectedContext {
-    /// The original request ID.
-    pub request_id: String,
-    /// Peer's Nostr pubkey (hex).
-    pub peer_pubkey: String,
-}
-
-/// Context for a decrypted incoming message.
-#[derive(Debug, Clone)]
-pub struct MessageReceivedContext {
-    /// Nostr event ID (hex).
-    pub event_id: String,
-    /// Sender's Nostr pubkey (hex).
-    pub sender_pubkey: String,
-    /// KCMessage kind.
-    pub kind: KCMessageKind,
-    /// Text content (if text message).
-    pub content: Option<String>,
-    /// Serialized full KCMessage payload (JSON).
-    pub payload_json: Option<String>,
-    /// Serialized Nostr event JSON (for resend support).
-    pub nostr_event_json: Option<String>,
-    /// Fallback text for unknown kinds.
-    pub fallback: Option<String>,
-    /// Event ID of the message being replied to.
-    pub reply_to_event_id: Option<String>,
-    /// Group ID if this is a group message.
-    pub group_id: Option<String>,
-    /// Thread ID for threaded conversations.
-    pub thread_id: Option<String>,
-    /// Relay URL that delivered this event.
-    pub relay_url: Option<String>,
-    /// Event created_at timestamp.
-    pub created_at: u64,
-}
-
-/// Context for a group invite.
-#[derive(Debug, Clone)]
-pub struct GroupInviteContext {
-    /// The group ID (Nostr pubkey of the group).
-    pub group_id: String,
-    /// Group name.
-    pub group_name: String,
-    /// Group type identifier (e.g. "signal").
-    pub group_type: String,
-    /// Pubkey of the member who sent the invite.
-    pub inviter_pubkey: String,
-}
-
-/// The kind of group change event.
-#[derive(Debug, Clone)]
-pub enum GroupChangeKind {
-    MemberRemoved { member_pubkey: Option<String> },
-    SelfLeave { group_id: String },
-    Dissolve { group_id: String },
-    NameChanged { new_name: Option<String> },
-}
-
-/// Context for a group change event.
-#[derive(Debug, Clone)]
-pub struct GroupChangedContext {
-    /// The group ID.
-    pub group_id: String,
-    /// What changed.
-    pub change: GroupChangeKind,
-    /// Nostr event ID (hex) of the event.
-    pub event_id: String,
 }
 
 /// Context for a NIP-17 DM.
@@ -229,7 +92,29 @@ pub struct ProtocolClient {
     peer_nostr_to_signal: HashMap<String, String>,
     peer_signal_to_nostr: HashMap<String, String>,
     receiving_addr_to_peer: HashMap<String, String>,
+    /// In-memory index of peers flagged as Public Agents (spec §3.6).
+    /// Keyed by peer signal identity hex for O(1) lookup on the send path.
+    /// Kept in sync with `peer_mappings.is_public_agent` in storage.
+    peer_is_public_agent: HashMap<String, bool>,
+    /// Whether this client runs in Public Agent mode (spec §3.6). When `true`:
+    /// - relay subscription collapses to own npub (plus legacy peer fallback),
+    /// - `friendApprove` messages carry `publicAgent: true`,
+    /// - peers observed sending dual p-tag events get marked as upgraded.
+    /// Persisted in `protocol_settings["self_is_public_agent"]`.
+    self_is_public_agent: bool,
+    /// In-memory index of peers that have sent us dual p-tag events (spec
+    /// §3.6 backward compatibility). Keyed by signal identity hex. Only
+    /// consulted when `self_is_public_agent == true` to skip upgraded peers'
+    /// ratchet addresses in the subscription filter.
+    peer_uses_dual_p_tag: HashMap<String, bool>,
     pending_outbound: HashMap<String, FriendRequestState>,
+    /// Per-peer first_inbox pubkeys that must remain subscribed and
+    /// routable after friend-approve completes (spec §8.3 / line 250).
+    /// After `complete_friend_approve` removes `pending_outbound` entry,
+    /// the peer may still send follow-up messages to our first_inbox
+    /// until their ratchet advances. Keyed by peer_signal_hex → our
+    /// first_inbox pubkey hex. Cleared on first successful session decrypt.
+    peer_pending_first_inbox: HashMap<String, String>,
     group_manager: GroupManager,
     next_signal_device_id: u32,
     subscription_ids: Vec<String>,
@@ -247,7 +132,11 @@ impl ProtocolClient {
             peer_nostr_to_signal: HashMap::new(),
             peer_signal_to_nostr: HashMap::new(),
             receiving_addr_to_peer: HashMap::new(),
+            peer_is_public_agent: HashMap::new(),
+            self_is_public_agent: false,
+            peer_uses_dual_p_tag: HashMap::new(),
             pending_outbound: HashMap::new(),
+            peer_pending_first_inbox: HashMap::new(),
             group_manager: GroupManager::new(),
             next_signal_device_id: 1,
             subscription_ids: Vec::new(),
@@ -343,6 +232,8 @@ impl ProtocolClient {
             self.peer_signal_to_nostr.remove(&signal_id);
             self.sessions.remove(&signal_id);
             self.receiving_addr_to_peer.retain(|_, v| v != &signal_id);
+            self.peer_is_public_agent.remove(&signal_id);
+            self.peer_uses_dual_p_tag.remove(&signal_id);
             self.pending_outbound
                 .retain(|_, s| s.peer_nostr_pubkey != nostr_pk);
             Some(signal_id)
@@ -360,7 +251,11 @@ impl ProtocolClient {
         self.peer_nostr_to_signal.clear();
         self.peer_signal_to_nostr.clear();
         self.receiving_addr_to_peer.clear();
+        self.peer_is_public_agent.clear();
+        self.self_is_public_agent = false;
+        self.peer_uses_dual_p_tag.clear();
         self.pending_outbound.clear();
+        self.peer_pending_first_inbox.clear();
         self.group_manager = GroupManager::new();
         self.next_signal_device_id = 1;
         self.subscription_ids.clear();
@@ -497,6 +392,14 @@ impl ProtocolClient {
             }
         }
 
+        // Snapshot self Public Agent mode while we still hold the lock.
+        let self_is_public_agent = store
+            .get_setting(SELF_PUBLIC_AGENT_KEY)
+            .ok()
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         // Drop the Mutex guard so restore_persistent can lock it
         drop(store);
 
@@ -508,9 +411,30 @@ impl ProtocolClient {
                 .insert(peer.nostr_pubkey.clone(), peer.signal_id.clone());
             self.peer_signal_to_nostr
                 .insert(peer.signal_id.clone(), peer.nostr_pubkey.clone());
+            if peer.is_public_agent {
+                self.peer_is_public_agent
+                    .insert(peer.signal_id.clone(), true);
+            }
+            if peer.peer_uses_dual_p_tag {
+                self.peer_uses_dual_p_tag
+                    .insert(peer.signal_id.clone(), true);
+            }
         }
         if !peers.is_empty() {
-            tracing::info!("restored {} peer mappings", peers.len());
+            tracing::info!(
+                "restored {} peer mappings ({} Public Agent peers, {} upgraded for dual p-tag)",
+                peers.len(),
+                self.peer_is_public_agent.len(),
+                self.peer_uses_dual_p_tag.len()
+            );
+        }
+
+        // Restore self Public Agent mode flag (spec §3.6).
+        self.self_is_public_agent = self_is_public_agent;
+        if self.self_is_public_agent {
+            tracing::info!(
+                "restored self_is_public_agent = true; relay subscription will collapse to own npub"
+            );
         }
 
         // 2. Restore active sessions with per-peer identity
@@ -578,6 +502,27 @@ impl ProtocolClient {
                 Arc::new(tokio::sync::Mutex::new(session)),
             );
             restored_count += 1;
+        }
+
+        // 2.5. Restore peer_pending_first_inbox (spec §8.3)
+        {
+            let store = storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("storage lock: {e}")))?;
+            if let Ok(entries) = store.load_all_pending_first_inboxes() {
+                for (peer_signal_hex, fi_pubkey) in entries {
+                    self.receiving_addr_to_peer
+                        .insert(fi_pubkey.clone(), peer_signal_hex.clone());
+                    self.peer_pending_first_inbox
+                        .insert(peer_signal_hex, fi_pubkey);
+                }
+                if !self.peer_pending_first_inbox.is_empty() {
+                    tracing::info!(
+                        "restored {} pending first_inbox entries",
+                        self.peer_pending_first_inbox.len()
+                    );
+                }
+            }
         }
 
         // 3. Restore pending outbound friend requests (per-peer identity)
@@ -869,10 +814,28 @@ impl ProtocolClient {
                 identity_pubkeys.push(pk);
             }
         }
+        // Spec §8.3: after friend-approve, keep our first_inbox subscribed
+        // so the peer's follow-up messages arrive until their ratchet takes
+        // over. Cleared on first session decrypt.
+        for fi_hex in self.peer_pending_first_inbox.values() {
+            if let Ok(pk) = nostr::PublicKey::from_hex(fi_hex) {
+                identity_pubkeys.push(pk);
+            }
+        }
 
-        // Ratchet keys: newly derived Signal addresses, no historical messages
+        // Ratchet keys: newly derived Signal addresses, no historical messages.
+        //
+        // Public Agent mode (spec §3.6): when we run as an agent, peers that
+        // have upgraded to dual p-tag no longer need a ratchet-address
+        // fallback subscription (they'll reach us via our own npub). Legacy
+        // peers keep their ratchet addresses until they upgrade.
         let mut ratchet_pubkeys = Vec::new();
-        for session_mutex in self.sessions.values() {
+        for (signal_hex, session_mutex) in &self.sessions {
+            if self.self_is_public_agent
+                && *self.peer_uses_dual_p_tag.get(signal_hex).unwrap_or(&false)
+            {
+                continue;
+            }
             let session = session_mutex.lock().await;
             for addr_str in session.addresses.get_all_receiving_address_strings() {
                 if let Ok(pk) = nostr::PublicKey::from_hex(&addr_str) {
@@ -944,6 +907,107 @@ impl ProtocolClient {
         Ok(())
     }
 
+    // ─── Public Agent Mode (spec §3.6) ───────────────────────────
+
+    /// Whether this client is running in Public Agent mode.
+    pub fn is_self_public_agent(&self) -> bool {
+        self.self_is_public_agent
+    }
+
+    /// Whether the given peer is flagged as a Public Agent (learned from
+    /// `friendApprove.publicAgent`). Allows callers to observe the flag
+    /// without going through the send path.
+    pub fn is_peer_public_agent(&self, peer_nostr_pk: &str) -> bool {
+        match self.peer_nostr_to_signal.get(peer_nostr_pk) {
+            Some(sig) => *self.peer_is_public_agent.get(sig).unwrap_or(&false),
+            None => false,
+        }
+    }
+
+    /// Whether the given peer has been observed sending dual p-tag events.
+    /// Only meaningful when this client runs in Public Agent mode.
+    pub fn is_peer_upgraded_to_dual_tag(&self, peer_nostr_pk: &str) -> bool {
+        match self.peer_nostr_to_signal.get(peer_nostr_pk) {
+            Some(sig) => *self.peer_uses_dual_p_tag.get(sig).unwrap_or(&false),
+            None => false,
+        }
+    }
+
+    /// Enable or disable Public Agent mode for this client (spec §3.6).
+    ///
+    /// When enabled:
+    /// - Subsequent `friendApprove` messages carry `publicAgent: true`.
+    /// - Relay subscription drops ratchet addresses of peers that have
+    ///   upgraded to dual p-tag (see `mark_peer_upgraded_if_dual_tag`).
+    /// - Legacy peers keep their ratchet-address fallback subscription.
+    ///
+    /// Persisted in `protocol_settings`. Callers SHOULD invoke
+    /// `refresh_subscriptions()` after toggling to apply the change to the
+    /// live relay filter.
+    pub fn set_self_public_agent(&mut self, flag: bool) -> Result<()> {
+        if let Ok(store) = self.storage.lock() {
+            store.set_setting(SELF_PUBLIC_AGENT_KEY, if flag { "1" } else { "0" })?;
+        }
+        self.self_is_public_agent = flag;
+        tracing::info!(
+            "self_is_public_agent set to {}; call refresh_subscriptions() to update the filter",
+            flag
+        );
+        Ok(())
+    }
+
+    /// Mark a peer as having upgraded to dual p-tag (spec §3.6).
+    ///
+    /// Called by the event loop after decrypting a session message. The peer
+    /// is considered "upgraded" if the event carried two or more `p`-tags AND
+    /// one of them matches our own identity pubkey — i.e., the peer is
+    /// addressing us as a Public Agent.
+    ///
+    /// Only has an effect when `self_is_public_agent == true`, because the
+    /// flag is only used to shrink the relay subscription in that mode.
+    /// Returns `true` if the state transitioned from false to true (caller
+    /// should refresh subscriptions in that case).
+    pub fn mark_peer_upgraded_if_dual_tag(
+        &mut self,
+        peer_signal_hex: &str,
+        p_tags: &[String],
+    ) -> bool {
+        if !self.self_is_public_agent {
+            return false;
+        }
+        let identity_hex = match self.identity.as_ref() {
+            Some(id) => id.pubkey_hex(),
+            None => return false,
+        };
+        let is_dual = p_tags.len() >= 2 && p_tags.iter().any(|t| t == &identity_hex);
+        if !is_dual {
+            return false;
+        }
+        if *self
+            .peer_uses_dual_p_tag
+            .get(peer_signal_hex)
+            .unwrap_or(&false)
+        {
+            return false; // already marked
+        }
+
+        // Persist (best-effort) keyed by nostr pubkey.
+        if let Some(nostr_pk) = self.peer_signal_to_nostr.get(peer_signal_hex).cloned() {
+            if let Ok(store) = self.storage.lock() {
+                if let Err(e) = store.set_peer_uses_dual_p_tag(&nostr_pk, true) {
+                    tracing::warn!("mark_peer_upgraded: persist failed: {e}");
+                }
+            }
+        }
+        self.peer_uses_dual_p_tag
+            .insert(peer_signal_hex.to_string(), true);
+        tracing::info!(
+            "peer {} upgraded to dual p-tag; ratchet fallback subscription will be dropped on next refresh",
+            &peer_signal_hex[..16.min(peer_signal_hex.len())]
+        );
+        true
+    }
+
     /// Get all receiving addresses across all sessions (for debugging).
     pub async fn get_all_receiving_addresses(&self) -> Vec<String> {
         let mut all = Vec::new();
@@ -985,6 +1049,34 @@ impl ProtocolClient {
             }
             for addr in &addr_update.dropped_receiving {
                 self.receiving_addr_to_peer.remove(addr);
+            }
+        }
+    }
+
+    /// Spec §8.3: once we receive on a ratchet-derived address, the peer's
+    /// ratchet is live and our first_inbox is no longer needed. Drops both
+    /// the `peer_pending_first_inbox` entry and its receiving_addr_to_peer
+    /// mapping. No-op if the message was received on our first_inbox itself
+    /// (peer hasn't seen a ratchet-derived addr from us yet).
+    pub fn clear_pending_first_inbox_on_ratchet(
+        &mut self,
+        peer_signal_hex: &str,
+        received_on_addr: &str,
+    ) {
+        let should_clear = match self.peer_pending_first_inbox.get(peer_signal_hex) {
+            Some(fi) => fi != received_on_addr,
+            None => false,
+        };
+        if should_clear {
+            if let Some(fi) = self.peer_pending_first_inbox.remove(peer_signal_hex) {
+                self.receiving_addr_to_peer.remove(&fi);
+                if let Ok(store) = self.storage.lock() {
+                    let _ = store.delete_pending_first_inbox(peer_signal_hex);
+                }
+                tracing::debug!(
+                    "cleared pending first_inbox for peer={} (ratchet active)",
+                    &peer_signal_hex[..16.min(peer_signal_hex.len())]
+                );
             }
         }
     }
@@ -1039,9 +1131,21 @@ impl ProtocolClient {
         let device_id = crate::DeviceId::new(1).expect("device_id 1 is valid");
         let remote_addr = crate::ProtocolAddress::new(signal_hex.clone(), device_id);
         let payload_json = msg.to_json().ok();
+
+        // Public Agent routing (spec §3.6): when the peer is flagged as a
+        // Public Agent, emit a second p-tag carrying the peer's Nostr npub so
+        // the agent can subscribe only to its own identity address.
+        let agent_npub = if *self.peer_is_public_agent.get(&signal_hex).unwrap_or(&false) {
+            Some(peer_pubkey.to_string())
+        } else {
+            None
+        };
+
         let (event, addr_update) = {
             let mut session = session_mutex.lock().await;
-            session.send_message(&signal_hex, &remote_addr, msg).await?
+            session
+                .send_message(&signal_hex, &remote_addr, msg, agent_npub.as_deref())
+                .await?
         };
 
         // 4. Serialize for resend support
@@ -1061,7 +1165,20 @@ impl ProtocolClient {
             connected.len()
         );
 
-        // 6. Update address reverse index
+        // 6. Update address reverse index + persist
+        if !addr_update.new_receiving.is_empty() || addr_update.new_sending.is_some() {
+            let addr_state_opt = {
+                let session = session_mutex.lock().await;
+                session.addresses.to_serialized(&signal_hex)
+            };
+            if let Some(addr_state) = addr_state_opt {
+                if let Ok(store) = self.storage.lock() {
+                    if let Err(e) = store.save_peer_addresses(&signal_hex, &addr_state) {
+                        tracing::error!("persist address state after send failed: {e}");
+                    }
+                }
+            }
+        }
         for addr in &addr_update.new_receiving {
             self.receiving_addr_to_peer
                 .insert(addr.clone(), signal_hex.clone());
@@ -1304,6 +1421,17 @@ impl ProtocolClient {
             )?;
         }
 
+        // Store in memory BEFORE publish so that the firstInbox is available
+        // for subscription refresh and the eventual reply can be decrypted
+        // even if we crash right after publishing.
+        self.pending_outbound.insert(request_id.clone(), state);
+
+        // Subscribe to firstInbox BEFORE publishing the FR event (spec §6.3).
+        // If we crash between subscribe and publish, the subscription is
+        // harmless; but crashing between publish and subscribe would lose
+        // the peer's approval.
+        self.refresh_subscriptions().await?;
+
         // Publish
         let transport = self
             .transport
@@ -1313,10 +1441,243 @@ impl ProtocolClient {
 
         let event_id_hex = event.id.to_hex();
 
-        // Store in memory
-        self.pending_outbound.insert(request_id.clone(), state);
-
         Ok((request_id, event_id_hex))
+    }
+
+    // ─── Bundle (offline / QR) flow (spec §6.5) ──────────────────
+    //
+    // Protocol-equivalent to the Gift Wrap path, but the FR payload is
+    // carried out-of-band (QR code, shared string, etc) instead of via
+    // NIP-17. The initiator prepares the payload + firstInbox and waits on
+    // the same `pending_outbound` state as the online FR path; the receiver
+    // runs the same `accept_friend_request_persistent` logic.
+    //
+    // Unlike the Gift Wrap path, `export_bundle` does NOT publish anything
+    // to relays — the returned JSON must be conveyed out-of-band by the
+    // caller. Nothing else about the session model differs.
+
+    /// Prepare a bundle to share out-of-band, and persist the matching
+    /// `pending_outbound` state so the eventual PreKey reply decrypts.
+    ///
+    /// Returns the JSON bundle string. Caller is responsible for the
+    /// out-of-band transfer (QR encode, copy-paste, etc.).
+    pub async fn export_bundle_protocol(
+        &mut self,
+        my_name: &str,
+        device_id_str: &str,
+    ) -> Result<String> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+
+        let signal_device_id = self.next_signal_device_id;
+        self.next_signal_device_id += 1;
+
+        let keys = crate::generate_prekey_material()?;
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, pk_id, pk_rec, kpk_id, kpk_rec) =
+            crate::serialize_prekey_material(&keys)?;
+
+        // Build a persistent SignalParticipant so OPK/SPK/Kyber are written
+        // to SecureStorage and libsignal can find them when Alice's PreKey
+        // arrives.
+        let signal_participant = crate::SignalParticipant::persistent(
+            identity.pubkey_hex(),
+            signal_device_id,
+            keys,
+            self.storage.clone(),
+        )?;
+
+        let first_inbox_keys = crate::EphemeralKeypair::generate();
+        let first_inbox_hex = first_inbox_keys.pubkey_hex();
+
+        let payload = crate::friend_request::build_friend_request_payload(
+            &identity,
+            my_name,
+            device_id_str,
+            &signal_participant,
+            &first_inbox_hex,
+        )?;
+
+        // The request_id mirrors `parse_bundle_as_friend_request`'s naming so
+        // a bundle exported here and consumed by the peer share the same id.
+        let time = payload.time.unwrap_or_default();
+        let request_id = format!("bundle-{}", time);
+        let first_inbox_secret = first_inbox_keys.secret_hex();
+        let peer_nostr_placeholder = String::new(); // filled when PreKey arrives
+
+        // Persist pending FR to SecureStorage so that a restart can still
+        // decrypt the eventual reply (same contract as send_friend_request_protocol).
+        if let Ok(store) = self.storage.lock() {
+            store.save_pending_fr(
+                &request_id,
+                signal_device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+                pk_id,
+                &pk_rec,
+                kpk_id,
+                &kpk_rec,
+                &first_inbox_secret,
+                &peer_nostr_placeholder,
+            )?;
+        }
+
+        // In-memory pending state — identical shape to online FR path so the
+        // Step 2 decrypt loop treats it the same way.
+        self.pending_outbound.insert(
+            request_id.clone(),
+            crate::FriendRequestState {
+                signal_participant,
+                first_inbox_keys,
+                request_id: request_id.clone(),
+                peer_nostr_pubkey: peer_nostr_placeholder,
+            },
+        );
+
+        // Refresh subscriptions so firstInbox is actually listened on before
+        // the peer (Alice) could send us anything. If not yet connected, skip
+        // silently — `collect_subscribe_pubkeys` will pick up the pending
+        // firstInbox at connect time via the shared pending_outbound map.
+        if self.transport.is_some() {
+            self.refresh_subscriptions().await?;
+        }
+
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| KeychatError::Signal(format!("bundle serialize: {e}")))?;
+        tracing::info!(
+            "[bundle] exported request_id={} firstInbox={}",
+            &request_id,
+            &first_inbox_hex[..16.min(first_inbox_hex.len())]
+        );
+        Ok(json)
+    }
+
+    /// Consume a peer's bundle (offline-delivered `KCFriendRequestPayload`)
+    /// and establish a session: runs the same accept path as an online FR.
+    /// Returns (peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex).
+    pub async fn add_contact_via_bundle_protocol(
+        &mut self,
+        bundle_json: &str,
+        my_name: &str,
+    ) -> Result<(String, String, String, String)> {
+        let identity = self
+            .identity
+            .clone()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+
+        let received = crate::friend_request::parse_bundle_as_friend_request(bundle_json)?;
+
+        // Reject a bundle that claims to be from ourselves.
+        if received.sender_pubkey_hex == identity.pubkey_hex() {
+            return Err(KeychatError::FriendRequest("bundle belongs to self".into()));
+        }
+        // Reject a bundle from a peer we already have a session with.
+        if self
+            .peer_nostr_to_signal
+            .contains_key(&received.sender_pubkey_hex)
+        {
+            return Err(KeychatError::FriendRequest(format!(
+                "already connected to peer {}",
+                &received.sender_pubkey_hex[..16.min(received.sender_pubkey_hex.len())]
+            )));
+        }
+
+        let signal_device_id = self.next_signal_device_id;
+        self.next_signal_device_id += 1;
+
+        let keys = crate::generate_prekey_material()?;
+        let (id_pub, id_priv, reg_id, spk_id, spk_rec, _pk_id, _pk_rec, _kpk_id, _kpk_rec) =
+            crate::serialize_prekey_material(&keys)?;
+
+        // Reuse the existing accept path wholesale.
+        let accepted = crate::accept_friend_request_persistent(
+            &identity,
+            &received,
+            my_name,
+            keys,
+            self.storage.clone(),
+            signal_device_id,
+            self.self_is_public_agent,
+        )
+        .await?;
+
+        let payload = &received.payload;
+        let peer_signal_hex = payload.signal_identity_key.clone();
+        let peer_nostr_hex = received.sender_pubkey_hex.clone();
+        let peer_name = payload.name.clone();
+
+        // Publish the PreKey message to peer's firstInbox.
+        let event_id_hex = accepted.event.id.to_hex();
+        let transport = self
+            .transport
+            .as_ref()
+            .ok_or_else(|| KeychatError::Transport("Not connected".into()))?;
+        transport.publish_event_async(accepted.event).await?;
+
+        // AddressManager initialization — mirrors accept_friend_request_protocol.
+        let mut addresses = crate::AddressManager::new();
+        addresses.add_peer(
+            &peer_signal_hex,
+            Some(payload.first_inbox.clone()),
+            Some(peer_nostr_hex.clone()),
+        );
+        if accepted.sender_address.is_some() {
+            let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
+        }
+        let recv_addrs = addresses.get_all_receiving_address_strings();
+        let session = crate::ChatSession::new(accepted.signal_participant, addresses, identity);
+
+        // Persist — critical: if these fail the session is lost on restart.
+        {
+            let store = self
+                .storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
+            store.save_signal_participant(
+                &peer_signal_hex,
+                signal_device_id,
+                &id_pub,
+                &id_priv,
+                reg_id,
+                spk_id,
+                &spk_rec,
+            )?;
+            store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
+            if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
+                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                    tracing::error!("persist address state failed: {e}");
+                }
+            }
+        }
+
+        // In-memory state.
+        self.sessions.insert(
+            peer_signal_hex.clone(),
+            Arc::new(tokio::sync::Mutex::new(session)),
+        );
+        self.peer_nostr_to_signal
+            .insert(peer_nostr_hex.clone(), peer_signal_hex.clone());
+        self.peer_signal_to_nostr
+            .insert(peer_signal_hex.clone(), peer_nostr_hex.clone());
+        for addr in &recv_addrs {
+            self.receiving_addr_to_peer
+                .insert(addr.clone(), peer_signal_hex.clone());
+        }
+
+        // Subscribe to our new ratchet address.
+        self.refresh_subscriptions().await?;
+
+        tracing::info!(
+            "[bundle] added contact via bundle: signal={} nostr={}",
+            &peer_signal_hex[..16.min(peer_signal_hex.len())],
+            &peer_nostr_hex[..16.min(peer_nostr_hex.len())]
+        );
+
+        Ok((peer_signal_hex, peer_nostr_hex, peer_name, event_id_hex))
     }
 
     /// Accept a friend request: load FR → generate keys → accept → create session → persist.
@@ -1369,6 +1730,7 @@ impl ProtocolClient {
             keys,
             self.storage.clone(),
             signal_device_id,
+            self.self_is_public_agent,
         )
         .await?;
 
@@ -1397,9 +1759,13 @@ impl ProtocolClient {
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = crate::ChatSession::new(accepted.signal_participant, addresses, identity);
 
-        // Persist to SecureStorage
-        if let Ok(store) = self.storage.lock() {
-            let _ = store.save_signal_participant(
+        // Persist to SecureStorage — critical for session survival.
+        {
+            let store = self
+                .storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
+            store.save_signal_participant(
                 &peer_signal_hex,
                 signal_device_id,
                 &id_pub,
@@ -1407,12 +1773,16 @@ impl ProtocolClient {
                 reg_id,
                 spk_id,
                 &spk_rec,
-            );
+            )?;
+            store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                    tracing::error!("persist address state failed: {e}");
+                }
             }
-            let _ = store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name);
-            let _ = store.delete_inbound_fr(request_id);
+            if let Err(e) = store.delete_inbound_fr(request_id) {
+                tracing::warn!("delete inbound FR failed: {e}");
+            }
         }
 
         // Update in-memory state
@@ -1756,6 +2126,12 @@ impl ProtocolClient {
             KeychatError::FriendRequest(format!("pending state not found for {request_id}"))
         })?;
 
+        // Spec §8.3 line 250: the peer may send follow-up messages to our
+        // first_inbox until their ratchet catches up. Keep the pubkey alive
+        // so we stay subscribed and can route it to this session. Cleared
+        // on first ratchet-derived decrypt (see try_decrypt_session_message).
+        let own_first_inbox_hex = state.first_inbox_keys.pubkey_hex();
+
         let identity = self
             .identity
             .clone()
@@ -1797,9 +2173,12 @@ impl ProtocolClient {
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = crate::ChatSession::new(state.signal_participant, addresses, identity);
 
-        // Persist to SecureStorage
-        if let Ok(store) = self.storage.lock() {
-            // Save signal participant identity (pub + priv key for restore_sessions)
+        // Persist to SecureStorage — critical for session survival.
+        {
+            let store = self
+                .storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
             let id_pub = session
                 .signal
                 .identity_key_pair()
@@ -1812,7 +2191,7 @@ impl ProtocolClient {
                 .private_key()
                 .serialize()
                 .to_vec();
-            let _ = store.save_signal_participant(
+            store.save_signal_participant(
                 &peer_signal_hex,
                 u32::from(session.signal.address().device_id()),
                 &id_pub,
@@ -1820,18 +2199,38 @@ impl ProtocolClient {
                 session.signal.registration_id(),
                 0,
                 &[],
-            );
-
-            // Save peer address state
+            )?;
+            store.save_peer_mapping(&peer_nostr_id, &peer_signal_hex, &peer_name)?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                    tracing::error!("persist address state failed: {e}");
+                }
             }
+            if let Err(e) = store.delete_pending_fr(request_id) {
+                tracing::warn!("delete pending FR failed: {e}");
+            }
+        }
 
-            // Save peer mapping
-            let _ = store.save_peer_mapping(&peer_nostr_id, &peer_signal_hex, &peer_name);
+        // Public Agent flag from friendApprove (spec §3.6). When set, future
+        // outbound Mode 1 messages to this peer use dual p-tag routing.
+        let peer_is_public_agent = msg
+            .friend_approve
+            .as_ref()
+            .and_then(|p| p.public_agent)
+            .unwrap_or(false);
 
-            // Delete the pending FR
-            let _ = store.delete_pending_fr(request_id);
+        if peer_is_public_agent {
+            if let Ok(store) = self.storage.lock() {
+                if let Err(e) = store.set_peer_public_agent(&peer_nostr_id, true) {
+                    tracing::warn!(
+                        "complete_friend_approve: persist public_agent flag failed: {e}"
+                    );
+                }
+            }
+            tracing::info!(
+                "[complete_friend_approve] peer is Public Agent; future sends will use dual p-tag: nostr={}",
+                &peer_nostr_id[..16.min(peer_nostr_id.len())]
+            );
         }
 
         // Update in-memory state
@@ -1843,9 +2242,22 @@ impl ProtocolClient {
             .insert(peer_nostr_id.clone(), peer_signal_hex.clone());
         self.peer_signal_to_nostr
             .insert(peer_signal_hex.clone(), peer_nostr_id.clone());
+        if peer_is_public_agent {
+            self.peer_is_public_agent
+                .insert(peer_signal_hex.clone(), true);
+        }
         for addr in &recv_addrs {
             self.receiving_addr_to_peer
                 .insert(addr.clone(), peer_signal_hex.clone());
+        }
+
+        // Spec §8.3: keep our first_inbox routable until peer's ratchet takes over.
+        self.receiving_addr_to_peer
+            .insert(own_first_inbox_hex.clone(), peer_signal_hex.clone());
+        self.peer_pending_first_inbox
+            .insert(peer_signal_hex.clone(), own_first_inbox_hex.clone());
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.save_pending_first_inbox(&peer_signal_hex, &own_first_inbox_hex);
         }
 
         tracing::info!(
@@ -1871,207 +2283,143 @@ impl ProtocolClient {
         Ok(sender)
     }
 
-    // ─── Event Loop Core ────────────────────────────────────────
+    // (The event-loop driver lives in `keychat-app-core::event_loop`,
+    // which calls the `try_decrypt_*` methods above directly.)
+}
 
-    /// Run the protocol event loop.
-    ///
-    /// Receives GiftWrap events from relay, deduplicates, attempts decryption
-    /// in priority order (friend request → approve → session → NIP-17 DM),
-    /// and notifies the delegate for app-layer persistence.
-    ///
-    /// Pure protocol: does NOT touch app_storage. All persistence happens
-    /// through the `OrchestratorDelegate` callbacks.
-    pub async fn run_event_loop(
-        client: Arc<tokio::sync::RwLock<Self>>,
-        delegate: Arc<dyn OrchestratorDelegate>,
-        mut stop_rx: tokio::sync::watch::Receiver<bool>,
-    ) {
-        // Get nostr client handle
-        let nostr_client = {
-            let inner = client.read().await;
-            match inner.transport.as_ref() {
-                Some(t) => t.client().clone(),
-                None => {
-                    delegate.on_error("transport not initialized".into()).await;
-                    return;
-                }
-            }
-        };
+// ─── Tests (Public Agent mode, spec §3.6) ────────────────────────────────────
 
-        let mut notifications = nostr_client.notifications();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
 
-        loop {
-            tokio::select! {
-                _ = stop_rx.changed() => {
-                    tracing::info!("protocol event loop: stop signal received");
-                    break;
-                }
-                result = notifications.recv() => {
-                    match result {
-                        Ok(crate::RelayPoolNotification::Event { relay_url, event, .. }) => {
-                            let eid = event.id.to_hex();
+    fn make_client() -> ProtocolClient {
+        let storage = Arc::new(Mutex::new(
+            SecureStorage::open_in_memory("test-key").unwrap(),
+        ));
+        let mut c = ProtocolClient::new(storage);
+        c.set_identity(Some(Identity::generate().unwrap().identity));
+        c
+    }
 
-                            // Deduplicate
-                            let deduped = {
-                                let inner = client.read().await;
-                                match inner.transport.as_ref() {
-                                    Some(t) => t.deduplicate((*event).clone()).await,
-                                    None => None,
-                                }
-                            };
+    #[test]
+    fn self_public_agent_mode_persists_and_restores() {
+        let storage = Arc::new(Mutex::new(
+            SecureStorage::open_in_memory("test-key").unwrap(),
+        ));
 
-                            if let Some(event) = deduped {
-                                if event.kind == crate::Kind::GiftWrap {
-                                    tracing::info!(
-                                        "⬇️ RECV kind={} id={} from={}",
-                                        event.kind.as_u16(),
-                                        &eid[..16.min(eid.len())],
-                                        relay_url
-                                    );
-                                    let relay = relay_url.to_string();
-                                    let nostr_event_json = serde_json::to_string(&event).ok();
-
-                                    // Update relay cursor
-                                    let event_ts = event.created_at.as_u64();
-                                    let cursor_storage = client.read().await.storage.clone();
-                                    if let Ok(store) = cursor_storage.lock() {
-                                        let _ = store.update_relay_cursor(&relay, event_ts);
-                                    }
-
-                                    // Step 1: Try friend request
-                                    {
-                                        let inner = client.read().await;
-                                        if let Some(ctx) = inner.try_decrypt_friend_request(&event) {
-                                            delegate.on_friend_request_received(ctx).await;
-                                            continue;
-                                        }
-                                    }
-
-                                    // Step 2: Try friend approve/reject
-                                    {
-                                        let mut inner = client.write().await;
-                                        if let Some((request_id, msg, decrypt_result)) = inner.try_decrypt_pending_outbound(&event) {
-                                            if msg.kind == crate::KCMessageKind::FriendApprove {
-                                                // Create session + update mappings + persist
-                                                match inner.complete_friend_approve(&request_id, &msg, &decrypt_result).await {
-                                                    Ok((peer_signal_hex, peer_nostr_id, peer_name)) => {
-                                                        // Re-subscribe to new ratchet addresses
-                                                        let _ = inner.refresh_subscriptions().await;
-                                                        drop(inner);
-                                                        delegate.on_friend_approved(FriendApprovedContext {
-                                                            request_id,
-                                                            peer_nostr_pubkey: peer_nostr_id,
-                                                            peer_name,
-                                                            peer_signal_id_hex: peer_signal_hex,
-                                                            event_id: event.id.to_hex(),
-                                                        }).await;
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::error!("complete_friend_approve failed: {e}");
-                                                        drop(inner);
-                                                    }
-                                                }
-                                            } else if msg.kind == crate::KCMessageKind::FriendReject {
-                                                let peer_pubkey = inner.pending_outbound.get(&request_id)
-                                                    .map(|s| s.peer_nostr_pubkey.clone())
-                                                    .unwrap_or_default();
-                                                inner.pending_outbound.remove(&request_id);
-                                                drop(inner);
-                                                delegate.on_friend_rejected(FriendRejectedContext {
-                                                    request_id,
-                                                    peer_pubkey,
-                                                }).await;
-                                            }
-                                            continue;
-                                        }
-                                    }
-
-                                    // Step 3: Try session message
-                                    // Need to drop read lock before async session decrypt
-                                    let step3_result = {
-                                        let inner = client.read().await;
-                                        inner.try_decrypt_session_message(&event).await
-                                    };
-                                    if let Some((peer_signal_hex, msg, metadata, addr_update, session_mutex)) = step3_result
-                                    {
-                                        // Update addresses
-                                        {
-                                            let mut inner_w = client.write().await;
-                                            inner_w.update_addresses_after_decrypt(
-                                                &peer_signal_hex, &session_mutex, &addr_update,
-                                            ).await;
-                                        }
-
-                                            // Resolve sender nostr pubkey
-                                            let sender_nostr_pubkey = {
-                                                let inner = client.read().await;
-                                                inner.peer_signal_to_nostr
-                                                    .get(&peer_signal_hex)
-                                                    .cloned()
-                                                    .unwrap_or_else(|| peer_signal_hex.clone())
-                                            };
-
-                                            let kind = msg.kind.clone();
-                                            let content = msg.text.as_ref().map(|t| t.content.clone());
-                                            let payload_json = msg.to_json().ok();
-                                            let group_id = msg.group_id.clone();
-                                            let thread_id = msg.thread_id.clone();
-                                            let fallback = msg.fallback.clone();
-                                            let reply_to_event_id = msg.reply_to.as_ref()
-                                                .and_then(|r| r.target_event_id.clone());
-
-                                            delegate.on_message_received(MessageReceivedContext {
-                                                event_id: metadata.event_id.to_hex(),
-                                                sender_pubkey: sender_nostr_pubkey,
-                                                kind,
-                                                content,
-                                                payload_json,
-                                                nostr_event_json: nostr_event_json.clone(),
-                                                fallback,
-                                                reply_to_event_id,
-                                                group_id,
-                                                thread_id,
-                                                relay_url: Some(relay.clone()),
-                                                created_at: event.created_at.as_u64(),
-                                            }).await;
-                                            continue;
-                                        }
-
-                                    // Step 4: Try NIP-17 DM fallback
-                                    {
-                                        let inner = client.read().await;
-                                        if let Some(mut ctx) = inner.try_decrypt_nip17_dm(&event) {
-                                            ctx.nostr_event_json = nostr_event_json;
-                                            ctx.relay_url = Some(relay);
-                                            delegate.on_nip17_dm_received(ctx).await;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            } else {
-                                tracing::debug!("⬇️ DUP id={}", &eid[..16.min(eid.len())]);
-                            }
-                        }
-                        Ok(crate::RelayPoolNotification::Message { relay_url, message }) => {
-                            if let crate::RelayMessage::Ok { event_id, status, message: msg } = message {
-                                delegate.on_relay_ok(
-                                    event_id.to_hex(),
-                                    relay_url.to_string(),
-                                    status,
-                                    msg,
-                                ).await;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!("event loop notification error: {e}");
-                            delegate.on_error(format!("notification error: {e}")).await;
-                            break;
-                        }
-                    }
-                }
-            }
+        // Enable in one client, then "restart" into another using the same storage.
+        {
+            let mut c = ProtocolClient::new(storage.clone());
+            c.set_identity(Some(Identity::generate().unwrap().identity));
+            assert!(!c.is_self_public_agent());
+            c.set_self_public_agent(true).unwrap();
+            assert!(c.is_self_public_agent());
         }
-        tracing::info!("protocol event loop exited");
+
+        // New ProtocolClient over same storage — restore_sessions should
+        // rehydrate the flag from protocol_settings.
+        let mut c2 = ProtocolClient::new(storage);
+        c2.set_identity(Some(Identity::generate().unwrap().identity));
+        let _ = c2.restore_sessions();
+        assert!(
+            c2.is_self_public_agent(),
+            "self_is_public_agent must survive restart via protocol_settings"
+        );
+    }
+
+    #[test]
+    fn mark_peer_upgraded_noop_when_not_agent_mode() {
+        let mut c = make_client();
+        // Not an agent — flag should not flip regardless of p-tags.
+        let me = c.identity().unwrap().pubkey_hex();
+        let other = "deadbeef".repeat(8);
+        let tags = vec![other.clone(), me.clone()];
+        assert!(!c.mark_peer_upgraded_if_dual_tag("peer-sig", &tags));
+        assert!(c.peer_uses_dual_p_tag.is_empty());
+    }
+
+    #[test]
+    fn mark_peer_upgraded_requires_own_npub_in_p_tags() {
+        let mut c = make_client();
+        c.set_self_public_agent(true).unwrap();
+
+        // Single p-tag — no upgrade.
+        assert!(!c.mark_peer_upgraded_if_dual_tag("peer-sig", &["x".into()]));
+        // Dual p-tag but neither is own npub — not addressing us as agent.
+        assert!(!c.mark_peer_upgraded_if_dual_tag("peer-sig", &["x".into(), "y".into()]));
+        assert!(c.peer_uses_dual_p_tag.is_empty());
+    }
+
+    #[test]
+    fn mark_peer_upgraded_flips_once_and_persists() {
+        let mut c = make_client();
+        c.set_self_public_agent(true).unwrap();
+        let me = c.identity().unwrap().pubkey_hex();
+
+        // Seed peer mapping so persist keyed-by-nostr works.
+        {
+            let store = c.storage.lock().unwrap();
+            store
+                .save_peer_mapping("npub-peer", "sig-peer", "Peer")
+                .unwrap();
+        }
+        c.peer_signal_to_nostr
+            .insert("sig-peer".into(), "npub-peer".into());
+
+        let tags = vec!["ratchet-addr".into(), me.clone()];
+        assert!(c.mark_peer_upgraded_if_dual_tag("sig-peer", &tags));
+        assert_eq!(c.peer_uses_dual_p_tag.get("sig-peer"), Some(&true));
+
+        // Second call is a no-op — already marked.
+        assert!(!c.mark_peer_upgraded_if_dual_tag("sig-peer", &tags));
+
+        // Persisted to storage.
+        let row = c
+            .storage
+            .lock()
+            .unwrap()
+            .load_peer_by_nostr("npub-peer")
+            .unwrap()
+            .unwrap();
+        assert!(row.peer_uses_dual_p_tag);
+    }
+
+    #[tokio::test]
+    async fn agent_mode_collects_own_npub_and_respects_upgrade_flag() {
+        use crate::address::AddressManager;
+        use crate::session::ChatSession;
+        use crate::signal_session::SignalParticipant;
+
+        let mut c = make_client();
+        c.set_self_public_agent(true).unwrap();
+
+        // Build a minimal session with an EMPTY address manager so we can
+        // deterministically assert how the collect-path handles it (empty
+        // receiving address list regardless of upgrade status).
+        fn build_session() -> Arc<tokio::sync::Mutex<ChatSession>> {
+            let id = Identity::generate().unwrap().identity;
+            let signal = SignalParticipant::new("peer", 1).unwrap();
+            let s = ChatSession::new(signal, AddressManager::new(), id);
+            Arc::new(tokio::sync::Mutex::new(s))
+        }
+        c.sessions.insert("sig-upgraded".into(), build_session());
+        c.peer_uses_dual_p_tag.insert("sig-upgraded".into(), true);
+
+        let (identity_pks, ratchet_pks) = c.collect_subscribe_pubkeys().await;
+
+        // Identity list always includes our own pubkey; agent mode does not
+        // add anything else beyond it (and any pending firstInboxes we'd have
+        // if this client had issued outbound friend requests — none here).
+        assert_eq!(
+            identity_pks.len(),
+            1,
+            "agent mode: only own npub in identity list"
+        );
+        assert!(
+            ratchet_pks.is_empty(),
+            "upgraded peer contributes no ratchet addresses in agent mode"
+        );
     }
 }

@@ -288,7 +288,7 @@ pub unsafe extern "C" fn keychat_receive_friend_request(
     // Auto-accept
     let accepted = match ctx
         .rt
-        .block_on(accept_friend_request(&ctx.identity, &fr, "ffi"))
+        .block_on(accept_friend_request(&ctx.identity, &fr, "ffi", false))
     {
         Ok(a) => a,
         Err(_) => return err,

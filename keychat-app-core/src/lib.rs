@@ -11,6 +11,8 @@ pub mod friend_request;
 pub mod group;
 pub mod media;
 pub mod messaging;
+#[cfg(feature = "mls")]
+pub mod mls_group;
 pub mod relay_tracker;
 pub mod types;
 
@@ -22,8 +24,13 @@ pub use app_storage::AppStorage;
 pub use relay_tracker::{RelaySendTracker, RelayStatusUpdate};
 pub use types::*;
 
-// Re-export commonly used free functions from libkeychat
+// Re-export commonly used types from libkeychat so uniffi doesn't need a direct dependency.
 pub use libkeychat::transport::DEFAULT_RELAYS;
+pub use libkeychat::{normalize_pubkey, DeviceId, PublicKey, Timestamp};
+pub use libkeychat::{KCMessageKind, KeychatError};
+#[cfg(feature = "mls")]
+pub use libkeychat::{MlsDecryptResult, MlsParticipant, MlsProvider};
+pub use nostr;
 
 /// Get the default relay URLs.
 pub fn default_relays() -> Vec<String> {

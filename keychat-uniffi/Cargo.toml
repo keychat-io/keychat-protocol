@@ -8,9 +8,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 uniffi = { version = "0.28", features = ["cli", "tokio"] }
-libkeychat = { path = "../libkeychat", features = ["mls"] }
 keychat-app-core = { path = "../keychat-app-core" }
-nostr = { workspace = true }
 tokio = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }

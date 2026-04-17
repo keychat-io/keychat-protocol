@@ -940,7 +940,7 @@ mod tests {
         assert_eq!(received.payload.name, "Alice");
 
         // 3. Bob accepts (Signal PrekeyMessage with signalPrekeyAuth)
-        let accepted = accept_friend_request(&bob_id, &received, "Bob")
+        let accepted = accept_friend_request(&bob_id, &received, "Bob", false)
             .await
             .unwrap();
         assert!(accepted.message.signal_prekey_auth.is_some());

@@ -51,15 +51,17 @@ pub struct FriendRequestAccepted {
 
 // ─── Shared helpers (C-DUP3) ────────────────────────────────────────────────
 
-/// Build a friend request event from an already-created SignalParticipant.
-async fn build_friend_request_event(
+/// Build just the payload structure (no event wrapping).
+///
+/// Used by both the FR Gift Wrap path (`build_friend_request_event`) and the
+/// offline bundle export path (§6.5 / mode-2).
+pub fn build_friend_request_payload(
     my_identity: &Identity,
-    peer_nostr_pubkey_hex: &str,
     display_name: &str,
     device_id: &str,
     signal_participant: &SignalParticipant,
     first_inbox_hex: &str,
-) -> Result<(Event, String)> {
+) -> Result<KCFriendRequestPayload> {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -73,7 +75,7 @@ async fn build_friend_request_event(
         time,
     )?;
 
-    let payload = KCFriendRequestPayload {
+    Ok(KCFriendRequestPayload {
         message: None,
         name: display_name.to_string(),
         nostr_identity_key: my_identity.pubkey_hex(),
@@ -94,7 +96,25 @@ async fn build_friend_request_event(
         relay: None,
         avatar: None,
         lightning: None,
-    };
+    })
+}
+
+/// Build a friend request event from an already-created SignalParticipant.
+async fn build_friend_request_event(
+    my_identity: &Identity,
+    peer_nostr_pubkey_hex: &str,
+    display_name: &str,
+    device_id: &str,
+    signal_participant: &SignalParticipant,
+    first_inbox_hex: &str,
+) -> Result<(Event, String)> {
+    let payload = build_friend_request_payload(
+        my_identity,
+        display_name,
+        device_id,
+        signal_participant,
+        first_inbox_hex,
+    )?;
 
     let request_id = format!("fr-{}", uuid_v4());
     let kc_message = KCMessage::friend_request(request_id.clone(), payload);
@@ -184,11 +204,16 @@ fn build_prekey_bundle_from_payload(
 }
 
 /// Build the accept event: process bundle, encrypt approval, wrap as kind:1059.
+///
+/// `self_is_public_agent` controls whether the emitted `friendApprove` carries
+/// `publicAgent: true` (spec §3.6). When `true`, the peer is expected to use
+/// dual p-tag routing for all future messages to us.
 async fn build_accept_event(
     my_identity: &Identity,
     my_signal: &mut SignalParticipant,
     friend_request: &FriendRequestReceived,
     display_name: &str,
+    self_is_public_agent: bool,
 ) -> Result<FriendRequestAccepted> {
     let payload = &friend_request.payload;
     let (prekey_bundle, remote_address) = build_prekey_bundle_from_payload(payload)?;
@@ -210,7 +235,11 @@ async fn build_accept_event(
         time,
     )?;
 
-    let mut approve_msg = KCMessage::friend_approve(request_id, None);
+    let mut approve_msg = if self_is_public_agent {
+        KCMessage::friend_approve_public_agent(request_id, None)
+    } else {
+        KCMessage::friend_approve(request_id, None)
+    };
     approve_msg.signal_prekey_auth = Some(SignalPrekeyAuth {
         nostr_id: my_identity.pubkey_hex(),
         signal_id: my_signal_id_hex,
@@ -335,18 +364,77 @@ pub fn receive_friend_request(
     })
 }
 
+/// Parse an offline-delivered bundle (e.g. scanned QR code, copy-paste) as a
+/// `FriendRequestReceived`.
+///
+/// Semantically equivalent to receiving the same `KCFriendRequestPayload`
+/// via NIP-17 Gift Wrap, except the sender's pubkey is taken from the payload
+/// itself (the Gift Wrap seal check is unavailable offline) — `globalSign`
+/// binds the Nostr identity to the Signal identity, so payload tampering is
+/// rejected even without the outer seal.
+pub fn parse_bundle_as_friend_request(bundle_json: &str) -> Result<FriendRequestReceived> {
+    let payload: KCFriendRequestPayload = serde_json::from_str(bundle_json)
+        .map_err(|e| KeychatError::Signal(format!("bundle parse failed: {e}")))?;
+
+    let time = payload
+        .time
+        .ok_or_else(|| KeychatError::Signal("bundle missing time".into()))?;
+
+    let valid = verify_global_sign(
+        &payload.nostr_identity_key,
+        &payload.signal_identity_key,
+        time,
+        &payload.global_sign,
+    )?;
+    if !valid {
+        return Err(KeychatError::Signal(
+            "bundle globalSign verification failed".into(),
+        ));
+    }
+
+    let sender_pubkey = PublicKey::from_hex(&payload.nostr_identity_key)
+        .map_err(|e| KeychatError::Signal(format!("invalid nostr_identity_key: {e}")))?;
+    let sender_pubkey_hex = payload.nostr_identity_key.clone();
+
+    // Synthetic KCMessage so downstream code that switches on kind still works.
+    // The request_id embeds the time so a replayed bundle yields the same id
+    // and existing idempotency / deduplication paths catch it.
+    let request_id = format!("bundle-{}", time);
+    let message = KCMessage::friend_request(request_id, payload.clone());
+
+    Ok(FriendRequestReceived {
+        sender_pubkey,
+        sender_pubkey_hex,
+        message,
+        payload,
+        created_at: time / 1000,
+    })
+}
+
 /// Accept a friend request (§7.3, §7.4).
+///
+/// `self_is_public_agent` (spec §3.6): pass `true` when the local client runs
+/// in Public Agent mode; the emitted `friendApprove` will carry
+/// `publicAgent: true` so the peer adopts dual p-tag routing for us.
 pub async fn accept_friend_request(
     my_identity: &Identity,
     friend_request: &FriendRequestReceived,
     display_name: &str,
+    self_is_public_agent: bool,
 ) -> Result<FriendRequestAccepted> {
     tracing::info!(
         "accepting friend request from {}",
         &friend_request.sender_pubkey_hex[..16.min(friend_request.sender_pubkey_hex.len())]
     );
     let mut my_signal = SignalParticipant::new(my_identity.pubkey_hex(), 1)?;
-    build_accept_event(my_identity, &mut my_signal, friend_request, display_name).await
+    build_accept_event(
+        my_identity,
+        &mut my_signal,
+        friend_request,
+        display_name,
+        self_is_public_agent,
+    )
+    .await
 }
 
 /// Send a friend request with persistent Signal participant (§6.2).
@@ -405,6 +493,7 @@ pub async fn accept_friend_request_persistent(
     keys: crate::signal_session::SignalPreKeyMaterial,
     storage: Arc<Mutex<SecureStorage>>,
     signal_device_id: u32,
+    self_is_public_agent: bool,
 ) -> Result<FriendRequestAccepted> {
     tracing::info!(
         "accepting friend request (persistent) from {}",
@@ -412,7 +501,14 @@ pub async fn accept_friend_request_persistent(
     );
     let mut my_signal =
         SignalParticipant::persistent(my_identity.pubkey_hex(), signal_device_id, keys, storage)?;
-    build_accept_event(my_identity, &mut my_signal, friend_request, display_name).await
+    build_accept_event(
+        my_identity,
+        &mut my_signal,
+        friend_request,
+        display_name,
+        self_is_public_agent,
+    )
+    .await
 }
 
 /// Send a Signal-encrypted KCMessage as kind:1059 Mode 1 (§8.1).
@@ -477,7 +573,7 @@ mod tests {
         assert_eq!(received.message.kind, KCMessageKind::FriendRequest);
 
         // Step 3: Bob accepts
-        let accepted = accept_friend_request(&bob_id, &received, "Bob")
+        let accepted = accept_friend_request(&bob_id, &received, "Bob", false)
             .await
             .unwrap();
         assert_eq!(accepted.event.kind, Kind::GiftWrap);
@@ -578,6 +674,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bundle_roundtrip_parses_as_friend_request() {
+        // Bob exports a bundle (just the payload, not wrapped). Alice parses it
+        // and must get a FriendRequestReceived equivalent to an online FR.
+        let bob_id = Identity::generate().unwrap().identity;
+        let bob_signal = SignalParticipant::new(bob_id.pubkey_hex(), 1).unwrap();
+        let bob_first_inbox = EphemeralKeypair::generate();
+
+        let payload = build_friend_request_payload(
+            &bob_id,
+            "Bob",
+            "dev-1",
+            &bob_signal,
+            &bob_first_inbox.pubkey_hex(),
+        )
+        .unwrap();
+        let bundle_json = serde_json::to_string(&payload).unwrap();
+
+        let received = parse_bundle_as_friend_request(&bundle_json).unwrap();
+        assert_eq!(received.sender_pubkey_hex, bob_id.pubkey_hex());
+        assert_eq!(received.payload.name, "Bob");
+        assert_eq!(
+            received.payload.signal_identity_key,
+            bob_signal.identity_public_key_hex()
+        );
+        assert_eq!(received.payload.first_inbox, bob_first_inbox.pubkey_hex());
+        assert_eq!(received.message.kind, KCMessageKind::FriendRequest);
+        assert!(received.message.id.as_ref().unwrap().starts_with("bundle-"));
+    }
+
+    #[tokio::test]
+    async fn bundle_tampered_rejected() {
+        let bob_id = Identity::generate().unwrap().identity;
+        let bob_signal = SignalParticipant::new(bob_id.pubkey_hex(), 1).unwrap();
+        let bob_first_inbox = EphemeralKeypair::generate();
+
+        let mut payload = build_friend_request_payload(
+            &bob_id,
+            "Bob",
+            "dev-1",
+            &bob_signal,
+            &bob_first_inbox.pubkey_hex(),
+        )
+        .unwrap();
+
+        // Tamper: swap in a different signal identity key, keep original globalSign.
+        let attacker_signal = SignalParticipant::new("attacker", 1).unwrap();
+        payload.signal_identity_key = attacker_signal.identity_public_key_hex();
+
+        let bundle_json = serde_json::to_string(&payload).unwrap();
+        let err = parse_bundle_as_friend_request(&bundle_json);
+        assert!(err.is_err(), "tampered bundle must be rejected");
+    }
+
+    #[tokio::test]
     async fn wrong_receiver_cannot_open() {
         let alice_id = Identity::generate().unwrap().identity;
         let bob_id = Identity::generate().unwrap().identity;
@@ -601,7 +751,7 @@ mod tests {
             .unwrap();
 
         let received = receive_friend_request(&bob_id, &gift_wrap).unwrap();
-        let accepted = accept_friend_request(&bob_id, &received, "Bob")
+        let accepted = accept_friend_request(&bob_id, &received, "Bob", false)
             .await
             .unwrap();
 

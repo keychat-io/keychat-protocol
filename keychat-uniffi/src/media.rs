@@ -155,20 +155,20 @@ pub struct FileUploadResult {
 
 // ─── FileCategory Conversion ────────────────────────────────────
 
-pub(crate) fn file_category_to_lib(c: &FileCategory) -> libkeychat::FileCategory {
+pub(crate) fn file_category_to_lib(c: &FileCategory) -> keychat_app_core::FileCategory {
     match c {
-        FileCategory::Image => libkeychat::FileCategory::Image,
-        FileCategory::Video => libkeychat::FileCategory::Video,
-        FileCategory::Voice => libkeychat::FileCategory::Voice,
-        FileCategory::Audio => libkeychat::FileCategory::Audio,
-        FileCategory::Document => libkeychat::FileCategory::Document,
-        FileCategory::Text => libkeychat::FileCategory::Text,
-        FileCategory::Archive => libkeychat::FileCategory::Archive,
-        FileCategory::Other => libkeychat::FileCategory::Other,
+        FileCategory::Image => keychat_app_core::FileCategory::Image,
+        FileCategory::Video => keychat_app_core::FileCategory::Video,
+        FileCategory::Voice => keychat_app_core::FileCategory::Voice,
+        FileCategory::Audio => keychat_app_core::FileCategory::Audio,
+        FileCategory::Document => keychat_app_core::FileCategory::Document,
+        FileCategory::Text => keychat_app_core::FileCategory::Text,
+        FileCategory::Archive => keychat_app_core::FileCategory::Archive,
+        FileCategory::Other => keychat_app_core::FileCategory::Other,
     }
 }
 
-impl From<FileCategory> for libkeychat::FileCategory {
+impl From<FileCategory> for keychat_app_core::FileCategory {
     fn from(c: FileCategory) -> Self {
         file_category_to_lib(&c)
     }

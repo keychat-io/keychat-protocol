@@ -49,6 +49,16 @@ pub struct PeerMapping {
     pub nostr_pubkey: String,
     pub signal_id: String,
     pub name: String,
+    /// Whether this peer is a Public Agent (spec §3.6).
+    /// Learned from `friendApprove.publicAgent`. When `true`, outbound messages
+    /// to this peer MUST use dual p-tag routing.
+    pub is_public_agent: bool,
+    /// Whether this peer has been observed sending dual p-tag events (spec §3.6
+    /// Backward Compatibility). Only meaningful when THIS client runs in
+    /// Public Agent mode: upgraded peers no longer need a ratchet-address
+    /// fallback subscription, so their addresses can be dropped from the
+    /// relay filter.
+    pub peer_uses_dual_p_tag: bool,
     pub created_at: i64,
 }
 
@@ -173,10 +183,17 @@ impl SecureStorage {
                 nostr_pubkey TEXT NOT NULL,
                 signal_id TEXT NOT NULL,
                 name TEXT NOT NULL,
+                is_public_agent INTEGER NOT NULL DEFAULT 0,
+                peer_uses_dual_p_tag INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 PRIMARY KEY (nostr_pubkey)
             );
             CREATE INDEX IF NOT EXISTS idx_peer_signal ON peer_mappings(signal_id);
+
+            CREATE TABLE IF NOT EXISTS protocol_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS signal_participants (
                 peer_signal_id TEXT PRIMARY KEY,
@@ -215,6 +232,11 @@ impl SecureStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_inbound_fr_sender ON inbound_friend_requests(sender_pubkey_hex);
 
+            CREATE TABLE IF NOT EXISTS pending_first_inbox (
+                peer_signal_hex TEXT PRIMARY KEY,
+                first_inbox_pubkey TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS signal_groups (
                 group_id TEXT PRIMARY KEY,
                 data_json TEXT NOT NULL,
@@ -239,6 +261,22 @@ impl SecureStorage {
             COMMIT;",
         )
         .map_err(|e| KeychatError::Storage(format!("create schema failed: {e}")))?;
+
+        // Idempotent column migrations for older databases. Failures are
+        // swallowed because the column may already exist (duplicate column name).
+        let _ = conn.execute(
+            "ALTER TABLE peer_mappings ADD COLUMN is_public_agent INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE peer_mappings ADD COLUMN peer_uses_dual_p_tag INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // CREATE IF NOT EXISTS is safe to re-run unconditionally.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS protocol_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        );
 
         tracing::info!("database schema v{} created", Self::SCHEMA_VERSION);
         Ok(())
@@ -570,14 +608,122 @@ impl SecureStorage {
     // ─── Peer Mapping ─────────────────────────────────────
 
     /// Save peer mapping (nostr pubkey → signal identity).
+    ///
+    /// Preserves `is_public_agent` across upserts: if a row already exists, its
+    /// flag is kept. Use `set_peer_public_agent` to change it explicitly.
     pub fn save_peer_mapping(&self, nostr_pubkey: &str, signal_id: &str, name: &str) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO peer_mappings (nostr_pubkey, signal_id, name, created_at) \
-                 VALUES (?1, ?2, ?3, strftime('%s','now'))",
+                "INSERT INTO peer_mappings (nostr_pubkey, signal_id, name, created_at) \
+                 VALUES (?1, ?2, ?3, strftime('%s','now')) \
+                 ON CONFLICT(nostr_pubkey) DO UPDATE SET \
+                    signal_id = excluded.signal_id, \
+                    name = excluded.name",
                 rusqlite::params![nostr_pubkey, signal_id, name],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save peer mapping: {e}")))?;
+        Ok(())
+    }
+
+    /// Set the `is_public_agent` flag for a peer (spec §3.6).
+    ///
+    /// Called when a `friendApprove` carrying `publicAgent: true` is processed.
+    pub fn set_peer_public_agent(&self, nostr_pubkey: &str, flag: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE peer_mappings SET is_public_agent = ?1 WHERE nostr_pubkey = ?2",
+                rusqlite::params![flag as i64, nostr_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to set public_agent flag: {e}")))?;
+        Ok(())
+    }
+
+    /// Load the list of peers flagged as Public Agents (nostr_pubkey, signal_id).
+    ///
+    /// Used at restore time to rehydrate the in-memory index.
+    pub fn load_public_agent_peers(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT nostr_pubkey, signal_id FROM peer_mappings WHERE is_public_agent = 1")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| KeychatError::Storage(format!("Failed to list public agents: {e}")))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| KeychatError::Storage(format!("row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    /// Set `peer_uses_dual_p_tag` for a peer (spec §3.6 agent-side backward compat).
+    ///
+    /// Called the first time a dual p-tag event is observed from this peer when
+    /// the local client runs in Public Agent mode. Once set, the peer's ratchet
+    /// addresses can be dropped from the relay subscription (they're only kept
+    /// as a fallback for legacy peers).
+    pub fn set_peer_uses_dual_p_tag(&self, nostr_pubkey: &str, flag: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE peer_mappings SET peer_uses_dual_p_tag = ?1 WHERE nostr_pubkey = ?2",
+                rusqlite::params![flag as i64, nostr_pubkey],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to set peer_uses_dual_p_tag: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Load the set of peers (nostr_pubkey, signal_id) who have upgraded to
+    /// dual p-tag. Used when the local client is a Public Agent to exclude
+    /// these peers' ratchet addresses from the relay subscription.
+    pub fn load_upgraded_peers(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT nostr_pubkey, signal_id FROM peer_mappings WHERE peer_uses_dual_p_tag = 1",
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row: &rusqlite::Row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| KeychatError::Storage(format!("Failed to list upgraded peers: {e}")))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| KeychatError::Storage(format!("row: {e}")))?);
+        }
+        Ok(out)
+    }
+
+    // ─── Protocol Settings (generic kv) ───────────────────────────
+
+    /// Get a protocol setting by key.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM protocol_settings WHERE key = ?1")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+        stmt.query_row(rusqlite::params![key], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|e| KeychatError::Storage(format!("Failed to load setting: {e}")))
+    }
+
+    /// Upsert a protocol setting.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO protocol_settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )
+            .map_err(|e| KeychatError::Storage(format!("Failed to set setting: {e}")))?;
         Ok(())
     }
 
@@ -586,7 +732,7 @@ impl SecureStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT nostr_pubkey, signal_id, name, created_at \
+                "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
                  FROM peer_mappings WHERE nostr_pubkey = ?1",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
@@ -597,7 +743,9 @@ impl SecureStorage {
                     nostr_pubkey: row.get(0)?,
                     signal_id: row.get(1)?,
                     name: row.get(2)?,
-                    created_at: row.get(3)?,
+                    is_public_agent: row.get::<_, i64>(3)? != 0,
+                    peer_uses_dual_p_tag: row.get::<_, i64>(4)? != 0,
+                    created_at: row.get(5)?,
                 })
             })
             .optional()
@@ -611,7 +759,7 @@ impl SecureStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT nostr_pubkey, signal_id, name, created_at \
+                "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
                  FROM peer_mappings WHERE signal_id = ?1",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
@@ -622,7 +770,9 @@ impl SecureStorage {
                     nostr_pubkey: row.get(0)?,
                     signal_id: row.get(1)?,
                     name: row.get(2)?,
-                    created_at: row.get(3)?,
+                    is_public_agent: row.get::<_, i64>(3)? != 0,
+                    peer_uses_dual_p_tag: row.get::<_, i64>(4)? != 0,
+                    created_at: row.get(5)?,
                 })
             })
             .optional()
@@ -657,7 +807,9 @@ impl SecureStorage {
     pub fn list_peers(&self) -> Result<Vec<PeerMapping>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT nostr_pubkey, signal_id, name, created_at FROM peer_mappings")
+            .prepare(
+                "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at FROM peer_mappings",
+            )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let rows = stmt
@@ -666,7 +818,9 @@ impl SecureStorage {
                     nostr_pubkey: row.get(0)?,
                     signal_id: row.get(1)?,
                     name: row.get(2)?,
-                    created_at: row.get(3)?,
+                    is_public_agent: row.get::<_, i64>(3)? != 0,
+                    peer_uses_dual_p_tag: row.get::<_, i64>(4)? != 0,
+                    created_at: row.get(5)?,
                 })
             })
             .map_err(|e| KeychatError::Storage(format!("Failed to list peers: {e}")))?;
@@ -938,6 +1092,48 @@ impl SecureStorage {
         for row in rows {
             results
                 .push(row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?);
+        }
+        Ok(results)
+    }
+
+    // ─── Pending First Inbox (spec §8.3) ──────────────────
+
+    pub fn save_pending_first_inbox(
+        &self,
+        peer_signal_hex: &str,
+        first_inbox_pubkey: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO pending_first_inbox (peer_signal_hex, first_inbox_pubkey) \
+                 VALUES (?1, ?2)",
+                rusqlite::params![peer_signal_hex, first_inbox_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("save pending_first_inbox: {e}")))?;
+        Ok(())
+    }
+
+    pub fn delete_pending_first_inbox(&self, peer_signal_hex: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_first_inbox WHERE peer_signal_hex = ?1",
+                rusqlite::params![peer_signal_hex],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete pending_first_inbox: {e}")))?;
+        Ok(())
+    }
+
+    pub fn load_all_pending_first_inboxes(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer_signal_hex, first_inbox_pubkey FROM pending_first_inbox")
+            .map_err(|e| KeychatError::Storage(format!("prepare pending_first_inbox: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| KeychatError::Storage(format!("query pending_first_inbox: {e}")))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| KeychatError::Storage(format!("read row: {e}")))?);
         }
         Ok(results)
     }
@@ -1534,6 +1730,116 @@ mod tests {
             .load_peer_by_signal("signal-unknown")
             .unwrap()
             .is_none());
+
+        // New peers default to is_public_agent = false
+        assert!(!alice.is_public_agent);
+        assert!(!bob.is_public_agent);
+    }
+
+    #[test]
+    fn test_peer_public_agent_flag_roundtrip() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store
+            .save_peer_mapping("npub-agent", "signal-agent", "Agent")
+            .unwrap();
+        store
+            .save_peer_mapping("npub-human", "signal-human", "Human")
+            .unwrap();
+
+        // Initial state: no public agents
+        assert!(store.load_public_agent_peers().unwrap().is_empty());
+
+        // Mark one peer as Public Agent
+        store.set_peer_public_agent("npub-agent", true).unwrap();
+
+        let agent = store.load_peer_by_nostr("npub-agent").unwrap().unwrap();
+        assert!(agent.is_public_agent);
+        let human = store.load_peer_by_nostr("npub-human").unwrap().unwrap();
+        assert!(!human.is_public_agent);
+
+        let agents = store.load_public_agent_peers().unwrap();
+        assert_eq!(agents, vec![("npub-agent".into(), "signal-agent".into())]);
+
+        // list_peers preserves the flag
+        let all = store.list_peers().unwrap();
+        let listed_agent = all.iter().find(|p| p.nostr_pubkey == "npub-agent").unwrap();
+        assert!(listed_agent.is_public_agent);
+
+        // Re-saving the mapping (e.g. name change) must NOT clobber the flag.
+        store
+            .save_peer_mapping("npub-agent", "signal-agent", "Renamed Agent")
+            .unwrap();
+        let still_agent = store.load_peer_by_nostr("npub-agent").unwrap().unwrap();
+        assert!(
+            still_agent.is_public_agent,
+            "is_public_agent must survive save_peer_mapping upsert"
+        );
+        assert_eq!(still_agent.name, "Renamed Agent");
+
+        // Unset brings it back to false
+        store.set_peer_public_agent("npub-agent", false).unwrap();
+        let cleared = store.load_peer_by_nostr("npub-agent").unwrap().unwrap();
+        assert!(!cleared.is_public_agent);
+        assert!(store.load_public_agent_peers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_peer_uses_dual_p_tag_roundtrip() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store.save_peer_mapping("npub-a", "signal-a", "A").unwrap();
+        store.save_peer_mapping("npub-b", "signal-b", "B").unwrap();
+
+        // Default: nobody has upgraded
+        assert!(store.load_upgraded_peers().unwrap().is_empty());
+        let a = store.load_peer_by_nostr("npub-a").unwrap().unwrap();
+        assert!(!a.peer_uses_dual_p_tag);
+
+        // Mark one upgraded
+        store.set_peer_uses_dual_p_tag("npub-a", true).unwrap();
+
+        let upgraded = store.load_upgraded_peers().unwrap();
+        assert_eq!(upgraded, vec![("npub-a".into(), "signal-a".into())]);
+
+        // save_peer_mapping must not clobber the upgrade flag
+        store
+            .save_peer_mapping("npub-a", "signal-a", "Renamed A")
+            .unwrap();
+        let still = store.load_peer_by_nostr("npub-a").unwrap().unwrap();
+        assert!(still.peer_uses_dual_p_tag);
+        assert_eq!(still.name, "Renamed A");
+
+        // is_public_agent and peer_uses_dual_p_tag are independent
+        assert!(!still.is_public_agent);
+    }
+
+    #[test]
+    fn test_protocol_settings_kv() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        // Missing key -> None
+        assert_eq!(store.get_setting("missing").unwrap(), None);
+
+        // Insert + read
+        store.set_setting("self_is_public_agent", "1").unwrap();
+        assert_eq!(
+            store
+                .get_setting("self_is_public_agent")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+
+        // Overwrite
+        store.set_setting("self_is_public_agent", "0").unwrap();
+        assert_eq!(
+            store
+                .get_setting("self_is_public_agent")
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
     }
 
     #[test]

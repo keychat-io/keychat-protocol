@@ -33,8 +33,8 @@ pub const MLS_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 /// Extension type for Nostr group data.
 const NOSTR_GROUP_EXTENSION_TYPE: u16 = 0xF233;
 
-/// MLS export secret label for deriving the temp inbox address.
-const MLS_TEMP_INBOX_LABEL: &str = "keychat-mls-temp-inbox";
+/// MLS export secret label for deriving the temp inbox address (spec §11.3).
+const MLS_TEMP_INBOX_LABEL: &str = "keychat-mls-inbox";
 
 /// Result of decrypting an MLS message — distinguishes application data from control messages.
 #[derive(Debug, Clone)]
@@ -55,6 +55,9 @@ pub enum MlsDecryptResult {
 /// Wrapper around OpenMLS provider with in-memory SQLite storage.
 pub struct MlsProvider {
     pub provider: OpenMlsRustPersistentCrypto,
+    /// Separate connection to the same DB for keychat-specific tables
+    /// (identity persistence). None for in-memory providers.
+    kc_conn: Option<rusqlite::Connection>,
 }
 
 impl MlsProvider {
@@ -62,6 +65,7 @@ impl MlsProvider {
     pub fn new() -> Self {
         Self {
             provider: OpenMlsRustPersistentCrypto::default(),
+            kc_conn: None,
         }
     }
 
@@ -69,12 +73,65 @@ impl MlsProvider {
     pub fn open(path: &str) -> Result<Self> {
         let provider = OpenMlsRustPersistentCrypto::open(path)
             .map_err(|e| KeychatError::Storage(format!("MLS storage open failed: {e}")))?;
-        Ok(Self { provider })
+
+        // Open a second connection for keychat-specific tables
+        let kc_conn = rusqlite::Connection::open(path)
+            .map_err(|e| KeychatError::Storage(format!("MLS kc_conn open failed: {e}")))?;
+        kc_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE IF NOT EXISTS keychat_mls_identity (
+                    nostr_id TEXT PRIMARY KEY,
+                    signer_json TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| KeychatError::Storage(format!("create keychat_mls_identity: {e}")))?;
+
+        Ok(Self {
+            provider,
+            kc_conn: Some(kc_conn),
+        })
     }
 
     /// Access the inner OpenMLS provider.
     pub fn inner(&self) -> &OpenMlsRustPersistentCrypto {
         &self.provider
+    }
+
+    /// Save the signer (as JSON) keyed by nostr_id.
+    pub fn save_signer(&self, nostr_id: &str, signer: &SignatureKeyPair) -> Result<()> {
+        let conn = self.kc_conn.as_ref().ok_or_else(|| {
+            KeychatError::Storage("MLS identity persistence requires file-backed provider".into())
+        })?;
+        let json = serde_json::to_string(signer)
+            .map_err(|e| KeychatError::Mls(format!("serialize signer: {e}")))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO keychat_mls_identity (nostr_id, signer_json) VALUES (?1, ?2)",
+            rusqlite::params![nostr_id, json],
+        )
+        .map_err(|e| KeychatError::Storage(format!("save signer: {e}")))?;
+        Ok(())
+    }
+
+    /// Load the signer for a given nostr_id.
+    pub fn load_signer(&self, nostr_id: &str) -> Result<Option<SignatureKeyPair>> {
+        let conn = self.kc_conn.as_ref().ok_or_else(|| {
+            KeychatError::Storage("MLS identity persistence requires file-backed provider".into())
+        })?;
+        let mut stmt = conn
+            .prepare("SELECT signer_json FROM keychat_mls_identity WHERE nostr_id = ?1")
+            .map_err(|e| KeychatError::Storage(format!("prepare load_signer: {e}")))?;
+        let result: Option<String> = stmt
+            .query_row(rusqlite::params![nostr_id], |row| row.get(0))
+            .ok();
+        match result {
+            Some(json) => {
+                let signer: SignatureKeyPair = serde_json::from_str(&json)
+                    .map_err(|e| KeychatError::Mls(format!("deserialize signer: {e}")))?;
+                Ok(Some(signer))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -100,7 +157,7 @@ pub struct MlsParticipant {
 
 impl MlsParticipant {
     /// Create a new MLS participant with the given Nostr identity.
-    /// Generates fresh MLS credential and signing keys.
+    /// Generates fresh MLS credential and signing keys (in-memory provider).
     pub fn new(nostr_id: impl Into<String>) -> Result<Self> {
         let nostr_id = nostr_id.into();
         let provider = MlsProvider::new();
@@ -109,13 +166,13 @@ impl MlsParticipant {
         let signer = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm()).map_err(|e| {
             KeychatError::Mls(format!("failed to generate MLS signature keypair: {e}"))
         })?;
+        signer
+            .store(provider.inner().storage())
+            .map_err(|e| KeychatError::Mls(format!("failed to store signature keypair: {e}")))?;
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
         };
-        signer
-            .store(provider.inner().storage())
-            .map_err(|e| KeychatError::Mls(format!("failed to store signature keypair: {e}")))?;
 
         tracing::info!(
             "MLS participant created: nostr_id={}",
@@ -129,38 +186,38 @@ impl MlsParticipant {
         })
     }
 
-    /// Create an MLS participant with a custom provider (e.g. file-backed).
+    /// Create or restore an MLS participant with a file-backed provider.
     ///
-    /// If `signer_public_key` is provided, attempts to restore the existing
-    /// signing key from the provider's storage. This is required for MLS group
-    /// state to survive restarts. If restoration fails or no key is provided,
-    /// generates a fresh signing key.
+    /// If a signer was previously saved for this `nostr_id`, it is restored.
+    /// Otherwise a fresh signing key is generated and persisted.
+    /// The signer is stored in the `keychat_mls_identity` table of `_mls.db`,
+    /// keyed by `nostr_id`, so the identity binding is explicit.
     pub fn with_provider(nostr_id: impl Into<String>, provider: MlsProvider) -> Result<Self> {
-        Self::with_provider_and_signer(nostr_id, provider, None)
-    }
-
-    /// Create an MLS participant, optionally restoring a saved signing key.
-    pub fn with_provider_and_signer(
-        nostr_id: impl Into<String>,
-        provider: MlsProvider,
-        signer_public_key: Option<&[u8]>,
-    ) -> Result<Self> {
         let nostr_id = nostr_id.into();
         let credential = BasicCredential::new(nostr_id.as_bytes().to_vec());
 
-        let signer = if let Some(restored) = signer_public_key.and_then(|pub_key| {
-            SignatureKeyPair::read(
-                provider.inner().storage(),
-                pub_key,
-                MLS_CIPHERSUITE.signature_algorithm(),
-            )
-        }) {
-            restored
+        // Try to restore signer from keychat_mls_identity table
+        let signer = if let Some(saved) = provider.load_signer(&nostr_id)? {
+            tracing::info!(
+                "MLS signer restored for {}",
+                &nostr_id[..16.min(nostr_id.len())]
+            );
+            // Also store in OpenMLS storage for group operations
+            saved
+                .store(provider.inner().storage())
+                .map_err(|e| KeychatError::Mls(format!("store restored signer: {e}")))?;
+            saved
         } else {
             let s = SignatureKeyPair::new(MLS_CIPHERSUITE.signature_algorithm())
                 .map_err(|e| KeychatError::Mls(format!("failed to generate MLS keypair: {e}")))?;
             s.store(provider.inner().storage())
                 .map_err(|e| KeychatError::Mls(format!("failed to store MLS keypair: {e}")))?;
+            // Persist to keychat_mls_identity keyed by nostr_id
+            provider.save_signer(&nostr_id, &s)?;
+            tracing::info!(
+                "MLS signer created for {}",
+                &nostr_id[..16.min(nostr_id.len())]
+            );
             s
         };
 
@@ -175,11 +232,6 @@ impl MlsParticipant {
             credential: credential_with_key,
             signer,
         })
-    }
-
-    /// Get the MLS signer's public key bytes (for persistence).
-    pub fn signer_public_key(&self) -> Vec<u8> {
-        self.signer.to_public_vec()
     }
 
     /// Generate a KeyPackage for others to add us to a group.
@@ -197,6 +249,13 @@ impl MlsParticipant {
             .map_err(|e| KeychatError::Mls(format!("failed to build KeyPackage: {e}")))?;
 
         Ok(kp.key_package().clone())
+    }
+
+    /// Generate a KeyPackage and return it as serialized TLS bytes.
+    pub fn generate_key_package_bytes(&self) -> Result<Vec<u8>> {
+        let kp = self.generate_key_package()?;
+        kp.tls_serialize_detached()
+            .map_err(|e| KeychatError::Mls(format!("serialize key package: {e}")))
     }
 
     /// Create a new MLS group with the given group_id and name.
@@ -430,6 +489,12 @@ impl MlsParticipant {
 
     /// Remove members from the group by their leaf indices.
     /// Returns the serialized Commit.
+    ///
+    /// **Does NOT merge** the pending commit — the caller must broadcast
+    /// the Commit to the old-epoch mlsTempInbox first, then call
+    /// `self_commit()` to advance to the new epoch. This matches the
+    /// production app's two-phase pattern and avoids the Commit being
+    /// sent to an inbox that only the admin has advanced to.
     pub fn remove_members(
         &self,
         group_id: &str,
@@ -441,10 +506,6 @@ impl MlsParticipant {
             .remove_members(self.provider.inner(), &self.signer, members_to_remove)
             .map_err(|e| KeychatError::Mls(format!("remove_members error: {e}")))?;
 
-        group
-            .merge_pending_commit(self.provider.inner())
-            .map_err(|e| KeychatError::Mls(format!("merge commit error: {e}")))?;
-
         let bytes = commit
             .tls_serialize_detached()
             .map_err(|e| KeychatError::Mls(format!("serialize commit: {e}")))?;
@@ -452,7 +513,24 @@ impl MlsParticipant {
         Ok(bytes)
     }
 
+    /// Merge the pending commit for a group (advance to new epoch).
+    ///
+    /// Call this AFTER broadcasting the Commit to the old-epoch
+    /// mlsTempInbox. After this returns, `derive_temp_inbox` will
+    /// produce the new-epoch address.
+    pub fn self_commit(&self, group_id: &str) -> Result<()> {
+        let mut group = self.load_group(group_id)?;
+        group
+            .merge_pending_commit(self.provider.inner())
+            .map_err(|e| KeychatError::Mls(format!("self_commit merge error: {e}")))?;
+        Ok(())
+    }
+
     /// Self-update (key rotation). Returns the serialized Commit.
+    ///
+    /// Like `remove_members`, does NOT merge the pending commit.
+    /// The caller must broadcast the Commit to the current mlsTempInbox
+    /// first, then call `self_commit()` to advance the epoch.
     pub fn self_update(&self, group_id: &str) -> Result<Vec<u8>> {
         let mut group = self.load_group(group_id)?;
 
@@ -468,10 +546,6 @@ impl MlsParticipant {
             .commit()
             .tls_serialize_detached()
             .map_err(|e| KeychatError::Mls(format!("serialize commit: {e}")))?;
-
-        group
-            .merge_pending_commit(self.provider.inner())
-            .map_err(|e| KeychatError::Mls(format!("merge commit error: {e}")))?;
 
         Ok(commit_bytes)
     }
@@ -528,14 +602,10 @@ impl MlsParticipant {
             .map_err(|e| KeychatError::Mls(format!("export_secret error: {e}")))
     }
 
-    /// Derive the MLS temp inbox address for a group (§11.2).
+    /// Derive the MLS temp inbox address for a group (§11.3).
     pub fn derive_temp_inbox(&self, group_id: &str) -> Result<String> {
         let export_secret = self.export_secret(group_id, MLS_TEMP_INBOX_LABEL, &[], 32)?;
-        Ok(derive_mls_temp_inbox(
-            &self.nostr_id,
-            group_id,
-            &export_secret,
-        ))
+        derive_mls_temp_inbox(&export_secret)
     }
 
     /// Get the list of members' credential identities in the group.
@@ -658,27 +728,28 @@ impl MlsParticipant {
     }
 }
 
-// ─── mlsTempInbox derivation (§11.2) ────────────────────────────────────────
+// ─── mlsTempInbox derivation (§11.3) ────────────────────────────────────────
 
 /// Derive the shared MLS receiving address from the export secret.
 ///
+/// MLS `export_secret` already domain-separates by `(group_id, epoch, label)`,
+/// so the 32-byte output is interpreted directly as a secp256k1 secret key.
 /// All members in the same epoch compute the same value.
-/// Returns a hex-encoded secp256k1 x-only pubkey string.
-pub fn derive_mls_temp_inbox(nostr_id: &str, group_id: &str, export_secret: &[u8]) -> String {
-    // Deterministic derivation: SHA256(export_secret || "keychat-mls-inbox" || group_id)
-    let mut hasher = Sha256::new();
-    hasher.update(export_secret);
-    hasher.update(b"keychat-mls-inbox");
-    hasher.update(group_id.as_bytes());
-    let hash = hasher.finalize();
-
-    // Interpret the hash as a secp256k1 secret key and derive the x-only pubkey
+///
+/// Returns a hex-encoded secp256k1 x-only pubkey (64 hex chars).
+pub fn derive_mls_temp_inbox(export_secret: &[u8]) -> Result<String> {
+    if export_secret.len() != 32 {
+        return Err(KeychatError::Mls(format!(
+            "export_secret must be 32 bytes, got {}",
+            export_secret.len()
+        )));
+    }
     let secp = secp256k1::Secp256k1::new();
-    let secret_key = secp256k1::SecretKey::from_slice(&hash)
-        .expect("SHA256 output should be valid secp256k1 secret key");
-    let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret_key);
-    let (x_only, _parity) = keypair.x_only_public_key();
-    hex::encode(x_only.serialize())
+    let secret_key = secp256k1::SecretKey::from_slice(export_secret)
+        .map_err(|e| KeychatError::Mls(format!("invalid secp256k1 secret from export: {e}")))?;
+    let (x_only, _parity) =
+        secp256k1::Keypair::from_secret_key(&secp, &secret_key).x_only_public_key();
+    Ok(hex::encode(x_only.serialize()))
 }
 
 // ─── MLS Group Transport (Part B) ──────────────────────────────────────────
@@ -833,6 +904,17 @@ pub fn publish_key_package(
 }
 
 /// Parse a kind 10443 event back into a KeyPackage.
+/// Parse a KeyPackage from raw TLS-serialized bytes.
+pub fn parse_key_package_bytes(kp_bytes: &[u8]) -> Result<KeyPackage> {
+    let kp_in = KeyPackageIn::tls_deserialize_exact(kp_bytes)
+        .map_err(|e| KeychatError::Mls(format!("deserialize key package: {e}")))?;
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    kp_in
+        .validate(&crypto, ProtocolVersion::Mls10)
+        .map_err(|e| KeychatError::Mls(format!("validate key package: {e}")))
+}
+
+/// Parse a KeyPackage from a kind 10443 Nostr event.
 pub fn parse_key_package(event: &nostr::Event) -> Result<KeyPackage> {
     if event.kind != nostr::Kind::from(KIND_MLS_KEY_PACKAGE) {
         return Err(KeychatError::Mls(format!(
@@ -975,19 +1057,18 @@ mod tests {
         // Get temp inbox before self_update
         let inbox_before = alice.derive_temp_inbox(group_id).unwrap();
 
-        // Alice does a self-update (key rotation)
+        // Alice does a self-update (two-phase: update → broadcast → merge)
         let commit = alice.self_update(group_id).unwrap();
+        bob.process_commit(group_id, &commit).unwrap();
+        alice.self_commit(group_id).unwrap();
 
-        // After the commit, Alice's temp inbox should change
+        // After merge, Alice's temp inbox should change
         let inbox_after = alice.derive_temp_inbox(group_id).unwrap();
 
         assert_ne!(
             inbox_before, inbox_after,
             "mlsTempInbox must change after epoch advance"
         );
-
-        // Bob processes the commit
-        bob.process_commit(group_id, &commit).unwrap();
         let bob_inbox_after = bob.derive_temp_inbox(group_id).unwrap();
 
         // Both should derive the same new inbox
@@ -1063,14 +1144,13 @@ mod tests {
         bob.join_group(&welcome).unwrap();
         charlie.join_group(&welcome).unwrap();
 
-        // Find Charlie's leaf index and remove
+        // Find Charlie's leaf index and remove (two-phase)
         let charlie_idx = alice.find_member_index(group_id, "charlie").unwrap();
         let commit = alice.remove_members(group_id, &[charlie_idx]).unwrap();
-
-        // Bob processes the removal
         bob.process_commit(group_id, &commit).unwrap();
+        alice.self_commit(group_id).unwrap();
 
-        // Alice sends a message
+        // Alice sends a message (both at new epoch)
         let ciphertext = alice.encrypt(group_id, b"Secret after removal").unwrap();
 
         // Bob can decrypt
@@ -1109,6 +1189,7 @@ mod tests {
         // For simplicity, Alice removes Bob
         let bob_idx = alice.find_member_index(group_id, "bob").unwrap();
         let commit = alice.remove_members(group_id, &[bob_idx]).unwrap();
+        alice.self_commit(group_id).unwrap();
 
         // Alice can still send messages
         let ciphertext = alice.encrypt(group_id, b"After Bob left").unwrap();
@@ -1177,25 +1258,36 @@ mod tests {
     #[test]
     fn test_mls_temp_inbox_deterministic() {
         let export_secret = [42u8; 32];
-        let group_id = "test-group";
 
-        // Different nostr_ids but same export_secret and group_id
-        // should produce the same result (nostr_id is NOT used in derivation)
-        let inbox1 = derive_mls_temp_inbox("alice", group_id, &export_secret);
-        let inbox2 = derive_mls_temp_inbox("bob", group_id, &export_secret);
-        let inbox3 = derive_mls_temp_inbox("charlie", group_id, &export_secret);
+        let inbox1 = derive_mls_temp_inbox(&export_secret).unwrap();
+        let inbox2 = derive_mls_temp_inbox(&export_secret).unwrap();
 
         assert_eq!(inbox1, inbox2);
-        assert_eq!(inbox2, inbox3);
 
         // Different export_secret should produce different result
         let export_secret2 = [43u8; 32];
-        let inbox4 = derive_mls_temp_inbox("alice", group_id, &export_secret2);
-        assert_ne!(inbox1, inbox4);
+        let inbox3 = derive_mls_temp_inbox(&export_secret2).unwrap();
+        assert_ne!(inbox1, inbox3);
 
         // The result should be a valid 64-char hex string (secp256k1 x-only pubkey)
         assert_eq!(inbox1.len(), 64);
         assert!(inbox1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_mls_temp_inbox_known_answer() {
+        let export_secret = [0x42u8; 32];
+        let inbox = derive_mls_temp_inbox(&export_secret).unwrap();
+        assert_eq!(
+            inbox,
+            "24653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c",
+        );
+    }
+
+    #[test]
+    fn test_mls_temp_inbox_rejects_wrong_length() {
+        let result = derive_mls_temp_inbox(&[0u8; 31]);
+        assert!(result.is_err());
     }
 
     // ─── Test 9: Multiple epochs ───────────────────────────────────────────
@@ -1214,10 +1306,11 @@ mod tests {
 
         let mut prev_inbox = alice.derive_temp_inbox(group_id).unwrap();
 
-        // Do several self-updates, checking messages work after each
+        // Do several self-updates (two-phase each)
         for i in 0..3 {
             let commit = alice.self_update(group_id).unwrap();
             bob.process_commit(group_id, &commit).unwrap();
+            alice.self_commit(group_id).unwrap();
 
             let new_inbox = alice.derive_temp_inbox(group_id).unwrap();
             assert_ne!(prev_inbox, new_inbox, "epoch {i}: inbox must change");
@@ -1358,5 +1451,318 @@ mod tests {
         assert_eq!(members.len(), 2);
         assert!(members.contains(&"alice".to_string()));
         assert!(members.contains(&"bob".to_string()));
+    }
+
+    // ─── Test: Persistence — 3 identities, 2 groups, restart + epoch rotation ──
+
+    /// Helper: open a file-backed MlsParticipant.
+    fn open_participant(db_path: &str, nostr_id: &str) -> MlsParticipant {
+        MlsParticipant::with_provider(nostr_id, MlsProvider::open(db_path).unwrap()).unwrap()
+    }
+
+    /// Helper: encrypt plaintext, assert all receivers can decrypt with correct sender.
+    fn assert_decrypt_all(
+        sender_id: &str,
+        group_id: &str,
+        ciphertext: &[u8],
+        receivers: &[&MlsParticipant],
+    ) {
+        for r in receivers {
+            let MlsDecryptResult::Application {
+                plaintext,
+                sender_id: sid,
+            } = r.decrypt(group_id, ciphertext).unwrap()
+            else {
+                panic!("{} failed to decrypt from {}", r.nostr_id, sender_id);
+            };
+            assert_eq!(sid, sender_id);
+            let _ = plaintext; // caller can check content separately
+        }
+    }
+
+    #[test]
+    fn test_persistence_multi_identity_multi_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = |name: &str| tmp.path().join(name).to_string_lossy().to_string();
+
+        let alice_db = db("alice.db");
+        let bob_db = db("bob.db");
+        let charlie_db = db("charlie.db");
+
+        let alice_id = "alice_nostr_aaaa1111222233334444";
+        let bob_id = "bob_nostr_bbbb5555666677778888";
+        let charlie_id = "charlie_nostr_cccc9999aaaabbbbcccc";
+
+        let group_a = "group-alpha";
+        let group_b = "group-beta";
+
+        // ════════════════════════════════════════════════════════
+        // Phase 1: Build two groups
+        //   group_a: Alice + Bob + Charlie
+        //   group_b: Bob + Charlie  (Bob creates)
+        // ════════════════════════════════════════════════════════
+        {
+            let alice = open_participant(&alice_db, alice_id);
+            let bob = open_participant(&bob_db, bob_id);
+            let charlie = open_participant(&charlie_db, charlie_id);
+
+            // ── group_a: Alice creates, adds Bob + Charlie ──
+            alice.create_group(group_a, "Alpha").unwrap();
+            let bob_kp = bob.generate_key_package().unwrap();
+            let charlie_kp = charlie.generate_key_package().unwrap();
+            let (commit_a, welcome_a) = alice
+                .add_members(group_a, vec![bob_kp, charlie_kp])
+                .unwrap();
+            bob.join_group(&welcome_a).unwrap();
+            charlie.join_group(&welcome_a).unwrap();
+
+            // Alice sends in group_a — both Bob & Charlie decrypt
+            let ct = alice.encrypt(group_a, b"alpha-hello").unwrap();
+            assert_decrypt_all(alice_id, group_a, &ct, &[&bob, &charlie]);
+
+            // ── group_b: Bob creates, adds Charlie (Alice is NOT in this group) ──
+            bob.create_group(group_b, "Beta").unwrap();
+            let charlie_kp2 = charlie.generate_key_package().unwrap();
+            let (_commit_b, welcome_b) = bob.add_members(group_b, vec![charlie_kp2]).unwrap();
+            charlie.join_group(&welcome_b).unwrap();
+
+            // Bob sends in group_b — only Charlie decrypts
+            let ct2 = bob.encrypt(group_b, b"beta-hello").unwrap();
+            let MlsDecryptResult::Application {
+                plaintext,
+                sender_id,
+            } = charlie.decrypt(group_b, &ct2).unwrap()
+            else {
+                panic!("Charlie should decrypt in group_b");
+            };
+            assert_eq!(plaintext, b"beta-hello");
+            assert_eq!(sender_id, bob_id);
+
+            // Alice should NOT have group_b
+            assert!(alice.encrypt(group_b, b"oops").is_err());
+        }
+        // ── All dropped — simulating full app restart ──
+
+        // ════════════════════════════════════════════════════════
+        // Phase 2: Restart — restore all 3 identities, verify both groups
+        // ════════════════════════════════════════════════════════
+        {
+            let alice = open_participant(&alice_db, alice_id);
+            let bob = open_participant(&bob_db, bob_id);
+            let charlie = open_participant(&charlie_db, charlie_id);
+
+            // ── group_a still works ──
+            // Verify members
+            let members_a = alice.group_members(group_a).unwrap();
+            assert_eq!(members_a.len(), 3);
+            assert!(members_a.contains(&alice_id.to_string()));
+            assert!(members_a.contains(&bob_id.to_string()));
+            assert!(members_a.contains(&charlie_id.to_string()));
+
+            // All three inboxes match
+            let inbox_a1 = alice.derive_temp_inbox(group_a).unwrap();
+            let inbox_a2 = bob.derive_temp_inbox(group_a).unwrap();
+            let inbox_a3 = charlie.derive_temp_inbox(group_a).unwrap();
+            assert_eq!(inbox_a1, inbox_a2);
+            assert_eq!(inbox_a2, inbox_a3);
+
+            // Bob sends in group_a
+            let ct = bob.encrypt(group_a, b"alpha-after-restart").unwrap();
+            assert_decrypt_all(bob_id, group_a, &ct, &[&alice, &charlie]);
+
+            // ── group_b still works ──
+            let members_b = bob.group_members(group_b).unwrap();
+            assert_eq!(members_b.len(), 2);
+            assert!(members_b.contains(&bob_id.to_string()));
+            assert!(members_b.contains(&charlie_id.to_string()));
+
+            // Charlie sends in group_b
+            let ct2 = charlie.encrypt(group_b, b"beta-after-restart").unwrap();
+            let MlsDecryptResult::Application { plaintext, .. } =
+                bob.decrypt(group_b, &ct2).unwrap()
+            else {
+                panic!("Bob should decrypt in group_b");
+            };
+            assert_eq!(plaintext, b"beta-after-restart");
+
+            // ── Epoch rotation in group_a (two-phase) ──
+            let commit = alice.self_update(group_a).unwrap();
+            bob.process_commit(group_a, &commit).unwrap();
+            charlie.process_commit(group_a, &commit).unwrap();
+            alice.self_commit(group_a).unwrap();
+
+            let new_inbox = alice.derive_temp_inbox(group_a).unwrap();
+            assert_ne!(new_inbox, inbox_a1, "epoch should advance");
+            assert_eq!(new_inbox, bob.derive_temp_inbox(group_a).unwrap());
+            assert_eq!(new_inbox, charlie.derive_temp_inbox(group_a).unwrap());
+
+            // Message in new epoch
+            let ct3 = charlie.encrypt(group_a, b"alpha-new-epoch").unwrap();
+            assert_decrypt_all(charlie_id, group_a, &ct3, &[&alice, &bob]);
+
+            // ── Epoch rotation in group_b (two-phase, independent of group_a) ──
+            let commit_b = bob.self_update(group_b).unwrap();
+            charlie.process_commit(group_b, &commit_b).unwrap();
+            bob.self_commit(group_b).unwrap();
+
+            let ct4 = bob.encrypt(group_b, b"beta-new-epoch").unwrap();
+            let MlsDecryptResult::Application { plaintext: p4, .. } =
+                charlie.decrypt(group_b, &ct4).unwrap()
+            else {
+                panic!("Charlie should decrypt in group_b new epoch");
+            };
+            assert_eq!(p4, b"beta-new-epoch");
+        }
+        // ── All dropped again ──
+
+        // ════════════════════════════════════════════════════════
+        // Phase 3: Second restart — add new member to group_a,
+        //          remove member from group_b, verify isolation
+        // ════════════════════════════════════════════════════════
+        {
+            let alice = open_participant(&alice_db, alice_id);
+            let bob = open_participant(&bob_db, bob_id);
+            let charlie = open_participant(&charlie_db, charlie_id);
+
+            // ── Remove Charlie from group_a (two-phase) ──
+            let charlie_idx = alice.find_member_index(group_a, charlie_id).unwrap();
+            let rm_commit = alice.remove_members(group_a, &[charlie_idx]).unwrap();
+            bob.process_commit(group_a, &rm_commit).unwrap();
+            alice.self_commit(group_a).unwrap();
+
+            // Alice sends — Bob can decrypt, Charlie cannot
+            let ct = alice.encrypt(group_a, b"alpha-no-charlie").unwrap();
+            let MlsDecryptResult::Application { plaintext, .. } =
+                bob.decrypt(group_a, &ct).unwrap()
+            else {
+                panic!("Bob should still decrypt in group_a");
+            };
+            assert_eq!(plaintext, b"alpha-no-charlie");
+            assert!(
+                charlie.decrypt(group_a, &ct).is_err(),
+                "Charlie should NOT decrypt after removal"
+            );
+
+            // ── group_b unaffected — Charlie still in group_b ──
+            let ct2 = charlie.encrypt(group_b, b"beta-still-here").unwrap();
+            let MlsDecryptResult::Application { plaintext: p2, .. } =
+                bob.decrypt(group_b, &ct2).unwrap()
+            else {
+                panic!("Bob should decrypt Charlie's msg in group_b");
+            };
+            assert_eq!(p2, b"beta-still-here");
+
+            // ── Verify metadata survives all restarts ──
+            let ext_a = alice.group_extension(group_a).unwrap();
+            assert_eq!(ext_a.name(), "Alpha");
+            assert_eq!(ext_a.status(), "active");
+
+            let ext_b = bob.group_extension(group_b).unwrap();
+            assert_eq!(ext_b.name(), "Beta");
+            assert_eq!(ext_b.status(), "active");
+        }
+        // ── Phase 4: Third restart — verify final state ──
+        {
+            let alice = open_participant(&alice_db, alice_id);
+            let bob = open_participant(&bob_db, bob_id);
+
+            // group_a: only Alice + Bob
+            let members = alice.group_members(group_a).unwrap();
+            assert_eq!(members.len(), 2);
+
+            let ct = bob.encrypt(group_a, b"final-check").unwrap();
+            let MlsDecryptResult::Application {
+                plaintext,
+                sender_id,
+            } = alice.decrypt(group_a, &ct).unwrap()
+            else {
+                panic!("Alice should decrypt final-check");
+            };
+            assert_eq!(plaintext, b"final-check");
+            assert_eq!(sender_id, bob_id);
+        }
+    }
+
+    /// Verify that after remove_members (which calls merge_pending_commit
+    /// on a local variable), the subsequent encrypt produces messages at
+    /// the new epoch. This is the exact scenario that fails in the
+    /// comprehensive E2E test (Phase 11).
+    #[test]
+    fn test_remove_member_epoch_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice_db = dir
+            .path()
+            .join("alice_mls.db")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bob_db = dir.path().join("bob_mls.db").to_str().unwrap().to_string();
+        let charlie_db = dir
+            .path()
+            .join("charlie_mls.db")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let alice_id = "alice_epoch_test";
+        let bob_id = "bob_epoch_test";
+        let charlie_id = "charlie_epoch_test";
+
+        let alice = open_participant(&alice_db, alice_id);
+        let bob = open_participant(&bob_db, bob_id);
+        let charlie = open_participant(&charlie_db, charlie_id);
+
+        let group_id = "epoch-test-group";
+        alice.create_group(group_id, "EpochTest").unwrap();
+
+        let bob_kp = bob.generate_key_package().unwrap();
+        let charlie_kp = charlie.generate_key_package().unwrap();
+
+        let (_commit, welcome) = alice
+            .add_members(group_id, vec![bob_kp, charlie_kp])
+            .unwrap();
+        bob.join_group(&welcome).unwrap();
+        charlie.join_group(&welcome).unwrap();
+
+        // Pre-remove: messaging works (Alice + Bob + Charlie all at same epoch)
+        let ct0 = alice.encrypt(group_id, b"before-remove").unwrap();
+        let MlsDecryptResult::Application { plaintext, .. } = bob.decrypt(group_id, &ct0).unwrap()
+        else {
+            panic!("pre-remove decrypt failed");
+        };
+        assert_eq!(plaintext, b"before-remove");
+
+        // Remove Charlie — two-phase: remove → self_commit
+        let charlie_idx = alice.find_member_index(group_id, charlie_id).unwrap();
+        let rm_commit = alice.remove_members(group_id, &[charlie_idx]).unwrap();
+
+        // Bob processes the remove commit BEFORE Alice merges
+        bob.process_commit(group_id, &rm_commit).unwrap();
+
+        // Alice merges (advancing to new epoch)
+        alice.self_commit(group_id).unwrap();
+
+        // Now Alice encrypts at new epoch — Bob is already there
+        let ct1 = alice.encrypt(group_id, b"post-remove").unwrap();
+
+        // Bob decrypts
+        match bob.decrypt(group_id, &ct1) {
+            Ok(MlsDecryptResult::Application { plaintext, .. }) => {
+                assert_eq!(plaintext, b"post-remove");
+            }
+            Ok(_) => panic!("expected Application message"),
+            Err(e) => panic!(
+                "EPOCH SYNC BUG: Bob cannot decrypt post-remove message: {e}\n\
+                 This means remove_members + merge_pending_commit did not persist \
+                 the new epoch to SQLite storage, so the subsequent encrypt() \
+                 loaded the old epoch via load_group()."
+            ),
+        }
+
+        // Charlie must NOT decrypt
+        assert!(
+            charlie.decrypt(group_id, &ct1).is_err(),
+            "Removed member must not decrypt"
+        );
     }
 }

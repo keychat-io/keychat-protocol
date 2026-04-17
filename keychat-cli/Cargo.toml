@@ -33,6 +33,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 unicode-width = "0.2"
 qrcode = "0.14"
 open = "5"
+base64 = { workspace = true }
 
 [dev-dependencies]
 keychat-uniffi = { path = "../keychat-uniffi" }
