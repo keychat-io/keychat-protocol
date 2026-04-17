@@ -1,5 +1,12 @@
 [workspace]
-members = ["libkeychat", "keychat-app-core", "keychat-uniffi", "keychat-cli"]
+members = [
+    "libkeychat",
+    "keychat-app-core",
+    "keychat-uniffi",
+    "keychat-cli",
+    "keychat-wallet",
+    "keychat-wallet-uniffi",
+]
 resolver = "2"
 
 [workspace.dependencies]
@@ -15,3 +22,22 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+bip39 = { version = "2", features = ["rand"] }
+bitcoin = { version = "0.32", features = ["serde"] }
+cdk = { version = "0.15.1", default-features = false, features = ["wallet"] }
+cdk-common = { version = "0.15.1", default-features = false }
+cdk-sqlite = { version = "0.15.1", default-features = false, features = ["wallet"] }
+
+[patch.crates-io]
+# Patch cdk-sqlite to use rusqlite 0.32 (same as the rest of the workspace)
+# to avoid the `links = "sqlite3"` conflict between rusqlite 0.31 and 0.32.
+#
+# The upstream crate on crates.io (0.15.1) pins rusqlite 0.31; two rusqlite
+# majors cannot coexist in one binary because both declare
+# `links = "sqlite3"`. The vendored copy under `patches/cdk-sqlite/` is a
+# byte-for-byte copy with rusqlite bumped to 0.32 — see the header of
+# `patches/cdk-sqlite/Cargo.toml` for the full rationale.
+#
+# Remove this patch entry (and the `patches/cdk-sqlite/` directory) once
+# upstream cdk-sqlite publishes a release that depends on rusqlite >= 0.32.
+cdk-sqlite = { path = "patches/cdk-sqlite" }

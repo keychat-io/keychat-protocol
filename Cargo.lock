@@ -797,6 +797,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdk-sql-common"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6625a8248a43fbebb92cc57f1b09c453d5de94d62a512b62e9a62b25d0dd5506"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "cdk-common",
+ "lightning-invoice",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cdk-sqlite"
+version = "0.15.1"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "cdk-common",
+ "cdk-sql-common",
+ "lightning-invoice",
+ "paste",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2464,6 +2502,36 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uniffi",
+]
+
+[[package]]
+name = "keychat-wallet"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bip39",
+ "bitcoin",
+ "cdk",
+ "cdk-common",
+ "cdk-sqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "keychat-wallet-uniffi"
+version = "0.1.0"
+dependencies = [
+ "keychat-wallet",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uniffi",
 ]
 

@@ -1,0 +1,52 @@
+# Local patch of cdk-sqlite 0.15.1.
+#
+# Why this patch exists:
+#   Upstream cdk-sqlite 0.15.1 pulls in `rusqlite` 0.31, while the rest of the
+#   workspace (and the keychat-app-core SQLCipher code) is on `rusqlite` 0.32.
+#   Cargo refuses to link two crates declaring `links = "sqlite3"` into the
+#   same binary, so the build fails with a duplicate-native-library error.
+#   This vendored copy is identical to the published crate except the
+#   `rusqlite` dependency is bumped to 0.32.
+#
+# When this patch can be removed:
+#   As soon as upstream cdk-sqlite releases a version that depends on
+#   rusqlite >= 0.32 (tracked in the CDK repo — see the `rusqlite` bump
+#   issue/PR on https://github.com/cashubtc/cdk). Once published, delete
+#   `patches/cdk-sqlite/` and drop the matching `[patch.crates-io]` entry
+#   in the workspace root `Cargo.toml`.
+
+[package]
+edition = "2021"
+rust-version = "1.85.0"
+name = "cdk-sqlite"
+version = "0.15.1"
+authors = ["CDK Developers"]
+description = "SQLite storage backend for CDK (patched for rusqlite 0.32)"
+license = "MIT"
+repository = "https://github.com/cashubtc/cdk.git"
+
+[lib]
+name = "cdk_sqlite"
+path = "src/lib.rs"
+
+[features]
+default = ["mint", "wallet"]
+mint    = ["cdk-common/mint", "cdk-sql-common/mint"]
+wallet  = ["cdk-common/wallet", "cdk-sql-common/wallet"]
+sqlcipher  = ["rusqlite/bundled-sqlcipher"]
+prometheus = ["cdk-sql-common/prometheus"]
+
+[dependencies]
+async-trait = "0.1"
+bitcoin = { version = "0.32.2", features = ["base64", "serde", "rand", "rand-std"] }
+cdk-common     = { version = "=0.15.1", features = ["test"], default-features = false }
+cdk-sql-common = { version = "=0.15.1" }
+lightning-invoice = { version = "0.34.0", features = ["serde", "std"] }
+paste       = "1.0.15"
+rusqlite    = { version = "0.32", features = ["bundled"] }
+serde       = { version = "1", features = ["derive", "rc"] }
+serde_json  = "1"
+thiserror   = "2"
+tokio       = { version = "1", features = ["rt", "macros", "sync", "rt-multi-thread"] }
+tracing     = { version = "0.1", features = ["attributes", "log"] }
+uuid        = { version = "1", features = ["v4", "serde"] }

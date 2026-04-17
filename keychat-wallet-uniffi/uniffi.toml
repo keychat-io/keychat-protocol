@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "KeychatWalletFFI"
+ffi_module_name = "keychat_wallet_uniffiFFI"
+generate_immutable_records = true
