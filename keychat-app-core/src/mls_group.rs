@@ -501,6 +501,39 @@ impl AppClient {
         Ok(())
     }
 
+    /// MLS self-update (key rotation). Broadcasts a Commit to the current
+    /// mlsTempInbox, then merges locally and re-subscribes.
+    pub async fn mls_self_update(&self, group_id: String) -> AppResult<()> {
+        // Phase 1: create Commit + derive CURRENT inbox (before merge)
+        let (commit_bytes, old_mls_temp_inbox) = {
+            let guard = self.lock_mls()?;
+            let participant = guard.as_ref().unwrap();
+            let old_inbox = participant.derive_temp_inbox(&group_id)?;
+            let commit_bytes = participant.self_update(&group_id)?;
+            (commit_bytes, old_inbox)
+        };
+
+        // Phase 2: broadcast to OLD inbox
+        let event = broadcast_commit(&commit_bytes, &old_mls_temp_inbox)?;
+        let inner = self.inner.read().await;
+        if let Some(t) = inner.protocol.transport() {
+            let _ = t.publish_event_async(event).await;
+        }
+        drop(inner);
+
+        // Phase 3: merge locally
+        {
+            let guard = self.lock_mls()?;
+            let participant = guard.as_ref().unwrap();
+            participant.self_commit(&group_id)?;
+        }
+
+        // Phase 4: re-subscribe
+        self.refresh_mls_subscriptions().await;
+
+        Ok(())
+    }
+
     /// Leave an MLS group.
     pub async fn leave_mls_group(&self, group_id: String) -> AppResult<()> {
         let (proposal_bytes, mls_temp_inbox) = {

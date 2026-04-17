@@ -255,6 +255,7 @@ impl ProtocolClient {
         self.self_is_public_agent = false;
         self.peer_uses_dual_p_tag.clear();
         self.pending_outbound.clear();
+        self.peer_pending_first_inbox.clear();
         self.group_manager = GroupManager::new();
         self.next_signal_device_id = 1;
         self.subscription_ids.clear();
@@ -1164,7 +1165,20 @@ impl ProtocolClient {
             connected.len()
         );
 
-        // 6. Update address reverse index
+        // 6. Update address reverse index + persist
+        if !addr_update.new_receiving.is_empty() || addr_update.new_sending.is_some() {
+            let addr_state_opt = {
+                let session = session_mutex.lock().await;
+                session.addresses.to_serialized(&signal_hex)
+            };
+            if let Some(addr_state) = addr_state_opt {
+                if let Ok(store) = self.storage.lock() {
+                    if let Err(e) = store.save_peer_addresses(&signal_hex, &addr_state) {
+                        tracing::error!("persist address state after send failed: {e}");
+                    }
+                }
+            }
+        }
         for addr in &addr_update.new_receiving {
             self.receiving_addr_to_peer
                 .insert(addr.clone(), signal_hex.clone());
@@ -1617,9 +1631,13 @@ impl ProtocolClient {
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = crate::ChatSession::new(accepted.signal_participant, addresses, identity);
 
-        // Persist.
-        if let Ok(store) = self.storage.lock() {
-            let _ = store.save_signal_participant(
+        // Persist — critical: if these fail the session is lost on restart.
+        {
+            let store = self
+                .storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
+            store.save_signal_participant(
                 &peer_signal_hex,
                 signal_device_id,
                 &id_pub,
@@ -1627,11 +1645,13 @@ impl ProtocolClient {
                 reg_id,
                 spk_id,
                 &spk_rec,
-            );
+            )?;
+            store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                    tracing::error!("persist address state failed: {e}");
+                }
             }
-            let _ = store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name);
         }
 
         // In-memory state.
@@ -1739,9 +1759,13 @@ impl ProtocolClient {
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = crate::ChatSession::new(accepted.signal_participant, addresses, identity);
 
-        // Persist to SecureStorage
-        if let Ok(store) = self.storage.lock() {
-            let _ = store.save_signal_participant(
+        // Persist to SecureStorage — critical for session survival.
+        {
+            let store = self
+                .storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
+            store.save_signal_participant(
                 &peer_signal_hex,
                 signal_device_id,
                 &id_pub,
@@ -1749,12 +1773,16 @@ impl ProtocolClient {
                 reg_id,
                 spk_id,
                 &spk_rec,
-            );
+            )?;
+            store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                    tracing::error!("persist address state failed: {e}");
+                }
             }
-            let _ = store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name);
-            let _ = store.delete_inbound_fr(request_id);
+            if let Err(e) = store.delete_inbound_fr(request_id) {
+                tracing::warn!("delete inbound FR failed: {e}");
+            }
         }
 
         // Update in-memory state
@@ -2145,9 +2173,12 @@ impl ProtocolClient {
         let recv_addrs = addresses.get_all_receiving_address_strings();
         let session = crate::ChatSession::new(state.signal_participant, addresses, identity);
 
-        // Persist to SecureStorage
-        if let Ok(store) = self.storage.lock() {
-            // Save signal participant identity (pub + priv key for restore_sessions)
+        // Persist to SecureStorage — critical for session survival.
+        {
+            let store = self
+                .storage
+                .lock()
+                .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
             let id_pub = session
                 .signal
                 .identity_key_pair()
@@ -2160,7 +2191,7 @@ impl ProtocolClient {
                 .private_key()
                 .serialize()
                 .to_vec();
-            let _ = store.save_signal_participant(
+            store.save_signal_participant(
                 &peer_signal_hex,
                 u32::from(session.signal.address().device_id()),
                 &id_pub,
@@ -2168,18 +2199,16 @@ impl ProtocolClient {
                 session.signal.registration_id(),
                 0,
                 &[],
-            );
-
-            // Save peer address state
+            )?;
+            store.save_peer_mapping(&peer_nostr_id, &peer_signal_hex, &peer_name)?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                let _ = store.save_peer_addresses(&peer_signal_hex, &addr_state);
+                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                    tracing::error!("persist address state failed: {e}");
+                }
             }
-
-            // Save peer mapping
-            let _ = store.save_peer_mapping(&peer_nostr_id, &peer_signal_hex, &peer_name);
-
-            // Delete the pending FR
-            let _ = store.delete_pending_fr(request_id);
+            if let Err(e) = store.delete_pending_fr(request_id) {
+                tracing::warn!("delete pending FR failed: {e}");
+            }
         }
 
         // Public Agent flag from friendApprove (spec §3.6). When set, future

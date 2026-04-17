@@ -102,6 +102,12 @@ impl KeychatClient {
         Ok(())
     }
 
+    /// MLS self-update (key rotation). Broadcasts Commit, advances epoch.
+    pub async fn mls_self_update(&self, group_id: String) -> Result<(), KeychatUniError> {
+        self.app.mls_self_update(group_id).await?;
+        Ok(())
+    }
+
     /// Leave an MLS group.
     pub async fn leave_mls_group(&self, group_id: String) -> Result<(), KeychatUniError> {
         self.app.leave_mls_group(group_id).await?;

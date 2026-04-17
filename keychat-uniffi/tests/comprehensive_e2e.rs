@@ -735,6 +735,56 @@ fn comprehensive_e2e_full_protocol() {
             }
 
             // ═══════════════════════════════════════════════════════
+            // Phase 11a: MLS self-update (key rotation) on MLS-Main
+            // ═══════════════════════════════════════════════════════
+            tracing::info!("═══ Phase 11a: MLS self-update on MLS-Main");
+
+            alice
+                .mls_self_update(mls_group_id.clone())
+                .await
+                .unwrap();
+
+            // Wait for Bob and Eve to process the self-update Commit
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+            // Post-rotation messaging must work
+            clear_events(&bob_ev);
+            clear_events(&eve_ev);
+
+            alice
+                .send_mls_text(mls_group_id.clone(), "post-rotation msg".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[("Bob", &bob_ev, &bob_n), ("Eve", &eve_ev, &eve_n)] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "post-rotation msg")
+                    })
+                    .await,
+                    "{name} did not receive 'post-rotation msg' after self-update"
+                );
+            }
+
+            // Bob also sends — verifies Bob's epoch is aligned
+            clear_events(&alice_ev);
+            clear_events(&eve_ev);
+
+            bob.send_mls_text(mls_group_id.clone(), "bob post-rotation".into(), None)
+                .await
+                .unwrap();
+
+            for (name, ev, n) in &[("Alice", &alice_ev, &alice_n), ("Eve", &eve_ev, &eve_n)] {
+                assert!(
+                    wait_event(ev, n, 30, |e| {
+                        matches!(e, ClientEvent::MessageReceived { content: Some(c), .. } if c == "bob post-rotation")
+                    })
+                    .await,
+                    "{name} did not receive 'bob post-rotation'"
+                );
+            }
+
+            // ═══════════════════════════════════════════════════════
             // Phase 11b: Signal Group 3 — Charlie creates "Project"
             // ═══════════════════════════════════════════════════════
             tracing::info!("═══ Phase 11b: Signal Group 3 — Project");

@@ -3384,10 +3384,11 @@ fn mls_multi_identity_multi_group_persistence() {
                 };
                 assert_eq!(p3, b"beta-after-restart");
 
-                // Epoch rotation in group_a
+                // Epoch rotation in group_a (two-phase: broadcast then merge)
                 let commit = alice.self_update(group_a).unwrap();
                 bob.process_commit(group_a, &commit).unwrap();
                 charlie.process_commit(group_a, &commit).unwrap();
+                alice.self_commit(group_a).unwrap();
 
                 // All 3 derive same new temp inbox
                 let inbox_a = alice.derive_temp_inbox(group_a).unwrap();
@@ -3405,9 +3406,10 @@ fn mls_multi_identity_multi_group_persistence() {
                 };
                 assert_eq!(p4, b"alpha-new-epoch");
 
-                // Epoch rotation in group_b (independent)
+                // Epoch rotation in group_b (independent, two-phase)
                 let commit_b = bob.self_update(group_b).unwrap();
                 charlie.process_commit(group_b, &commit_b).unwrap();
+                bob.self_commit(group_b).unwrap();
 
                 let ct4 = bob.encrypt(group_b, b"beta-new-epoch").unwrap();
                 let MlsDecryptResult::Application { plaintext: p5, .. } =

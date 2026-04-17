@@ -527,6 +527,10 @@ impl MlsParticipant {
     }
 
     /// Self-update (key rotation). Returns the serialized Commit.
+    ///
+    /// Like `remove_members`, does NOT merge the pending commit.
+    /// The caller must broadcast the Commit to the current mlsTempInbox
+    /// first, then call `self_commit()` to advance the epoch.
     pub fn self_update(&self, group_id: &str) -> Result<Vec<u8>> {
         let mut group = self.load_group(group_id)?;
 
@@ -542,10 +546,6 @@ impl MlsParticipant {
             .commit()
             .tls_serialize_detached()
             .map_err(|e| KeychatError::Mls(format!("serialize commit: {e}")))?;
-
-        group
-            .merge_pending_commit(self.provider.inner())
-            .map_err(|e| KeychatError::Mls(format!("merge commit error: {e}")))?;
 
         Ok(commit_bytes)
     }
@@ -605,7 +605,7 @@ impl MlsParticipant {
     /// Derive the MLS temp inbox address for a group (§11.3).
     pub fn derive_temp_inbox(&self, group_id: &str) -> Result<String> {
         let export_secret = self.export_secret(group_id, MLS_TEMP_INBOX_LABEL, &[], 32)?;
-        Ok(derive_mls_temp_inbox(&export_secret))
+        derive_mls_temp_inbox(&export_secret)
     }
 
     /// Get the list of members' credential identities in the group.
@@ -737,18 +737,19 @@ impl MlsParticipant {
 /// All members in the same epoch compute the same value.
 ///
 /// Returns a hex-encoded secp256k1 x-only pubkey (64 hex chars).
-pub fn derive_mls_temp_inbox(export_secret: &[u8]) -> String {
-    assert_eq!(
-        export_secret.len(),
-        32,
-        "export_secret must be 32 bytes (MLS exportSecret len=32)"
-    );
+pub fn derive_mls_temp_inbox(export_secret: &[u8]) -> Result<String> {
+    if export_secret.len() != 32 {
+        return Err(KeychatError::Mls(format!(
+            "export_secret must be 32 bytes, got {}",
+            export_secret.len()
+        )));
+    }
     let secp = secp256k1::Secp256k1::new();
     let secret_key = secp256k1::SecretKey::from_slice(export_secret)
-        .expect("32-byte MLS export_secret is a valid secp256k1 secret key");
+        .map_err(|e| KeychatError::Mls(format!("invalid secp256k1 secret from export: {e}")))?;
     let (x_only, _parity) =
         secp256k1::Keypair::from_secret_key(&secp, &secret_key).x_only_public_key();
-    hex::encode(x_only.serialize())
+    Ok(hex::encode(x_only.serialize()))
 }
 
 // ─── MLS Group Transport (Part B) ──────────────────────────────────────────
@@ -1056,19 +1057,18 @@ mod tests {
         // Get temp inbox before self_update
         let inbox_before = alice.derive_temp_inbox(group_id).unwrap();
 
-        // Alice does a self-update (key rotation)
+        // Alice does a self-update (two-phase: update → broadcast → merge)
         let commit = alice.self_update(group_id).unwrap();
+        bob.process_commit(group_id, &commit).unwrap();
+        alice.self_commit(group_id).unwrap();
 
-        // After the commit, Alice's temp inbox should change
+        // After merge, Alice's temp inbox should change
         let inbox_after = alice.derive_temp_inbox(group_id).unwrap();
 
         assert_ne!(
             inbox_before, inbox_after,
             "mlsTempInbox must change after epoch advance"
         );
-
-        // Bob processes the commit
-        bob.process_commit(group_id, &commit).unwrap();
         let bob_inbox_after = bob.derive_temp_inbox(group_id).unwrap();
 
         // Both should derive the same new inbox
@@ -1259,14 +1259,14 @@ mod tests {
     fn test_mls_temp_inbox_deterministic() {
         let export_secret = [42u8; 32];
 
-        let inbox1 = derive_mls_temp_inbox(&export_secret);
-        let inbox2 = derive_mls_temp_inbox(&export_secret);
+        let inbox1 = derive_mls_temp_inbox(&export_secret).unwrap();
+        let inbox2 = derive_mls_temp_inbox(&export_secret).unwrap();
 
         assert_eq!(inbox1, inbox2);
 
         // Different export_secret should produce different result
         let export_secret2 = [43u8; 32];
-        let inbox3 = derive_mls_temp_inbox(&export_secret2);
+        let inbox3 = derive_mls_temp_inbox(&export_secret2).unwrap();
         assert_ne!(inbox1, inbox3);
 
         // The result should be a valid 64-char hex string (secp256k1 x-only pubkey)
@@ -1276,10 +1276,8 @@ mod tests {
 
     #[test]
     fn test_mls_temp_inbox_known_answer() {
-        // Known-answer test: lock the derivation so accidental changes get caught.
-        // export_secret = [0x42; 32] interpreted as secp256k1 secret key.
         let export_secret = [0x42u8; 32];
-        let inbox = derive_mls_temp_inbox(&export_secret);
+        let inbox = derive_mls_temp_inbox(&export_secret).unwrap();
         assert_eq!(
             inbox,
             "24653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c",
@@ -1287,9 +1285,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "export_secret must be 32 bytes")]
     fn test_mls_temp_inbox_rejects_wrong_length() {
-        let _ = derive_mls_temp_inbox(&[0u8; 31]);
+        let result = derive_mls_temp_inbox(&[0u8; 31]);
+        assert!(result.is_err());
     }
 
     // ─── Test 9: Multiple epochs ───────────────────────────────────────────
@@ -1308,10 +1306,11 @@ mod tests {
 
         let mut prev_inbox = alice.derive_temp_inbox(group_id).unwrap();
 
-        // Do several self-updates, checking messages work after each
+        // Do several self-updates (two-phase each)
         for i in 0..3 {
             let commit = alice.self_update(group_id).unwrap();
             bob.process_commit(group_id, &commit).unwrap();
+            alice.self_commit(group_id).unwrap();
 
             let new_inbox = alice.derive_temp_inbox(group_id).unwrap();
             assert_ne!(prev_inbox, new_inbox, "epoch {i}: inbox must change");
@@ -1586,10 +1585,11 @@ mod tests {
             };
             assert_eq!(plaintext, b"beta-after-restart");
 
-            // ── Epoch rotation in group_a ──
+            // ── Epoch rotation in group_a (two-phase) ──
             let commit = alice.self_update(group_a).unwrap();
             bob.process_commit(group_a, &commit).unwrap();
             charlie.process_commit(group_a, &commit).unwrap();
+            alice.self_commit(group_a).unwrap();
 
             let new_inbox = alice.derive_temp_inbox(group_a).unwrap();
             assert_ne!(new_inbox, inbox_a1, "epoch should advance");
@@ -1600,9 +1600,10 @@ mod tests {
             let ct3 = charlie.encrypt(group_a, b"alpha-new-epoch").unwrap();
             assert_decrypt_all(charlie_id, group_a, &ct3, &[&alice, &bob]);
 
-            // ── Epoch rotation in group_b (independent of group_a) ──
+            // ── Epoch rotation in group_b (two-phase, independent of group_a) ──
             let commit_b = bob.self_update(group_b).unwrap();
             charlie.process_commit(group_b, &commit_b).unwrap();
+            bob.self_commit(group_b).unwrap();
 
             let ct4 = bob.encrypt(group_b, b"beta-new-epoch").unwrap();
             let MlsDecryptResult::Application { plaintext: p4, .. } =
