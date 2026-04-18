@@ -531,6 +531,142 @@ impl KCMessage {
         }
     }
 
+    /// Try to parse as v2; if that fails, fall back to a minimal v1
+    /// KeychatMessage parser so we can inter-operate with legacy Flutter
+    /// peers that emit `{"c":"signal","type":<n>,"msg":..,"name":..,"data":..}`
+    /// after Signal-decrypting a DM or friend-approve.
+    ///
+    /// Only the v1 message types needed for 1:1 compat are recognised (DM,
+    /// FriendApprove, FriendReject). Unknown v1 types return `None` so the
+    /// caller can route them through app-core's richer `v1_to_v2`.
+    pub fn try_parse_any(s: &str) -> Option<Self> {
+        if let Some(v2) = Self::try_parse(s) {
+            return Some(v2);
+        }
+        let v: serde_json::Value = match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => return Some(Self::text(s.to_string())),
+        };
+        let msg_type = match v.get("type").and_then(|t| t.as_u64()) {
+            Some(n) => n as u32,
+            None => return Some(Self::text(s.to_string())),
+        };
+        match msg_type {
+            // v1 DM
+            100 => {
+                let text = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+                Some(Self::text(text.to_string()))
+            }
+            // v1 ADD_CONTACT_FROM_ALICE (friend request). `name` carries the
+            // QRUserModel as a serialized JSON string with camelCase fields.
+            101 => {
+                let name_field = v.get("name").and_then(|n| n.as_str())?;
+                let qr: serde_json::Value = serde_json::from_str(name_field).ok()?;
+                let greeting = v
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let payload = KCFriendRequestPayload {
+                    message: if greeting.is_empty() {
+                        None
+                    } else {
+                        Some(greeting)
+                    },
+                    name: qr
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    nostr_identity_key: qr
+                        .get("pubkey")
+                        .and_then(|x| x.as_str())?
+                        .to_string(),
+                    signal_identity_key: qr
+                        .get("curve25519PkHex")
+                        .and_then(|x| x.as_str())?
+                        .to_string(),
+                    first_inbox: qr
+                        .get("onetimekey")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    device_id: "1".to_string(),
+                    signal_signed_prekey_id: qr
+                        .get("signedId")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0) as u32,
+                    signal_signed_prekey: qr
+                        .get("signedPublic")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    signal_signed_prekey_signature: qr
+                        .get("signedSignature")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    signal_one_time_prekey_id: qr
+                        .get("prekeyId")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0) as u32,
+                    signal_one_time_prekey: qr
+                        .get("prekeyPubkey")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    signal_kyber_prekey_id: 0,
+                    signal_kyber_prekey: String::new(),
+                    signal_kyber_prekey_signature: String::new(),
+                    global_sign: qr
+                        .get("globalSign")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    time: qr.get("time").and_then(|x| x.as_u64()),
+                    version: 1,
+                    relay: qr
+                        .get("relay")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                    avatar: qr
+                        .get("avatar")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                    lightning: qr
+                        .get("lightning")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                };
+                let mut msg = Self::empty();
+                msg.v = 2;
+                msg.kind = KCMessageKind::FriendRequest;
+                msg.friend_request = Some(payload);
+                Some(msg)
+            }
+            // v1 ADD_CONTACT_FROM_BOB (friend approve). `data` carries the v2
+            // SignalPrekeyAuth as a serialized JSON string so we can preserve
+            // identity-binding context across the v1 wire format.
+            102 => {
+                let mut msg = Self::friend_approve(String::new(), None);
+                if let Some(data_str) = v.get("data").and_then(|d| d.as_str()) {
+                    if let Ok(auth) =
+                        serde_json::from_str::<crate::message::SignalPrekeyAuth>(data_str)
+                    {
+                        msg.signal_prekey_auth = Some(auth);
+                    }
+                }
+                Some(msg)
+            }
+            // v1 REJECT (friend reject)
+            104 => Some(Self::friend_reject(String::new(), None)),
+            _ => Some(Self::text(s.to_string())),
+        }
+    }
+
     /// Serialize to JSON string.
     pub fn to_json(&self) -> crate::Result<String> {
         serde_json::to_string(self).map_err(crate::KeychatError::from)

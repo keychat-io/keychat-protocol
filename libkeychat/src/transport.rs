@@ -129,7 +129,9 @@ impl Transport {
         pubkeys: Vec<PublicKey>,
         since: Option<Timestamp>,
     ) -> Result<SubscriptionId> {
-        let mut filter = Filter::new().kind(Kind::GiftWrap).pubkeys(pubkeys);
+        let mut filter = Filter::new()
+            .kinds([Kind::GiftWrap, Kind::from(4)])
+            .pubkeys(pubkeys);
 
         if let Some(since_ts) = since {
             filter = filter.since(since_ts);
