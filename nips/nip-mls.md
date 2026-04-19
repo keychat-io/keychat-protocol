@@ -1,18 +1,6 @@
-# NIP-XX: MLS Protocol over Nostr (DRAFT)
+# NIP-XX -- MLS Protocol over Nostr
 
-```
-NIP: undefined
-Title: MLS Protocol over Nostr
-Author: Keychat Developer
-Status: Draft V4
-Type: TBD
-Created: 2026-02-06
-License: CC0-1.0
-```
-
-```
-draft` `optional` `author:keychat
-```
+`optional` `author:keychat`
 
 ## Abstract
 
@@ -35,7 +23,7 @@ However, MLS was designed with the assumption of a semi-trusted infrastructure �
 - **Member:** A Nostr account (secp256k1 pubkey) participating in an MLS group. Each member maintains a local MLS group state including their position in the ratchet tree.
 - **Admin:** A member with elevated privileges (stored in group context extensions). Admins can add/remove members and update group metadata. The creator is the initial admin.
 - **Sender:** A member broadcasting MLS messages or group operations (Add/Remove/Update). For application messages, the sender uses a random one-time Nostr keypair to prevent metadata correlation.
-- **Relay:** Acts as the **MLS Delivery Service (DS)**, storing and forwarding encrypted events. Relays are unaware of message content due to MLS encryption (MLS + NIP-44). Unlike a traditional MLS DS, Nostr relays provide **no ordering or delivery guarantees**.
+- **Relay:** Acts as the **MLS Delivery Service (DS)**, storing and forwarding encrypted events. Relays are unaware of message content due to MLS encryption. Unlike a traditional MLS DS, Nostr relays provide **no ordering or delivery guarantees**.
 - **Directory Service:** Implemented via `kind: 10443` Nostr events to host and serve `KeyPackages` for asynchronous group joining. Unlike a traditional MLS Directory Service, there is no central authority — KeyPackages are published by members and may be stored by any relay.
 
 ### Cryptographic Primitives
@@ -54,7 +42,7 @@ This provides:
 
 For details on how these primitives compose within MLS, see RFC 9420 Section 5 (Cryptographic Objects) and Section 13 (Ciphersuites).
 
-Additionally, all MLS protocol messages are wrapped in a **NIP-44 encryption layer** before being published to Nostr relays. The NIP-44 key is derived from the group's `export_secret`:
+The group's shared subscription address (`listen_key`, referred to as `mlsTempInbox` in implementations) is derived from the MLS `export_secret`:
 
 ```
 export_secret = MLS_Export(group_state, label="nostr", context=b"nostr", length=32)
@@ -62,9 +50,7 @@ keypair = secp256k1_keypair_from(export_secret)
 listen_key = x_only_pubkey(keypair)
 ```
 
-This dual-layer encryption ensures:
-1. **MLS layer:** End-to-end encryption among group members with forward secrecy
-2. **NIP-44 layer:** Prevents relays from learning the MLS message structure; provides a stable subscription address (`listen_key`) for all group members
+MLS messages are already end-to-end encrypted by the MLS layer. They are published directly as `kind: 1059` events with `base64(mls_ciphertext)` as the content — no additional NIP-44 encryption is applied.
 
 ### Credential Binding
 
@@ -115,13 +101,17 @@ KeyPackages enable asynchronous group joining. A member publishes their MLS KeyP
 **Notes:**
 
 - `kind: 10443` is a replaceable event, so each new publication replaces the previous one per relay.
-- Clients SHOULD rotate KeyPackages periodically (recommended: every 30 days) and validate expiration via the `lifetime` extension before use.
+- Clients SHOULD rotate KeyPackages periodically and validate expiration via the `lifetime` extension before use. However, on a decentralized network, the target member may be offline and unable to refresh an expired KeyPackage. Implementations SHOULD decide their own policy — for example, accepting recently expired KeyPackages with a grace period, using a longer `lifetime` (e.g., 180 days), or prompting the admin to retry later. The trade-off is between security (rejecting stale key material) and usability (not blocking group invitations).
+- After a KeyPackage is consumed by a Welcome, the member SHOULD publish a fresh one as soon as possible.
 - The KeyPackage's `LeafNode` credential MUST contain the member's Nostr secp256k1 public key in hex format.
+- **Identity verification:** When fetching a KeyPackage, the consumer MUST verify that the `kind: 10443` event's `pubkey` matches the Nostr public key in the KeyPackage's `BasicCredential`. A mismatch indicates a forged credential and the KeyPackage MUST be rejected.
 - Clients SHOULD upload fresh KeyPackages on startup and after joining a group (since the KeyPackage is consumed by the Welcome).
 
 ### 2. Welcome Message (`kind: 444`)
 
-When a member is added to a group, the admin sends a `Welcome` message containing the group state needed for the new member to initialize their local MLS group. // 按照MLS协议，不应该限制仅管理员可邀请成员。
+When a member is added to a group, the admin sends a `Welcome` message containing the group state needed for the new member to initialize their local MLS group.
+
+> **Note:** Per RFC 9420, MLS does not restrict invitation to admins only. However, in this specification, only admins SHOULD perform Add operations to simplify group governance on a decentralized network.
 
 **Event Structure (NIP-17 Gift Wrap):**
 
@@ -163,31 +153,62 @@ All MLS protocol messages (application messages, Commits, Proposals) within a gr
 {
   "kind": 1059,
   "pubkey": "<random one-time pubkey>",
-  "content": "<NIP-44 encrypted MLS ciphertext>",
+  "content": "<base64(mls_ciphertext)>",
   "tags": [["p", "<listen_key>"]],
   "created_at": <unix_timestamp>
 }
 ```
 
-**Encryption layers (inner to outer):**
+**Encryption:**
 
 1. **MLS PrivateMessage:** Plaintext → `MlsGroup.create_message()` → MLS ciphertext (AuthenticatedContent)
-2. **NIP-44 wrap:** MLS ciphertext → `nip44::encrypt(export_secret_keypair, ...)` → NIP-44 ciphertext string
-3. **Nostr event:** NIP-44 ciphertext → `kind: 1059` event signed by random one-time keypair
+2. **Nostr event:** `base64(mls_ciphertext)` → `kind: 1059` event signed by random one-time keypair
 
-**Decryption (outer to inner):**
+**Decryption:**
 
-1. Member subscribes to `listen_key` on designated relays for `kind: 1059` events
-2. NIP-44 decrypt using `export_secret` derived keypair → MLS ciphertext bytes
+1. Member subscribes to `listen_key` (`mlsTempInbox`) on designated relays for `kind: 1059` events
+2. `base64_decode(content)` → MLS ciphertext bytes
 3. Parse MLS message type: `Application` | `Commit` | `Proposal`
 4. Process accordingly via `MlsGroup.process_message()`
 
 **Listen Key Rotation:**
 
-The `listen_key` is derived from the group's `export_secret`, which changes every time the group epoch advances (after a Commit is merged). After processing a Commit, all members MUST:
+The `listen_key` (stored as `mlsTempInbox` on the room) is derived from the group's `export_secret`, which changes every time the group epoch advances (after a Commit is merged). After processing a Commit, all members MUST:
 1. Derive the new `listen_key` from the updated `export_secret`
 2. Subscribe to the new `listen_key` on the group's relays
 3. Continue listening to the old `listen_key` briefly to handle in-flight messages
+
+## mlsGroupInvite Message
+
+When an admin adds a member to an MLS group, the Welcome data is delivered to the invitee via an `mlsGroupInvite` KCMessage. This message can be sent through an existing Signal session (Mode 1) or via NIP-17 Gift Wrap (Mode 2) if no Signal session exists.
+
+**KCMessage Structure:**
+
+```json
+{
+  "v": 2,
+  "kind": "mlsGroupInvite",
+  "mlsGroupInvite": {
+    "groupId": "<group_pubkey_hex>",
+    "name": "Group Name",
+    "description": "Group description",
+    "adminPubkeys": ["<admin_pubkey_hex>"],
+    "relays": ["wss://relay1.example.com", "wss://relay2.example.com"],
+    "welcome": "<base64-encoded MLS Welcome message>"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `groupId` | `string` | Yes | Group public key (hex) |
+| `name` | `string` | Yes | Group display name |
+| `description` | `string` | No | Group description |
+| `adminPubkeys` | `string[]` | Yes | List of admin Nostr pubkeys (hex) |
+| `relays` | `string[]` | Yes | Designated relay URLs for the group |
+| `welcome` | `string` | Yes | Base64-encoded MLS Welcome message (TLS-serialized) |
+
+The invitee processes the Welcome to join the group (see §3 Joining a Group).
 
 ## Protocol Flow
 
@@ -216,9 +237,9 @@ The creator(admin) initializes the MLS group state locally and generates a `Welc
 1. **Validate KeyPackages**: Fetch kind: 10443 KeyPackages from relays for all invitees and perform validation (ciphersuite, lifetime, signature).
 2. **Add Members & Generate Messages**: Execute add_members to perform an MLS Commit with Add proposals, which generates both the Commit (queued_msg) and Welcome messages.
 3. **Merge Local Commit**: A self_commit() merges the pending Commit into the local group state.
-4. **Distribute Encrypted Messages**:
-    • Broadcast the NIP-44-encrypted Commit message (kind: 1059) to the group's listen_key.
-    • Send the NIP-17 gift-wrapped Welcome message (kind: 444) to each invitee individually.
+4. **Distribute Messages**:
+    • Broadcast the Commit message (kind: 1059, base64-encoded) to the group's `listen_key`.
+    • Send the Welcome to each invitee individually via `mlsGroupInvite` (see [mlsGroupInvite Message](#mlsgroupinvite-message)).
 
 ### 3. Joining a Group
 
@@ -237,7 +258,7 @@ When a member receives a Welcome message:
 
 All group communication — application messages, Commits, and Proposals — flows through `kind: 1059` events addressed to the group's `listen_key`. Welcome messages are **not** part of this flow; they are delivered individually to invitees via NIP-17 (`kind: 444`) as described in §2 (Event Classification) and §3 (Joining a Group).
 
-Members subscribe to the group's `listen_key` on designated relays. Upon receiving a `kind: 1059` event, the client decrypts it (NIP-44 → MLS) and dispatches based on message type:
+Members subscribe to the group's `listen_key` (`mlsTempInbox`) on designated relays. Upon receiving a `kind: 1059` event, the client decodes and decrypts it via MLS and dispatches based on message type:
 
 | Message Type                                          | Action                                                    | Result                                       |
 | ----------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------- |
@@ -245,11 +266,13 @@ Members subscribe to the group's `listen_key` on designated relays. Upon receivi
 | **Commit** (Add/Remove/Update/GroupContextExtensions) | `others_commit_normal()` → update group state             | Derive new `listen_key`, rotate subscription |
 | **Proposal** (e.g. self-leave)                        | `others_proposal_leave()` → queue proposal                |                                              |
 
-To send a message, a member encrypts the plaintext through the same layers in reverse (MLS → NIP-44 → `kind: 1059` signed by a random one-time keypair) and broadcasts to the group's designated relays. The encryption layer structure is defined in Event Classification §3.
+To send a message, a member encrypts the plaintext via MLS, base64-encodes the ciphertext, and publishes it as a `kind: 1059` event signed by a random one-time keypair to the group's designated relays.
 
 **Fan-out:** Since all members derive the same `listen_key` from the shared `export_secret`, a single broadcast reaches all members.
 
 **Sequencing:** MLS requires strictly ordered messages within an epoch. Clients MUST handle potential out-of-order delivery using the MLS internal `epoch` counter and `sender_data`. If a Commit is received, it MUST be processed before any subsequent application messages in the new epoch.
+
+**Commit authority:** This specification RECOMMENDS an admin-only Commit model — only admins issue Commits for membership changes (Add/Remove) and group metadata updates. This significantly reduces the probability of concurrent Commit conflicts on a decentralized network. Member-initiated operations (self-update for key rotation, self-leave) produce Proposals that are committed by an admin. Implementations MAY adopt alternative governance models (e.g., any-member Commit) at their own discretion.
 
 ### 5. Membership Changes
 
@@ -277,7 +300,7 @@ A non-admin member can leave a group:
 2. Admin processes the proposal (`others_proposal_leave`) and commits (`admin_proposal_leave` → `admin_commit_leave`)
 3. Remaining members process via `normal_member_commit_leave()`
 
-> **Open question:** The current implementation sends the leave proposal without NIP-44 encryption. Whether leave operations should be encrypted (consistent with other MLS messages) or left as plaintext (simpler, since the leaving member no longer participates) is under discussion.
+Leave proposals SHOULD be encrypted consistently with other MLS messages to avoid leaking membership change metadata to relays.
 
 #### Group Dissolution
 
@@ -346,7 +369,7 @@ Running MLS over a decentralized relay network introduces challenges not address
 
 MLS assumes a Delivery Service that reliably forwards messages to all group members. Nostr relays provide no such guarantee:
 
-- **Message dropping:** A relay may silently discard evehnts, causing some members to miss Commits or application messages. This can cause **epoch desynchronization** — some members advance to epoch N+1 while others remain at epoch N.
+- **Message dropping:** A relay may silently discard events, causing some members to miss Commits or application messages. This can cause **epoch desynchronization** — some members advance to epoch N+1 while others remain at epoch N.
 - **Selective withholding:** A malicious relay could deliver messages to some members but not others, creating a **split-view attack** where the group's state diverges.
 - **Mitigation:** Members SHOULD connect to multiple relays from the group's relay list. Clients SHOULD detect epoch gaps (missing Commits) and attempt to re-fetch from alternative relays. As a last resort, a desynchronized member can leave and rejoin via a new Welcome.
 
@@ -377,42 +400,35 @@ MLS does not address transport-layer metadata. This specification employs severa
 - **NIP-17 timestamp tweaking:** Welcome messages use randomized `created_at` timestamps (±2 days), preventing timing correlation.
 
 **Residual metadata exposure:**
-- Relays see the `listen_key` (p tag) and can correlate all events addressed to it within an epoch — they know "these N events are for the same group" but not which group, how many members, or the content. Mandate an epoch update within a given interval could mitigate. 
-- Message sizes may reveal whether a message is an application message vs. a Commit (Commits with Add proposals are larger). Message padding could mitigate.
+- Relays see the `listen_key` (p tag) and can correlate all events addressed to it within an epoch — they know "these N events are for the same group" but not which group, how many members, or the content. Periodic epoch advances (e.g., via scheduled self-updates) limit the correlation window.
+- Message sizes may reveal whether a message is an application message vs. a Commit (Commits with Add proposals are larger). Implementations SHOULD pad messages to the nearest 256-byte boundary to reduce size-based classification.
 
 ## Implementation Reference
 
-### Code Structure
+### Reference Implementation
 
-The reference implementation consists of three layers:
+The reference implementation is [libkeychat](https://github.com/nicobao/keychat-protocol) (`libkeychat/src/`):
 
-**1. Rust MLS Core** (`keychat_rust_ffi_plugin/rust/src/`)
-- `api_mls.rs` — Public FFI API: `init_mls_db`, `create_key_package`, `create_mls_group`, `add_members`, `join_mls_group`, `create_message`, `decrypt_message`, `remove_members`, `self_commit`, `self_update`, `self_leave`, etc.
-- `api_mls.user.rs` — User implementation: MLS group operations, NIP-44 encrypt/decrypt, KeyPackage management, Commit processing
-- `api_mls.types.rs` — Type definitions: `KeyPackageResult`, `MessageResult`, `DecryptedMessage`, `AddMembersResult`, `CommitResult`, `MessageInType`
-
-**2. Nostr Crypto Layer** (`keychat_rust_ffi_plugin/rust/src/`)
-- `api_nostr.rs` — NIP-44 encryption/decryption, NIP-17 gift wrap creation, Schnorr signatures, secp256k1 key management
-
-**3. Flutter/Dart Application Layer** (`keychat-app/packages/app/lib/`)
-- `service/mls_group.service.dart` — High-level MLS group operations: create group, join group, send/receive messages, manage members, upload KeyPackages
-- `constants.dart` — Event kind definitions: `mlsNipKeypackages = 10443`, `mlsNipWelcome = 444`
-- `nostr-core/nostr.dart` — Nostr event construction, NIP-17 message sending, event signing
+- `mls.rs` — Core MLS operations: group creation, member add/remove, message encrypt/decrypt, Commit processing, self-update, self-leave
+- `mls_extension.rs` — `NostrGroupDataExtension` definition and serialization
+- `mls_provider.rs` — OpenMLS provider wrapper with persistent storage
+- `nip44.rs` — NIP-44 v2 encryption/decryption
+- `giftwrap.rs` — NIP-17 / NIP-59 gift wrap creation and unwrapping
+- `transport.rs` — Relay connection and event publishing
 
 ### Dependencies
 
 - [openmls](https://github.com/openmls/openmls) — Rust implementation of MLS (RFC 9420)
 - [openmls-sqlite-storage](https://crates.io/crates/openmls-sqlite-storage) — Persistent MLS state storage
-- [nostr-rs](https://github.com/rust-nostr/nostr) — Nostr protocol primitives (NIP-04, NIP-44, NIP-59)
-- [libsignal](https://github.com/signalapp/libsignal) — Curve25519 operations (shared with Signal Protocol layer)
+- [nostr-rs](https://github.com/rust-nostr/nostr) — Nostr protocol primitives (NIP-44, NIP-59)
 
 ### Event Kind Summary
 
 | Kind | Name | Use | Encryption | Replaceable |
 |------|------|-----|------------|-------------|
 | `10443` | MLS KeyPackage | Publish KeyPackage for async group join | None (public) | Yes (per pubkey) |
-| `444` | MLS Welcome | Invite member to group (via NIP-17) | NIP-44 + NIP-59 Gift Wrap | No |
-| `1059` | MLS Group Message | Application messages, Commits, Proposals | MLS + NIP-44 | No |
+| `444` | MLS Welcome | Invite member to group (via mlsGroupInvite) | Signal or NIP-59 Gift Wrap | No |
+| `1059` | MLS Group Message | Application messages, Commits, Proposals | MLS | No |
 
 
 
