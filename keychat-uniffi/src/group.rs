@@ -79,28 +79,6 @@ impl KeychatClient {
         Ok(convert_group_sent_message(result))
     }
 
-    /// Send a red packet to a Signal group.
-    pub async fn send_group_red_packet(
-        &self,
-        group_id: String,
-        mint: String,
-        tokens: Vec<String>,
-        total_amount: u64,
-        count: u32,
-        memo: Option<String>,
-        reply_to: Option<ReplyToPayload>,
-    ) -> Result<GroupSentMessage, KeychatUniError> {
-        let core_reply = reply_to.map(|r| keychat_app_core::ReplyToPayload {
-            target_event_id: r.target_event_id,
-            content: r.content,
-        });
-        let result = self
-            .app
-            .send_group_red_packet(group_id, mint, tokens, total_amount, count, memo, core_reply)
-            .await?;
-        Ok(convert_group_sent_message(result))
-    }
-
     /// Leave a Signal group. Notifies all members.
     pub async fn leave_signal_group(&self, group_id: String) -> Result<(), KeychatUniError> {
         self.app.leave_signal_group(group_id).await?;

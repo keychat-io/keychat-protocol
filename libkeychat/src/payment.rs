@@ -50,42 +50,6 @@ pub fn build_lightning_message(invoice: &str, amount: u64, memo: Option<&str>) -
     }
 }
 
-/// Build a red packet message with N pre-minted independent tokens.
-/// Receivers try each token in order; mint's double-spend protection gives
-/// first-come-first-served semantics.
-pub fn build_red_packet_message(
-    mint: &str,
-    tokens: Vec<String>,
-    total_amount: u64,
-    count: u32,
-    memo: Option<&str>,
-) -> KCMessage {
-    use crate::message::{KCRedPacketPayload, uuid_v4};
-    KCMessage {
-        v: 2,
-        id: Some(uuid_v4()),
-        kind: KCMessageKind::RedPacket,
-        red_packet: Some(KCRedPacketPayload {
-            mint: mint.to_string(),
-            tokens,
-            total_amount,
-            count,
-            memo: memo.map(|s| s.to_string()),
-        }),
-        ..KCMessage::empty()
-    }
-}
-
-/// Split a total amount into N roughly-equal shares. Remainder goes to last share.
-pub fn split_red_packet_equal(total: u64, count: u32) -> Vec<u64> {
-    if count == 0 { return vec![]; }
-    let base = total / count as u64;
-    let remainder = total % count as u64;
-    let mut shares = vec![base; count as usize];
-    if let Some(last) = shares.last_mut() { *last += remainder; }
-    shares
-}
-
 // ─── Cashu Token Validation ─────────────────────────────────────────────────
 
 /// Parse a Cashu token string, validate format (must start with "cashuA").
@@ -178,42 +142,6 @@ mod tests {
     #[test]
     fn validate_cashu_token_too_short() {
         assert!(validate_cashu_token("cashuA").is_err());
-    }
-
-    #[test]
-    fn red_packet_message_roundtrip_json() {
-        let msg = build_red_packet_message(
-            "https://mint.example.com",
-            vec!["cashuAtok1".into(), "cashuAtok2".into(), "cashuAtok3".into()],
-            1000, 3, Some("Happy New Year"),
-        );
-        let json = msg.to_json().unwrap();
-        assert!(json.contains("\"kind\":\"redPacket\""));
-        assert!(json.contains("\"totalAmount\":1000"));
-        assert!(json.contains("\"count\":3"));
-        let decoded = KCMessage::try_parse(&json).unwrap();
-        assert_eq!(decoded.kind, KCMessageKind::RedPacket);
-        let rp = decoded.red_packet.unwrap();
-        assert_eq!(rp.tokens.len(), 3);
-        assert_eq!(rp.total_amount, 1000);
-    }
-
-    #[test]
-    fn split_equal_no_remainder() {
-        assert_eq!(split_red_packet_equal(1000, 10), vec![100u64; 10]);
-    }
-
-    #[test]
-    fn split_equal_with_remainder() {
-        let r = split_red_packet_equal(103, 10);
-        assert_eq!(r.len(), 10);
-        assert_eq!(r[..9].iter().sum::<u64>(), 90);
-        assert_eq!(r[9], 13);
-    }
-
-    #[test]
-    fn split_zero_count() {
-        assert_eq!(split_red_packet_equal(1000, 0), Vec::<u64>::new());
     }
 
     #[test]

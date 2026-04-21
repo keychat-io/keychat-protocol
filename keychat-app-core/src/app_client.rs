@@ -20,7 +20,7 @@
 //! - keychat-cli uses this directly (no FFI overhead, no UniFFI dependency)
 //! - Lightweight agents use only `libkeychat::ProtocolClient` (skip app-core entirely)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Once};
 
 use libkeychat::{
@@ -232,18 +232,6 @@ pub struct AppClient {
     pub mls_inbox_map: Mutex<HashMap<String, String>>,
     /// MLS group_id → current Nostr SubscriptionId (for clean unsubscribe on epoch rotation).
     pub mls_sub_ids: Mutex<HashMap<String, nostr::SubscriptionId>>,
-    /// Sender half of the background PQXDH-upgrade trigger channel. Set once
-    /// in `start_event_loop` after the consumer task is spawned; call sites
-    /// that observe a peer_version bump push the room_id here to request an
-    /// auto-upgrade from X3DH to PQXDH. `None` until the event loop starts
-    /// (migration paths bumping peer_version before start just no-op).
-    pub upgrade_trigger_tx:
-        tokio::sync::OnceCell<tokio::sync::mpsc::UnboundedSender<String>>,
-    /// Room IDs with an in-flight background upgrade FR. Prevents re-firing
-    /// while a previous trigger's FR publish is still outstanding. Cleared
-    /// when the spawned task completes (success or final failure), so a
-    /// transiently-failed upgrade retries on the next observed v2 event.
-    pub pqxdh_upgrade_inflight: Mutex<HashSet<String>>,
 }
 
 impl AppClient {
@@ -330,8 +318,6 @@ impl AppClient {
             mls_signer_pk: Mutex::new(None),
             mls_inbox_map: Mutex::new(HashMap::new()),
             mls_sub_ids: Mutex::new(HashMap::new()),
-            upgrade_trigger_tx: tokio::sync::OnceCell::new(),
-            pqxdh_upgrade_inflight: Mutex::new(HashSet::new()),
         })
     }
 

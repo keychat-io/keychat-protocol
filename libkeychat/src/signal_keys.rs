@@ -124,76 +124,6 @@ impl std::fmt::Debug for KyberPrekey {
     }
 }
 
-/// Derive a v1-Flutter-compatible Signal Curve25519 identity from a BIP-39 mnemonic.
-///
-/// Mirrors the derivation used by the v1 Keychat Flutter app
-/// (`keychat_rust_ffi_plugin::api_nostr::generate_curve25519_keypair`):
-///
-/// 1. `mnemonic → 64-byte seed` via BIP-39 (PBKDF2-SHA512, optional passphrase).
-/// 2. BIP-32 master key on `Network::Bitcoin`.
-/// 3. Derive child at `m/44'/1238'/{account}'/0/0`.
-/// 4. Feed the 32-byte child secret into libsignal's `PrivateKey::deserialize`
-///    (Djb/Curve25519 variant) and derive the matching 33-byte public key.
-///
-/// Used by v1 → v1.5 migration to recover the user's Signal identity keypair
-/// without needing the plaintext key to be present in the v1 export.
-pub fn derive_v1_signal_identity(
-    mnemonic_words: &str,
-    passphrase: Option<&str>,
-    account: u32,
-) -> Result<SignalIdentity> {
-    use bitcoin::bip32::{DerivationPath, Xpriv};
-    use libsignal_protocol::PrivateKey as SignalPrivateKey;
-    use std::str::FromStr;
-
-    let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, mnemonic_words)
-        .map_err(|e| KeychatError::KeyDerivation(format!("invalid v1 mnemonic: {e}")))?;
-    let seed = mnemonic.to_seed(passphrase.unwrap_or(""));
-
-    let ctx = bitcoin::secp256k1::Secp256k1::new();
-    let root_key = Xpriv::new_master(bitcoin::Network::Bitcoin, &seed)
-        .map_err(|e| KeychatError::KeyDerivation(format!("BIP-32 master: {e}")))?;
-    let path_str = format!("m/44'/1238'/{}'/0/0", account);
-    let path = DerivationPath::from_str(&path_str)
-        .map_err(|e| KeychatError::KeyDerivation(format!("bad derivation path: {e}")))?;
-    let child = root_key
-        .derive_priv(&ctx, &path)
-        .map_err(|e| KeychatError::KeyDerivation(format!("BIP-32 derive: {e}")))?;
-
-    let secret_bytes: [u8; 32] = child.private_key.secret_bytes();
-    let signal_priv = SignalPrivateKey::deserialize(&secret_bytes)
-        .map_err(|e| KeychatError::KeyDerivation(format!("signal privkey decode: {e}")))?;
-    let signal_pub = signal_priv
-        .public_key()
-        .map_err(|e| KeychatError::KeyDerivation(format!("signal pubkey derive: {e}")))?;
-
-    let priv_vec = signal_priv.serialize();
-    let pub_vec = signal_pub.serialize();
-
-    if priv_vec.len() != 32 {
-        return Err(KeychatError::KeyDerivation(format!(
-            "unexpected v1 signal private key length: {}",
-            priv_vec.len()
-        )));
-    }
-    if pub_vec.len() != 33 {
-        return Err(KeychatError::KeyDerivation(format!(
-            "unexpected v1 signal public key length: {}",
-            pub_vec.len()
-        )));
-    }
-
-    let mut private_key = [0u8; 32];
-    private_key.copy_from_slice(&priv_vec);
-    let mut public_key = [0u8; 33];
-    public_key.copy_from_slice(&pub_vec);
-
-    Ok(SignalIdentity {
-        private_key,
-        public_key,
-    })
-}
-
 /// Generate a new Signal identity keypair (Curve25519).
 ///
 /// The private key is clamped per Curve25519 convention:
@@ -516,34 +446,6 @@ pub struct FriendRequestSecrets {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn v1_signal_identity_matches_flutter_derivation() {
-        // Real v1 export: identity "老版本" at account=0 with mnemonic
-        // "town helmet tongue lizard gap merry surround exist erode maze horn upgrade".
-        // Expected curve25519PkHex from Isar snapshot:
-        //   05a8c796464794748f45b8f685707110223e8456ec7eb87c0fc2baa17efe261145
-        let mnemonic =
-            "town helmet tongue lizard gap merry surround exist erode maze horn upgrade";
-        let id = derive_v1_signal_identity(mnemonic, None, 0).unwrap();
-        let pub_hex = hex::encode(id.public_key);
-        assert_eq!(
-            pub_hex,
-            "05a8c796464794748f45b8f685707110223e8456ec7eb87c0fc2baa17efe261145",
-            "v1 derivation must match keychat_rust_ffi_plugin::generate_curve25519_keypair"
-        );
-        // Matches v1 Flutter curve25519 public key stored in Identity.curve25519PkHex.
-    }
-
-    #[test]
-    fn v1_signal_identity_same_mnemonic_different_account() {
-        let mnemonic =
-            "town helmet tongue lizard gap merry surround exist erode maze horn upgrade";
-        let id0 = derive_v1_signal_identity(mnemonic, None, 0).unwrap();
-        let id1 = derive_v1_signal_identity(mnemonic, None, 1).unwrap();
-        assert_ne!(id0.public_key, id1.public_key);
-        assert_ne!(id0.private_key, id1.private_key);
-    }
 
     #[test]
     fn generate_signal_identity_key_sizes() {

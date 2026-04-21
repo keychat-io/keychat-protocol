@@ -295,7 +295,6 @@ pub enum MessageKind {
     CallSignal,
     GroupPinMessage,
     GroupAnnouncement,
-    RedPacket,
 }
 
 impl From<libkeychat::KCMessageKind> for MessageKind {
@@ -319,8 +318,6 @@ impl From<libkeychat::KCMessageKind> for MessageKind {
             }
             libkeychat::KCMessageKind::MlsGroupInvite => MessageKind::MlsGroupInvite,
             libkeychat::KCMessageKind::AgentReply => MessageKind::AgentReply,
-            libkeychat::KCMessageKind::GroupAnnouncement => MessageKind::GroupAnnouncement,
-            libkeychat::KCMessageKind::RedPacket => MessageKind::RedPacket,
             _ => MessageKind::Text,
         }
     }

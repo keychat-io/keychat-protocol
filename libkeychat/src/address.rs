@@ -332,13 +332,7 @@ impl Default for AddressManager {
 ///
 /// The ratchet key is in format `"{private_hex}-{public_hex}"`.
 /// Returns a `DerivedAddress` with the x-only public key and corresponding secret key.
-///
-/// Exposed (pub) for the v1 → v1.5 migration path in `keychat-app-core`:
-/// v1 Flutter stores its rolling receive addresses in the same
-/// `"{private}-{public}"` format inside `session.aliceAddresses`, so the
-/// migration re-runs this derivation to reconstruct the full
-/// `DerivedAddressSerialized` triple (address + secret_key + ratchet_key).
-pub fn derive_address_with_secret(ratchet_key: &str) -> Result<DerivedAddress> {
+fn derive_address_with_secret(ratchet_key: &str) -> Result<DerivedAddress> {
     use sha2::Digest;
 
     let (private_hex, public_hex) = ratchet_key.split_once('-').ok_or_else(|| {

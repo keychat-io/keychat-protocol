@@ -104,88 +104,10 @@ impl AppClient {
         let identity_pubkey = self.cached_identity_pubkey();
         let payload_json = msg.to_json().ok();
 
-        // Look up peer_version so the outgoing payload uses v1 schema when the
-        // peer is still on the Flutter v1 app. `from_peer_version(None)` is V1
-        // by design (unknown peers default to legacy until a `clientv:2` tag
-        // confirms v2). Migrated rooms carry peer_version=1 explicitly.
-        let peer_protocol = {
-            let app_storage = self.inner.read().await.app_storage.clone();
-            let store = lock_app_storage(&app_storage);
-            let peer_version = store
-                .get_app_room(&room_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.peer_version.map(|v| v as u32));
-            crate::v1_compat::PeerProtocol::from_peer_version(peer_version)
-        };
-
         // 1. Protocol: encrypt + publish + address update
         let result = {
             let mut inner = self.inner.write().await;
-            let r = match peer_protocol {
-                crate::v1_compat::PeerProtocol::V2 => {
-                    inner.protocol.send_message_core(&peer_pubkey, &msg).await?
-                }
-                crate::v1_compat::PeerProtocol::V1 => {
-                    // Emit v1 KeychatMessage JSON as the Signal-encrypted payload
-                    // AND switch the outer Nostr kind to 4 — v1 Flutter peers
-                    // subscribe to kind:4 and ignore kind:1059. See
-                    // `event_loop.rs` "dual-kind subscription" comment for the
-                    // symmetric receive side.
-                    let v1_json = crate::v1_compat::v2_to_v1(&msg).map_err(|e| {
-                        AppError::Serialization(format!("v1 downgrade: {e}"))
-                    })?;
-                    let wire_kind = crate::v1_compat::PeerProtocol::V1.nostr_kind();
-
-                    // Until the peer has replied, our send still targets their
-                    // `peer_first_inbox` (onetimekey). v1 Flutter routes kind=4
-                    // events whose `p`-tag matches a stored Mykey through
-                    // `decryptPreKeyMessage`, which requires the plaintext to
-                    // be a `PrekeyMessageModel` JSON — not a plain v1
-                    // KeychatMessage. Wrap it for that phase; once a ratchet
-                    // sending address is set, fall back to raw v1 JSON.
-                    let owned_pmm;
-                    let payload_bytes: &[u8] = if inner
-                        .protocol
-                        .peer_first_inbox_pending(&peer_pubkey)
-                        .await
-                        .is_some()
-                    {
-                        // Prefer the app-level display name from the identity
-                        // table; fall back to the pubkey if not persisted.
-                        let display_name = {
-                            let app_storage = inner.app_storage.clone();
-                            let store = lock_app_storage(&app_storage);
-                            store
-                                .get_app_identities()
-                                .ok()
-                                .and_then(|rows| rows.into_iter().next())
-                                .map(|r| r.name)
-                                .unwrap_or_else(|| identity_pubkey.clone())
-                        };
-                        owned_pmm = inner
-                            .protocol
-                            .build_v1_prekey_pmm(&peer_pubkey, v1_json.as_bytes(), &display_name)
-                            .await
-                            .map_err(|e| {
-                                AppError::Serialization(format!("v1 pmm wrap: {e}"))
-                            })?;
-                        owned_pmm.as_slice()
-                    } else {
-                        v1_json.as_bytes()
-                    };
-
-                    inner
-                        .protocol
-                        .send_message_with_content_core(
-                            &peer_pubkey,
-                            &msg,
-                            payload_bytes,
-                            Some(wire_kind),
-                        )
-                        .await?
-                }
-            };
+            let r = inner.protocol.send_message_core(&peer_pubkey, &msg).await?;
             // §9.2: "After encrypt: new_receiving_addr is YOUR new address. Subscribe to it."
             if !r.addr_update.new_receiving.is_empty() {
                 if let Err(e) = inner.protocol.refresh_subscriptions().await {
@@ -370,65 +292,6 @@ impl AppClient {
             dropped_receiving_addresses: vec![],
             new_sending_address: None,
         })
-    }
-
-    pub async fn send_cashu(
-        &self,
-        room_id: String,
-        mint: String,
-        token: String,
-        amount: u64,
-        memo: Option<String>,
-        reply_to: Option<ReplyToPayload>,
-    ) -> AppResult<SentMessage> {
-        let mut msg = libkeychat::build_cashu_message(
-            &mint, &token, amount, None, memo.as_deref(),
-        );
-        if let Some(ref rt) = reply_to {
-            msg.reply_to = Some(libkeychat::ReplyTo {
-                target_id: None,
-                target_event_id: Some(rt.target_event_id.clone()),
-                content: rt.content.clone().unwrap_or_default(),
-                user_id: None,
-                user_name: None,
-            });
-        }
-        msg.fallback = Some(format!("{} sats sent", amount));
-        let display_text = if let Some(ref m) = memo {
-            if m.is_empty() { format!("💰 {} sats", amount) }
-            else { format!("💰 {} sats — {}", amount, m) }
-        } else {
-            format!("💰 {} sats", amount)
-        };
-        self.send_message_internal(room_id, msg, display_text, reply_to).await
-    }
-
-    pub async fn send_lightning_invoice(
-        &self,
-        room_id: String,
-        invoice: String,
-        amount: u64,
-        memo: Option<String>,
-        reply_to: Option<ReplyToPayload>,
-    ) -> AppResult<SentMessage> {
-        let mut msg = libkeychat::build_lightning_message(&invoice, amount, memo.as_deref());
-        if let Some(ref rt) = reply_to {
-            msg.reply_to = Some(libkeychat::ReplyTo {
-                target_id: None,
-                target_event_id: Some(rt.target_event_id.clone()),
-                content: rt.content.clone().unwrap_or_default(),
-                user_id: None,
-                user_name: None,
-            });
-        }
-        msg.fallback = Some(format!("⚡ Invoice for {} sats", amount));
-        let display_text = if let Some(ref m) = memo {
-            if m.is_empty() { format!("⚡ {} sats", amount) }
-            else { format!("⚡ {} sats — {}", amount, m) }
-        } else {
-            format!("⚡ {} sats", amount)
-        };
-        self.send_message_internal(room_id, msg, display_text, reply_to).await
     }
 
     pub async fn retry_failed_messages(&self) -> AppResult<u32> {

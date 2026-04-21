@@ -72,50 +72,20 @@ impl ChatSession {
         remote_address: &ProtocolAddress,
         message: &KCMessage,
     ) -> Result<(Event, AddressUpdate)> {
-        self.send_message_with_bytes(peer_id, remote_address, None, message, None)
-            .await
-    }
-
-    /// Variant of `send_message` that lets the caller override the encrypted
-    /// payload and/or the outer Nostr event kind.
-    ///
-    /// - `override_payload`: when `Some`, these bytes are Signal-encrypted
-    ///   instead of `message.to_json()`. Used by the v1 compatibility layer
-    ///   to emit a legacy KeychatMessage JSON schema.
-    /// - `wire_kind`: when `Some`, the outer event is built with this Nostr
-    ///   `Kind` instead of the default `Kind::GiftWrap` (1059). Pass
-    ///   `Kind::from(4)` for v1 Flutter peers, which subscribe to kind:4.
-    ///
-    /// `message` is still accepted so debug logs have a typed reference; its
-    /// JSON content is only read when `override_payload` is `None`.
-    pub async fn send_message_with_bytes(
-        &mut self,
-        peer_id: &str,
-        remote_address: &ProtocolAddress,
-        override_payload: Option<&[u8]>,
-        message: &KCMessage,
-        wire_kind: Option<Kind>,
-    ) -> Result<(Event, AddressUpdate)> {
+        // Resolve where to send
         let to_address = self.addresses.resolve_send_address(peer_id)?;
 
-        let payload_owned;
-        let payload_bytes: &[u8] = match override_payload {
-            Some(b) => b,
-            None => {
-                payload_owned = message.to_json()?;
-                payload_owned.as_bytes()
-            }
-        };
-        let enc = self.signal.encrypt(remote_address, payload_bytes)?;
+        // Encrypt
+        let json = message.to_json()?;
+        let enc = self.signal.encrypt(remote_address, json.as_bytes())?;
 
+        // Update addresses after encrypt
         let update = self
             .addresses
             .on_encrypt(peer_id, enc.sender_address.as_deref())?;
 
-        let event = match wire_kind {
-            Some(k) => crate::chat::build_mode1_event_with_kind(&enc.bytes, &to_address, k).await?,
-            None => build_mode1_event(&enc.bytes, &to_address).await?,
-        };
+        // Build kind:1059 event
+        let event = build_mode1_event(&enc.bytes, &to_address).await?;
 
         tracing::info!(
             "ChatSession sent message to peer={}",
@@ -135,12 +105,9 @@ impl ChatSession {
         remote_address: &ProtocolAddress,
         event: &Event,
     ) -> Result<(KCMessage, MessageMetadata, AddressUpdate)> {
-        // Accept both v2 Mode 1 (kind:1059) and v1 Signal wire (kind:4).
-        // The ciphertext layout is identical across both kinds — see
-        // `build_mode1_event_with_kind` and `event_loop.rs` dual-kind subscription.
-        if event.kind != Kind::GiftWrap && event.kind != Kind::from(4) {
+        if event.kind != Kind::GiftWrap {
             return Err(KeychatError::Signal(format!(
-                "expected kind 1059 or 4, got {}",
+                "expected kind 1059, got {}",
                 event.kind.as_u16()
             )));
         }
@@ -165,11 +132,8 @@ impl ChatSession {
         let plaintext_str = String::from_utf8(decrypt_result.plaintext)
             .map_err(|e| KeychatError::Signal(format!("invalid UTF-8: {e}")))?;
 
-        // Accept both v2 native and v1 legacy envelopes; v1_compat in app-core
-        // has the richer conversion, this minimal path handles the kinds used
-        // for post-handshake DMs.
-        let message = KCMessage::try_parse_any(&plaintext_str).ok_or_else(|| {
-            KeychatError::Signal("decrypted content is not a valid KCMessage".into())
+        let message = KCMessage::try_parse(&plaintext_str).ok_or_else(|| {
+            KeychatError::Signal("decrypted content is not a valid KCMessage v2".into())
         })?;
 
         // Extract p-tags (§3.6: may contain dual p-tags for public agent routing)

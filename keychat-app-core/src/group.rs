@@ -189,42 +189,6 @@ impl AppClient {
             .await
     }
 
-    pub async fn send_group_red_packet(
-        &self,
-        group_id: String,
-        mint: String,
-        tokens: Vec<String>,
-        total_amount: u64,
-        count: u32,
-        memo: Option<String>,
-        reply_to: Option<ReplyToPayload>,
-    ) -> AppResult<GroupSentMessage> {
-        let mut msg = libkeychat::build_red_packet_message(
-            &mint, tokens, total_amount, count, memo.as_deref(),
-        );
-        if let Some(ref rt) = reply_to {
-            msg.reply_to = Some(libkeychat::ReplyTo {
-                target_id: None,
-                target_event_id: Some(rt.target_event_id.clone()),
-                content: rt.content.clone().unwrap_or_default(),
-                user_id: None,
-                user_name: None,
-            });
-        }
-        msg.fallback = Some(format!("🧧 Red packet: {} sats in {} shares", total_amount, count));
-        let display = if let Some(ref m) = memo {
-            if m.is_empty() {
-                format!("🧧 {} sats × {}", total_amount, count)
-            } else {
-                format!("🧧 {} sats × {} — {}", total_amount, count, m)
-            }
-        } else {
-            format!("🧧 {} sats × {}", total_amount, count)
-        };
-        self.send_group_message_internal(group_id, msg, &display, &reply_to)
-            .await
-    }
-
     pub async fn leave_signal_group(&self, group_id: String) -> AppResult<()> {
         let mut inner = self.inner.write().await;
         inner.protocol.leave_group_protocol(&group_id).await?;

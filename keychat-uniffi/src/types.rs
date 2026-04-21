@@ -120,23 +120,6 @@ pub struct GroupSentMessage {
     pub relay_status_json: Option<String>,
 }
 
-// ─── MLS Group Records ───────────────────────────────────────────
-
-#[derive(uniffi::Record)]
-pub struct MlsGroupCreatedInfo {
-    pub room_id: String,
-    pub group_id: String,
-    pub name: String,
-    pub member_count: u32,
-}
-
-#[derive(uniffi::Record)]
-pub struct MlsSentMessage {
-    pub msgid: String,
-    pub group_id: String,
-    pub event_id: Option<String>,
-}
-
 // ─── Enums ───────────────────────────────────────────────────────
 
 #[derive(uniffi::Enum, Clone)]
@@ -198,7 +181,6 @@ pub enum MessageKind {
     CallSignal,
     GroupPinMessage,
     GroupAnnouncement,
-    RedPacket,
 }
 
 impl From<libkeychat::KCMessageKind> for MessageKind {
@@ -222,8 +204,6 @@ impl From<libkeychat::KCMessageKind> for MessageKind {
             }
             libkeychat::KCMessageKind::MlsGroupInvite => MessageKind::MlsGroupInvite,
             libkeychat::KCMessageKind::AgentReply => MessageKind::AgentReply,
-            libkeychat::KCMessageKind::GroupAnnouncement => MessageKind::GroupAnnouncement,
-            libkeychat::KCMessageKind::RedPacket => MessageKind::RedPacket,
             _ => MessageKind::Text, // Unknown kinds fallback to Text
         }
     }
@@ -320,7 +300,6 @@ pub enum RoomStatus {
     Requesting, // 0
     Enabled,    // 1
     Approving,  // 2
-    Archived,   // 3 — read-only (migrated v1 MLS groups, left/rebuilt groups)
     Rejected,   // -1
 }
 
@@ -330,7 +309,6 @@ impl RoomStatus {
             0 => RoomStatus::Requesting,
             1 => RoomStatus::Enabled,
             2 => RoomStatus::Approving,
-            3 => RoomStatus::Archived,
             -1 => RoomStatus::Rejected,
             _ => RoomStatus::Requesting,
         }
@@ -341,7 +319,6 @@ impl RoomStatus {
             RoomStatus::Requesting => 0,
             RoomStatus::Enabled => 1,
             RoomStatus::Approving => 2,
-            RoomStatus::Archived => 3,
             RoomStatus::Rejected => -1,
         }
     }
@@ -472,15 +449,6 @@ pub struct ContactInfoFull {
     pub petname: Option<String>,
     pub name: Option<String>,
     pub avatar: Option<String>,
-}
-
-#[derive(uniffi::Record)]
-pub struct RoomMemberInfo {
-    pub pubkey: String,
-    pub name: Option<String>,
-    pub is_admin: bool,
-    /// Member status: 0=Invited, 1=Inviting, 2=InviteFailed, 3=Removed.
-    pub status: i32,
 }
 
 #[derive(uniffi::Enum, Clone, Debug)]

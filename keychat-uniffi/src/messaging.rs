@@ -47,33 +47,6 @@ impl KeychatClient {
         Ok(convert_sent_message(r))
     }
 
-    pub async fn send_cashu(
-        &self,
-        room_id: String,
-        mint: String,
-        token: String,
-        amount: u64,
-        memo: Option<String>,
-        reply_to: Option<ReplyToPayload>,
-    ) -> Result<SentMessage, KeychatUniError> {
-        let core_reply = reply_to.map(convert_reply_to);
-        let r = self.app.send_cashu(room_id, mint, token, amount, memo, core_reply).await?;
-        Ok(convert_sent_message(r))
-    }
-
-    pub async fn send_lightning_invoice(
-        &self,
-        room_id: String,
-        invoice: String,
-        amount: u64,
-        memo: Option<String>,
-        reply_to: Option<ReplyToPayload>,
-    ) -> Result<SentMessage, KeychatUniError> {
-        let core_reply = reply_to.map(convert_reply_to);
-        let r = self.app.send_lightning_invoice(room_id, invoice, amount, memo, core_reply).await?;
-        Ok(convert_sent_message(r))
-    }
-
     pub async fn retry_failed_messages(&self) -> Result<u32, KeychatUniError> {
         self.app.retry_failed_messages().await.map_err(Into::into)
     }

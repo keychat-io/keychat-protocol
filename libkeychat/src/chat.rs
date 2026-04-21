@@ -398,40 +398,6 @@ pub async fn build_mode1_event(ciphertext: &[u8], to_address: &str) -> Result<Ev
     build_mode1_event_with_routing(ciphertext, to_address, None).await
 }
 
-/// Build a Mode 1-style event with a caller-chosen Nostr `wire_kind`.
-///
-/// v2 peers use `Kind::GiftWrap` (1059); v1 Flutter peers expect `Kind::from(4)`.
-/// The content layout (base64 Signal ciphertext, single `p`-tag to receiver,
-/// ephemeral sender key) is otherwise identical — see `event_loop.rs`'s
-/// dual-kind subscription comment.
-pub async fn build_mode1_event_with_kind(
-    ciphertext: &[u8],
-    to_address: &str,
-    wire_kind: Kind,
-) -> Result<Event> {
-    let sender = EphemeralKeypair::generate();
-    let content = base64::engine::general_purpose::STANDARD.encode(ciphertext);
-    let to_pubkey = PublicKey::from_hex(to_address)
-        .map_err(|e| KeychatError::Signal(format!("invalid to_address: {e}")))?;
-
-    let event = EventBuilder::new(wire_kind, &content)
-        .tag(Tag::public_key(to_pubkey))
-        .tag(clientv_v2_tag())
-        .sign(sender.keys())
-        .await
-        .map_err(|e| KeychatError::Signal(format!("failed to sign event: {e}")))?;
-
-    Ok(event)
-}
-
-/// The `["clientv", "2"]` Nostr tag. Every v1.5-generated event carries this
-/// so peers can detect us without decrypting. Mirrors `clientv_tag()` in
-/// keychat-app-core's v1_compat module but lives here to avoid an upward
-/// crate dependency.
-fn clientv_v2_tag() -> Tag {
-    Tag::custom(TagKind::custom("clientv"), ["2"])
-}
-
 /// Build a Mode 1 event with optional Public Agent routing (§3.6).
 ///
 /// When `agent_npub` is `Some`, the event includes dual p-tags:
@@ -449,9 +415,7 @@ pub async fn build_mode1_event_with_routing(
     let to_pubkey = PublicKey::from_hex(to_address)
         .map_err(|e| KeychatError::Signal(format!("invalid to_address: {e}")))?;
 
-    let mut builder = EventBuilder::new(Kind::GiftWrap, &content)
-        .tag(Tag::public_key(to_pubkey))
-        .tag(clientv_v2_tag());
+    let mut builder = EventBuilder::new(Kind::GiftWrap, &content).tag(Tag::public_key(to_pubkey));
 
     if let Some(npub_hex) = agent_npub {
         let npub_pubkey = PublicKey::from_hex(npub_hex)
@@ -1185,7 +1149,6 @@ mod tests {
             files: None,
             cashu: None,
             lightning: None,
-            red_packet: None,
             friend_request: None,
             friend_approve: None,
             friend_reject: None,

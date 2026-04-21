@@ -70,30 +70,6 @@ impl KeychatClient {
             .map(|v| v.map(convert_room_info))
             .map_err(Into::into)
     }
-
-    /// Read persisted room members (MLS groups populate this; Signal groups
-    /// keep membership in the in-memory `group_manager` and won't appear here).
-    pub async fn get_room_members(
-        &self,
-        room_id: String,
-    ) -> Result<Vec<RoomMemberInfo>, KeychatUniError> {
-        use crate::client::lock_app_storage;
-        let inner = self.app.inner.read().await;
-        let store = lock_app_storage(&inner.app_storage);
-        store
-            .get_room_members(&room_id)
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|m| RoomMemberInfo {
-                        pubkey: m.pubkey,
-                        name: m.name,
-                        is_admin: m.is_admin,
-                        status: m.status,
-                    })
-                    .collect()
-            })
-            .map_err(|e| KeychatUniError::Storage { msg: e.to_string() })
-    }
     pub async fn mark_room_read(&self, room_id: String) -> Result<(), KeychatUniError> {
         self.app.mark_room_read(room_id).await.map_err(Into::into)
     }

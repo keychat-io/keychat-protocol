@@ -124,7 +124,6 @@ fn message_kind_str(k: &MessageKind) -> &'static str {
         MessageKind::CallSignal => "call_signal",
         MessageKind::GroupPinMessage => "group_pin_message",
         MessageKind::GroupAnnouncement => "group_announcement",
-        MessageKind::RedPacket => "red_packet",
     }
 }
 

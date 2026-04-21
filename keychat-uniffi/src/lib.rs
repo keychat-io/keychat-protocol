@@ -93,11 +93,6 @@ pub struct V1MigrationResult {
 /// `app_db_key`: encryption key for app.db
 /// `protocol_db_path`: path to new protocol.db
 /// `protocol_db_key`: encryption key for protocol.db
-/// `mnemonic`: v1 BIP-39 mnemonic (optional). Required to restore active
-/// Signal sessions — without it we copy the SessionRecord rows but cannot
-/// populate `peer_mappings` + `signal_participants`, so the orchestrator
-/// will not resume the session and the chat will appear empty. Pass an
-/// empty string when the caller does not have access to the mnemonic.
 #[uniffi::export]
 pub fn migrate_v1_data(
     isar_json: String,
@@ -106,7 +101,6 @@ pub fn migrate_v1_data(
     app_db_key: String,
     protocol_db_path: String,
     protocol_db_key: String,
-    mnemonic: String,
 ) -> Result<V1MigrationResult, KeychatUniError> {
     let app_storage =
         keychat_app_core::app_storage::AppStorage::open(&app_db_path, &app_db_key)
@@ -114,20 +108,12 @@ pub fn migrate_v1_data(
                 msg: format!("open app.db: {e}"),
             })?;
 
-    let trimmed = mnemonic.trim();
-    let mnemonic_opt = if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    };
-
     let report = keychat_app_core::v1_migration::migrate_from_v1(
         &isar_json,
         &signal_db_path,
         &app_storage,
         &protocol_db_path,
         &protocol_db_key,
-        mnemonic_opt,
     )
     .map_err(|e| KeychatUniError::Storage {
         msg: format!("migration failed: {e}"),

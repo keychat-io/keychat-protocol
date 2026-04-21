@@ -6,13 +6,6 @@ keychat-cli-human/Cargo.lock
 keychat-cli-agent/Cargo.lock
 keychat-uniffi/Cargo.lock
 keychat-uniffi/generated/
-
-# Local libsignal fork (kc-x3dh-compat branch) + staging copy — not vendored
-# into this repo. Workspace [patch] in root Cargo.toml points to
-# `libsignal-local/rust/protocol`; contributors need to clone the fork into
-# this directory to build the v1 X3DH compat path. See SPEC.md §6.
-libsignal-local/
-libsignal-protocol-patch/
 node_modules/
 dist/
 build/

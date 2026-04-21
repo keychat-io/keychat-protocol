@@ -64,7 +64,6 @@ pub enum KCMessageKind {
     CallSignal,
     GroupPinMessage,
     GroupAnnouncement,
-    RedPacket,
     /// Forward-compatible catch-all for unknown kinds.
     Unknown(String),
 }
@@ -118,7 +117,6 @@ impl KCMessageKind {
             Self::CallSignal => "callSignal",
             Self::GroupPinMessage => "groupPinMessage",
             Self::GroupAnnouncement => "groupAnnouncement",
-            Self::RedPacket => "redPacket",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -171,7 +169,6 @@ impl KCMessageKind {
             "callSignal" => Self::CallSignal,
             "groupPinMessage" => Self::GroupPinMessage,
             "groupAnnouncement" => Self::GroupAnnouncement,
-            "redPacket" => Self::RedPacket,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -339,22 +336,6 @@ pub struct KCLightningPayload {
     pub message: Option<String>,
 }
 
-/// Red packet payload (group-chat multi-token). Uses Cashu mint's double-spend
-/// protection for "first-come-first-served" semantics — no protocol arbitration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct KCRedPacketPayload {
-    pub mint: String,
-    /// N independent Cashu tokens, one per share.
-    pub tokens: Vec<String>,
-    /// Total amount across all shares (sats).
-    pub total_amount: u64,
-    /// Number of shares.
-    pub count: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memo: Option<String>,
-}
-
 // ─── Envelope metadata types ─────────────────────────────────────────────────
 
 /// Reply reference (§4.6).
@@ -431,9 +412,6 @@ pub struct KCMessage {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lightning: Option<KCLightningPayload>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub red_packet: Option<KCRedPacketPayload>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub friend_request: Option<KCFriendRequestPayload>,
@@ -706,7 +684,6 @@ impl KCMessage {
             files: None,
             cashu: None,
             lightning: None,
-            red_packet: None,
             friend_request: None,
             friend_approve: None,
             friend_reject: None,
