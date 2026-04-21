@@ -47,12 +47,3 @@ cdk-sqlite = { version = "0.15.1", default-features = false, features = ["wallet
 # Remove this patch entry (and the `patches/cdk-sqlite/` directory) once
 # upstream cdk-sqlite publishes a release that depends on rusqlite >= 0.32.
 cdk-sqlite = { path = "patches/cdk-sqlite" }
-
-# Patch libsignal-protocol to Keychat's fork (branch `kc-x3dh-compat`),
-# which adds `PreKeyBundle::new_without_kyber()` for X3DH-only (v1) peer
-# compatibility, plus X3DH HKDF label and session-version fixes. The
-# fork lives at https://github.com/keychat-io/libsignal; we pin a specific
-# rev to avoid silent upstream changes. See SPEC.md §6 (v1↔v1.5 interop)
-# for the protocol rationale.
-[patch."https://github.com/signalapp/libsignal.git"]
-libsignal-protocol = { git = "https://github.com/keychat-io/libsignal.git", rev = "d0848d0b055716e9c37954b85e71d5e5878550c7" }
