@@ -103,6 +103,10 @@ async fn build_friend_request_event(
     let peer_pubkey = PublicKey::from_hex(peer_nostr_pubkey_hex)
         .map_err(|e| KeychatError::Signal(format!("invalid peer pubkey: {e}")))?;
 
+    // Initial FR is sent in v2 schema. Cross-version FR (1.5 ↔ Flutter v1) is a
+    // known gap: the payload carries Kyber prekey fields that v1 lacks, and the
+    // Flutter app's JSON parser doesn't understand the v2 `{v:2,kind,...}` shape.
+    // The outer Gift Wrap still tags `clientv=2` for peer-version discovery.
     let gift_wrap_event = create_gift_wrap(my_identity.keys(), &peer_pubkey, &kc_json).await?;
     tracing::info!("friend request event built: request_id={request_id}");
     Ok((gift_wrap_event, request_id))
@@ -133,19 +137,6 @@ fn build_prekey_bundle_from_payload(
         libsignal_protocol::PublicKey::deserialize(&remote_one_time_prekey_bytes)
             .map_err(|e| KeychatError::Signal(format!("invalid one-time prekey: {e}")))?;
 
-    if payload.signal_kyber_prekey.is_empty() {
-        return Err(KeychatError::Signal(
-            "Kyber prekey is required for PQXDH session establishment".into(),
-        ));
-    }
-
-    let kyber_prekey_bytes = hex::decode(&payload.signal_kyber_prekey)
-        .map_err(|e| KeychatError::Signal(format!("hex decode kyber prekey: {e}")))?;
-    let kyber_public_key = kem::PublicKey::deserialize(&kyber_prekey_bytes)
-        .map_err(|e| KeychatError::Signal(format!("invalid kyber prekey: {e}")))?;
-    let kyber_sig = hex::decode(&payload.signal_kyber_prekey_signature)
-        .map_err(|e| KeychatError::Signal(format!("hex decode kyber sig: {e}")))?;
-
     let remote_device_id: u32 = payload.device_id.parse().unwrap_or_else(|_| {
         tracing::warn!(
             "device_id parse failed for '{}', defaulting to 1",
@@ -161,22 +152,53 @@ fn build_prekey_bundle_from_payload(
         DeviceId::new(1).unwrap()
     });
 
-    let prekey_bundle = PreKeyBundle::new(
-        1,
-        device_id,
-        Some((
-            libsignal_protocol::PreKeyId::from(payload.signal_one_time_prekey_id),
-            remote_one_time_prekey,
-        )),
-        libsignal_protocol::SignedPreKeyId::from(payload.signal_signed_prekey_id),
-        remote_signed_prekey,
-        remote_signed_prekey_sig,
-        KyberPreKeyId::from(payload.signal_kyber_prekey_id),
-        kyber_public_key,
-        kyber_sig,
-        remote_identity_key,
-    )
-    .map_err(|e| KeychatError::Signal(format!("failed to build prekey bundle: {e}")))?;
+    let prekey_bundle = if payload.signal_kyber_prekey.is_empty() {
+        // v1 (X3DH-only) peer — no Kyber prekey. Build a legacy bundle.
+        tracing::info!("building X3DH-only PreKeyBundle (no Kyber) for v1 peer");
+        PreKeyBundle::new_without_kyber(
+            1,
+            device_id,
+            Some((
+                libsignal_protocol::PreKeyId::from(payload.signal_one_time_prekey_id),
+                remote_one_time_prekey,
+            )),
+            libsignal_protocol::SignedPreKeyId::from(payload.signal_signed_prekey_id),
+            remote_signed_prekey,
+            remote_signed_prekey_sig,
+            remote_identity_key,
+        )
+        .map_err(|e| KeychatError::Signal(format!("failed to build X3DH prekey bundle: {e}")))?
+    } else {
+        // v2 (PQXDH) peer — include Kyber prekey.
+        tracing::info!(
+            "building PQXDH PreKeyBundle (with Kyber1024) for v2 peer; kyber_prekey_id={} kyber_prekey_bytes={}",
+            payload.signal_kyber_prekey_id,
+            payload.signal_kyber_prekey.len() / 2,
+        );
+        let kyber_prekey_bytes = hex::decode(&payload.signal_kyber_prekey)
+            .map_err(|e| KeychatError::Signal(format!("hex decode kyber prekey: {e}")))?;
+        let kyber_public_key = kem::PublicKey::deserialize(&kyber_prekey_bytes)
+            .map_err(|e| KeychatError::Signal(format!("invalid kyber prekey: {e}")))?;
+        let kyber_sig = hex::decode(&payload.signal_kyber_prekey_signature)
+            .map_err(|e| KeychatError::Signal(format!("hex decode kyber sig: {e}")))?;
+
+        PreKeyBundle::new(
+            1,
+            device_id,
+            Some((
+                libsignal_protocol::PreKeyId::from(payload.signal_one_time_prekey_id),
+                remote_one_time_prekey,
+            )),
+            libsignal_protocol::SignedPreKeyId::from(payload.signal_signed_prekey_id),
+            remote_signed_prekey,
+            remote_signed_prekey_sig,
+            KyberPreKeyId::from(payload.signal_kyber_prekey_id),
+            kyber_public_key,
+            kyber_sig,
+            remote_identity_key,
+        )
+        .map_err(|e| KeychatError::Signal(format!("failed to build prekey bundle: {e}")))?
+    };
 
     let remote_address = ProtocolAddress::new(payload.signal_identity_key.clone(), device_id);
 
@@ -190,6 +212,10 @@ async fn build_accept_event(
     friend_request: &FriendRequestReceived,
     display_name: &str,
 ) -> Result<FriendRequestAccepted> {
+    if friend_request.payload.version == 1 {
+        return build_v1_accept_event(my_identity, my_signal, friend_request, display_name).await;
+    }
+
     let payload = &friend_request.payload;
     let (prekey_bundle, remote_address) = build_prekey_bundle_from_payload(payload)?;
 
@@ -224,6 +250,103 @@ async fn build_accept_event(
     let approve_json = approve_msg.to_json()?;
     let ct = my_signal.encrypt(&remote_address, approve_json.as_bytes())?;
     let event = build_mode1_event(&ct.bytes, &payload.first_inbox).await?;
+
+    Ok(FriendRequestAccepted {
+        signal_participant: my_signal.clone(),
+        event,
+        message: approve_msg,
+        sender_address: ct.sender_address,
+    })
+}
+
+/// Build a v1 Flutter-compatible accept event.
+///
+/// In v1, accepting a friend request is NOT a dedicated protocol message. The
+/// approver just sends a plain chat "hello" (see `chat_page.dart` approve
+/// button, which calls `sendMessage(room, RoomUtil.getHelloMessage(name))`).
+/// But the first Signal message after `addRoomKPA` goes through v1's
+/// `decryptPreKeyMessage` path, which expects the decrypted plaintext to be a
+/// `PrekeyMessageModel` JSON carrying identity proof (schnorr sig over
+/// `Keychat-{nostrId}-{signalId}-{time}`) plus the actual message string.
+///
+/// Wire shape:
+///   - Plaintext = PrekeyMessageModel JSON (`nostrId`/`signalId`/`time`/`sig`
+///     /`name`/`message`)
+///   - Signal-encrypted against alice's freshly-built session
+///   - Wrapped as nostr `kind=4`, ephemeral sender, p-tagged to alice's
+///     `onetimekey` from the FR (the address she's subscribed to)
+async fn build_v1_accept_event(
+    my_identity: &Identity,
+    my_signal: &mut SignalParticipant,
+    friend_request: &FriendRequestReceived,
+    display_name: &str,
+) -> Result<FriendRequestAccepted> {
+    let payload = &friend_request.payload;
+    let (prekey_bundle, remote_address) = build_prekey_bundle_from_payload(payload)?;
+
+    my_signal.process_prekey_bundle(&remote_address, &prekey_bundle)?;
+    tracing::info!("session established (v1 path) for friend request acceptance");
+
+    if payload.first_inbox.is_empty() {
+        return Err(KeychatError::Signal(
+            "v1 FR missing onetimekey (payload.first_inbox) — cannot route accept".into(),
+        ));
+    }
+
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let my_signal_id_hex = my_signal.identity_public_key_hex();
+    let sig = compute_global_sign(
+        my_identity.secret_key(),
+        &my_identity.pubkey_hex(),
+        &my_signal_id_hex,
+        time,
+    )?;
+
+    // Plaintext human-readable body shown in alice's chat log. Must match
+    // `RoomUtil.getHelloMessage` so the UX looks identical to a native v1
+    // approve.
+    let hello = format!(
+        "\u{1F604} Hi, I'm {display_name}.\nLet's start an encrypted chat."
+    );
+
+    // v1 `PrekeyMessageModel` — field names are lowerCamelCase to match the
+    // Dart `@JsonSerializable` output. `lightning`/`avatar` are optional;
+    // serde_json's `Value` skips them naturally.
+    let pmm = serde_json::json!({
+        "nostrId": my_identity.pubkey_hex(),
+        "signalId": my_signal_id_hex,
+        "time": time,
+        "sig": sig.clone(),
+        "name": display_name,
+        "message": hello.clone(),
+    });
+    let pmm_bytes = serde_json::to_vec(&pmm)
+        .map_err(|e| KeychatError::Signal(format!("pmm serialize: {e}")))?;
+
+    let ct = my_signal.encrypt(&remote_address, &pmm_bytes)?;
+
+    // kind=4 with ephemeral signer and p-tag to alice's onetimekey.
+    let event =
+        crate::chat::build_mode1_event_with_kind(&ct.bytes, &payload.first_inbox, Kind::from(4))
+            .await?;
+
+    // Caller bookkeeping — expose a friendApprove KCMessage with the same
+    // SignalPrekeyAuth the v2 path produces, so upstream logging is uniform.
+    let request_id = friend_request.message.id.clone().unwrap_or_default();
+    let mut approve_msg = KCMessage::friend_approve(request_id, None);
+    approve_msg.signal_prekey_auth = Some(SignalPrekeyAuth {
+        nostr_id: my_identity.pubkey_hex(),
+        signal_id: my_signal_id_hex,
+        time,
+        name: display_name.to_string(),
+        sig,
+        avatar: None,
+        lightning: None,
+    });
 
     Ok(FriendRequestAccepted {
         signal_participant: my_signal.clone(),
@@ -278,7 +401,7 @@ pub fn receive_friend_request(
 ) -> Result<FriendRequestReceived> {
     let unwrapped = unwrap_gift_wrap(my_identity.keys(), gift_wrap_event)?;
 
-    let message = KCMessage::try_parse(&unwrapped.content)
+    let message = KCMessage::try_parse_any(&unwrapped.content)
         .ok_or_else(|| KeychatError::Signal("failed to parse KCMessage from Gift Wrap".into()))?;
 
     if message.kind != KCMessageKind::FriendRequest {
@@ -443,8 +566,11 @@ pub fn receive_signal_message(
     let plaintext_str = String::from_utf8(decrypt_result.plaintext.clone())
         .map_err(|e| KeychatError::Signal(format!("not valid UTF-8: {e}")))?;
 
-    let message = KCMessage::try_parse(&plaintext_str)
-        .ok_or_else(|| KeychatError::Signal("not a valid KCMessage v2".into()))?;
+    // Accept both v2 native and v1 legacy payloads so peers on the older
+    // Flutter app that emit `{"c":"signal","type":<n>,...}` after the handshake
+    // remain interoperable.
+    let message = KCMessage::try_parse_any(&plaintext_str)
+        .ok_or_else(|| KeychatError::Signal("not a valid KCMessage".into()))?;
 
     Ok((message, decrypt_result))
 }
@@ -455,6 +581,335 @@ use crate::message::uuid_v4;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the exact wire shape that v1 Flutter 1.40.9 puts on the relay:
+    /// outer kind=1059 Gift Wrap whose inner rumor has `kind=1059` (v1 reuses
+    /// nip17Kind for both layers) and whose rumor content is the
+    /// `KeychatMessage{c,type=101,msg,name}` envelope with `name` carrying a
+    /// serialized QRUserModel. The resulting event is what a v1 peer emits on
+    /// the wire; libkeychat must accept it end-to-end.
+    ///
+    /// `sender_signal` supplies real Signal keys so the receiver can finish
+    /// X3DH on accept. Callers without a persistent store pass an ephemeral
+    /// `SignalParticipant::new(...)`.
+    async fn build_v1_flutter_friend_request(
+        sender: &Identity,
+        sender_signal: &SignalParticipant,
+        sender_onetimekey_hex: &str,
+        receiver_pubkey: &PublicKey,
+        sender_display_name: &str,
+    ) -> Event {
+        use crate::signal_keys::compute_global_sign;
+
+        let signal_identity_hex = sender_signal.identity_public_key_hex();
+        let time: u64 = 1_700_000_000_000; // milliseconds, as v1 emits
+        let global_sign = compute_global_sign(
+            sender.secret_key(),
+            &sender.pubkey_hex(),
+            &signal_identity_hex,
+            time,
+        )
+        .unwrap();
+
+        let qr = serde_json::json!({
+            "name": sender_display_name,
+            "pubkey": sender.pubkey_hex(),
+            "curve25519PkHex": signal_identity_hex,
+            "onetimekey": sender_onetimekey_hex,
+            "signedId": sender_signal.signed_prekey_id(),
+            "signedPublic": sender_signal.signed_prekey_public_hex().unwrap(),
+            "signedSignature": sender_signal.signed_prekey_signature_hex().unwrap(),
+            "prekeyId": sender_signal.prekey_id(),
+            "prekeyPubkey": sender_signal.prekey_public_hex().unwrap(),
+            "time": time,
+            "globalSign": global_sign,
+            "relay": "",
+        });
+
+        let outer = serde_json::json!({
+            "c": "signal",
+            "type": 101, // dmAddContactFromAlice
+            "msg": "Hi, I'm Alice. Let's start an encrypted chat.",
+            "name": qr.to_string(),
+        });
+        let content = outer.to_string();
+
+        // Build the wire event with rumor kind=1059 (v1's quirk).
+        let wrapper = EphemeralKeypair::generate();
+        let now = Timestamp::now();
+        let rumor: UnsignedEvent = EventBuilder::new(Kind::from(1059), &content)
+            .tag(Tag::public_key(*receiver_pubkey))
+            .custom_created_at(now)
+            .build(sender.public_key());
+        let seal_content =
+            crate::nip44::encrypt(sender.secret_key(), receiver_pubkey, &rumor.as_json()).unwrap();
+        let seal = EventBuilder::new(Kind::from(13), &seal_content)
+            .custom_created_at(now)
+            .sign(sender.keys())
+            .await
+            .unwrap();
+        let wrap_content =
+            crate::nip44::encrypt(wrapper.keys().secret_key(), receiver_pubkey, &seal.as_json())
+                .unwrap();
+        EventBuilder::new(Kind::GiftWrap, &wrap_content)
+            .tag(Tag::public_key(*receiver_pubkey))
+            .custom_created_at(now)
+            .sign(wrapper.keys())
+            .await
+            .unwrap()
+    }
+
+    /// End-to-end: accepting a v1 Flutter FR must produce a plain
+    /// signal-encrypted `kind=4` nostr event p-tagged to alice's onetimekey
+    /// (from her FR). No QRUserModel, no KeychatMessage envelope — alice's
+    /// v1 client will just decrypt it as the first chat message from bob.
+    #[tokio::test]
+    async fn v1_accept_is_signal_kind4_to_onetimekey() {
+        let alice = Identity::generate().unwrap().identity; // v1 sender
+        let bob = Identity::generate().unwrap().identity; // v1.5 receiver
+        let alice_onetimekey = EphemeralKeypair::generate();
+
+        let mut alice_signal = SignalParticipant::new(alice.pubkey_hex(), 1).unwrap();
+        let fr_gw = build_v1_flutter_friend_request(
+            &alice,
+            &alice_signal,
+            &alice_onetimekey.pubkey_hex(),
+            &bob.public_key(),
+            "Alice-v1",
+        )
+        .await;
+        let received = receive_friend_request(&bob, &fr_gw).unwrap();
+        assert_eq!(received.payload.version, 1);
+        assert_eq!(received.payload.first_inbox, alice_onetimekey.pubkey_hex());
+
+        let accepted = accept_friend_request(&bob, &received, "Bob-1.5")
+            .await
+            .unwrap();
+
+        // Wire shape v1 subscribes to: plain kind=4 with a p-tag to alice's
+        // onetimekey. No gift wrap, no QR.
+        assert_eq!(accepted.event.kind, Kind::from(4));
+        let p_tags: Vec<&str> = accepted
+            .event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)))
+            .filter_map(|t| t.content())
+            .collect();
+        assert_eq!(
+            p_tags,
+            vec![alice_onetimekey.pubkey_hex().as_str()],
+            "v1 accept must p-tag exactly alice's onetimekey"
+        );
+        // Sender is ephemeral, not bob's main identity.
+        assert_ne!(accepted.event.pubkey, bob.public_key());
+
+        // Alice can decrypt the content with her signal session against bob's
+        // signal identity — i.e. a real X3DH session was established.
+        let bob_signal_addr = ProtocolAddress::new(
+            accepted.signal_participant.identity_public_key_hex(),
+            DeviceId::new(1).unwrap(),
+        );
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(&accepted.event.content)
+            .unwrap();
+        assert!(
+            SignalParticipant::is_prekey_message(&ciphertext),
+            "first accept ciphertext must be a PrekeyMessage"
+        );
+        let plaintext = alice_signal
+            .decrypt_bytes(&bob_signal_addr, &ciphertext)
+            .unwrap();
+        let decoded = String::from_utf8(plaintext).unwrap();
+        // Plaintext is a PrekeyMessageModel JSON — the shape v1's
+        // `decryptPreKeyMessage` parses.
+        let pmm: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(pmm["nostrId"], bob.pubkey_hex());
+        assert_eq!(pmm["name"], "Bob-1.5");
+        assert!(
+            pmm["message"].as_str().unwrap().contains("Bob-1.5"),
+            "message field should contain hello greeting"
+        );
+        assert_eq!(
+            pmm["signalId"].as_str().unwrap(),
+            accepted.signal_participant.identity_public_key_hex()
+        );
+
+        // sig verifies as a schnorr sig over `Keychat-{nostrId}-{signalId}-{time}`,
+        // exactly what v1's `SignalChatUtil.verifySignedMessage` checks.
+        let sig_valid = verify_global_sign(
+            pmm["nostrId"].as_str().unwrap(),
+            pmm["signalId"].as_str().unwrap(),
+            pmm["time"].as_u64().unwrap(),
+            pmm["sig"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(sig_valid, "PrekeyMessageModel sig must verify");
+    }
+
+    /// End-to-end: after bob accepts a v1 FR, his follow-up chat sends (before
+    /// alice replies) must still land on alice's onetimekey AND wrap the v1
+    /// KeychatMessage JSON as a `PrekeyMessageModel`. v1's
+    /// `decryptPreKeyMessage` (the p-tag=onetimekey branch) expects the Signal
+    /// plaintext to be PMM JSON — a raw v1 KCMessage JSON would fail the
+    /// `PrekeyMessageModel.fromJson` parse and the message would be dropped.
+    #[tokio::test]
+    async fn v1_follow_up_wraps_v1_json_as_pmm_before_peer_reply() {
+        // ── setup: alice sends v1 FR, bob accepts ────────────────────────
+        let alice = Identity::generate().unwrap().identity;
+        let bob = Identity::generate().unwrap().identity;
+        let alice_onetimekey = EphemeralKeypair::generate();
+
+        let mut alice_signal = SignalParticipant::new(alice.pubkey_hex(), 1).unwrap();
+        let fr_gw = build_v1_flutter_friend_request(
+            &alice,
+            &alice_signal,
+            &alice_onetimekey.pubkey_hex(),
+            &bob.public_key(),
+            "Alice-v1",
+        )
+        .await;
+        let received = receive_friend_request(&bob, &fr_gw).unwrap();
+        let accepted = accept_friend_request(&bob, &received, "Bob-1.5")
+            .await
+            .unwrap();
+
+        // Drain the accept ciphertext on alice's side so her Signal session
+        // state matches what it would be after receiving bob's accept off the
+        // relay — otherwise the follow-up `decrypt` below would still hit the
+        // prekey branch incorrectly.
+        let bob_signal_addr = ProtocolAddress::new(
+            accepted.signal_participant.identity_public_key_hex(),
+            DeviceId::new(1).unwrap(),
+        );
+        let accept_ct = base64::engine::general_purpose::STANDARD
+            .decode(&accepted.event.content)
+            .unwrap();
+        alice_signal.decrypt_bytes(&bob_signal_addr, &accept_ct).unwrap();
+
+        // ── bob, still in the "peer hasn't replied" phase, sends a follow-up.
+        // This mirrors the v1 path in keychat-app-core's messaging.rs:
+        //   1. v2_to_v1 → "{\"c\":\"signal\",\"type\":100,\"msg\":\"…\"}"
+        //   2. wrap in PrekeyMessageModel
+        //   3. Signal-encrypt
+        //   4. build_mode1_event_with_kind (kind=4, p-tag = alice_onetimekey)
+        let mut bob_signal = accepted.signal_participant;
+        let v1_json =
+            r#"{"c":"signal","type":100,"msg":"follow-up from bob"}"#.to_string();
+
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let bob_signal_id_hex = bob_signal.identity_public_key_hex();
+        let sig = compute_global_sign(
+            bob.secret_key(),
+            &bob.pubkey_hex(),
+            &bob_signal_id_hex,
+            time,
+        )
+        .unwrap();
+        let pmm = serde_json::json!({
+            "nostrId": bob.pubkey_hex(),
+            "signalId": bob_signal_id_hex,
+            "time": time,
+            "sig": sig,
+            "name": "Bob-1.5",
+            "message": v1_json.clone(),
+        });
+        let pmm_bytes = serde_json::to_vec(&pmm).unwrap();
+
+        let alice_signal_addr = ProtocolAddress::new(
+            alice_signal.identity_public_key_hex(),
+            DeviceId::new(1).unwrap(),
+        );
+        let ct = bob_signal.encrypt(&alice_signal_addr, &pmm_bytes).unwrap();
+        let event = crate::chat::build_mode1_event_with_kind(
+            &ct.bytes,
+            &alice_onetimekey.pubkey_hex(),
+            Kind::from(4),
+        )
+        .await
+        .unwrap();
+
+        // ── wire-shape assertions ──────────────────────────────────────
+        assert_eq!(event.kind, Kind::from(4), "v1 follow-up must be kind=4");
+        let p_tags: Vec<&str> = event
+            .tags
+            .iter()
+            .filter(|t| t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)))
+            .filter_map(|t| t.content())
+            .collect();
+        assert_eq!(
+            p_tags,
+            vec![alice_onetimekey.pubkey_hex().as_str()],
+            "v1 follow-up must p-tag alice's onetimekey while she hasn't replied"
+        );
+        assert_ne!(
+            event.pubkey,
+            bob.public_key(),
+            "v1 follow-up sender must be ephemeral, not bob's main identity"
+        );
+
+        // ── alice decrypts: plaintext must parse as PMM (v1 requirement) ─
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(&event.content)
+            .unwrap();
+        // PreKey vs Signal message depends on whether alice has acked yet.
+        // We drained accept above, so ratchets have advanced; the follow-up
+        // may be either kind depending on ordering. Either way alice decrypts.
+        let plaintext = alice_signal
+            .decrypt_bytes(&bob_signal_addr, &ciphertext)
+            .unwrap();
+        let decoded = String::from_utf8(plaintext).unwrap();
+
+        let pmm: serde_json::Value = serde_json::from_str(&decoded)
+            .expect("v1 follow-up plaintext must be parseable as PrekeyMessageModel JSON");
+        assert_eq!(pmm["nostrId"], bob.pubkey_hex());
+        assert_eq!(pmm["signalId"], bob_signal_id_hex);
+        assert_eq!(pmm["name"], "Bob-1.5");
+        assert_eq!(
+            pmm["message"].as_str().unwrap(),
+            v1_json,
+            "PMM.message must carry the v1 KCMessage JSON unchanged"
+        );
+        let sig_valid = verify_global_sign(
+            pmm["nostrId"].as_str().unwrap(),
+            pmm["signalId"].as_str().unwrap(),
+            pmm["time"].as_u64().unwrap(),
+            pmm["sig"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(sig_valid, "PMM sig must verify");
+    }
+
+    /// End-to-end: a v1 Flutter-shaped FR must be unwrapped and parsed into
+    /// a `FriendRequestReceived` — i.e. the UI can show the accept button.
+    #[tokio::test]
+    async fn v1_flutter_friend_request_round_trip() {
+        let alice = Identity::generate().unwrap().identity;
+        let bob = Identity::generate().unwrap().identity;
+        let alice_signal = SignalParticipant::new(alice.pubkey_hex(), 1).unwrap();
+        let alice_onetimekey = EphemeralKeypair::generate();
+
+        let gw = build_v1_flutter_friend_request(
+            &alice,
+            &alice_signal,
+            &alice_onetimekey.pubkey_hex(),
+            &bob.public_key(),
+            "Alice-v1",
+        )
+        .await;
+        assert_eq!(gw.kind, Kind::GiftWrap);
+
+        let received = receive_friend_request(&bob, &gw).expect("v1 FR must unwrap + parse");
+        assert_eq!(received.sender_pubkey, alice.public_key());
+        assert_eq!(received.payload.name, "Alice-v1");
+        assert_eq!(received.message.kind, KCMessageKind::FriendRequest);
+        assert_eq!(received.payload.version, 1);
+        assert!(received.payload.signal_kyber_prekey.is_empty(), "v1 has no Kyber");
+        assert!(received.payload.message.is_some(), "greeting message preserved");
+    }
 
     #[tokio::test]
     async fn full_friend_request_roundtrip() {
