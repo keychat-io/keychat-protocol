@@ -300,6 +300,109 @@ impl ProtocolClient {
     pub fn signal_to_nostr(&self, signal_id: &str) -> Option<&String> {
         self.peer_signal_to_nostr.get(signal_id)
     }
+
+    /// Returns `Some(onetimekey_hex)` when the next send to this peer would
+    /// still be routed to their stored `peer_first_inbox` — i.e. no ratchet
+    /// sending address has been set yet.
+    ///
+    /// For v1 Flutter peers, events on the `peer_first_inbox` (their
+    /// onetimekey) are handled by `decryptPreKeyMessage`, which expects the
+    /// Signal plaintext to be a `PrekeyMessageModel` JSON, not a plain
+    /// KeychatMessage. Callers use this signal to wrap follow-up sends in the
+    /// PMM envelope until the peer replies and a ratchet address takes over.
+    ///
+    /// Returns `None` if the peer is unknown or a ratchet sending address is
+    /// already in place.
+    pub async fn peer_first_inbox_pending(&self, peer_nostr_pk: &str) -> Option<String> {
+        let signal_id = self.peer_nostr_to_signal.get(peer_nostr_pk)?.clone();
+        let session_mutex = self.sessions.get(&signal_id)?.clone();
+        let session = session_mutex.lock().await;
+        let state = session.addresses.get_peer(&signal_id)?;
+        if state.sending_address.is_some() {
+            return None;
+        }
+        state.peer_first_inbox.clone()
+    }
+
+    /// Build a v1 `PrekeyMessageModel` JSON wrapping `inner_payload` as its
+    /// `message` field. The returned bytes are what callers should pass as
+    /// `override_payload` to `send_message_with_content_core` when the peer is
+    /// still in the prekey phase (see [`Self::peer_first_inbox_pending`]).
+    ///
+    /// v1 Flutter's `decryptPreKeyMessage` (triggered when the outer kind=4
+    /// event's `p`-tag matches a stored Mykey / onetimekey) requires:
+    ///   - Plaintext parses as `PrekeyMessageModel` JSON
+    ///     (`nostrId`/`signalId`/`time`/`sig`/`name`/`message`).
+    ///   - `sig` is the schnorr signature over
+    ///     `"Keychat-{nostrId}-{signalId}-{time}"` by our nostr identity.
+    ///   - `message` is either a KeychatMessage JSON (dispatched to the
+    ///     matching service) or a plain string (rendered as DM).
+    ///
+    /// Caller must already know the peer has an active session
+    /// (`peer_nostr_to_signal` hit). Errors if not.
+    pub async fn build_v1_prekey_pmm(
+        &self,
+        peer_nostr_pk: &str,
+        inner_payload: &[u8],
+        display_name: &str,
+    ) -> Result<Vec<u8>> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| KeychatError::Identity("no identity set".into()))?;
+
+        let signal_hex = self
+            .peer_nostr_to_signal
+            .get(peer_nostr_pk)
+            .ok_or_else(|| {
+                KeychatError::SignalSession(format!(
+                    "peer not found: {}",
+                    &peer_nostr_pk[..16.min(peer_nostr_pk.len())]
+                ))
+            })?
+            .clone();
+        let session_mutex = self
+            .sessions
+            .get(&signal_hex)
+            .ok_or_else(|| {
+                KeychatError::SignalSession(format!(
+                    "no session for signal id: {}",
+                    &signal_hex[..16.min(signal_hex.len())]
+                ))
+            })?
+            .clone();
+
+        let my_signal_id_hex = {
+            let session = session_mutex.lock().await;
+            session.signal.identity_public_key_hex()
+        };
+
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let sig = crate::signal_keys::compute_global_sign(
+            identity.secret_key(),
+            &identity.pubkey_hex(),
+            &my_signal_id_hex,
+            time,
+        )?;
+
+        let inner_str = std::str::from_utf8(inner_payload)
+            .map_err(|e| KeychatError::Signal(format!("v1 inner payload not utf-8: {e}")))?;
+
+        let pmm = serde_json::json!({
+            "nostrId": identity.pubkey_hex(),
+            "signalId": my_signal_id_hex,
+            "time": time,
+            "sig": sig,
+            "name": display_name,
+            "message": inner_str,
+        });
+        serde_json::to_vec(&pmm)
+            .map_err(|e| KeychatError::Signal(format!("pmm serialize: {e}")))
+    }
     pub fn peer_count(&self) -> usize {
         self.peer_nostr_to_signal.len()
     }
@@ -1001,6 +1104,37 @@ impl ProtocolClient {
         peer_pubkey: &str,
         msg: &crate::KCMessage,
     ) -> Result<SendResult> {
+        self.send_message_core_inner(peer_pubkey, msg, None, None)
+            .await
+    }
+
+    /// Variant of `send_message_core` used by the v1 compatibility layer.
+    ///
+    /// - `override_payload`: Signal-encrypts these bytes instead of
+    ///   `msg.to_json()`. Let callers emit a legacy KeychatMessage schema.
+    /// - `wire_kind`: when `Some`, the outer event uses this Nostr `Kind`
+    ///   (pass `Kind::from(4)` for Flutter v1 peers subscribed to kind:4).
+    ///
+    /// `payload_json` in the returned `SendResult` reflects the bytes that
+    /// were actually encrypted, so app-layer persistence stays consistent.
+    pub async fn send_message_with_content_core(
+        &mut self,
+        peer_pubkey: &str,
+        msg: &crate::KCMessage,
+        override_payload: &[u8],
+        wire_kind: Option<crate::Kind>,
+    ) -> Result<SendResult> {
+        self.send_message_core_inner(peer_pubkey, msg, Some(override_payload), wire_kind)
+            .await
+    }
+
+    async fn send_message_core_inner(
+        &mut self,
+        peer_pubkey: &str,
+        msg: &crate::KCMessage,
+        override_payload: Option<&[u8]>,
+        wire_kind: Option<crate::Kind>,
+    ) -> Result<SendResult> {
         // 1. Check relay connection
         let transport = self
             .transport
@@ -1038,10 +1172,23 @@ impl ProtocolClient {
         // 3. Encrypt via Signal session
         let device_id = crate::DeviceId::new(1).expect("device_id 1 is valid");
         let remote_addr = crate::ProtocolAddress::new(signal_hex.clone(), device_id);
-        let payload_json = msg.to_json().ok();
+        // Persist the actually-encrypted bytes (override wins over msg.to_json())
+        // so the app-layer message record matches what the peer will see.
+        let payload_json = match override_payload {
+            Some(b) => std::str::from_utf8(b).ok().map(String::from),
+            None => msg.to_json().ok(),
+        };
         let (event, addr_update) = {
             let mut session = session_mutex.lock().await;
-            session.send_message(&signal_hex, &remote_addr, msg).await?
+            session
+                .send_message_with_bytes(
+                    &signal_hex,
+                    &remote_addr,
+                    override_payload,
+                    msg,
+                    wire_kind,
+                )
+                .await?
         };
 
         // 4. Serialize for resend support
@@ -1089,7 +1236,10 @@ impl ProtocolClient {
 
         let received = match crate::receive_friend_request(identity, event) {
             Ok(r) => r,
-            Err(_) => return None,
+            Err(e) => {
+                tracing::debug!("[Step1] receive_friend_request failed: {e}");
+                return None;
+            }
         };
 
         let request_id = received

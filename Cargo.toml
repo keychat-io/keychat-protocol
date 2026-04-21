@@ -7,6 +7,10 @@ members = [
     "keychat-wallet",
     "keychat-wallet-uniffi",
 ]
+exclude = [
+    "libsignal-local",
+    "libsignal-protocol-patch",
+]
 resolver = "2"
 
 [workspace.dependencies]
@@ -14,7 +18,9 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 nostr = { version = "0.37", features = ["nip44", "nip06"] }
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+# vendored-openssl so Android NDK cross-compile works without a system OpenSSL;
+# iOS is unaffected since the bundled build is self-contained on both platforms.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hex = "0.4"
 base64 = "0.22"

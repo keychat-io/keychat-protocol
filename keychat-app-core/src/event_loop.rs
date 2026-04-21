@@ -93,6 +93,49 @@ impl AppClient {
             }
         });
 
+        // Spawn the PQXDH background-upgrade processor.
+        //
+        // Observing a `clientv=2` event from a peer triggers
+        // `set_peer_version(room, 2)` at four call sites inside this file.
+        // Each of those sites is an `&self` async method that can't spawn a
+        // self-owning task on its own, so instead they push `room_id`s onto
+        // this channel. This processor owns `Arc<Self>` and dispatches each
+        // request to `handle_upgrade_trigger`, which is responsible for the
+        // tiebreak, the in-flight dedup, and the actual FR publish.
+        //
+        // Dispatching each trigger as its own `tokio::spawn` means a slow
+        // relay handshake on one room doesn't block upgrades on other rooms
+        // while the event loop is still receiving messages.
+        let (upgrade_tx, mut upgrade_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        let _ = self.upgrade_trigger_tx.set(upgrade_tx);
+        let self_for_upgrade = Arc::clone(&self);
+        let mut upgrade_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = upgrade_stop.changed() => {
+                        tracing::info!("pqxdh upgrade processor: stop signal received");
+                        break;
+                    }
+                    msg = upgrade_rx.recv() => {
+                        match msg {
+                            Some(room_id) => {
+                                let self_clone = Arc::clone(&self_for_upgrade);
+                                tokio::spawn(async move {
+                                    self_clone.handle_upgrade_trigger(room_id).await;
+                                });
+                            }
+                            None => {
+                                tracing::info!("pqxdh upgrade processor: channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Spawn the event loop task
         let self_clone = Arc::clone(&self);
         tokio::spawn(async move {
@@ -163,7 +206,7 @@ impl AppClient {
                                     let relay = relay_url.to_string();
                                     let event_json = serde_json::to_string(&event).ok();
 
-                                    self.handle_incoming_event(&event, Some(relay.clone()), event_json).await;
+                                    self.handle_incoming_event(&event, Some(relay.clone()), event_json, is_v2_peer).await;
 
                                     // Update relay cursor AFTER handling (only for handled events).
                                     // Clamp to now() to prevent NIP-17's randomized ±2 day
@@ -214,13 +257,14 @@ impl AppClient {
         event: &libkeychat::Event,
         relay_url: Option<String>,
         nostr_event_json: Option<String>,
+        is_v2_peer: bool,
     ) {
         // Step 1: Try friend request
         {
             let inner = self.inner.read().await;
             if let Some(ctx) = inner.protocol.try_decrypt_friend_request(event) {
                 drop(inner);
-                self.on_friend_request_app_persist(ctx, event).await;
+                self.on_friend_request_app_persist(ctx, event, is_v2_peer).await;
                 return;
             }
         }
@@ -263,7 +307,7 @@ impl AppClient {
                     drop(inner);
                 }
 
-                self.on_friend_approve_app_persist(&request_id, &msg, event)
+                self.on_friend_approve_app_persist(&request_id, &msg, event, is_v2_peer)
                     .await;
                 return;
             }
@@ -352,6 +396,7 @@ impl AppClient {
                 event,
                 relay_url,
                 nostr_event_json,
+                is_v2_peer,
             )
             .await;
             return;
@@ -372,7 +417,7 @@ impl AppClient {
                 ctx.nostr_event_json = nostr_event_json;
                 ctx.relay_url = relay_url;
                 drop(inner);
-                self.on_nip17_dm_app_persist(ctx).await;
+                self.on_nip17_dm_app_persist(ctx, is_v2_peer).await;
                 return;
             }
         }
@@ -384,6 +429,7 @@ impl AppClient {
         &self,
         ctx: libkeychat::FriendRequestContext,
         _event: &libkeychat::Event,
+        is_v2_peer: bool,
     ) {
         let identity_pubkey = self.cached_identity_pubkey();
         if identity_pubkey.is_empty() {
@@ -468,6 +514,18 @@ impl AppClient {
         };
 
         if let Some(room_id) = saved_room_id {
+            if is_v2_peer {
+                let app_storage = self.inner.read().await.app_storage.clone();
+                let store = lock_app_storage(&app_storage);
+                let _ = store.set_peer_version(&room_id, 2);
+                drop(store);
+                // Ask the background processor whether this peer bump
+                // warrants a PQXDH auto-upgrade FR from our side (tiebreak
+                // + idempotency live there, not here).
+                if let Some(tx) = self.upgrade_trigger_tx.get() {
+                    let _ = tx.send(room_id.clone());
+                }
+            }
             self.emit_data_change(DataChange::RoomListChanged).await;
             self.emit_data_change(DataChange::ContactListChanged).await;
             self.emit_data_change(DataChange::MessageAdded { room_id, msgid })
@@ -496,7 +554,28 @@ impl AppClient {
                 .accept_friend_request(ctx.request_id.clone(), my_name)
                 .await
             {
-                Ok(_) => tracing::info!("auto-approved friend request from existing friend"),
+                Ok(_) => {
+                    tracing::info!("auto-approved friend request from existing friend");
+                    // If the re-key came from a v2 peer, the Signal session we
+                    // just rebuilt is PQXDH (every 1.5 FR carries Kyber). Latch
+                    // session_type so the background trigger doesn't re-fire
+                    // this same upgrade on the next observed v2 event.
+                    if is_v2_peer {
+                        let rid = make_room_id(&ctx.sender_pubkey, &identity_pubkey);
+                        let app_storage = self.inner.read().await.app_storage.clone();
+                        let store = lock_app_storage(&app_storage);
+                        match store.set_session_type(&rid, "pqxdh") {
+                            Ok(n) if n > 0 => tracing::info!(
+                                "pqxdh upgrade: latched session_type=pqxdh on auto-accept room={}..",
+                                &rid[..16.min(rid.len())]
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                "pqxdh upgrade: set_session_type failed on auto-accept: {e}"
+                            ),
+                        }
+                    }
+                }
                 Err(e) => tracing::warn!("auto-approve failed: {e}"),
             }
         }
@@ -507,6 +586,7 @@ impl AppClient {
         request_id: &str,
         msg: &libkeychat::KCMessage,
         event: &libkeychat::Event,
+        is_v2_peer: bool,
     ) {
         if msg.kind == libkeychat::KCMessageKind::FriendApprove {
             let peer_name = msg
@@ -592,6 +672,28 @@ impl AppClient {
                 };
 
                 if let Some(room_id) = saved_room_id {
+                    if is_v2_peer {
+                        let app_storage = self.inner.read().await.app_storage.clone();
+                        let store = lock_app_storage(&app_storage);
+                        let _ = store.set_peer_version(&room_id, 2);
+                        // Receiving an accept from a v2 peer means the FR we
+                        // sent was PQXDH, so our freshly-built Signal session
+                        // is PQXDH. Latch session_type so:
+                        //   (a) the UI/debug layer can tell x3dh-migrated
+                        //       rooms from upgraded rooms, and
+                        //   (b) future v2 peer_version observations don't
+                        //       re-trigger a redundant upgrade FR.
+                        match store.set_session_type(&room_id, "pqxdh") {
+                            Ok(n) if n > 0 => tracing::info!(
+                                "pqxdh upgrade: latched session_type=pqxdh on approve room={}..",
+                                &room_id[..16.min(room_id.len())]
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                "pqxdh upgrade: set_session_type failed on approve: {e}"
+                            ),
+                        }
+                    }
                     self.emit_data_change(DataChange::RoomUpdated {
                         room_id: room_id.clone(),
                     })
@@ -654,8 +756,16 @@ impl AppClient {
         event: &libkeychat::Event,
         relay_url: Option<String>,
         nostr_event_json: Option<String>,
+        is_v2_peer: bool,
     ) {
         let identity_pubkey = self.cached_identity_pubkey();
+        tracing::info!(
+            "on_message_app_persist: entered kind={:?} sender={} is_v2_peer={} my_id={}",
+            msg.kind,
+            &sender_nostr_pubkey[..16.min(sender_nostr_pubkey.len())],
+            is_v2_peer,
+            &identity_pubkey[..16.min(identity_pubkey.len())]
+        );
 
         // ── Group-specific message dispatch ──────────────────────────
         match msg.kind {
@@ -1061,6 +1171,30 @@ impl AppClient {
             };
 
             if let Some(msgid) = saved_msgid {
+                tracing::info!(
+                    "on_message_app_persist: saved msgid={} is_v2_peer={} group={}",
+                    &msgid[..16.min(msgid.len())],
+                    is_v2_peer,
+                    group_id.is_some()
+                );
+                if is_v2_peer && group_id.is_none() {
+                    let app_storage = self.inner.read().await.app_storage.clone();
+                    let store = lock_app_storage(&app_storage);
+                    let _ = store.set_peer_version(&full_room_id, 2);
+                    drop(store);
+                    // Normal message from a confirmed v2 peer — request a
+                    // background PQXDH auto-upgrade if our session is still
+                    // on X3DH. Processor re-validates preconditions.
+                    tracing::info!(
+                        "on_message_app_persist: pushing upgrade trigger for room={}",
+                        &full_room_id[..16.min(full_room_id.len())]
+                    );
+                    if let Some(tx) = self.upgrade_trigger_tx.get() {
+                        let _ = tx.send(full_room_id.clone());
+                    } else {
+                        tracing::warn!("on_message_app_persist: upgrade_trigger_tx is None!");
+                    }
+                }
                 self.emit_data_change(DataChange::MessageAdded {
                     room_id: full_room_id.clone(),
                     msgid,
@@ -1090,7 +1224,7 @@ impl AppClient {
         .await;
     }
 
-    async fn on_nip17_dm_app_persist(&self, ctx: libkeychat::Nip17DmContext) {
+    async fn on_nip17_dm_app_persist(&self, ctx: libkeychat::Nip17DmContext, is_v2_peer: bool) {
         let identity_pubkey = self.cached_identity_pubkey();
         if identity_pubkey.is_empty() {
             return;
@@ -1111,6 +1245,15 @@ impl AppClient {
                 None,
                 None,
             );
+            if is_v2_peer {
+                let _ = store.set_peer_version(&room_id, 2);
+                // Same auto-upgrade trigger as the regular-message path
+                // above, but for NIP-17 DMs. The channel send is outside
+                // the lock critical section via the per-iteration scope.
+                if let Some(tx) = self.upgrade_trigger_tx.get() {
+                    let _ = tx.send(room_id.clone());
+                }
+            }
             let _ = store.save_app_message(
                 &msgid,
                 Some(&ctx.event_id),
@@ -1234,5 +1377,196 @@ impl AppClient {
             let mut tracker = self.relay_tracker.lock().unwrap_or_else(|e| e.into_inner());
             tracker.cleanup_resolved();
         }
+    }
+
+    /// Background PQXDH-upgrade handler. Invoked asynchronously by the
+    /// upgrade-processor task whenever a `set_peer_version(room, 2)` site
+    /// pushes a room onto the upgrade channel (see `start_event_loop`).
+    ///
+    /// Responsibilities:
+    /// - Confirm the room is a direct-message session that actually needs
+    ///   upgrading (peer_version=2, session_type not already pqxdh,
+    ///   status enabled).
+    /// - Apply a deterministic pubkey tiebreak so exactly one side of a
+    ///   re-handshake initiates. The side with the lexicographically
+    ///   smaller identity pubkey sends the upgrade FR; the other side
+    ///   waits and relies on the existing-friend auto-accept path in
+    ///   `on_friend_request_app_persist` to complete the PQXDH handshake
+    ///   on its end.
+    /// - Hold an in-memory in-flight guard to prevent repeat triggers
+    ///   while a previous upgrade FR is still outstanding.
+    /// - Publish a fresh friend request via the protocol layer. Because
+    ///   every 1.5 client always produces Kyber prekeys for its FR bundle,
+    ///   the resulting Signal session is PQXDH end-to-end.
+    /// - Skip the app-layer `send_friend_request` wrapper on purpose:
+    ///   that wrapper writes a "[Friend Request Sent]" chat bubble and
+    ///   flips the room into Requesting, neither of which is desirable
+    ///   for a silent background re-key between existing friends.
+    ///
+    /// Session_type is latched to "pqxdh" separately, after the actual
+    /// handshake lands: on A's side in `on_friend_approve_app_persist`
+    /// when the accept-ack arrives, on B's side in the existing-friend
+    /// auto-accept branch of `on_friend_request_app_persist`.
+    async fn handle_upgrade_trigger(self: Arc<Self>, room_id: String) {
+        tracing::info!(
+            "pqxdh upgrade: trigger received for room={}..",
+            &room_id[..16.min(room_id.len())]
+        );
+        // Snapshot room state (drop lock before any awaits on relay I/O).
+        let room = {
+            let app_storage = self.inner.read().await.app_storage.clone();
+            let store = lock_app_storage(&app_storage);
+            match store.get_app_room(&room_id) {
+                Ok(Some(r)) => r,
+                _ => {
+                    tracing::debug!(
+                        "pqxdh upgrade: room {} not found, skip",
+                        &room_id[..16.min(room_id.len())]
+                    );
+                    return;
+                }
+            }
+        };
+        tracing::info!(
+            "pqxdh upgrade: room snapshot type={} status={} peer_version={:?} session_type={:?}",
+            room.room_type,
+            room.status,
+            room.peer_version,
+            room.session_type
+        );
+
+        // Preconditions.
+        if room.room_type != RoomType::Dm.to_i32() {
+            return;
+        }
+        if room.status != RoomStatus::Enabled.to_i32() {
+            return;
+        }
+        if room.peer_version != Some(2) {
+            // Should be true at the call site, but guard against races.
+            return;
+        }
+        // Only trigger on explicit "x3dh" (i.e. a session carried over from a
+        // v1 migration — see `v1_migration::migrate_signal_sessions` which
+        // inserts `session_type='x3dh'`). `None` means "fresh 1.5 session of
+        // unknown type", which for 1.5-built FRs is already PQXDH by
+        // construction and shouldn't be re-upgraded. Any other value
+        // (including `"pqxdh"`) is also a no-op.
+        if room.session_type.as_deref() != Some("x3dh") {
+            return;
+        }
+
+        // Pubkey tiebreak — deterministic and symmetric.
+        let my_pub = self.cached_identity_pubkey();
+        let peer_pub = &room.to_main_pubkey;
+        if my_pub.is_empty() || my_pub.as_str() >= peer_pub.as_str() {
+            tracing::debug!(
+                "pqxdh upgrade: tiebreak skip me={}.. peer={}..",
+                &my_pub[..16.min(my_pub.len())],
+                &peer_pub[..16.min(peer_pub.len())]
+            );
+            return;
+        }
+
+        // In-flight guard — insert-or-bail.
+        {
+            let mut inflight = self
+                .pqxdh_upgrade_inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !inflight.insert(room_id.clone()) {
+                tracing::debug!(
+                    "pqxdh upgrade: already in flight for room {}..",
+                    &room_id[..16.min(room_id.len())]
+                );
+                return;
+            }
+        }
+
+        tracing::info!(
+            "pqxdh upgrade: initiating silent FR to peer {}.. room {}..",
+            &peer_pub[..16.min(peer_pub.len())],
+            &room_id[..16.min(room_id.len())]
+        );
+
+        // Resolve our display name for the FR payload.
+        let my_name = self
+            .get_identities()
+            .await
+            .ok()
+            .and_then(|ids| ids.into_iter().next())
+            .map(|id| id.name)
+            .unwrap_or_default();
+
+        // Publish the FR via the protocol layer directly. Short retry
+        // loop handles the common "relay not yet connected" race at
+        // app startup; non-transient errors bail immediately so real
+        // bugs don't get hidden behind a spin loop.
+        let mut last_err: Option<String> = None;
+        let mut sent = false;
+        for attempt in 0..20u32 {
+            let res = {
+                let mut inner = self.inner.write().await;
+                inner
+                    .protocol
+                    .send_friend_request_protocol(peer_pub, &my_name, "1")
+                    .await
+            };
+            match res {
+                Ok(_) => {
+                    tracing::info!(
+                        "pqxdh upgrade: FR published (attempt={}) peer={}..",
+                        attempt,
+                        &peer_pub[..16.min(peer_pub.len())]
+                    );
+                    sent = true;
+                    break;
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    last_err = Some(msg.clone());
+                    if msg.contains("Not connected to any relay")
+                        || msg.contains("no relay accepted the event")
+                        || msg.contains("relay transport not ready")
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                            .await;
+                        continue;
+                    }
+                    tracing::warn!(
+                        "pqxdh upgrade: non-retryable FR send error peer={}.. err={msg}",
+                        &peer_pub[..16.min(peer_pub.len())]
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Ensure we're subscribed to the new first_inbox so the approve
+        // response can reach us. Mirrors the post-FR refresh in the
+        // app-layer `send_friend_request`.
+        if sent {
+            let mut inner = self.inner.write().await;
+            if let Err(e) = inner.protocol.refresh_subscriptions().await {
+                tracing::warn!("pqxdh upgrade: refresh_subscriptions after FR: {e}");
+            }
+        }
+
+        if !sent {
+            tracing::warn!(
+                "pqxdh upgrade: FR publish failed peer={}.. last_err={:?}",
+                &peer_pub[..16.min(peer_pub.len())],
+                last_err
+            );
+        }
+
+        // Release the slot so a future v2 event can retry on failure,
+        // or so subsequent transient trigger pushes (e.g. from rapid
+        // message bursts) land cleanly after this one completes.
+        let mut inflight = self
+            .pqxdh_upgrade_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        inflight.remove(&room_id);
     }
 }

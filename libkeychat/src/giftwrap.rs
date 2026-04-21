@@ -55,11 +55,33 @@ pub async fn create_gift_wrap_with_wrapper(
     receiver_pubkey: &PublicKey,
     content: &str,
 ) -> Result<Event> {
+    create_gift_wrap_inner(wrapper_keys, sender_keys, receiver_pubkey, content, 14, true).await
+}
+
+/// Create a v1 Flutter-style Gift Wrap: outer kind 1059, rumor kind also 1059
+/// (v1's `createGiftJson` reuses `nip17Kind` for both layers). The outer event
+/// omits the `clientv=2` tag so v1 clients don't misread it.
+pub async fn create_v1_gift_wrap(
+    sender_keys: &Keys,
+    receiver_pubkey: &PublicKey,
+    content: &str,
+) -> Result<Event> {
+    let wrapper = EphemeralKeypair::generate();
+    create_gift_wrap_inner(wrapper.keys(), sender_keys, receiver_pubkey, content, 1059, false).await
+}
+
+async fn create_gift_wrap_inner(
+    wrapper_keys: &Keys,
+    sender_keys: &Keys,
+    receiver_pubkey: &PublicKey,
+    content: &str,
+    rumor_kind: u16,
+    include_clientv: bool,
+) -> Result<Event> {
     let now = Timestamp::now();
 
-    // Layer 1: Rumor (kind 14, unsigned)
-    // The rumor contains the actual plaintext content
-    let rumor: UnsignedEvent = EventBuilder::new(Kind::from(14), content)
+    // Layer 1: Rumor — v1.5 uses kind 14 (NIP-17), v1 Flutter uses kind 1059.
+    let rumor: UnsignedEvent = EventBuilder::new(Kind::from(rumor_kind), content)
         .tag(Tag::public_key(*receiver_pubkey))
         .custom_created_at(now)
         .build(sender_keys.public_key());
@@ -84,9 +106,13 @@ pub async fn create_gift_wrap_with_wrapper(
     let wrap_content =
         crate::nip44::encrypt(wrapper_keys.secret_key(), receiver_pubkey, &seal_json)?;
 
-    let gift_wrap = EventBuilder::new(Kind::GiftWrap, &wrap_content)
+    let mut builder = EventBuilder::new(Kind::GiftWrap, &wrap_content)
         .tag(Tag::public_key(*receiver_pubkey))
-        .custom_created_at(now)
+        .custom_created_at(now);
+    if include_clientv {
+        builder = builder.tag(Tag::custom(TagKind::custom("clientv"), ["2"]));
+    }
+    let gift_wrap = builder
         .sign(wrapper_keys)
         .await
         .map_err(|e| KeychatError::GiftWrap(format!("failed to sign gift wrap: {e}")))?;
@@ -140,11 +166,12 @@ pub fn unwrap_gift_wrap(receiver_keys: &Keys, event: &Event) -> Result<Unwrapped
     let rumor: UnsignedEvent = UnsignedEvent::from_json(&rumor_json)
         .map_err(|e| KeychatError::GiftWrap(format!("invalid rumor event: {e}")))?;
 
-    // Verify rumor is kind 14
-    if rumor.kind != Kind::from(14) {
+    // Accept kind 14 (v1.5/NIP-17 DM) or kind 1059 (v1 Flutter, which reuses
+    // the outer nip17Kind for its rumor). Other kinds are unexpected.
+    let rumor_kind = rumor.kind.as_u16();
+    if rumor_kind != 14 && rumor_kind != 1059 {
         return Err(KeychatError::GiftWrap(format!(
-            "expected rumor kind 14, got kind {}",
-            rumor.kind.as_u16()
+            "unexpected rumor kind {rumor_kind} (want 14 or 1059)"
         )));
     }
 
@@ -218,6 +245,89 @@ mod tests {
         let event_time = gift_wrap.created_at;
         assert!(event_time >= before);
         assert!(event_time <= after);
+    }
+
+    /// Build a gift wrap whose inner rumor kind is 1059, matching the wire
+    /// format emitted by v1 Flutter (`createGiftJson` reuses `nip17Kind=1059`
+    /// for both the outer wrap and the rumor).
+    async fn create_v1_style_gift_wrap(
+        sender: &Keys,
+        receiver_pubkey: &PublicKey,
+        content: &str,
+    ) -> Event {
+        let wrapper = EphemeralKeypair::generate();
+        let now = Timestamp::now();
+
+        let rumor: UnsignedEvent = EventBuilder::new(Kind::from(1059), content)
+            .tag(Tag::public_key(*receiver_pubkey))
+            .custom_created_at(now)
+            .build(sender.public_key());
+
+        let seal_content =
+            crate::nip44::encrypt(sender.secret_key(), receiver_pubkey, &rumor.as_json()).unwrap();
+        let seal = EventBuilder::new(Kind::from(13), &seal_content)
+            .custom_created_at(now)
+            .sign(sender)
+            .await
+            .unwrap();
+
+        let wrap_content =
+            crate::nip44::encrypt(wrapper.keys().secret_key(), receiver_pubkey, &seal.as_json())
+                .unwrap();
+        EventBuilder::new(Kind::GiftWrap, &wrap_content)
+            .tag(Tag::public_key(*receiver_pubkey))
+            .custom_created_at(now)
+            .sign(wrapper.keys())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn v1_flutter_rumor_kind_1059_unwraps() {
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+        let content = r#"{"c":"signal","type":101,"msg":"hi","name":"{}"}"#;
+
+        let gw = create_v1_style_gift_wrap(&sender, &receiver.public_key(), content).await;
+        let unwrapped = unwrap_gift_wrap(&receiver, &gw).unwrap();
+        assert_eq!(unwrapped.sender_pubkey, sender.public_key());
+        assert_eq!(unwrapped.content, content);
+        assert_eq!(unwrapped.rumor_kind.as_u16(), 1059);
+    }
+
+    #[tokio::test]
+    async fn unexpected_rumor_kind_rejected() {
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+        let wrapper = EphemeralKeypair::generate();
+        let now = Timestamp::now();
+
+        let rumor: UnsignedEvent = EventBuilder::new(Kind::from(42), "nope")
+            .tag(Tag::public_key(receiver.public_key()))
+            .custom_created_at(now)
+            .build(sender.public_key());
+        let seal_content =
+            crate::nip44::encrypt(sender.secret_key(), &receiver.public_key(), &rumor.as_json())
+                .unwrap();
+        let seal = EventBuilder::new(Kind::from(13), &seal_content)
+            .custom_created_at(now)
+            .sign(&sender)
+            .await
+            .unwrap();
+        let wrap_content = crate::nip44::encrypt(
+            wrapper.keys().secret_key(),
+            &receiver.public_key(),
+            &seal.as_json(),
+        )
+        .unwrap();
+        let gw = EventBuilder::new(Kind::GiftWrap, &wrap_content)
+            .tag(Tag::public_key(receiver.public_key()))
+            .custom_created_at(now)
+            .sign(wrapper.keys())
+            .await
+            .unwrap();
+
+        assert!(unwrap_gift_wrap(&receiver, &gw).is_err());
     }
 
     #[tokio::test]

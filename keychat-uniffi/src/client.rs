@@ -282,6 +282,44 @@ impl KeychatClient {
         self.app.debug_subscription_state().await
     }
 
+    /// Debug/test-only: flip a room's `session_type` back to `"x3dh"` and
+    /// `peer_version` back to `1`, as if it had just come out of the v1 →
+    /// v1.5 migration. Used by the UI-test harness to simulate a migrated
+    /// room on a sim that actually handshook natively, so the background
+    /// PQXDH auto-upgrade path can be exercised end-to-end without
+    /// needing a real v1 Isar dump.
+    ///
+    /// Fails quietly (returns Ok) if no room matches the peer.
+    pub async fn debug_downgrade_room_to_v1(
+        &self,
+        peer_hex: String,
+    ) -> Result<(), KeychatUniError> {
+        let identity_pubkey = self.app.identity_pubkey_hex.get().cloned().unwrap_or_default();
+        if identity_pubkey.is_empty() {
+            return Err(KeychatUniError::Storage {
+                msg: "no identity loaded".into(),
+            });
+        }
+        let room_id = format!("{peer_hex}:{identity_pubkey}");
+        let inner = self.app.inner.read().await;
+        let store = lock_app_storage_result(&inner.app_storage)?;
+        // Directly downgrade both markers back to the v1-migration baseline.
+        // Bypasses the monotonic guard in `set_peer_version` on purpose —
+        // this is the one case where we *want* to decrement.
+        store
+            .transaction(|conn| {
+                conn.execute(
+                    "UPDATE app_rooms SET session_type='x3dh', peer_version=1 WHERE id=?1",
+                    rusqlite::params![room_id],
+                )
+                .map_err(|e| libkeychat::KeychatError::Storage(
+                    format!("debug_downgrade_room_to_v1: {e}"),
+                ))?;
+                Ok(())
+            })
+            .map_err(|e| KeychatUniError::Storage { msg: e.to_string() })
+    }
+
     // ─── File Storage ────────────────────────────────────────────────
 
     /// Get the base files directory path.

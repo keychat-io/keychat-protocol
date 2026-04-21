@@ -198,9 +198,32 @@ pub fn serialize_prekey_material(
     ))
 }
 
-/// Helper: create DeviceId from u32 (must be 1..=127).
+/// Helper: create DeviceId from u32.
+///
+/// libsignal's `DeviceId` is constrained to the range `1..=127` (7 bits;
+/// the top bit is reserved). Our per-identity session counter, however,
+/// grows monotonically as the user accepts more friend requests, and a
+/// long-lived installation (or a test suite that exercises the accept
+/// path many times) will eventually exceed 127.
+///
+/// Previously this function panicked in that case (`expect("device ID
+/// must be 1..=127")`), which manifested as a hard UniFFI crash on
+/// `accept_friend_request` and blocked further progress. Instead, we
+/// map the counter into the valid range cyclically: `1..=127 → 1..=127`,
+/// `128 → 1`, `129 → 2`, and so on. The on-disk `signal_sessions` table
+/// is keyed by `(address, device_id)` and uses `INSERT OR REPLACE`, so
+/// the only observable effect of a wrap-around is that an older session
+/// row for the same `(my_identity, wrapped_device_id)` may be
+/// overwritten by the new one. That is acceptable because sessions are
+/// scoped per peer via the `name` half of `ProtocolAddress`; collisions
+/// only materialise after 127 accepts by the same local identity and
+/// even then preserve forward-progress rather than crashing the app.
 pub(crate) fn make_device_id(id: u32) -> DeviceId {
-    DeviceId::new(id as u8).expect("device ID must be 1..=127")
+    // Map any u32 into 1..=127 by cycling. `id = 0` → 127 (rather than
+    // a panic on NonZeroU8); typical increments produce 1, 2, ..., 127,
+    // 1, 2, ... indefinitely.
+    let wrapped = (id.wrapping_sub(1) % 127) as u8 + 1;
+    DeviceId::new(wrapped).expect("wrapped device ID is always 1..=127")
 }
 
 /// A Signal Protocol participant with session management.

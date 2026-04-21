@@ -81,7 +81,9 @@ pub mod stamp;
 pub mod storage;
 pub mod transport;
 
-pub use address::{AddressManager, AddressUpdate, DerivedAddress, PeerAddressState};
+pub use address::{
+    derive_address_with_secret, AddressManager, AddressUpdate, DerivedAddress, PeerAddressState,
+};
 pub use chat::{
     create_signal_prekey_auth, extract_p_tags, handle_received_message, parse_and_route,
     receive_encrypted_message, receive_encrypted_message_flexible, send_encrypted_message,
@@ -108,7 +110,7 @@ pub use media::{
 pub use message::{
     FileCategory, ForwardFrom, KCCashuPayload, KCFilePayload, KCFilesPayload,
     KCFriendApprovePayload, KCFriendRejectPayload, KCFriendRequestPayload, KCLightningPayload,
-    KCMessage, KCMessageKind, KCTextPayload, ReplyTo, SignalPrekeyAuth,
+    KCMessage, KCMessageKind, KCRedPacketPayload, KCTextPayload, ReplyTo, SignalPrekeyAuth,
 };
 #[cfg(feature = "mls")]
 pub use mls::{
@@ -117,13 +119,15 @@ pub use mls::{
     MlsMessageMetadata, MlsParticipant, MlsProvider, KIND_MLS_KEY_PACKAGE, MLS_CIPHERSUITE,
 };
 pub use payment::{
-    attach_ecash_stamp, build_cashu_message, build_lightning_message, validate_cashu_token,
+    attach_ecash_stamp, build_cashu_message, build_lightning_message, build_red_packet_message,
+    split_red_packet_equal, validate_cashu_token,
 };
 pub use session::ChatSession;
 pub use signal_keys::{
-    build_friend_request_payload, compute_global_sign, generate_kyber_prekey,
-    generate_one_time_prekey, generate_signal_identity, generate_signed_prekey, verify_global_sign,
-    FriendRequestSecrets, KyberPrekey, OneTimePrekey, SignalIdentity, SignedPrekey,
+    build_friend_request_payload, compute_global_sign, derive_v1_signal_identity,
+    generate_kyber_prekey, generate_one_time_prekey, generate_signal_identity,
+    generate_signed_prekey, verify_global_sign, FriendRequestSecrets, KyberPrekey, OneTimePrekey,
+    SignalIdentity, SignedPrekey,
 };
 pub use signal_session::{
     derive_nostr_address_from_ratchet, generate_prekey_material, reconstruct_prekey_material,

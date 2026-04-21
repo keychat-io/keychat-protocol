@@ -652,6 +652,40 @@ impl AppStorage {
         Ok(())
     }
 
+    /// Record that the peer on this room is running protocol version `version`.
+    /// Monotonic: never downgrades an already-known version (e.g. a stray
+    /// clientv-less event from a v2 peer won't flip them back to v1).
+    pub fn set_peer_version(&self, room_id: &str, version: i32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE app_rooms SET peer_version = ?1 \
+                 WHERE id = ?2 AND (peer_version IS NULL OR peer_version < ?1)",
+                rusqlite::params![version, room_id],
+            )
+            .map(|_| ())
+            .map_err(|e| KeychatError::Storage(format!("set_peer_version: {e}")))
+    }
+
+    /// Record the key-agreement type for this room's Signal session
+    /// ("x3dh" for v1 or legacy / migrated sessions, "pqxdh" once both
+    /// parties have run a hybrid classical+Kyber handshake). Idempotent:
+    /// the UPDATE is a no-op when the room is already at the requested
+    /// type, so repeated callers don't need to read-then-write.
+    ///
+    /// Returns the number of rows actually modified (0 or 1) so callers
+    /// can distinguish "I latched it" from "someone beat me to it" —
+    /// useful as an atomic check-and-set during the background PQXDH
+    /// upgrade trigger.
+    pub fn set_session_type(&self, room_id: &str, session_type: &str) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE app_rooms SET session_type = ?1 \
+                 WHERE id = ?2 AND (session_type IS NULL OR session_type != ?1)",
+                rusqlite::params![session_type, room_id],
+            )
+            .map_err(|e| KeychatError::Storage(format!("set_session_type: {e}")))
+    }
+
     pub fn increment_app_room_unread(&self, room_id: &str) -> Result<()> {
         self.conn
             .execute(
