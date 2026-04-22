@@ -3,7 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-IOS_DIR="$(cd "$PROJECT_DIR/../keychat-iOS" && pwd)"
+# iOS projects that consume this XCFramework
+IOS_TARGETS=(
+    "$PROJECT_DIR/../keychat-agent-chat-iOS"
+    "$PROJECT_DIR/../keychat-ios-native"
+)
 TMP_DIR="$SCRIPT_DIR/.build-tmp"
 
 cd "$PROJECT_DIR"
@@ -49,23 +53,30 @@ xcodebuild -create-xcframework \
     -headers "$TMP_DIR/headers/" \
     -output "$TMP_DIR/KeychatFFI.xcframework"
 
-# Deploy to iOS project
-echo "==> Deploying to $IOS_DIR ..."
-rm -rf "$IOS_DIR/KeychatFFI.xcframework"
-cp -R "$TMP_DIR/KeychatFFI.xcframework" "$IOS_DIR/KeychatFFI.xcframework"
-cp "$TMP_DIR/swift/KeychatFFI.swift" "$IOS_DIR/agentChat/Services/KeychatFFI.swift"
-
-# Patch: UniFFI generates a function reference that Xcode 26 / Swift 6 rejects as
-# "a C function pointer can only be formed from a reference to a 'func' or a literal closure".
-# Wrap it in a literal closure to satisfy the compiler.
-echo "==> Patching Swift bindings for Xcode 26 compatibility..."
-sed -i '' 's/                uniffiFutureContinuationCallback,/                { handle, pollResult in uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult) },/' \
-    "$IOS_DIR/agentChat/Services/KeychatFFI.swift"
+# Deploy to each iOS project that exists
+DEPLOYED=0
+for TARGET_DIR in "${IOS_TARGETS[@]}"; do
+    RESOLVED_DIR="$(cd "$TARGET_DIR" 2>/dev/null && pwd)" || continue
+    PROJECT_NAME="$(basename "$RESOLVED_DIR")"
+    echo "==> Deploying to $PROJECT_NAME ..."
+    rm -rf "$RESOLVED_DIR/KeychatFFI.xcframework"
+    cp -R "$TMP_DIR/KeychatFFI.xcframework" "$RESOLVED_DIR/KeychatFFI.xcframework"
+    if [[ -d "$RESOLVED_DIR/agentChat/Services" ]]; then
+        cp "$TMP_DIR/swift/KeychatFFI.swift" "$RESOLVED_DIR/agentChat/Services/KeychatFFI.swift"
+        sed -i '' 's/                uniffiFutureContinuationCallback,/                { handle, pollResult in uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult) },/' \
+            "$RESOLVED_DIR/agentChat/Services/KeychatFFI.swift"
+    fi
+    DEPLOYED=$((DEPLOYED + 1))
+done
 
 # Clean temp
 rm -rf "$TMP_DIR"
 
 echo ""
 echo "==> Done!"
-echo "    XCFramework → $IOS_DIR/KeychatFFI.xcframework"
-echo "    Swift bindings → $IOS_DIR/agentChat/Services/KeychatFFI.swift"
+echo "    XCFramework deployed to $DEPLOYED project(s)"
+for TARGET_DIR in "${IOS_TARGETS[@]}"; do
+    if [[ -d "$TARGET_DIR/KeychatFFI.xcframework" ]]; then
+        echo "    ✓ $(basename "$TARGET_DIR")"
+    fi
+done
