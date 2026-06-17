@@ -180,6 +180,7 @@ struct App {
     identity_hex: Option<String>,
     identity_name: Option<String>,
     owner_pubkey: Option<String>,
+    pending_delete_identity: Option<String>,
     /// Pending inbound friend requests: (request_id, sender_pubkey, sender_name)
     pending_requests: Vec<(String, String, String)>,
     connected_relays: usize,
@@ -222,6 +223,7 @@ impl App {
             identity_hex: None,
             identity_name: None,
             owner_pubkey: None,
+            pending_delete_identity: None,
             pending_requests: Vec::new(),
             connected_relays: 0,
             total_relays: 0,
@@ -1000,6 +1002,10 @@ fn draw_welcome(app: &App) -> Vec<Line<'static>> {
                 "  /import <m>   — Import from mnemonic",
                 Style::default().fg(t.success),
             )),
+            Line::from(Span::styled(
+                "  /identities   — List and switch identities",
+                Style::default().fg(t.success),
+            )),
             Line::from(""),
             Line::from(Span::styled(
                 "  Press F1 or /help for all commands",
@@ -1168,7 +1174,11 @@ fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  /create  /import  /whoami  /delete-identity",
+            "  /create  /import  /identities  /switch",
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            "  /create-id  /import-nsec  /whoami  /delete-identity",
             Style::default().fg(Color::Green),
         )),
         Line::from(""),
@@ -1604,6 +1614,10 @@ async fn handle_input_key(app: &mut App, key: KeyEvent) {
 const COMMANDS: &[&str] = &[
     "/create",
     "/import",
+    "/identities",
+    "/switch",
+    "/create-id",
+    "/import-nsec",
     "/whoami",
     "/delete-identity",
     "/confirm-delete",
@@ -1741,6 +1755,11 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /create <name>  (set your display name)".into());
                 return;
             }
+            if matches!(app.client.get_identities().await, Ok(ref identities) if !identities.is_empty())
+            {
+                app.notify("Identity exists. Use /create-id <name> to add another.".into());
+                return;
+            }
             let display_name = args.to_string();
             match crate::commands::create_identity(&app.client, &display_name).await {
                 Ok((pubkey_hex, npub, mnemonic)) => {
@@ -1791,6 +1810,13 @@ async fn process_command(app: &mut App, input: &str) {
                 app.notify("Usage: /import <mnemonic words>".into());
                 return;
             }
+            if matches!(app.client.get_identities().await, Ok(ref identities) if !identities.is_empty())
+            {
+                app.notify(
+                    "Identity exists. Use /import-nsec <nsec> <name> to add another.".into(),
+                );
+                return;
+            }
             match crate::commands::import_identity(&app.client, args).await {
                 Ok(pubkey) => {
                     app.identity_hex = Some(pubkey.clone());
@@ -1818,27 +1844,123 @@ async fn process_command(app: &mut App, input: &str) {
                 Err(e) => app.show_error(format!("Import failed: {e}")),
             }
         }
+        "/identities" => match app.client.get_identities().await {
+            Ok(identities) if identities.is_empty() => {
+                app.push_output("No identities.".into(), app.theme.muted);
+            }
+            Ok(identities) => {
+                let active = app.client.get_pubkey_hex().await.ok();
+                app.push_output(format!("Identities ({}):", identities.len()), Color::Cyan);
+                for identity in identities {
+                    let marker = if active.as_deref() == Some(identity.nostr_pubkey_hex.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    app.push_output(
+                        format!(
+                            "{marker} [{}] {} {}",
+                            identity.index,
+                            identity.name,
+                            short_key(&identity.nostr_pubkey_hex)
+                        ),
+                        Color::White,
+                    );
+                }
+            }
+            Err(e) => app.show_error(format!("List identities failed: {e}")),
+        },
+        "/switch" => {
+            if args.is_empty() {
+                app.notify("Usage: /switch <index|pubkey>".into());
+                return;
+            }
+            match crate::commands::switch_identity(&app.client, args).await {
+                Ok(pubkey) => {
+                    app.identity_hex = Some(pubkey.clone());
+                    if let Ok(identities) = app.client.get_identities().await {
+                        if let Some(id) = identities.iter().find(|i| i.nostr_pubkey_hex == pubkey) {
+                            app.identity_name = Some(id.name.clone());
+                        }
+                    }
+                    refresh_rooms(app).await;
+                    refresh_contacts(app).await;
+                    app.notify(format!("Active identity: {}", short_key(&pubkey)));
+                }
+                Err(e) => app.show_error(format!("Switch failed: {e}")),
+            }
+        }
+        "/create-id" => {
+            let display_name = if args.is_empty() { "CLI User" } else { args };
+            match crate::commands::create_additional_identity(&app.client, display_name).await {
+                Ok((pubkey, npub)) => {
+                    app.push_output(
+                        format!("Identity added: {display_name} ({})", short_key(&pubkey)),
+                        Color::Green,
+                    );
+                    app.push_output(npub, Color::Cyan);
+                }
+                Err(e) => app.show_error(format!("Create identity failed: {e}")),
+            }
+        }
+        "/import-nsec" => {
+            let mut parts = args.splitn(2, char::is_whitespace);
+            let nsec = parts.next().unwrap_or("").trim();
+            let name = parts.next().unwrap_or("Imported Identity").trim();
+            if nsec.is_empty() {
+                app.notify("Usage: /import-nsec <nsec> <name>".into());
+                return;
+            }
+            match crate::commands::import_identity_from_nsec(&app.client, nsec, name).await {
+                Ok((pubkey, npub)) => {
+                    app.push_output(
+                        format!("Identity imported: {name} ({})", short_key(&pubkey)),
+                        Color::Green,
+                    );
+                    app.push_output(npub, Color::Cyan);
+                }
+                Err(e) => app.show_error(format!("Import nsec failed: {e}")),
+            }
+        }
         "/whoami" => {
             app.show_whoami = true;
         }
         "/delete-identity" => {
+            let target = if args.is_empty() {
+                match app.client.get_pubkey_hex().await {
+                    Ok(pubkey) => pubkey,
+                    Err(e) => {
+                        app.show_error(format!("No active identity: {e}"));
+                        return;
+                    }
+                }
+            } else {
+                args.to_string()
+            };
+            app.pending_delete_identity = Some(target);
             app.push_output(
                 "Type /confirm-delete to confirm identity deletion".into(),
                 Color::Yellow,
             );
         }
-        "/confirm-delete" => match app.client.remove_identity().await {
-            Ok(_) => {
-                delete_mnemonic(&app.client).await;
-                app.identity_hex = None;
-                app.identity_name = None;
-                app.owner_pubkey = None;
-                app.rooms.clear();
-                app.display_rows.clear();
-                app.messages.clear();
-                app.notify("Identity deleted".into());
+        "/confirm-delete" => match app.pending_delete_identity.take() {
+            Some(target) => match crate::commands::delete_identity(&app.client, &target).await {
+                Ok(_) => {
+                    app.identity_hex = app.client.get_pubkey_hex().await.ok();
+                    app.identity_name = None;
+                    app.owner_pubkey = None;
+                    app.rooms.clear();
+                    app.display_rows.clear();
+                    app.messages.clear();
+                    refresh_rooms(app).await;
+                    refresh_contacts(app).await;
+                    app.notify("Identity deleted".into());
+                }
+                Err(e) => app.show_error(format!("Delete failed: {e}")),
+            },
+            None => {
+                app.notify("No pending identity deletion.".into());
             }
-            Err(e) => app.show_error(format!("Delete failed: {e}")),
         },
         "/reset" => {
             app.push_output(
@@ -3228,8 +3350,6 @@ async fn save_theme_setting(client: &AppClient, theme: &str) {
         .set_setting(SETTING_THEME.to_string(), theme.to_string())
         .await;
 }
-
-use crate::commands::delete_mnemonic;
 
 // ─── QR code rendering ─────────────────────────────────────
 

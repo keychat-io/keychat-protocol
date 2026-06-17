@@ -10,9 +10,9 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
-        Json,
+        Html, Json,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use keychat_app_core::{
@@ -151,9 +151,15 @@ pub fn build_router(
 
     Router::new()
         // Identity
+        .route("/debug/identities", get(debug_identities_page))
         .route("/identity", get(get_identity))
+        .route("/identities", get(list_identities))
         .route("/identity/create", post(create_identity))
         .route("/identity/import", post(import_identity))
+        .route("/identity/switch", post(switch_identity))
+        .route("/identity/create-derived", post(create_derived_identity))
+        .route("/identity/import-nsec", post(import_nsec_identity))
+        .route("/identity/{pubkey}", delete(delete_identity))
         // Connection
         .route("/connect", post(connect_relays))
         .route("/disconnect", post(disconnect_relays))
@@ -197,16 +203,25 @@ pub async fn run(
     data_tx: broadcast::Sender<DataChange>,
     port: u16,
 ) -> anyhow::Result<()> {
+    // AppClient owns an internal Tokio runtime. The daemon is process-lifetime,
+    // so keep one strong reference alive to avoid dropping that runtime from
+    // inside the async server shutdown/error path.
+    let client = {
+        let keep_alive = Arc::clone(&client);
+        let _ = Arc::into_raw(client);
+        keep_alive
+    };
+
     // Shared startup: restore identity → sessions → connect → event loop
     let relay_urls = keychat_app_core::default_relays();
     crate::commands::init_and_connect(&client, relay_urls).await;
 
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
     let router = build_router(client, event_tx, data_tx);
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!("daemon listening on http://{addr}");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
 
     Ok(())
@@ -215,6 +230,10 @@ pub async fn run(
 // ═══════════════════════════════════════════════════════════════
 // Identity
 // ═══════════════════════════════════════════════════════════════
+
+async fn debug_identities_page() -> Html<&'static str> {
+    Html(DEBUG_IDENTITIES_HTML)
+}
 
 async fn get_identity(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match state.client.get_pubkey_hex().await {
@@ -228,6 +247,621 @@ async fn get_identity(State(state): State<AppState>) -> (StatusCode, Json<serde_
             }))
         }
         Err(_) => err_json(StatusCode::NOT_FOUND, "no identity set"),
+    }
+}
+
+const DEBUG_IDENTITIES_HTML: &str = r###"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multi-Identity Debug</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #1d2430;
+      --muted: #637083;
+      --line: #dbe1ea;
+      --primary: #0c6b58;
+      --primary-strong: #07483d;
+      --danger: #b42318;
+      --danger-bg: #fff1f0;
+      --ok-bg: #ecfdf5;
+      --shadow: 0 10px 30px rgba(24, 39, 75, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.45;
+    }
+
+    main {
+      width: min(1160px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.15;
+      font-weight: 760;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 17px;
+      line-height: 1.25;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    button,
+    input,
+    textarea {
+      font: inherit;
+    }
+
+    button {
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 0 14px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    button.primary {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #ffffff;
+    }
+
+    button.primary:hover {
+      background: var(--primary-strong);
+    }
+
+    button.danger {
+      border-color: #fecaca;
+      background: var(--danger-bg);
+      color: var(--danger);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #ffffff;
+      color: var(--text);
+      padding: 8px 10px;
+      outline: none;
+    }
+
+    input:focus,
+    textarea:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(12, 107, 88, 0.13);
+    }
+
+    textarea {
+      min-height: 76px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .active {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      min-height: 88px;
+      margin-bottom: 18px;
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .mono {
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 0 10px;
+      background: var(--ok-bg);
+      color: #047857;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .identity-list {
+      display: grid;
+      gap: 10px;
+      min-height: 112px;
+    }
+
+    .identity {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px;
+      background: #ffffff;
+    }
+
+    .identity.current {
+      border-color: rgba(12, 107, 88, 0.5);
+      background: #fbfffd;
+    }
+
+    .identity-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .name-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
+    .name {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      font-weight: 750;
+    }
+
+    .forms {
+      display: grid;
+      gap: 14px;
+    }
+
+    .form {
+      display: grid;
+      gap: 9px;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+    }
+
+    .form:first-child {
+      border-top: 0;
+      padding-top: 0;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+
+    .mnemonic {
+      margin-top: 18px;
+      border-color: #fbbf24;
+      background: #fffbeb;
+    }
+
+    .log {
+      margin-top: 18px;
+      min-height: 120px;
+      max-height: 260px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: #354052;
+      background: #101828;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }
+
+    .log span {
+      color: #d1fadf;
+    }
+
+    .empty {
+      display: grid;
+      place-items: center;
+      min-height: 160px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      text-align: center;
+      padding: 20px;
+    }
+
+    @media (max-width: 880px) {
+      main {
+        width: min(100% - 20px, 680px);
+        padding-top: 18px;
+      }
+
+      header,
+      .grid,
+      .active,
+      .identity,
+      .row {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        align-items: stretch;
+      }
+
+      .toolbar,
+      .identity-actions {
+        justify-content: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Multi-Identity Debug</h1>
+        <p>Local daemon identity controls for manual testing.</p>
+      </div>
+      <div class="toolbar">
+        <button id="refreshBtn" type="button">Refresh</button>
+        <button id="createFirstBtn" class="primary" type="button">Create First Identity</button>
+      </div>
+    </header>
+
+    <section class="active panel" aria-live="polite">
+      <div>
+        <span class="label">Active identity</span>
+        <div id="activeName" class="name">Loading...</div>
+        <div id="activePubkey" class="mono"></div>
+      </div>
+      <div id="activeBadge" class="badge" hidden>Active</div>
+    </section>
+
+    <div class="grid">
+      <section class="panel">
+        <h2>Identities</h2>
+        <div id="identityList" class="identity-list"></div>
+      </section>
+
+      <aside class="panel">
+        <h2>Actions</h2>
+        <div class="forms">
+          <form id="derivedForm" class="form">
+            <div>
+              <label class="label" for="derivedName">Derived identity name</label>
+              <div class="row">
+                <input id="derivedName" name="name" autocomplete="off" placeholder="Work">
+                <button class="primary" type="submit">Add Derived</button>
+              </div>
+            </div>
+          </form>
+
+          <form id="nsecForm" class="form">
+            <div>
+              <label class="label" for="nsecName">Imported identity name</label>
+              <input id="nsecName" name="name" autocomplete="off" placeholder="Imported">
+            </div>
+            <div>
+              <label class="label" for="nsecValue">nsec private key</label>
+              <textarea id="nsecValue" name="nsec" autocomplete="off" spellcheck="false" placeholder="nsec1..."></textarea>
+            </div>
+            <button class="primary" type="submit">Import nsec</button>
+          </form>
+        </div>
+
+        <section id="mnemonicPanel" class="panel mnemonic" hidden>
+          <h2>Save Mnemonic Now</h2>
+          <p>This seed is returned once by the daemon.</p>
+          <textarea id="mnemonicValue" readonly></textarea>
+        </section>
+
+        <pre id="log" class="log"><span>Ready.</span></pre>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    const state = {
+      active: null,
+      identities: []
+    };
+
+    const els = {
+      refreshBtn: document.getElementById("refreshBtn"),
+      createFirstBtn: document.getElementById("createFirstBtn"),
+      activeName: document.getElementById("activeName"),
+      activePubkey: document.getElementById("activePubkey"),
+      activeBadge: document.getElementById("activeBadge"),
+      identityList: document.getElementById("identityList"),
+      derivedForm: document.getElementById("derivedForm"),
+      derivedName: document.getElementById("derivedName"),
+      nsecForm: document.getElementById("nsecForm"),
+      nsecName: document.getElementById("nsecName"),
+      nsecValue: document.getElementById("nsecValue"),
+      mnemonicPanel: document.getElementById("mnemonicPanel"),
+      mnemonicValue: document.getElementById("mnemonicValue"),
+      log: document.getElementById("log")
+    };
+
+    function log(message, data) {
+      const time = new Date().toLocaleTimeString();
+      const extra = data ? "\n" + JSON.stringify(data, null, 2) : "";
+      els.log.textContent = `[${time}] ${message}${extra}`;
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { "content-type": "application/json" },
+        ...options
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload.error || response.statusText || `HTTP ${response.status}`);
+      }
+      return payload.data;
+    }
+
+    function identityTitle(identity) {
+      return identity.name || identity.npub || identity.pubkey_hex || "Unnamed identity";
+    }
+
+    function render() {
+      const active = state.identities.find((identity) => identity.pubkey_hex === state.active);
+      els.activeName.textContent = active ? identityTitle(active) : "No active identity";
+      els.activePubkey.textContent = active ? active.pubkey_hex : "Create or import an identity to begin.";
+      els.activeBadge.hidden = !active;
+      els.createFirstBtn.disabled = state.identities.length > 0;
+
+      if (!state.identities.length) {
+        els.identityList.innerHTML = '<div class="empty">No local identities yet.</div>';
+        return;
+      }
+
+      els.identityList.replaceChildren(
+        ...state.identities.map((identity) => {
+          const current = identity.pubkey_hex === state.active;
+          const item = document.createElement("article");
+          item.className = `identity${current ? " current" : ""}`;
+
+          const details = document.createElement("div");
+          const nameRow = document.createElement("div");
+          nameRow.className = "name-row";
+
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = identityTitle(identity);
+          nameRow.append(name);
+
+          if (current) {
+            const badge = document.createElement("span");
+            badge.className = "badge";
+            badge.textContent = "Active";
+            nameRow.append(badge);
+          }
+
+          const pubkey = document.createElement("div");
+          pubkey.className = "mono";
+          pubkey.textContent = identity.pubkey_hex;
+
+          const meta = document.createElement("p");
+          meta.textContent = `index ${identity.index}${identity.is_default ? " / default" : ""}`;
+
+          details.append(nameRow, pubkey, meta);
+
+          const actions = document.createElement("div");
+          actions.className = "identity-actions";
+
+          const switchBtn = document.createElement("button");
+          switchBtn.type = "button";
+          switchBtn.textContent = "Switch";
+          switchBtn.disabled = current;
+          switchBtn.addEventListener("click", () => switchIdentity(identity.pubkey_hex));
+
+          const deleteBtn = document.createElement("button");
+          deleteBtn.type = "button";
+          deleteBtn.className = "danger";
+          deleteBtn.textContent = "Delete";
+          deleteBtn.addEventListener("click", () => deleteIdentity(identity.pubkey_hex));
+
+          actions.append(switchBtn, deleteBtn);
+          item.append(details, actions);
+          return item;
+        })
+      );
+    }
+
+    async function refresh() {
+      try {
+        const data = await api("/identities");
+        state.active = data.active;
+        state.identities = data.identities || [];
+        render();
+        log("Loaded identities.", data);
+      } catch (error) {
+        log(`Refresh failed: ${error.message}`);
+      }
+    }
+
+    async function createFirstIdentity() {
+      try {
+        const data = await api("/identity/create", { method: "POST" });
+        if (data.mnemonic) {
+          els.mnemonicValue.value = data.mnemonic;
+          els.mnemonicPanel.hidden = false;
+        }
+        log("Created first identity.", data);
+        await refresh();
+      } catch (error) {
+        log(`Create failed: ${error.message}`);
+      }
+    }
+
+    async function createDerivedIdentity(event) {
+      event.preventDefault();
+      try {
+        const name = els.derivedName.value.trim() || "Derived Identity";
+        const data = await api("/identity/create-derived", {
+          method: "POST",
+          body: JSON.stringify({ name })
+        });
+        els.derivedName.value = "";
+        log("Created derived identity.", data);
+        await refresh();
+      } catch (error) {
+        log(`Create derived failed: ${error.message}`);
+      }
+    }
+
+    async function importNsecIdentity(event) {
+      event.preventDefault();
+      try {
+        const nsec = els.nsecValue.value.trim();
+        if (!nsec) {
+          throw new Error("nsec is required");
+        }
+        const name = els.nsecName.value.trim() || "Imported Identity";
+        const data = await api("/identity/import-nsec", {
+          method: "POST",
+          body: JSON.stringify({ nsec, name })
+        });
+        els.nsecName.value = "";
+        els.nsecValue.value = "";
+        log("Imported nsec identity.", data);
+        await refresh();
+      } catch (error) {
+        log(`Import failed: ${error.message}`);
+      }
+    }
+
+    async function switchIdentity(pubkey) {
+      try {
+        const data = await api("/identity/switch", {
+          method: "POST",
+          body: JSON.stringify({ identity: pubkey })
+        });
+        log("Switched identity.", data);
+        await refresh();
+      } catch (error) {
+        log(`Switch failed: ${error.message}`);
+      }
+    }
+
+    async function deleteIdentity(pubkey) {
+      if (!window.confirm("Delete this identity and its local scoped data?")) {
+        return;
+      }
+
+      try {
+        const data = await api(`/identity/${encodeURIComponent(pubkey)}`, {
+          method: "DELETE"
+        });
+        log("Deleted identity.", data);
+        await refresh();
+      } catch (error) {
+        log(`Delete failed: ${error.message}`);
+      }
+    }
+
+    els.refreshBtn.addEventListener("click", refresh);
+    els.createFirstBtn.addEventListener("click", createFirstIdentity);
+    els.derivedForm.addEventListener("submit", createDerivedIdentity);
+    els.nsecForm.addEventListener("submit", importNsecIdentity);
+    refresh();
+  </script>
+</body>
+</html>
+"###;
+
+async fn list_identities(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.client.get_identities().await {
+        Ok(identities) => {
+            let active = state.client.get_pubkey_hex().await.ok();
+            ok_json(serde_json::json!({
+                "active": active,
+                "identities": identities.into_iter().map(|identity| {
+                    serde_json::json!({
+                        "pubkey_hex": identity.nostr_pubkey_hex,
+                        "npub": identity.npub,
+                        "name": identity.name,
+                        "index": identity.index,
+                        "is_default": identity.is_default,
+                    })
+                }).collect::<Vec<_>>()
+            }))
+        }
+        Err(e) => internal_err(e),
     }
 }
 
@@ -257,6 +891,70 @@ async fn import_identity(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match crate::commands::import_identity(&state.client, &req.mnemonic).await {
         Ok(pubkey) => ok_json(serde_json::json!({ "pubkey_hex": pubkey })),
+        Err(e) => bad_request(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SwitchIdentityReq {
+    identity: String,
+}
+
+async fn switch_identity(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchIdentityReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match crate::commands::switch_identity(&state.client, &req.identity).await {
+        Ok(pubkey) => ok_json(serde_json::json!({ "pubkey_hex": pubkey })),
+        Err(e) => bad_request(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateDerivedIdentityReq {
+    name: Option<String>,
+}
+
+async fn create_derived_identity(
+    State(state): State<AppState>,
+    Json(req): Json<CreateDerivedIdentityReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let name = req.name.as_deref().unwrap_or("CLI User");
+    match crate::commands::create_additional_identity(&state.client, name).await {
+        Ok((pubkey_hex, npub)) => ok_json(serde_json::json!({
+            "pubkey_hex": pubkey_hex,
+            "npub": npub,
+        })),
+        Err(e) => bad_request(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportNsecIdentityReq {
+    nsec: String,
+    name: Option<String>,
+}
+
+async fn import_nsec_identity(
+    State(state): State<AppState>,
+    Json(req): Json<ImportNsecIdentityReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let name = req.name.as_deref().unwrap_or("Imported Identity");
+    match crate::commands::import_identity_from_nsec(&state.client, &req.nsec, name).await {
+        Ok((pubkey_hex, npub)) => ok_json(serde_json::json!({
+            "pubkey_hex": pubkey_hex,
+            "npub": npub,
+        })),
+        Err(e) => bad_request(e),
+    }
+}
+
+async fn delete_identity(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match crate::commands::delete_identity(&state.client, &pubkey).await {
+        Ok(pubkey_hex) => ok_json(serde_json::json!({ "deleted": pubkey_hex })),
         Err(e) => bad_request(e),
     }
 }

@@ -1,9 +1,13 @@
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
+use keychat_app_core::AppClient;
 use keychat_cli::commands;
 use keychat_uniffi::{decrypt_file_data, encrypt_file_data};
-use keychat_uniffi::{ClientEvent, DataChange, EventListener, KeychatClient};
-use keychat_uniffi::{MessageKind, MessageStatus, RoomStatus, RoomType};
+use keychat_uniffi::{
+    ClientEvent, EventListener, GroupMemberInput, KeychatClient, MlsKeyPackageInput,
+};
+use keychat_uniffi::{MessageKind, RoomStatus, RoomType};
 use tokio::sync::broadcast;
 
 fn temp_db(dir: &tempfile::TempDir, name: &str) -> String {
@@ -88,6 +92,34 @@ async_test!(test_create_and_get_identity, {
         pubkey.chars().all(|c| c.is_ascii_hexdigit()),
         "pubkey should be valid hex"
     );
+
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
+});
+
+async_test!(test_cli_multi_identity_create_and_switch, {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = temp_db(&dir, "multi_identity.db");
+    let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
+    let app_client = client.app_client();
+
+    let (first_pubkey, _first_npub, _mnemonic) = commands::create_identity(app_client, "Alice")
+        .await
+        .unwrap();
+    let (second_pubkey, _second_npub) = commands::create_additional_identity(app_client, "Bob")
+        .await
+        .unwrap();
+
+    let identities = app_client.get_identities().await.unwrap();
+    assert_eq!(identities.len(), 2);
+    assert_eq!(identities[0].index, 0);
+    assert_eq!(identities[1].index, 1);
+
+    let switched = commands::switch_identity(app_client, "1").await.unwrap();
+    assert_eq!(switched, second_pubkey);
+    assert_eq!(app_client.get_pubkey_hex().await.unwrap(), second_pubkey);
+    assert_ne!(first_pubkey, second_pubkey);
 
     tokio::task::spawn_blocking(move || drop(client))
         .await
@@ -206,6 +238,1150 @@ async_test!(test_daemon_create_identity_route, {
         .await
         .unwrap();
 });
+
+async_test!(test_daemon_debug_identities_page, {
+    use axum::body::Body;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = temp_db(&dir, "daemon_debug_identities.db");
+    let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
+
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/debug/identities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(html.contains("Multi-Identity Debug"));
+    assert!(html.contains("/identity/create-derived"));
+
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
+});
+
+async_test!(test_daemon_multi_identity_routes, {
+    use axum::body::Body;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = temp_db(&dir, "daemon_multi_identity.db");
+    let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
+
+    let (event_tx, _) = broadcast::channel::<keychat_app_core::ClientEvent>(16);
+    let (data_tx, _) = broadcast::channel::<keychat_app_core::DataChange>(16);
+
+    let app = keychat_cli::daemon::build_router(client.app_client().clone(), event_tx, data_tx);
+
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/identity/create")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+
+    let create_derived_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/identity/create-derived")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"Bob"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_derived_response.status(), 200);
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/identities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), 200);
+    let body = list_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["data"]["identities"].as_array().unwrap().len(), 2);
+
+    let switch_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/identity/switch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"identity":"1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(switch_response.status(), 200);
+
+    tokio::task::spawn_blocking(move || drop(client))
+        .await
+        .unwrap();
+});
+
+async_test!(test_multi_identity_friendship_and_dm_via_local_relay, {
+    let (relay, relay_handle) = start_local_relay().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = temp_db(&dir, "multi_identity_chat.db");
+    let client = Arc::new(KeychatClient::new(db_path, "test-key-cli".into()).unwrap());
+    let app = client.app_client().clone();
+
+    let (alice_pubkey, _, _) = commands::create_identity(&app, "Alice").await.unwrap();
+    let (bob_pubkey, _) = commands::create_additional_identity(&app, "Bob")
+        .await
+        .unwrap();
+
+    let (listener, mut rx) = TestListener::new();
+    client.set_event_listener(Box::new(listener)).await;
+
+    client.connect(vec![relay.url.clone()]).await.unwrap();
+    let client_loop = client.clone();
+    tokio::spawn(async move {
+        let _ = client_loop.start_event_loop().await;
+    });
+
+    assert!(
+        wait_for_relay_connection(&client, 10).await,
+        "multi-identity client should connect to local relay"
+    );
+
+    // Alice sends a friend request to Bob while both identities live in the same client.
+    commands::switch_identity(&app, &alice_pubkey)
+        .await
+        .unwrap();
+    app.send_friend_request(bob_pubkey.clone(), "Alice".into(), "alice-device".into())
+        .await
+        .unwrap();
+
+    let friend_request = wait_for_event(&mut rx, 10, |event| {
+        matches!(
+            event,
+            ClientEvent::FriendRequestReceived {
+                sender_pubkey,
+                ..
+            } if sender_pubkey == &alice_pubkey
+        )
+    })
+    .await
+    .expect("Bob identity should receive Alice's friend request");
+
+    let request_id = match friend_request {
+        ClientEvent::FriendRequestReceived { request_id, .. } => request_id,
+        _ => unreachable!(),
+    };
+
+    // Bob accepts, then Alice receives the acceptance.
+    commands::switch_identity(&app, &bob_pubkey).await.unwrap();
+    app.accept_friend_request(request_id, "Bob".into())
+        .await
+        .unwrap();
+
+    wait_for_event(&mut rx, 10, |event| {
+        matches!(
+            event,
+            ClientEvent::FriendRequestAccepted {
+                peer_pubkey,
+                ..
+            } if peer_pubkey == &bob_pubkey
+        )
+    })
+    .await
+    .expect("Alice identity should receive Bob's acceptance");
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let alice_rooms = client.get_rooms(alice_pubkey.clone()).await.unwrap();
+    let alice_dm = alice_rooms
+        .iter()
+        .find(|room| room.to_main_pubkey == bob_pubkey)
+        .expect("Alice should have a DM room with Bob");
+    assert_eq!(alice_dm.status, RoomStatus::Enabled);
+    let alice_room_id = alice_dm.id.clone();
+
+    let bob_rooms = client.get_rooms(bob_pubkey.clone()).await.unwrap();
+    let bob_dm = bob_rooms
+        .iter()
+        .find(|room| room.to_main_pubkey == alice_pubkey)
+        .expect("Bob should have a DM room with Alice");
+    assert_eq!(bob_dm.status, RoomStatus::Enabled);
+    let bob_room_id = bob_dm.id.clone();
+
+    commands::switch_identity(&app, &alice_pubkey)
+        .await
+        .unwrap();
+    let alice_sent = client
+        .send_text(
+            alice_room_id.clone(),
+            "hello bob from alice identity".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!alice_sent.event_id.is_empty());
+
+    wait_for_event(&mut rx, 10, |event| {
+        matches!(
+            event,
+            ClientEvent::MessageReceived {
+                sender_pubkey,
+                content: Some(content),
+                ..
+            } if sender_pubkey == &alice_pubkey
+                && content == "hello bob from alice identity"
+        )
+    })
+    .await
+    .expect("Bob identity should receive Alice's message");
+
+    commands::switch_identity(&app, &bob_pubkey).await.unwrap();
+    let bob_sent = client
+        .send_text(
+            bob_room_id.clone(),
+            "hello alice from bob identity".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!bob_sent.event_id.is_empty());
+
+    wait_for_event(&mut rx, 10, |event| {
+        matches!(
+            event,
+            ClientEvent::MessageReceived {
+                sender_pubkey,
+                content: Some(content),
+                ..
+            } if sender_pubkey == &bob_pubkey
+                && content == "hello alice from bob identity"
+        )
+    })
+    .await
+    .expect("Alice identity should receive Bob's message");
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let alice_messages = client
+        .get_messages(alice_room_id.clone(), 50, 0)
+        .await
+        .unwrap();
+    let alice_text: Vec<_> = alice_messages
+        .iter()
+        .filter(|message| !message.content.starts_with('['))
+        .collect();
+    assert_eq!(alice_text.len(), 2);
+    assert_eq!(alice_text[0].content, "hello bob from alice identity");
+    assert!(alice_text[0].is_me_send);
+    assert_eq!(alice_text[1].content, "hello alice from bob identity");
+    assert!(!alice_text[1].is_me_send);
+
+    let bob_messages = client
+        .get_messages(bob_room_id.clone(), 50, 0)
+        .await
+        .unwrap();
+    let bob_text: Vec<_> = bob_messages
+        .iter()
+        .filter(|message| !message.content.starts_with('['))
+        .collect();
+    assert_eq!(bob_text.len(), 2);
+    assert_eq!(bob_text[0].content, "hello bob from alice identity");
+    assert!(!bob_text[0].is_me_send);
+    assert_eq!(bob_text[1].content, "hello alice from bob identity");
+    assert!(bob_text[1].is_me_send);
+
+    client.stop_event_loop().await;
+    let _ = client.disconnect().await;
+    relay_handle.abort();
+    tokio::task::spawn_blocking(move || {
+        drop(app);
+        drop(client);
+    })
+    .await
+    .unwrap();
+});
+
+async fn enabled_dm_room_id(
+    client: &KeychatClient,
+    identity_pubkey: &str,
+    peer_pubkey: &str,
+) -> String {
+    let rooms = client
+        .get_rooms(identity_pubkey.to_string())
+        .await
+        .expect("get rooms");
+    let room = rooms
+        .iter()
+        .find(|room| {
+            room.room_type == RoomType::Dm
+                && room.status == RoomStatus::Enabled
+                && room.to_main_pubkey == peer_pubkey
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "enabled DM room not found: local={} peer={}",
+                identity_pubkey, peer_pubkey
+            )
+        });
+    room.id.clone()
+}
+
+async fn establish_identity_friendship(
+    requester_client: &KeychatClient,
+    requester_app: &Arc<AppClient>,
+    requester_rx: &mut broadcast::Receiver<ClientEvent>,
+    requester_pubkey: &str,
+    requester_name: &str,
+    receiver_client: &KeychatClient,
+    receiver_app: &Arc<AppClient>,
+    receiver_rx: &mut broadcast::Receiver<ClientEvent>,
+    receiver_pubkey: &str,
+    receiver_name: &str,
+) {
+    commands::switch_identity(requester_app, requester_pubkey)
+        .await
+        .unwrap();
+    requester_app
+        .send_friend_request(
+            receiver_pubkey.to_string(),
+            requester_name.to_string(),
+            format!("{requester_name}-device"),
+        )
+        .await
+        .unwrap();
+
+    let friend_request = wait_for_event(receiver_rx, 30, |event| {
+        matches!(
+            event,
+            ClientEvent::FriendRequestReceived {
+                sender_pubkey,
+                ..
+            } if sender_pubkey.as_str() == requester_pubkey
+        )
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!("{receiver_name} should receive friend request from {requester_name}")
+    });
+
+    let request_id = match friend_request {
+        ClientEvent::FriendRequestReceived { request_id, .. } => request_id,
+        _ => unreachable!(),
+    };
+
+    commands::switch_identity(receiver_app, receiver_pubkey)
+        .await
+        .unwrap();
+    receiver_app
+        .accept_friend_request(request_id, receiver_name.to_string())
+        .await
+        .unwrap();
+
+    wait_for_event(requester_rx, 30, |event| {
+        matches!(
+            event,
+            ClientEvent::FriendRequestAccepted { peer_pubkey, .. }
+                if peer_pubkey.as_str() == receiver_pubkey
+        )
+    })
+    .await
+    .unwrap_or_else(|| panic!("{requester_name} should receive acceptance from {receiver_name}"));
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let _ = enabled_dm_room_id(requester_client, requester_pubkey, receiver_pubkey).await;
+    let _ = enabled_dm_room_id(receiver_client, receiver_pubkey, requester_pubkey).await;
+}
+
+async fn send_identity_dm(
+    sender_client: &KeychatClient,
+    sender_app: &Arc<AppClient>,
+    sender_pubkey: &str,
+    sender_name: &str,
+    receiver_client: &KeychatClient,
+    receiver_rx: &mut broadcast::Receiver<ClientEvent>,
+    receiver_pubkey: &str,
+    receiver_name: &str,
+    text: &str,
+) {
+    let sender_room_id = enabled_dm_room_id(sender_client, sender_pubkey, receiver_pubkey).await;
+    let receiver_room_id =
+        enabled_dm_room_id(receiver_client, receiver_pubkey, sender_pubkey).await;
+
+    commands::switch_identity(sender_app, sender_pubkey)
+        .await
+        .unwrap();
+    let sent = sender_client
+        .send_text(sender_room_id.clone(), text.to_string(), None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        !sent.event_id.is_empty(),
+        "{sender_name} -> {receiver_name} should publish an event"
+    );
+
+    wait_for_event(receiver_rx, 30, |event| {
+        matches!(
+            event,
+            ClientEvent::MessageReceived {
+                sender_pubkey: actual_sender,
+                content: Some(content),
+                group_id: None,
+                ..
+            } if actual_sender.as_str() == sender_pubkey && content == text
+        )
+    })
+    .await
+    .unwrap_or_else(|| panic!("{receiver_name} should receive DM from {sender_name}: {text}"));
+
+    let receiver_messages = receiver_client
+        .get_messages(receiver_room_id, 50, 0)
+        .await
+        .unwrap();
+    assert!(
+        receiver_messages
+            .iter()
+            .any(|message| !message.is_me_send && message.content == text),
+        "{receiver_name}'s DM room should persist message from {sender_name}"
+    );
+}
+
+async fn wait_for_group_text(
+    rx: &mut broadcast::Receiver<ClientEvent>,
+    group_id: &str,
+    sender_pubkey: &str,
+    text: &str,
+    expectation: &str,
+) {
+    wait_for_event(rx, 30, |event| {
+        matches!(
+            event,
+            ClientEvent::MessageReceived {
+                sender_pubkey: actual_sender,
+                content: Some(content),
+                group_id: Some(actual_group_id),
+                ..
+            } if actual_group_id.as_str() == group_id
+                && actual_sender.as_str() == sender_pubkey
+                && content == text
+        )
+    })
+    .await
+    .unwrap_or_else(|| panic!("{expectation}: missing group message {text}"));
+}
+
+async fn wait_for_mls_welcome(
+    client: &KeychatClient,
+    identity_pubkey: &str,
+    expected_group_name: &str,
+    timeout_secs: u64,
+) -> Option<(Vec<u8>, String)> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if let Ok(rooms) = client.get_rooms(identity_pubkey.to_string()).await {
+            for room in rooms
+                .iter()
+                .filter(|room| room.room_type == RoomType::MlsGroup)
+            {
+                let Ok(messages) = client.get_messages(room.id.clone(), 20, 0).await else {
+                    continue;
+                };
+                for message in messages {
+                    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    else {
+                        continue;
+                    };
+                    let payload_name = payload
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(expected_group_name);
+                    if payload_name != expected_group_name {
+                        continue;
+                    }
+                    let Some(welcome_b64) = payload.get("welcome").and_then(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    let Ok(welcome) = base64::engine::general_purpose::STANDARD.decode(welcome_b64)
+                    else {
+                        continue;
+                    };
+                    return Some((welcome, payload_name.to_string()));
+                }
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+async_test!(
+    test_three_phone_multi_identity_friendship_dm_signal_and_mls_groups_via_local_relay,
+    {
+        let (relay, relay_handle) = start_local_relay().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let phone_a = Arc::new(
+            KeychatClient::new(temp_db(&dir, "phone_a.db"), "test-key-cli".into()).unwrap(),
+        );
+        let phone_2 = Arc::new(
+            KeychatClient::new(temp_db(&dir, "phone_2.db"), "test-key-cli".into()).unwrap(),
+        );
+        let phone_3 = Arc::new(
+            KeychatClient::new(temp_db(&dir, "phone_3.db"), "test-key-cli".into()).unwrap(),
+        );
+
+        let phone_a_app = phone_a.app_client().clone();
+        let phone_2_app = phone_2.app_client().clone();
+        let phone_3_app = phone_3.app_client().clone();
+
+        let (alice_pubkey, _, _) = commands::create_identity(&phone_a_app, "Alice")
+            .await
+            .unwrap();
+        let (bob_pubkey, _) = commands::create_additional_identity(&phone_a_app, "Bob")
+            .await
+            .unwrap();
+        commands::switch_identity(&phone_a_app, &alice_pubkey)
+            .await
+            .unwrap();
+
+        let (tom_pubkey, _, _) = commands::create_identity(&phone_2_app, "Tom")
+            .await
+            .unwrap();
+        let (lily_pubkey, _) = commands::create_additional_identity(&phone_2_app, "Lily")
+            .await
+            .unwrap();
+        commands::switch_identity(&phone_2_app, &tom_pubkey)
+            .await
+            .unwrap();
+
+        let (candy_pubkey, _, _) = commands::create_identity(&phone_3_app, "Candy")
+            .await
+            .unwrap();
+
+        let (phone_a_listener, mut phone_a_rx) = TestListener::new();
+        let (phone_2_listener, mut phone_2_rx) = TestListener::new();
+        let (phone_3_listener, mut phone_3_rx) = TestListener::new();
+        phone_a.set_event_listener(Box::new(phone_a_listener)).await;
+        phone_2.set_event_listener(Box::new(phone_2_listener)).await;
+        phone_3.set_event_listener(Box::new(phone_3_listener)).await;
+
+        phone_a.connect(vec![relay.url.clone()]).await.unwrap();
+        phone_2.connect(vec![relay.url.clone()]).await.unwrap();
+        phone_3.connect(vec![relay.url.clone()]).await.unwrap();
+
+        let phone_a_loop = phone_a.clone();
+        tokio::spawn(async move {
+            let _ = phone_a_loop.start_event_loop().await;
+        });
+        let phone_2_loop = phone_2.clone();
+        tokio::spawn(async move {
+            let _ = phone_2_loop.start_event_loop().await;
+        });
+        let phone_3_loop = phone_3.clone();
+        tokio::spawn(async move {
+            let _ = phone_3_loop.start_event_loop().await;
+        });
+
+        assert!(
+            wait_for_relay_connection(&phone_a, 10).await,
+            "phone A should connect"
+        );
+        assert!(
+            wait_for_relay_connection(&phone_2, 10).await,
+            "phone 2 should connect"
+        );
+        assert!(
+            wait_for_relay_connection(&phone_3, 10).await,
+            "phone 3 should connect"
+        );
+
+        establish_identity_friendship(
+            &phone_a,
+            &phone_a_app,
+            &mut phone_a_rx,
+            &alice_pubkey,
+            "Alice",
+            &phone_2,
+            &phone_2_app,
+            &mut phone_2_rx,
+            &tom_pubkey,
+            "Tom",
+        )
+        .await;
+        establish_identity_friendship(
+            &phone_a,
+            &phone_a_app,
+            &mut phone_a_rx,
+            &alice_pubkey,
+            "Alice",
+            &phone_2,
+            &phone_2_app,
+            &mut phone_2_rx,
+            &lily_pubkey,
+            "Lily",
+        )
+        .await;
+        establish_identity_friendship(
+            &phone_a,
+            &phone_a_app,
+            &mut phone_a_rx,
+            &bob_pubkey,
+            "Bob",
+            &phone_2,
+            &phone_2_app,
+            &mut phone_2_rx,
+            &tom_pubkey,
+            "Tom",
+        )
+        .await;
+        establish_identity_friendship(
+            &phone_a,
+            &phone_a_app,
+            &mut phone_a_rx,
+            &bob_pubkey,
+            "Bob",
+            &phone_2,
+            &phone_2_app,
+            &mut phone_2_rx,
+            &lily_pubkey,
+            "Lily",
+        )
+        .await;
+        establish_identity_friendship(
+            &phone_a,
+            &phone_a_app,
+            &mut phone_a_rx,
+            &alice_pubkey,
+            "Alice",
+            &phone_3,
+            &phone_3_app,
+            &mut phone_3_rx,
+            &candy_pubkey,
+            "Candy",
+        )
+        .await;
+        establish_identity_friendship(
+            &phone_2,
+            &phone_2_app,
+            &mut phone_2_rx,
+            &tom_pubkey,
+            "Tom",
+            &phone_3,
+            &phone_3_app,
+            &mut phone_3_rx,
+            &candy_pubkey,
+            "Candy",
+        )
+        .await;
+
+        send_identity_dm(
+            &phone_a,
+            &phone_a_app,
+            &alice_pubkey,
+            "Alice",
+            &phone_2,
+            &mut phone_2_rx,
+            &tom_pubkey,
+            "Tom",
+            "dm Alice -> Tom",
+        )
+        .await;
+        send_identity_dm(
+            &phone_2,
+            &phone_2_app,
+            &tom_pubkey,
+            "Tom",
+            &phone_a,
+            &mut phone_a_rx,
+            &alice_pubkey,
+            "Alice",
+            "dm Tom -> Alice",
+        )
+        .await;
+        send_identity_dm(
+            &phone_a,
+            &phone_a_app,
+            &alice_pubkey,
+            "Alice",
+            &phone_2,
+            &mut phone_2_rx,
+            &lily_pubkey,
+            "Lily",
+            "dm Alice -> Lily",
+        )
+        .await;
+        send_identity_dm(
+            &phone_2,
+            &phone_2_app,
+            &lily_pubkey,
+            "Lily",
+            &phone_a,
+            &mut phone_a_rx,
+            &alice_pubkey,
+            "Alice",
+            "dm Lily -> Alice",
+        )
+        .await;
+        send_identity_dm(
+            &phone_a,
+            &phone_a_app,
+            &bob_pubkey,
+            "Bob",
+            &phone_2,
+            &mut phone_2_rx,
+            &tom_pubkey,
+            "Tom",
+            "dm Bob -> Tom",
+        )
+        .await;
+        send_identity_dm(
+            &phone_2,
+            &phone_2_app,
+            &tom_pubkey,
+            "Tom",
+            &phone_a,
+            &mut phone_a_rx,
+            &bob_pubkey,
+            "Bob",
+            "dm Tom -> Bob",
+        )
+        .await;
+        send_identity_dm(
+            &phone_a,
+            &phone_a_app,
+            &bob_pubkey,
+            "Bob",
+            &phone_2,
+            &mut phone_2_rx,
+            &lily_pubkey,
+            "Lily",
+            "dm Bob -> Lily",
+        )
+        .await;
+        send_identity_dm(
+            &phone_2,
+            &phone_2_app,
+            &lily_pubkey,
+            "Lily",
+            &phone_a,
+            &mut phone_a_rx,
+            &bob_pubkey,
+            "Bob",
+            "dm Lily -> Bob",
+        )
+        .await;
+        send_identity_dm(
+            &phone_a,
+            &phone_a_app,
+            &alice_pubkey,
+            "Alice",
+            &phone_3,
+            &mut phone_3_rx,
+            &candy_pubkey,
+            "Candy",
+            "dm Alice -> Candy",
+        )
+        .await;
+        send_identity_dm(
+            &phone_3,
+            &phone_3_app,
+            &candy_pubkey,
+            "Candy",
+            &phone_a,
+            &mut phone_a_rx,
+            &alice_pubkey,
+            "Alice",
+            "dm Candy -> Alice",
+        )
+        .await;
+        send_identity_dm(
+            &phone_2,
+            &phone_2_app,
+            &tom_pubkey,
+            "Tom",
+            &phone_3,
+            &mut phone_3_rx,
+            &candy_pubkey,
+            "Candy",
+            "dm Tom -> Candy",
+        )
+        .await;
+        send_identity_dm(
+            &phone_3,
+            &phone_3_app,
+            &candy_pubkey,
+            "Candy",
+            &phone_2,
+            &mut phone_2_rx,
+            &tom_pubkey,
+            "Tom",
+            "dm Candy -> Tom",
+        )
+        .await;
+
+        commands::switch_identity(&phone_a_app, &alice_pubkey)
+            .await
+            .unwrap();
+        let signal_group = phone_a
+            .create_signal_group(
+                "Alice Tom Candy Signal".into(),
+                vec![
+                    GroupMemberInput {
+                        nostr_pubkey: tom_pubkey.clone(),
+                        name: "Tom".into(),
+                    },
+                    GroupMemberInput {
+                        nostr_pubkey: candy_pubkey.clone(),
+                        name: "Candy".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(signal_group.member_count, 3);
+
+        wait_for_event(&mut phone_2_rx, 30, |event| {
+            matches!(
+                event,
+                ClientEvent::GroupInviteReceived {
+                    group_type,
+                    group_name,
+                    inviter_pubkey,
+                    ..
+                } if group_type == "signal"
+                    && group_name == "Alice Tom Candy Signal"
+                    && inviter_pubkey == &alice_pubkey
+            )
+        })
+        .await
+        .expect("Tom should receive Alice/Tom/Candy Signal group invite");
+        wait_for_event(&mut phone_3_rx, 30, |event| {
+            matches!(
+                event,
+                ClientEvent::GroupInviteReceived {
+                    group_type,
+                    group_name,
+                    inviter_pubkey,
+                    ..
+                } if group_type == "signal"
+                    && group_name == "Alice Tom Candy Signal"
+                    && inviter_pubkey == &alice_pubkey
+            )
+        })
+        .await
+        .expect("Candy should receive Alice/Tom/Candy Signal group invite");
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let signal_alice_text = "signal group Alice -> Tom/Candy";
+        let signal_sent = phone_a
+            .send_group_text(
+                signal_group.group_id.clone(),
+                signal_alice_text.into(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!signal_sent.event_ids.is_empty());
+        wait_for_group_text(
+            &mut phone_2_rx,
+            &signal_group.group_id,
+            &alice_pubkey,
+            signal_alice_text,
+            "Tom should receive Alice Signal group text",
+        )
+        .await;
+        wait_for_group_text(
+            &mut phone_3_rx,
+            &signal_group.group_id,
+            &alice_pubkey,
+            signal_alice_text,
+            "Candy should receive Alice Signal group text",
+        )
+        .await;
+
+        commands::switch_identity(&phone_2_app, &tom_pubkey)
+            .await
+            .unwrap();
+        let signal_tom_text = "signal group Tom -> Alice/Candy";
+        phone_2
+            .send_group_text(signal_group.group_id.clone(), signal_tom_text.into(), None)
+            .await
+            .unwrap();
+        wait_for_group_text(
+            &mut phone_a_rx,
+            &signal_group.group_id,
+            &tom_pubkey,
+            signal_tom_text,
+            "Alice should receive Tom Signal group text",
+        )
+        .await;
+        wait_for_group_text(
+            &mut phone_3_rx,
+            &signal_group.group_id,
+            &tom_pubkey,
+            signal_tom_text,
+            "Candy should receive Tom Signal group text",
+        )
+        .await;
+
+        commands::switch_identity(&phone_3_app, &candy_pubkey)
+            .await
+            .unwrap();
+        let signal_candy_text = "signal group Candy -> Alice/Tom";
+        phone_3
+            .send_group_text(
+                signal_group.group_id.clone(),
+                signal_candy_text.into(),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_for_group_text(
+            &mut phone_a_rx,
+            &signal_group.group_id,
+            &candy_pubkey,
+            signal_candy_text,
+            "Alice should receive Candy Signal group text",
+        )
+        .await;
+        wait_for_group_text(
+            &mut phone_2_rx,
+            &signal_group.group_id,
+            &candy_pubkey,
+            signal_candy_text,
+            "Tom should receive Candy Signal group text",
+        )
+        .await;
+
+        commands::switch_identity(&phone_2_app, &tom_pubkey)
+            .await
+            .unwrap();
+        let tom_key_package = phone_2.generate_mls_key_package().await.unwrap();
+        commands::switch_identity(&phone_3_app, &candy_pubkey)
+            .await
+            .unwrap();
+        let candy_key_package = phone_3.generate_mls_key_package().await.unwrap();
+
+        commands::switch_identity(&phone_a_app, &alice_pubkey)
+            .await
+            .unwrap();
+        let mls_group = phone_a
+            .create_mls_group(
+                "Alice Tom Candy MLS".into(),
+                vec![
+                    MlsKeyPackageInput {
+                        nostr_pubkey: tom_pubkey.clone(),
+                        key_package_bytes: tom_key_package,
+                    },
+                    MlsKeyPackageInput {
+                        nostr_pubkey: candy_pubkey.clone(),
+                        key_package_bytes: candy_key_package,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(mls_group.member_count, 3);
+
+        wait_for_event(&mut phone_2_rx, 30, |event| {
+            matches!(
+                event,
+                ClientEvent::GroupInviteReceived {
+                    group_type,
+                    group_name,
+                    inviter_pubkey,
+                    ..
+                } if group_type == "mls"
+                    && group_name == "Alice Tom Candy MLS"
+                    && inviter_pubkey == &alice_pubkey
+            )
+        })
+        .await
+        .expect("Tom should receive Alice/Tom/Candy MLS invite");
+        wait_for_event(&mut phone_3_rx, 30, |event| {
+            matches!(
+                event,
+                ClientEvent::GroupInviteReceived {
+                    group_type,
+                    group_name,
+                    inviter_pubkey,
+                    ..
+                } if group_type == "mls"
+                    && group_name == "Alice Tom Candy MLS"
+                    && inviter_pubkey == &alice_pubkey
+            )
+        })
+        .await
+        .expect("Candy should receive Alice/Tom/Candy MLS invite");
+
+        commands::switch_identity(&phone_2_app, &tom_pubkey)
+            .await
+            .unwrap();
+        let (tom_welcome, tom_group_name) =
+            wait_for_mls_welcome(&phone_2, &tom_pubkey, "Alice Tom Candy MLS", 30)
+                .await
+                .expect("Tom should have MLS welcome bytes");
+        let tom_joined = phone_2
+            .join_mls_group(tom_welcome, tom_group_name, vec![alice_pubkey.clone()])
+            .await
+            .unwrap();
+        assert_eq!(tom_joined.group_id, mls_group.group_id);
+
+        commands::switch_identity(&phone_3_app, &candy_pubkey)
+            .await
+            .unwrap();
+        let (candy_welcome, candy_group_name) =
+            wait_for_mls_welcome(&phone_3, &candy_pubkey, "Alice Tom Candy MLS", 30)
+                .await
+                .expect("Candy should have MLS welcome bytes");
+        let candy_joined = phone_3
+            .join_mls_group(candy_welcome, candy_group_name, vec![alice_pubkey.clone()])
+            .await
+            .unwrap();
+        assert_eq!(candy_joined.group_id, mls_group.group_id);
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        commands::switch_identity(&phone_a_app, &alice_pubkey)
+            .await
+            .unwrap();
+        let mls_alice_text = "mls group Alice -> Tom/Candy";
+        let mls_sent = phone_a
+            .send_mls_text(mls_group.group_id.clone(), mls_alice_text.into(), None)
+            .await
+            .unwrap();
+        assert!(!mls_sent.event_id.is_empty());
+        wait_for_group_text(
+            &mut phone_2_rx,
+            &mls_group.group_id,
+            &alice_pubkey,
+            mls_alice_text,
+            "Tom should receive Alice MLS group text",
+        )
+        .await;
+        wait_for_group_text(
+            &mut phone_3_rx,
+            &mls_group.group_id,
+            &alice_pubkey,
+            mls_alice_text,
+            "Candy should receive Alice MLS group text",
+        )
+        .await;
+
+        commands::switch_identity(&phone_2_app, &tom_pubkey)
+            .await
+            .unwrap();
+        let mls_tom_text = "mls group Tom -> Alice/Candy";
+        phone_2
+            .send_mls_text(mls_group.group_id.clone(), mls_tom_text.into(), None)
+            .await
+            .unwrap();
+        wait_for_group_text(
+            &mut phone_a_rx,
+            &mls_group.group_id,
+            &tom_pubkey,
+            mls_tom_text,
+            "Alice should receive Tom MLS group text",
+        )
+        .await;
+        wait_for_group_text(
+            &mut phone_3_rx,
+            &mls_group.group_id,
+            &tom_pubkey,
+            mls_tom_text,
+            "Candy should receive Tom MLS group text",
+        )
+        .await;
+
+        commands::switch_identity(&phone_3_app, &candy_pubkey)
+            .await
+            .unwrap();
+        let mls_candy_text = "mls group Candy -> Alice/Tom";
+        phone_3
+            .send_mls_text(mls_group.group_id.clone(), mls_candy_text.into(), None)
+            .await
+            .unwrap();
+        wait_for_group_text(
+            &mut phone_a_rx,
+            &mls_group.group_id,
+            &candy_pubkey,
+            mls_candy_text,
+            "Alice should receive Candy MLS group text",
+        )
+        .await;
+        wait_for_group_text(
+            &mut phone_2_rx,
+            &mls_group.group_id,
+            &candy_pubkey,
+            mls_candy_text,
+            "Tom should receive Candy MLS group text",
+        )
+        .await;
+
+        let _ = phone_a.stop_event_loop().await;
+        let _ = phone_2.stop_event_loop().await;
+        let _ = phone_3.stop_event_loop().await;
+        let _ = phone_a.disconnect().await;
+        let _ = phone_2.disconnect().await;
+        let _ = phone_3.disconnect().await;
+        relay_handle.abort();
+        tokio::task::spawn_blocking(move || {
+            drop(phone_a_app);
+            drop(phone_2_app);
+            drop(phone_3_app);
+            drop(phone_a);
+            drop(phone_2);
+            drop(phone_3);
+        })
+        .await
+        .unwrap();
+    }
+);
 
 // ─── File Transfer: Encrypt/Decrypt Round-Trip Tests ────────────
 
@@ -702,6 +1878,204 @@ async_test!(test_file_attachments_download_path, {
 // ─── Relay Integration: Test Infrastructure ─────────────────────
 
 const TEST_RELAY: &str = "wss://backup.keychat.io";
+
+#[derive(Clone)]
+struct LocalRelay {
+    url: String,
+}
+
+#[derive(Clone)]
+struct LocalRelayState {
+    events: Arc<Mutex<Vec<serde_json::Value>>>,
+    subscribers: Arc<
+        Mutex<
+            Vec<(
+                String,
+                Vec<serde_json::Value>,
+                tokio::sync::mpsc::UnboundedSender<String>,
+            )>,
+        >,
+    >,
+}
+
+fn local_relay_event_matches_filter(event: &serde_json::Value, filter: &serde_json::Value) -> bool {
+    if let Some(kinds) = filter.get("kinds").and_then(|value| value.as_array()) {
+        let event_kind = event.get("kind").and_then(|value| value.as_u64());
+        if !kinds
+            .iter()
+            .filter_map(|value| value.as_u64())
+            .any(|kind| Some(kind) == event_kind)
+        {
+            return false;
+        }
+    }
+
+    if let Some(since) = filter.get("since").and_then(|value| value.as_u64()) {
+        let created_at = event
+            .get("created_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        if created_at < since {
+            return false;
+        }
+    }
+
+    if let Some(p_tags) = filter.get("#p").and_then(|value| value.as_array()) {
+        let event_p_tags = event
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|tag| tag.as_array())
+            .filter(|tag| tag.first().and_then(|value| value.as_str()) == Some("p"))
+            .filter_map(|tag| tag.get(1).and_then(|value| value.as_str()));
+
+        if !event_p_tags.into_iter().any(|event_p| {
+            p_tags
+                .iter()
+                .any(|filter_p| filter_p.as_str() == Some(event_p))
+        }) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn local_relay_event_matches_filters(
+    event: &serde_json::Value,
+    filters: &[serde_json::Value],
+) -> bool {
+    filters
+        .iter()
+        .any(|filter| local_relay_event_matches_filter(event, filter))
+}
+
+async fn start_local_relay() -> (LocalRelay, tokio::task::JoinHandle<()>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local relay");
+    let addr = listener.local_addr().expect("local relay addr");
+    let relay = LocalRelay {
+        url: format!("ws://{addr}"),
+    };
+    let state = LocalRelayState {
+        events: Arc::new(Mutex::new(Vec::new())),
+        subscribers: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let (mut sink, mut source) = ws.split();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+                let writer = tokio::spawn(async move {
+                    while let Some(text) = rx.recv().await {
+                        if sink.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                while let Some(Ok(message)) = source.next().await {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    let Some(kind) = value.get(0).and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+
+                    match kind {
+                        "EVENT" => {
+                            let Some(event) = value.get(1).cloned() else {
+                                continue;
+                            };
+                            let event_id = event
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            state.events.lock().unwrap().push(event.clone());
+
+                            let ok = serde_json::json!(["OK", event_id, true, ""]).to_string();
+                            let _ = tx.send(ok);
+
+                            let subscribers = state.subscribers.lock().unwrap().clone();
+                            for (sub_id, filters, sub_tx) in subscribers {
+                                if !local_relay_event_matches_filters(&event, &filters) {
+                                    continue;
+                                }
+                                let relay_event =
+                                    serde_json::json!(["EVENT", sub_id, event]).to_string();
+                                let _ = sub_tx.send(relay_event);
+                            }
+                        }
+                        "REQ" => {
+                            let Some(sub_id) = value.get(1).and_then(|v| v.as_str()) else {
+                                continue;
+                            };
+                            let sub_id = sub_id.to_string();
+                            let filters = value
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .skip(2)
+                                .cloned()
+                                .collect::<Vec<_>>();
+
+                            {
+                                let mut subscribers = state.subscribers.lock().unwrap();
+                                subscribers.retain(|(existing, _, _)| existing != &sub_id);
+                                subscribers.push((sub_id.clone(), filters.clone(), tx.clone()));
+                            }
+
+                            let events = state.events.lock().unwrap().clone();
+                            for event in events {
+                                if !local_relay_event_matches_filters(&event, &filters) {
+                                    continue;
+                                }
+                                let relay_event =
+                                    serde_json::json!(["EVENT", sub_id, event]).to_string();
+                                let _ = tx.send(relay_event);
+                            }
+                            let eose = serde_json::json!(["EOSE", sub_id]).to_string();
+                            let _ = tx.send(eose);
+                        }
+                        "CLOSE" => {
+                            if let Some(sub_id) = value.get(1).and_then(|v| v.as_str()) {
+                                state
+                                    .subscribers
+                                    .lock()
+                                    .unwrap()
+                                    .retain(|(existing, _, _)| existing != sub_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                writer.abort();
+            });
+        }
+    });
+
+    (relay, handle)
+}
 
 /// Event listener for relay integration tests.
 /// Collects events and broadcasts them for waiters.

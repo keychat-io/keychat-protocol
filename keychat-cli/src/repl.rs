@@ -117,9 +117,13 @@ async fn dispatch(
         // ── Identity ──
         "/create" => cmd_create(Arc::clone(&client), args).await?,
         "/import" => cmd_import(Arc::clone(&client), args).await?,
+        "/identities" => cmd_identities(&client).await?,
+        "/switch" => cmd_switch_identity(&client, args).await?,
+        "/create-id" => cmd_create_additional_identity(&client, args).await?,
+        "/import-nsec" => cmd_import_nsec_identity(&client, args).await?,
         "/whoami" => cmd_whoami(&client).await?,
         "/backup" => cmd_backup(&client).await?,
-        "/delete-identity" => cmd_delete_identity(&client, active_room_id).await?,
+        "/delete-identity" => cmd_delete_identity(&client, args, active_room_id).await?,
         "/reset" => return cmd_reset(data_dir).await,
 
         // ── Connection ──
@@ -177,6 +181,10 @@ async fn dispatch(
 // ─── Identity commands ──────────────────────────────────────────
 
 async fn cmd_create(client: Arc<AppClient>, name: &str) -> anyhow::Result<()> {
+    if !client.get_identities().await?.is_empty() {
+        print_err("Identity already exists. Use /create-id <name> to add another identity.");
+        return Ok(());
+    }
     let display_name = if name.is_empty() { "CLI User" } else { name };
     let (pubkey_hex, npub, mnemonic) =
         crate::commands::create_identity(&client, display_name).await?;
@@ -199,12 +207,81 @@ async fn cmd_import(client: Arc<AppClient>, args: &str) -> anyhow::Result<()> {
         print_err("Usage: /import <mnemonic words>");
         return Ok(());
     }
+    if !client.get_identities().await?.is_empty() {
+        print_err("Identity already exists. Use /import-nsec <nsec> <name> for an additional imported identity.");
+        return Ok(());
+    }
     let pubkey = crate::commands::import_identity(&client, args).await?;
     print_ok(&format!("Identity imported: {}", pubkey.cyan()));
 
     // Auto-connect to relays
     crate::commands::connect_and_start(&client, keychat_app_core::default_relays());
     print_sys("Connecting to relays...");
+    Ok(())
+}
+
+async fn cmd_identities(client: &AppClient) -> anyhow::Result<()> {
+    let identities = client.get_identities().await?;
+    let active = client.get_pubkey_hex().await.ok();
+    if identities.is_empty() {
+        print_sys("No identities.");
+        return Ok(());
+    }
+    for identity in identities {
+        let marker = if active.as_deref() == Some(identity.nostr_pubkey_hex.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "  {} [{}] {} {}",
+            marker.green(),
+            identity.index,
+            identity.name.bold(),
+            short_key(&identity.nostr_pubkey_hex).cyan()
+        );
+        println!("      {}", identity.npub.dimmed());
+    }
+    Ok(())
+}
+
+async fn cmd_switch_identity(client: &AppClient, args: &str) -> anyhow::Result<()> {
+    if args.is_empty() {
+        print_err("Usage: /switch <index|pubkey|npub>");
+        return Ok(());
+    }
+    let pubkey = crate::commands::switch_identity(client, args).await?;
+    print_ok(&format!("Active identity: {}", short_key(&pubkey).cyan()));
+    Ok(())
+}
+
+async fn cmd_create_additional_identity(client: &AppClient, args: &str) -> anyhow::Result<()> {
+    let display_name = if args.is_empty() { "CLI User" } else { args };
+    let (pubkey, npub) = crate::commands::create_additional_identity(client, display_name).await?;
+    print_ok(&format!(
+        "Identity added: {} ({})",
+        display_name.green(),
+        short_key(&pubkey).cyan()
+    ));
+    println!("  {} {}", "npub:".dimmed(), npub.cyan());
+    Ok(())
+}
+
+async fn cmd_import_nsec_identity(client: &AppClient, args: &str) -> anyhow::Result<()> {
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let nsec = parts.next().unwrap_or("").trim();
+    let name = parts.next().unwrap_or("Imported Identity").trim();
+    if nsec.is_empty() {
+        print_err("Usage: /import-nsec <nsec> <name>");
+        return Ok(());
+    }
+    let (pubkey, npub) = crate::commands::import_identity_from_nsec(client, nsec, name).await?;
+    print_ok(&format!(
+        "Identity imported: {} ({})",
+        name.green(),
+        short_key(&pubkey).cyan()
+    ));
+    println!("  {} {}", "npub:".dimmed(), npub.cyan());
     Ok(())
 }
 
@@ -237,16 +314,23 @@ async fn cmd_backup(client: &AppClient) -> anyhow::Result<()> {
 
 async fn cmd_delete_identity(
     client: &AppClient,
+    args: &str,
     active_room_id: &mut Option<String>,
 ) -> anyhow::Result<()> {
-    print_sys("This will delete your identity and ALL data. Type 'yes' to confirm:");
+    let target = if args.is_empty() {
+        client.get_pubkey_hex().await?
+    } else {
+        args.to_string()
+    };
+    print_sys(&format!(
+        "This will delete identity {target} and its local data. Type 'yes' to confirm:"
+    ));
     let mut rl = rustyline::DefaultEditor::new()?;
     match rl.readline("  Confirm> ") {
         Ok(input) if input.trim() == "yes" => {
-            client.remove_identity().await?;
-            crate::commands::delete_mnemonic(client).await;
+            let deleted = crate::commands::delete_identity(client, &target).await?;
             *active_room_id = None;
-            print_ok("Identity and all data deleted.");
+            print_ok(&format!("Identity deleted: {}", short_key(&deleted).cyan()));
         }
         _ => print_sys("Cancelled."),
     }
@@ -1726,11 +1810,24 @@ fn print_help() {
     println!("  {}", "Identity:".bold());
     println!("    {}  Create new identity", "/create".green());
     println!("    {}  Import from mnemonic", "/import <mnemonic>".green());
+    println!("    {}  List identities", "/identities".green());
+    println!(
+        "    {}  Switch active identity",
+        "/switch <index|pubkey>".green()
+    );
+    println!(
+        "    {}  Create additional derived identity",
+        "/create-id <name>".green()
+    );
+    println!(
+        "    {}  Import additional nsec identity",
+        "/import-nsec <nsec> <name>".green()
+    );
     println!("    {}   Show current pubkey", "/whoami".green());
     println!("    {}   Show backup info", "/backup".green());
     println!(
         "    {}  Remove identity (with confirmation)",
-        "/delete-identity".green()
+        "/delete-identity <index|pubkey>".green()
     );
     println!("    {}    Delete ALL data and quit", "/reset".green());
     println!();

@@ -9,6 +9,7 @@
 
 use crate::error::{KeychatError, Result};
 use bip39::Mnemonic;
+use nostr::nips::nip06::FromMnemonic;
 use nostr::prelude::*;
 
 /// A Keychat identity — holds the derived Nostr keypair only.
@@ -65,7 +66,7 @@ impl Identity {
                 }
             };
         let mnemonic_str = mnemonic.to_string();
-        let identity = Self::from_mnemonic(mnemonic)?;
+        let identity = Self::from_mnemonic(mnemonic, 0)?;
         Ok(IdentityWithMnemonic {
             identity,
             mnemonic: mnemonic_str,
@@ -76,18 +77,43 @@ impl Identity {
     ///
     /// The mnemonic is used only for derivation and is NOT stored in the returned `Identity`.
     pub fn from_mnemonic_str(phrase: &str) -> Result<Self> {
+        Self::from_mnemonic_with_account_str(phrase, 0)
+    }
+
+    /// Import an identity from an existing mnemonic phrase with a NIP-06 account index.
+    ///
+    /// Account 0 is the default identity; higher account indexes derive additional
+    /// independent identities from the same mnemonic root.
+    pub fn from_mnemonic_with_account_str(phrase: &str, account: u32) -> Result<Self> {
         let mnemonic: Mnemonic = phrase
             .parse()
             .map_err(|e: bip39::Error| KeychatError::InvalidMnemonic(e.to_string()))?;
-        Self::from_mnemonic(mnemonic)
+        Self::from_mnemonic(mnemonic, account)
     }
 
     /// Import an identity from an existing Mnemonic.
-    fn from_mnemonic(mnemonic: Mnemonic) -> Result<Self> {
-        // NIP-06: derive Nostr keys from BIP-39 mnemonic via m/44'/1237'/0'/0/0
-        let keys = Keys::from_mnemonic(mnemonic.to_string(), None)
-            .map_err(|e| KeychatError::KeyDerivation(e.to_string()))?;
+    fn from_mnemonic(mnemonic: Mnemonic, account: u32) -> Result<Self> {
+        // NIP-06: derive Nostr keys from BIP-39 mnemonic via m/44'/1237'/{account}'/0/0
+        let keys =
+            Keys::from_mnemonic_with_account(mnemonic.to_string(), None::<String>, Some(account))
+                .map_err(|e| KeychatError::KeyDerivation(e.to_string()))?;
         // Mnemonic is dropped here — not stored in Identity
+        Ok(Self { keys })
+    }
+
+    /// Import an identity from a raw Nostr secret key hex string.
+    pub fn from_secret_hex(secret_hex: &str) -> Result<Self> {
+        let secret_key = SecretKey::from_hex(secret_hex)
+            .map_err(|e| KeychatError::Identity(format!("invalid secret hex: {e}")))?;
+        let keys = Keys::new(secret_key);
+        Ok(Self { keys })
+    }
+
+    /// Import an identity from a Nostr nsec bech32 secret key.
+    pub fn from_nsec(nsec: &str) -> Result<Self> {
+        let secret_key = SecretKey::from_bech32(nsec)
+            .map_err(|e| KeychatError::Identity(format!("invalid nsec: {e}")))?;
+        let keys = Keys::new(secret_key);
         Ok(Self { keys })
     }
 
@@ -263,6 +289,30 @@ mod tests {
         let id1 = Identity::from_mnemonic_str(phrase).unwrap();
         let id2 = Identity::from_mnemonic_str(phrase).unwrap();
         assert_eq!(id1.pubkey_hex(), id2.pubkey_hex());
+    }
+
+    #[test]
+    fn derive_mnemonic_accounts_are_distinct_and_stable() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let account0 = Identity::from_mnemonic_with_account_str(phrase, 0).unwrap();
+        let account1 = Identity::from_mnemonic_with_account_str(phrase, 1).unwrap();
+        let account1_again = Identity::from_mnemonic_with_account_str(phrase, 1).unwrap();
+
+        assert_ne!(account0.pubkey_hex(), account1.pubkey_hex());
+        assert_eq!(account1.pubkey_hex(), account1_again.pubkey_hex());
+    }
+
+    #[test]
+    fn import_secret_hex_and_nsec_roundtrip() {
+        let generated = Identity::generate().unwrap().identity;
+        let secret_hex = generated.secret_hex();
+        let nsec = generated.nsec().unwrap();
+
+        let from_hex = Identity::from_secret_hex(&secret_hex).unwrap();
+        let from_nsec = Identity::from_nsec(&nsec).unwrap();
+
+        assert_eq!(generated.pubkey_hex(), from_hex.pubkey_hex());
+        assert_eq!(generated.pubkey_hex(), from_nsec.pubkey_hex());
     }
 
     #[test]

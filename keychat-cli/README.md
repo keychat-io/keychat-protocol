@@ -18,7 +18,7 @@ keychat-cli provides four interface modes for interacting with the Keychat netwo
 - **E2E encryption** — Signal Protocol (PQXDH) for 1:1 and group chats over Nostr
 - **Database encryption** — DB key stored in OS keyring (macOS Keychain, Linux secret-service) with automatic file fallback
 - **Signal groups** — Create, invite, rename, kick, leave, and dissolve encrypted group chats
-- **Multi-instance** — Run multiple identities side-by-side via `--data-dir` isolation
+- **Multi-identity** — Create, import, list, switch, and delete multiple identities in one local database
 - **Shared protocol library** — Uses keychat-uniffi, identical to the iOS app
 
 ## Installation
@@ -178,13 +178,37 @@ Secret files are stored in `<data-dir>/secrets/` with `0600` permissions.
 
 ### Identity
 
-| Command            | Description                                           |
-| ------------------ | ----------------------------------------------------- |
-| `/create`          | Create a new Nostr identity                           |
-| `/import`          | Import an existing identity from nsec/hex private key |
-| `/whoami`          | Show current identity (npub, hex pubkey)              |
-| `/backup`          | Export identity for backup (displays nsec)            |
-| `/delete-identity` | Delete the current identity                           |
+| Command                         | Description                                      |
+| ------------------------------- | ------------------------------------------------ |
+| `/create <name>`                | Create the first Nostr identity and seed         |
+| `/import <mnemonic>`            | Import the first identity from a mnemonic        |
+| `/identities`                   | List local identities                            |
+| `/switch <index\|pubkey\|npub>` | Switch the active identity                       |
+| `/create-id <name>`             | Add another identity derived from the saved seed |
+| `/import-nsec <nsec> <name>`    | Add another identity from an nsec private key    |
+| `/whoami`                       | Show current identity                            |
+| `/backup`                       | Show backup guidance                             |
+| `/delete-identity <index\|pubkey>` | Delete one identity and its local scoped data |
+
+The first identity keeps backward compatibility with the old `identity_mnemonic`
+setting. Additional derived identities are restored from the saved seed and their
+account index; imported nsec identities are restored from an encrypted per-identity
+secret setting.
+
+### HTTP Identity API
+
+| Method   | Path                       | Description                         |
+| -------- | -------------------------- | ----------------------------------- |
+| `GET`    | `/identity`                | Get the active identity             |
+| `GET`    | `/identities`              | List local identities               |
+| `POST`   | `/identity/create`         | Create the first identity           |
+| `POST`   | `/identity/import`         | Import the first mnemonic identity  |
+| `POST`   | `/identity/switch`         | Switch active identity              |
+| `POST`   | `/identity/create-derived` | Add a derived identity              |
+| `POST`   | `/identity/import-nsec`    | Add an nsec identity                |
+| `DELETE` | `/identity/{pubkey}`       | Delete one identity                 |
+
+For local manual testing, start the daemon and open `/debug/identities`.
 
 ### Connection
 

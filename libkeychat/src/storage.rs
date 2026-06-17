@@ -118,7 +118,7 @@ impl SecureStorage {
     }
 
     /// Schema version.
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 4;
 
     /// Create schema if database is fresh.
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -126,8 +126,25 @@ impl SecureStorage {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| KeychatError::Storage(format!("Failed to read user_version: {e}")))?;
 
+        let mut current = current;
+
         if current == 0 {
             Self::create_schema(conn)?;
+            return Ok(());
+        }
+
+        if current < 2 {
+            Self::migrate_to_v2(conn)?;
+            current = 2;
+        }
+
+        if current < 3 {
+            Self::migrate_to_v3(conn)?;
+            current = 3;
+        }
+
+        if current < 4 {
+            Self::migrate_to_v4(conn)?;
         }
         Ok(())
     }
@@ -139,39 +156,50 @@ impl SecureStorage {
             "BEGIN;
 
             CREATE TABLE IF NOT EXISTS signal_sessions (
+                my_pubkey TEXT NOT NULL DEFAULT '',
                 address TEXT NOT NULL,
                 device_id INTEGER NOT NULL,
                 record BLOB NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                PRIMARY KEY (address, device_id)
+                PRIMARY KEY (my_pubkey, address, device_id)
             );
 
             CREATE TABLE IF NOT EXISTS pre_keys (
-                id INTEGER PRIMARY KEY,
-                record BLOB NOT NULL
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (my_pubkey, id)
             );
 
             CREATE TABLE IF NOT EXISTS signed_pre_keys (
-                id INTEGER PRIMARY KEY,
-                record BLOB NOT NULL
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (my_pubkey, id)
             );
 
             CREATE TABLE IF NOT EXISTS kyber_pre_keys (
-                id INTEGER PRIMARY KEY,
-                record BLOB NOT NULL
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (my_pubkey, id)
             );
 
             CREATE TABLE IF NOT EXISTS identity_keys (
-                address TEXT PRIMARY KEY,
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL,
                 public_key BLOB NOT NULL,
                 private_key BLOB,
-                is_own INTEGER NOT NULL DEFAULT 0
+                is_own INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (my_pubkey, address, is_own)
             );
 
             CREATE TABLE IF NOT EXISTS peer_addresses (
-                peer_signal_id TEXT PRIMARY KEY,
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                peer_signal_id TEXT NOT NULL,
                 state_json TEXT NOT NULL,
-                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, peer_signal_id)
             );
 
             CREATE TABLE IF NOT EXISTS processed_events (
@@ -180,15 +208,16 @@ impl SecureStorage {
             );
 
             CREATE TABLE IF NOT EXISTS peer_mappings (
+                my_pubkey TEXT NOT NULL DEFAULT '',
                 nostr_pubkey TEXT NOT NULL,
                 signal_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 is_public_agent INTEGER NOT NULL DEFAULT 0,
                 peer_uses_dual_p_tag INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                PRIMARY KEY (nostr_pubkey)
+                PRIMARY KEY (my_pubkey, nostr_pubkey)
             );
-            CREATE INDEX IF NOT EXISTS idx_peer_signal ON peer_mappings(signal_id);
+            CREATE INDEX IF NOT EXISTS idx_peer_signal ON peer_mappings(my_pubkey, signal_id);
 
             CREATE TABLE IF NOT EXISTS protocol_settings (
                 key TEXT PRIMARY KEY,
@@ -196,18 +225,21 @@ impl SecureStorage {
             );
 
             CREATE TABLE IF NOT EXISTS signal_participants (
-                peer_signal_id TEXT PRIMARY KEY,
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                peer_signal_id TEXT NOT NULL,
                 device_id INTEGER NOT NULL,
                 identity_public BLOB NOT NULL,
                 identity_private BLOB NOT NULL,
                 registration_id INTEGER NOT NULL,
                 signed_prekey_id INTEGER NOT NULL,
                 signed_prekey_record BLOB NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, peer_signal_id)
             );
 
             CREATE TABLE IF NOT EXISTS pending_friend_requests (
                 request_id TEXT PRIMARY KEY,
+                my_pubkey TEXT NOT NULL DEFAULT '',
                 device_id INTEGER NOT NULL,
                 identity_public BLOB NOT NULL,
                 identity_private BLOB NOT NULL,
@@ -224,23 +256,29 @@ impl SecureStorage {
             );
 
             CREATE TABLE IF NOT EXISTS inbound_friend_requests (
-                request_id TEXT PRIMARY KEY,
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                request_id TEXT NOT NULL,
                 sender_pubkey_hex TEXT NOT NULL,
                 message_json TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, request_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_inbound_fr_sender ON inbound_friend_requests(sender_pubkey_hex);
+            CREATE INDEX IF NOT EXISTS idx_inbound_fr_sender ON inbound_friend_requests(my_pubkey, sender_pubkey_hex);
 
             CREATE TABLE IF NOT EXISTS pending_first_inbox (
-                peer_signal_hex TEXT PRIMARY KEY,
-                first_inbox_pubkey TEXT NOT NULL
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                peer_signal_hex TEXT NOT NULL,
+                first_inbox_pubkey TEXT NOT NULL,
+                PRIMARY KEY (my_pubkey, peer_signal_hex)
             );
 
             CREATE TABLE IF NOT EXISTS signal_groups (
-                group_id TEXT PRIMARY KEY,
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                group_id TEXT NOT NULL,
                 data_json TEXT NOT NULL,
-                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, group_id)
             );
 
             CREATE TABLE IF NOT EXISTS mls_group_ids (
@@ -256,7 +294,7 @@ impl SecureStorage {
 
             CREATE INDEX IF NOT EXISTS idx_processed_events_at ON processed_events(processed_at);
 
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 4;
 
             COMMIT;",
         )
@@ -282,15 +320,221 @@ impl SecureStorage {
         Ok(())
     }
 
+    fn migrate_to_v2(conn: &Connection) -> Result<()> {
+        tracing::info!("migrating database schema to v2");
+        conn.execute_batch(
+            "BEGIN;
+
+            ALTER TABLE peer_mappings RENAME TO peer_mappings_v1;
+            CREATE TABLE peer_mappings (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                nostr_pubkey TEXT NOT NULL,
+                signal_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                is_public_agent INTEGER NOT NULL DEFAULT 0,
+                peer_uses_dual_p_tag INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, nostr_pubkey)
+            );
+            INSERT INTO peer_mappings (
+                my_pubkey, nostr_pubkey, signal_id, name, is_public_agent,
+                peer_uses_dual_p_tag, created_at
+            )
+            SELECT '', nostr_pubkey, signal_id, name, is_public_agent,
+                   peer_uses_dual_p_tag, created_at
+            FROM peer_mappings_v1;
+            DROP TABLE peer_mappings_v1;
+            CREATE INDEX IF NOT EXISTS idx_peer_signal ON peer_mappings(my_pubkey, signal_id);
+
+            ALTER TABLE peer_addresses RENAME TO peer_addresses_v1;
+            CREATE TABLE peer_addresses (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                peer_signal_id TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, peer_signal_id)
+            );
+            INSERT INTO peer_addresses (my_pubkey, peer_signal_id, state_json, updated_at)
+            SELECT '', peer_signal_id, state_json, updated_at FROM peer_addresses_v1;
+            DROP TABLE peer_addresses_v1;
+
+            ALTER TABLE signal_participants RENAME TO signal_participants_v1;
+            CREATE TABLE signal_participants (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                peer_signal_id TEXT NOT NULL,
+                device_id INTEGER NOT NULL,
+                identity_public BLOB NOT NULL,
+                identity_private BLOB NOT NULL,
+                registration_id INTEGER NOT NULL,
+                signed_prekey_id INTEGER NOT NULL,
+                signed_prekey_record BLOB NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, peer_signal_id)
+            );
+            INSERT INTO signal_participants (
+                my_pubkey, peer_signal_id, device_id, identity_public, identity_private,
+                registration_id, signed_prekey_id, signed_prekey_record, created_at
+            )
+            SELECT '', peer_signal_id, device_id, identity_public, identity_private,
+                   registration_id, signed_prekey_id, signed_prekey_record, created_at
+            FROM signal_participants_v1;
+            DROP TABLE signal_participants_v1;
+
+            ALTER TABLE pending_friend_requests ADD COLUMN my_pubkey TEXT NOT NULL DEFAULT '';
+
+            ALTER TABLE pending_first_inbox RENAME TO pending_first_inbox_v1;
+            CREATE TABLE pending_first_inbox (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                peer_signal_hex TEXT NOT NULL,
+                first_inbox_pubkey TEXT NOT NULL,
+                PRIMARY KEY (my_pubkey, peer_signal_hex)
+            );
+            INSERT INTO pending_first_inbox (my_pubkey, peer_signal_hex, first_inbox_pubkey)
+            SELECT '', peer_signal_hex, first_inbox_pubkey FROM pending_first_inbox_v1;
+            DROP TABLE pending_first_inbox_v1;
+
+            ALTER TABLE signal_groups RENAME TO signal_groups_v1;
+            CREATE TABLE signal_groups (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                group_id TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, group_id)
+            );
+            INSERT INTO signal_groups (my_pubkey, group_id, data_json, updated_at)
+            SELECT '', group_id, data_json, updated_at FROM signal_groups_v1;
+            DROP TABLE signal_groups_v1;
+
+            PRAGMA user_version = 2;
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("migrate schema v2 failed: {e}")))?;
+        Ok(())
+    }
+
+    fn migrate_to_v3(conn: &Connection) -> Result<()> {
+        tracing::info!("migrating database schema to v3");
+        conn.execute_batch(
+            "BEGIN;
+
+            ALTER TABLE signal_sessions RENAME TO signal_sessions_v2;
+            CREATE TABLE signal_sessions (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL,
+                device_id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, address, device_id)
+            );
+            INSERT INTO signal_sessions (my_pubkey, address, device_id, record, updated_at)
+            SELECT '', address, device_id, record, updated_at FROM signal_sessions_v2;
+            DROP TABLE signal_sessions_v2;
+
+            PRAGMA user_version = 3;
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("migrate schema v3 failed: {e}")))?;
+        Ok(())
+    }
+
+    fn migrate_to_v4(conn: &Connection) -> Result<()> {
+        tracing::info!("migrating database schema to v4");
+        conn.execute_batch(
+            "BEGIN;
+
+            ALTER TABLE pre_keys RENAME TO pre_keys_v3;
+            CREATE TABLE pre_keys (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (my_pubkey, id)
+            );
+            INSERT INTO pre_keys (my_pubkey, id, record)
+            SELECT '', id, record FROM pre_keys_v3;
+            DROP TABLE pre_keys_v3;
+
+            ALTER TABLE signed_pre_keys RENAME TO signed_pre_keys_v3;
+            CREATE TABLE signed_pre_keys (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (my_pubkey, id)
+            );
+            INSERT INTO signed_pre_keys (my_pubkey, id, record)
+            SELECT '', id, record FROM signed_pre_keys_v3;
+            DROP TABLE signed_pre_keys_v3;
+
+            ALTER TABLE kyber_pre_keys RENAME TO kyber_pre_keys_v3;
+            CREATE TABLE kyber_pre_keys (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (my_pubkey, id)
+            );
+            INSERT INTO kyber_pre_keys (my_pubkey, id, record)
+            SELECT '', id, record FROM kyber_pre_keys_v3;
+            DROP TABLE kyber_pre_keys_v3;
+
+            ALTER TABLE identity_keys RENAME TO identity_keys_v3;
+            CREATE TABLE identity_keys (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                private_key BLOB,
+                is_own INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (my_pubkey, address, is_own)
+            );
+            INSERT INTO identity_keys (my_pubkey, address, public_key, private_key, is_own)
+            SELECT '', address, public_key, private_key, is_own FROM identity_keys_v3;
+            DROP TABLE identity_keys_v3;
+
+            ALTER TABLE inbound_friend_requests RENAME TO inbound_friend_requests_v3;
+            CREATE TABLE inbound_friend_requests (
+                my_pubkey TEXT NOT NULL DEFAULT '',
+                request_id TEXT NOT NULL,
+                sender_pubkey_hex TEXT NOT NULL,
+                message_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY (my_pubkey, request_id)
+            );
+            INSERT INTO inbound_friend_requests (
+                my_pubkey, request_id, sender_pubkey_hex, message_json, payload_json, created_at
+            )
+            SELECT '', request_id, sender_pubkey_hex, message_json, payload_json, created_at
+            FROM inbound_friend_requests_v3;
+            DROP TABLE inbound_friend_requests_v3;
+            CREATE INDEX IF NOT EXISTS idx_inbound_fr_sender
+                ON inbound_friend_requests(my_pubkey, sender_pubkey_hex);
+
+            PRAGMA user_version = 4;
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("migrate schema v4 failed: {e}")))?;
+        Ok(())
+    }
+
     // ─── Signal Session Store ─────────────────────────────
 
     /// Save a Signal session record.
     pub fn save_session(&self, address: &str, device_id: u32, record: &[u8]) -> Result<()> {
+        self.save_session_for_identity("", address, device_id, record)
+    }
+
+    /// Save a Signal session record scoped to one local identity.
+    pub fn save_session_for_identity(
+        &self,
+        my_pubkey: &str,
+        address: &str,
+        device_id: u32,
+        record: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO signal_sessions (address, device_id, record, updated_at) \
-                 VALUES (?1, ?2, ?3, strftime('%s','now'))",
-                rusqlite::params![address, device_id, record],
+                "INSERT OR REPLACE INTO signal_sessions \
+                 (my_pubkey, address, device_id, record, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
+                rusqlite::params![my_pubkey, address, device_id, record],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save session: {e}")))?;
         Ok(())
@@ -298,14 +542,27 @@ impl SecureStorage {
 
     /// Load a Signal session record.
     pub fn load_session(&self, address: &str, device_id: u32) -> Result<Option<Vec<u8>>> {
+        self.load_session_for_identity("", address, device_id)
+    }
+
+    /// Load a Signal session record scoped to one local identity.
+    pub fn load_session_for_identity(
+        &self,
+        my_pubkey: &str,
+        address: &str,
+        device_id: u32,
+    ) -> Result<Option<Vec<u8>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT record FROM signal_sessions WHERE address = ?1 AND device_id = ?2")
+            .prepare(
+                "SELECT record FROM signal_sessions \
+                 WHERE my_pubkey = ?1 AND address = ?2 AND device_id = ?3",
+            )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
             .query_row(
-                rusqlite::params![address, device_id],
+                rusqlite::params![my_pubkey, address, device_id],
                 |row: &rusqlite::Row| row.get(0),
             )
             .optional()
@@ -336,12 +593,45 @@ impl SecureStorage {
         Ok(results)
     }
 
+    /// List session addresses scoped to one local identity.
+    pub fn list_sessions_for_identity(&self, my_pubkey: &str) -> Result<Vec<(String, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address, device_id FROM signal_sessions WHERE my_pubkey = ?1")
+            .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![my_pubkey], |row: &rusqlite::Row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|e| KeychatError::Storage(format!("Failed to list sessions: {e}")))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let pair: (String, u32) =
+                row.map_err(|e| KeychatError::Storage(format!("Failed to read row: {e}")))?;
+            results.push(pair);
+        }
+        Ok(results)
+    }
+
     /// Delete a session.
     pub fn delete_session(&self, address: &str, device_id: u32) -> Result<()> {
+        self.delete_session_for_identity("", address, device_id)
+    }
+
+    /// Delete a session scoped to one local identity.
+    pub fn delete_session_for_identity(
+        &self,
+        my_pubkey: &str,
+        address: &str,
+        device_id: u32,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM signal_sessions WHERE address = ?1 AND device_id = ?2",
-                rusqlite::params![address, device_id],
+                "DELETE FROM signal_sessions \
+                 WHERE my_pubkey = ?1 AND address = ?2 AND device_id = ?3",
+                rusqlite::params![my_pubkey, address, device_id],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete session: {e}")))?;
         Ok(())
@@ -351,10 +641,14 @@ impl SecureStorage {
 
     /// Save a pre-key.
     pub fn save_pre_key(&self, id: u32, record: &[u8]) -> Result<()> {
+        self.save_pre_key_for_identity("", id, record)
+    }
+
+    pub fn save_pre_key_for_identity(&self, my_pubkey: &str, id: u32, record: &[u8]) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO pre_keys (id, record) VALUES (?1, ?2)",
-                rusqlite::params![id, record],
+                "INSERT OR REPLACE INTO pre_keys (my_pubkey, id, record) VALUES (?1, ?2, ?3)",
+                rusqlite::params![my_pubkey, id, record],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save pre-key: {e}")))?;
         Ok(())
@@ -362,13 +656,19 @@ impl SecureStorage {
 
     /// Load a pre-key.
     pub fn load_pre_key(&self, id: u32) -> Result<Option<Vec<u8>>> {
+        self.load_pre_key_for_identity("", id)
+    }
+
+    pub fn load_pre_key_for_identity(&self, my_pubkey: &str, id: u32) -> Result<Option<Vec<u8>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT record FROM pre_keys WHERE id = ?1")
+            .prepare("SELECT record FROM pre_keys WHERE my_pubkey = ?1 AND id = ?2")
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![id], |row: &rusqlite::Row| row.get(0))
+            .query_row(rusqlite::params![my_pubkey, id], |row: &rusqlite::Row| {
+                row.get(0)
+            })
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load pre-key: {e}")))?;
 
@@ -377,8 +677,15 @@ impl SecureStorage {
 
     /// Remove a pre-key (consumed after use).
     pub fn remove_pre_key(&self, id: u32) -> Result<()> {
+        self.remove_pre_key_for_identity("", id)
+    }
+
+    pub fn remove_pre_key_for_identity(&self, my_pubkey: &str, id: u32) -> Result<()> {
         self.conn
-            .execute("DELETE FROM pre_keys WHERE id = ?1", rusqlite::params![id])
+            .execute(
+                "DELETE FROM pre_keys WHERE my_pubkey = ?1 AND id = ?2",
+                rusqlite::params![my_pubkey, id],
+            )
             .map_err(|e| KeychatError::Storage(format!("Failed to remove pre-key: {e}")))?;
         Ok(())
     }
@@ -387,10 +694,19 @@ impl SecureStorage {
 
     /// Save a signed pre-key.
     pub fn save_signed_pre_key(&self, id: u32, record: &[u8]) -> Result<()> {
+        self.save_signed_pre_key_for_identity("", id, record)
+    }
+
+    pub fn save_signed_pre_key_for_identity(
+        &self,
+        my_pubkey: &str,
+        id: u32,
+        record: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO signed_pre_keys (id, record) VALUES (?1, ?2)",
-                rusqlite::params![id, record],
+                "INSERT OR REPLACE INTO signed_pre_keys (my_pubkey, id, record) VALUES (?1, ?2, ?3)",
+                rusqlite::params![my_pubkey, id, record],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save signed pre-key: {e}")))?;
         Ok(())
@@ -398,13 +714,23 @@ impl SecureStorage {
 
     /// Load a signed pre-key.
     pub fn load_signed_pre_key(&self, id: u32) -> Result<Option<Vec<u8>>> {
+        self.load_signed_pre_key_for_identity("", id)
+    }
+
+    pub fn load_signed_pre_key_for_identity(
+        &self,
+        my_pubkey: &str,
+        id: u32,
+    ) -> Result<Option<Vec<u8>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT record FROM signed_pre_keys WHERE id = ?1")
+            .prepare("SELECT record FROM signed_pre_keys WHERE my_pubkey = ?1 AND id = ?2")
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![id], |row: &rusqlite::Row| row.get(0))
+            .query_row(rusqlite::params![my_pubkey, id], |row: &rusqlite::Row| {
+                row.get(0)
+            })
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load signed pre-key: {e}")))?;
 
@@ -415,10 +741,19 @@ impl SecureStorage {
 
     /// Save a Kyber pre-key.
     pub fn save_kyber_pre_key(&self, id: u32, record: &[u8]) -> Result<()> {
+        self.save_kyber_pre_key_for_identity("", id, record)
+    }
+
+    pub fn save_kyber_pre_key_for_identity(
+        &self,
+        my_pubkey: &str,
+        id: u32,
+        record: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO kyber_pre_keys (id, record) VALUES (?1, ?2)",
-                rusqlite::params![id, record],
+                "INSERT OR REPLACE INTO kyber_pre_keys (my_pubkey, id, record) VALUES (?1, ?2, ?3)",
+                rusqlite::params![my_pubkey, id, record],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save kyber pre-key: {e}")))?;
         Ok(())
@@ -426,13 +761,23 @@ impl SecureStorage {
 
     /// Load a Kyber pre-key.
     pub fn load_kyber_pre_key(&self, id: u32) -> Result<Option<Vec<u8>>> {
+        self.load_kyber_pre_key_for_identity("", id)
+    }
+
+    pub fn load_kyber_pre_key_for_identity(
+        &self,
+        my_pubkey: &str,
+        id: u32,
+    ) -> Result<Option<Vec<u8>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT record FROM kyber_pre_keys WHERE id = ?1")
+            .prepare("SELECT record FROM kyber_pre_keys WHERE my_pubkey = ?1 AND id = ?2")
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![id], |row: &rusqlite::Row| row.get(0))
+            .query_row(rusqlite::params![my_pubkey, id], |row: &rusqlite::Row| {
+                row.get(0)
+            })
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load kyber pre-key: {e}")))?;
 
@@ -441,10 +786,14 @@ impl SecureStorage {
 
     /// Remove a Kyber pre-key (consumed after use).
     pub fn remove_kyber_pre_key(&self, id: u32) -> Result<()> {
+        self.remove_kyber_pre_key_for_identity("", id)
+    }
+
+    pub fn remove_kyber_pre_key_for_identity(&self, my_pubkey: &str, id: u32) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM kyber_pre_keys WHERE id = ?1",
-                rusqlite::params![id],
+                "DELETE FROM kyber_pre_keys WHERE my_pubkey = ?1 AND id = ?2",
+                rusqlite::params![my_pubkey, id],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to remove kyber pre-key: {e}")))?;
         Ok(())
@@ -459,11 +808,21 @@ impl SecureStorage {
         public_key: &[u8],
         private_key: &[u8],
     ) -> Result<()> {
+        self.save_identity_key_for_identity("", address, public_key, private_key)
+    }
+
+    pub fn save_identity_key_for_identity(
+        &self,
+        my_pubkey: &str,
+        address: &str,
+        public_key: &[u8],
+        private_key: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO identity_keys (address, public_key, private_key, is_own) \
-                 VALUES (?1, ?2, ?3, 1)",
-                rusqlite::params![address, public_key, private_key],
+                "INSERT OR REPLACE INTO identity_keys (my_pubkey, address, public_key, private_key, is_own) \
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                rusqlite::params![my_pubkey, address, public_key, private_key],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save identity key: {e}")))?;
         Ok(())
@@ -471,18 +830,27 @@ impl SecureStorage {
 
     /// Load our identity key pair.
     pub fn load_identity_key(&self, address: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.load_identity_key_for_identity("", address)
+    }
+
+    pub fn load_identity_key_for_identity(
+        &self,
+        my_pubkey: &str,
+        address: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT public_key, private_key FROM identity_keys \
-                 WHERE address = ?1 AND is_own = 1",
+                 WHERE my_pubkey = ?1 AND address = ?2 AND is_own = 1",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![address], |row: &rusqlite::Row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
+            .query_row(
+                rusqlite::params![my_pubkey, address],
+                |row: &rusqlite::Row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load identity key: {e}")))?;
 
@@ -491,11 +859,20 @@ impl SecureStorage {
 
     /// Save a peer's identity key (for trust verification).
     pub fn save_peer_identity(&self, address: &str, public_key: &[u8]) -> Result<()> {
+        self.save_peer_identity_for_identity("", address, public_key)
+    }
+
+    pub fn save_peer_identity_for_identity(
+        &self,
+        my_pubkey: &str,
+        address: &str,
+        public_key: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO identity_keys (address, public_key, private_key, is_own) \
-                 VALUES (?1, ?2, NULL, 0)",
-                rusqlite::params![address, public_key],
+                "INSERT OR REPLACE INTO identity_keys (my_pubkey, address, public_key, private_key, is_own) \
+                 VALUES (?1, ?2, ?3, NULL, 0)",
+                rusqlite::params![my_pubkey, address, public_key],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save peer identity: {e}")))?;
         Ok(())
@@ -503,13 +880,27 @@ impl SecureStorage {
 
     /// Load a peer's identity key.
     pub fn load_peer_identity(&self, address: &str) -> Result<Option<Vec<u8>>> {
+        self.load_peer_identity_for_identity("", address)
+    }
+
+    pub fn load_peer_identity_for_identity(
+        &self,
+        my_pubkey: &str,
+        address: &str,
+    ) -> Result<Option<Vec<u8>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT public_key FROM identity_keys WHERE address = ?1 AND is_own = 0")
+            .prepare(
+                "SELECT public_key FROM identity_keys \
+                 WHERE my_pubkey = ?1 AND address = ?2 AND is_own = 0",
+            )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![address], |row: &rusqlite::Row| row.get(0))
+            .query_row(
+                rusqlite::params![my_pubkey, address],
+                |row: &rusqlite::Row| row.get(0),
+            )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load peer identity: {e}")))?;
 
@@ -524,14 +915,23 @@ impl SecureStorage {
         peer_signal_id: &str,
         state: &PeerAddressStateSerialized,
     ) -> Result<()> {
+        self.save_peer_addresses_for_identity("", peer_signal_id, state)
+    }
+
+    pub fn save_peer_addresses_for_identity(
+        &self,
+        my_pubkey: &str,
+        peer_signal_id: &str,
+        state: &PeerAddressStateSerialized,
+    ) -> Result<()> {
         let json = serde_json::to_string(state)
             .map_err(|e| KeychatError::Storage(format!("Failed to serialize state: {e}")))?;
 
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO peer_addresses (peer_signal_id, state_json, updated_at) \
-                 VALUES (?1, ?2, strftime('%s','now'))",
-                rusqlite::params![peer_signal_id, json],
+                "INSERT OR REPLACE INTO peer_addresses (my_pubkey, peer_signal_id, state_json, updated_at) \
+                 VALUES (?1, ?2, ?3, strftime('%s','now'))",
+                rusqlite::params![my_pubkey, peer_signal_id, json],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save peer addresses: {e}")))?;
         Ok(())
@@ -539,13 +939,26 @@ impl SecureStorage {
 
     /// Load all peer address states.
     pub fn load_all_peer_addresses(&self) -> Result<Vec<(String, PeerAddressStateSerialized)>> {
+        self.load_all_peer_addresses_for_identity("", false)
+    }
+
+    pub fn load_all_peer_addresses_for_identity(
+        &self,
+        my_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<Vec<(String, PeerAddressStateSerialized)>> {
+        let sql = if include_legacy {
+            "SELECT peer_signal_id, state_json FROM peer_addresses WHERE my_pubkey = ?1 OR my_pubkey = ''"
+        } else {
+            "SELECT peer_signal_id, state_json FROM peer_addresses WHERE my_pubkey = ?1"
+        };
         let mut stmt = self
             .conn
-            .prepare("SELECT peer_signal_id, state_json FROM peer_addresses")
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row: &rusqlite::Row| {
+            .query_map(rusqlite::params![my_pubkey], |row: &rusqlite::Row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| KeychatError::Storage(format!("Failed to load peer addresses: {e}")))?;
@@ -612,14 +1025,24 @@ impl SecureStorage {
     /// Preserves `is_public_agent` across upserts: if a row already exists, its
     /// flag is kept. Use `set_peer_public_agent` to change it explicitly.
     pub fn save_peer_mapping(&self, nostr_pubkey: &str, signal_id: &str, name: &str) -> Result<()> {
+        self.save_peer_mapping_for_identity("", nostr_pubkey, signal_id, name)
+    }
+
+    pub fn save_peer_mapping_for_identity(
+        &self,
+        my_pubkey: &str,
+        nostr_pubkey: &str,
+        signal_id: &str,
+        name: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO peer_mappings (nostr_pubkey, signal_id, name, created_at) \
-                 VALUES (?1, ?2, ?3, strftime('%s','now')) \
-                 ON CONFLICT(nostr_pubkey) DO UPDATE SET \
+                "INSERT INTO peer_mappings (my_pubkey, nostr_pubkey, signal_id, name, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now')) \
+                 ON CONFLICT(my_pubkey, nostr_pubkey) DO UPDATE SET \
                     signal_id = excluded.signal_id, \
                     name = excluded.name",
-                rusqlite::params![nostr_pubkey, signal_id, name],
+                rusqlite::params![my_pubkey, nostr_pubkey, signal_id, name],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save peer mapping: {e}")))?;
         Ok(())
@@ -629,12 +1052,31 @@ impl SecureStorage {
     ///
     /// Called when a `friendApprove` carrying `publicAgent: true` is processed.
     pub fn set_peer_public_agent(&self, nostr_pubkey: &str, flag: bool) -> Result<()> {
-        self.conn
+        self.set_peer_public_agent_for_identity("", nostr_pubkey, flag)
+    }
+
+    pub fn set_peer_public_agent_for_identity(
+        &self,
+        my_pubkey: &str,
+        nostr_pubkey: &str,
+        flag: bool,
+    ) -> Result<()> {
+        let updated = self.conn
             .execute(
-                "UPDATE peer_mappings SET is_public_agent = ?1 WHERE nostr_pubkey = ?2",
-                rusqlite::params![flag as i64, nostr_pubkey],
+                "UPDATE peer_mappings SET is_public_agent = ?1 WHERE my_pubkey = ?2 AND nostr_pubkey = ?3",
+                rusqlite::params![flag as i64, my_pubkey, nostr_pubkey],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to set public_agent flag: {e}")))?;
+        if updated == 0 && !my_pubkey.is_empty() {
+            self.conn
+                .execute(
+                    "UPDATE peer_mappings SET is_public_agent = ?1 WHERE my_pubkey = '' AND nostr_pubkey = ?2",
+                    rusqlite::params![flag as i64, nostr_pubkey],
+                )
+                .map_err(|e| {
+                    KeychatError::Storage(format!("Failed to set legacy public_agent flag: {e}"))
+                })?;
+        }
         Ok(())
     }
 
@@ -667,14 +1109,35 @@ impl SecureStorage {
     /// addresses can be dropped from the relay subscription (they're only kept
     /// as a fallback for legacy peers).
     pub fn set_peer_uses_dual_p_tag(&self, nostr_pubkey: &str, flag: bool) -> Result<()> {
-        self.conn
+        self.set_peer_uses_dual_p_tag_for_identity("", nostr_pubkey, flag)
+    }
+
+    pub fn set_peer_uses_dual_p_tag_for_identity(
+        &self,
+        my_pubkey: &str,
+        nostr_pubkey: &str,
+        flag: bool,
+    ) -> Result<()> {
+        let updated = self.conn
             .execute(
-                "UPDATE peer_mappings SET peer_uses_dual_p_tag = ?1 WHERE nostr_pubkey = ?2",
-                rusqlite::params![flag as i64, nostr_pubkey],
+                "UPDATE peer_mappings SET peer_uses_dual_p_tag = ?1 WHERE my_pubkey = ?2 AND nostr_pubkey = ?3",
+                rusqlite::params![flag as i64, my_pubkey, nostr_pubkey],
             )
             .map_err(|e| {
                 KeychatError::Storage(format!("Failed to set peer_uses_dual_p_tag: {e}"))
             })?;
+        if updated == 0 && !my_pubkey.is_empty() {
+            self.conn
+                .execute(
+                    "UPDATE peer_mappings SET peer_uses_dual_p_tag = ?1 WHERE my_pubkey = '' AND nostr_pubkey = ?2",
+                    rusqlite::params![flag as i64, nostr_pubkey],
+                )
+                .map_err(|e| {
+                    KeychatError::Storage(format!(
+                        "Failed to set legacy peer_uses_dual_p_tag: {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 
@@ -729,25 +1192,42 @@ impl SecureStorage {
 
     /// Load peer mapping by nostr pubkey.
     pub fn load_peer_by_nostr(&self, nostr_pubkey: &str) -> Result<Option<PeerMapping>> {
+        self.load_peer_by_nostr_for_identity("", nostr_pubkey, false)
+    }
+
+    pub fn load_peer_by_nostr_for_identity(
+        &self,
+        my_pubkey: &str,
+        nostr_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<Option<PeerMapping>> {
+        let sql = if include_legacy {
+            "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
+                 FROM peer_mappings WHERE nostr_pubkey = ?1 AND (my_pubkey = ?2 OR my_pubkey = '') \
+                 ORDER BY CASE WHEN my_pubkey = ?2 THEN 0 ELSE 1 END LIMIT 1"
+        } else {
+            "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
+                 FROM peer_mappings WHERE nostr_pubkey = ?1 AND my_pubkey = ?2"
+        };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
-                 FROM peer_mappings WHERE nostr_pubkey = ?1",
-            )
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![nostr_pubkey], |row: &rusqlite::Row| {
-                Ok(PeerMapping {
-                    nostr_pubkey: row.get(0)?,
-                    signal_id: row.get(1)?,
-                    name: row.get(2)?,
-                    is_public_agent: row.get::<_, i64>(3)? != 0,
-                    peer_uses_dual_p_tag: row.get::<_, i64>(4)? != 0,
-                    created_at: row.get(5)?,
-                })
-            })
+            .query_row(
+                rusqlite::params![nostr_pubkey, my_pubkey],
+                |row: &rusqlite::Row| {
+                    Ok(PeerMapping {
+                        nostr_pubkey: row.get(0)?,
+                        signal_id: row.get(1)?,
+                        name: row.get(2)?,
+                        is_public_agent: row.get::<_, i64>(3)? != 0,
+                        peer_uses_dual_p_tag: row.get::<_, i64>(4)? != 0,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load peer: {e}")))?;
 
@@ -756,25 +1236,42 @@ impl SecureStorage {
 
     /// Load peer mapping by signal identity.
     pub fn load_peer_by_signal(&self, signal_id: &str) -> Result<Option<PeerMapping>> {
+        self.load_peer_by_signal_for_identity("", signal_id, false)
+    }
+
+    pub fn load_peer_by_signal_for_identity(
+        &self,
+        my_pubkey: &str,
+        signal_id: &str,
+        include_legacy: bool,
+    ) -> Result<Option<PeerMapping>> {
+        let sql = if include_legacy {
+            "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
+                 FROM peer_mappings WHERE signal_id = ?1 AND (my_pubkey = ?2 OR my_pubkey = '') \
+                 ORDER BY CASE WHEN my_pubkey = ?2 THEN 0 ELSE 1 END LIMIT 1"
+        } else {
+            "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
+                 FROM peer_mappings WHERE signal_id = ?1 AND my_pubkey = ?2"
+        };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
-                 FROM peer_mappings WHERE signal_id = ?1",
-            )
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![signal_id], |row: &rusqlite::Row| {
-                Ok(PeerMapping {
-                    nostr_pubkey: row.get(0)?,
-                    signal_id: row.get(1)?,
-                    name: row.get(2)?,
-                    is_public_agent: row.get::<_, i64>(3)? != 0,
-                    peer_uses_dual_p_tag: row.get::<_, i64>(4)? != 0,
-                    created_at: row.get(5)?,
-                })
-            })
+            .query_row(
+                rusqlite::params![signal_id, my_pubkey],
+                |row: &rusqlite::Row| {
+                    Ok(PeerMapping {
+                        nostr_pubkey: row.get(0)?,
+                        signal_id: row.get(1)?,
+                        name: row.get(2)?,
+                        is_public_agent: row.get::<_, i64>(3)? != 0,
+                        peer_uses_dual_p_tag: row.get::<_, i64>(4)? != 0,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load peer: {e}")))?;
 
@@ -783,10 +1280,18 @@ impl SecureStorage {
 
     /// Delete a peer mapping.
     pub fn delete_peer_mapping(&self, nostr_pubkey: &str) -> Result<()> {
+        self.delete_peer_mapping_for_identity("", nostr_pubkey)
+    }
+
+    pub fn delete_peer_mapping_for_identity(
+        &self,
+        my_pubkey: &str,
+        nostr_pubkey: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM peer_mappings WHERE nostr_pubkey = ?1",
-                rusqlite::params![nostr_pubkey],
+                "DELETE FROM peer_mappings WHERE my_pubkey = ?1 AND nostr_pubkey = ?2",
+                rusqlite::params![my_pubkey, nostr_pubkey],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete peer mapping: {e}")))?;
         Ok(())
@@ -794,10 +1299,18 @@ impl SecureStorage {
 
     /// Delete peer addresses.
     pub fn delete_peer_addresses(&self, peer_signal_id: &str) -> Result<()> {
+        self.delete_peer_addresses_for_identity("", peer_signal_id)
+    }
+
+    pub fn delete_peer_addresses_for_identity(
+        &self,
+        my_pubkey: &str,
+        peer_signal_id: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM peer_addresses WHERE peer_signal_id = ?1",
-                rusqlite::params![peer_signal_id],
+                "DELETE FROM peer_addresses WHERE my_pubkey = ?1 AND peer_signal_id = ?2",
+                rusqlite::params![my_pubkey, peer_signal_id],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete peer addresses: {e}")))?;
         Ok(())
@@ -805,15 +1318,28 @@ impl SecureStorage {
 
     /// List all peers.
     pub fn list_peers(&self) -> Result<Vec<PeerMapping>> {
+        self.list_peers_for_identity("", false)
+    }
+
+    pub fn list_peers_for_identity(
+        &self,
+        my_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<Vec<PeerMapping>> {
+        let sql = if include_legacy {
+            "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
+             FROM peer_mappings WHERE my_pubkey = ?1 OR my_pubkey = ''"
+        } else {
+            "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at \
+             FROM peer_mappings WHERE my_pubkey = ?1"
+        };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT nostr_pubkey, signal_id, name, is_public_agent, peer_uses_dual_p_tag, created_at FROM peer_mappings",
-            )
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row: &rusqlite::Row| {
+            .query_map(rusqlite::params![my_pubkey], |row: &rusqlite::Row| {
                 Ok(PeerMapping {
                     nostr_pubkey: row.get(0)?,
                     signal_id: row.get(1)?,
@@ -847,13 +1373,39 @@ impl SecureStorage {
         signed_prekey_id: u32,
         signed_prekey_record: &[u8],
     ) -> Result<()> {
+        self.save_signal_participant_for_identity(
+            "",
+            peer_signal_id,
+            device_id,
+            identity_public,
+            identity_private,
+            registration_id,
+            signed_prekey_id,
+            signed_prekey_record,
+        )
+    }
+
+    /// Save per-peer session metadata for a local identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_signal_participant_for_identity(
+        &self,
+        my_pubkey: &str,
+        peer_signal_id: &str,
+        device_id: u32,
+        identity_public: &[u8],
+        identity_private: &[u8],
+        registration_id: u32,
+        signed_prekey_id: u32,
+        signed_prekey_record: &[u8],
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO signal_participants \
-                 (peer_signal_id, device_id, identity_public, identity_private, \
+                 (my_pubkey, peer_signal_id, device_id, identity_public, identity_private, \
                   registration_id, signed_prekey_id, signed_prekey_record, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'))",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%s','now'))",
                 rusqlite::params![
+                    my_pubkey,
                     peer_signal_id,
                     device_id,
                     identity_public,
@@ -877,26 +1429,45 @@ impl SecureStorage {
         &self,
         peer_signal_id: &str,
     ) -> Result<Option<(u32, Vec<u8>, Vec<u8>, u32, u32, Vec<u8>)>> {
+        self.load_signal_participant_for_identity("", peer_signal_id, false)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn load_signal_participant_for_identity(
+        &self,
+        my_pubkey: &str,
+        peer_signal_id: &str,
+        include_legacy: bool,
+    ) -> Result<Option<(u32, Vec<u8>, Vec<u8>, u32, u32, Vec<u8>)>> {
+        let sql = if include_legacy {
+            "SELECT device_id, identity_public, identity_private, registration_id, \
+                 signed_prekey_id, signed_prekey_record \
+                 FROM signal_participants WHERE peer_signal_id = ?1 AND (my_pubkey = ?2 OR my_pubkey = '') \
+                 ORDER BY CASE WHEN my_pubkey = ?2 THEN 0 ELSE 1 END LIMIT 1"
+        } else {
+            "SELECT device_id, identity_public, identity_private, registration_id, \
+                 signed_prekey_id, signed_prekey_record \
+                 FROM signal_participants WHERE peer_signal_id = ?1 AND my_pubkey = ?2"
+        };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT device_id, identity_public, identity_private, registration_id, \
-                 signed_prekey_id, signed_prekey_record \
-                 FROM signal_participants WHERE peer_signal_id = ?1",
-            )
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![peer_signal_id], |row: &rusqlite::Row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, u32>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                ))
-            })
+            .query_row(
+                rusqlite::params![peer_signal_id, my_pubkey],
+                |row: &rusqlite::Row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, u32>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
             .optional()
             .map_err(|e| {
                 KeychatError::Storage(format!("Failed to load signal participant: {e}"))
@@ -907,13 +1478,28 @@ impl SecureStorage {
 
     /// List all signal participant peer_signal_ids.
     pub fn list_signal_participants(&self) -> Result<Vec<String>> {
+        self.list_signal_participants_for_identity("", false)
+    }
+
+    pub fn list_signal_participants_for_identity(
+        &self,
+        my_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<Vec<String>> {
+        let sql = if include_legacy {
+            "SELECT peer_signal_id FROM signal_participants WHERE my_pubkey = ?1 OR my_pubkey = ''"
+        } else {
+            "SELECT peer_signal_id FROM signal_participants WHERE my_pubkey = ?1"
+        };
         let mut stmt = self
             .conn
-            .prepare("SELECT peer_signal_id FROM signal_participants")
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .query_map(rusqlite::params![my_pubkey], |row: &rusqlite::Row| {
+                row.get(0)
+            })
             .map_err(|e| {
                 KeychatError::Storage(format!("Failed to list signal participants: {e}"))
             })?;
@@ -928,10 +1514,18 @@ impl SecureStorage {
 
     /// Delete a signal participant.
     pub fn delete_signal_participant(&self, peer_signal_id: &str) -> Result<()> {
+        self.delete_signal_participant_for_identity("", peer_signal_id)
+    }
+
+    pub fn delete_signal_participant_for_identity(
+        &self,
+        my_pubkey: &str,
+        peer_signal_id: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM signal_participants WHERE peer_signal_id = ?1",
-                rusqlite::params![peer_signal_id],
+                "DELETE FROM signal_participants WHERE my_pubkey = ?1 AND peer_signal_id = ?2",
+                rusqlite::params![my_pubkey, peer_signal_id],
             )
             .map_err(|e| {
                 KeychatError::Storage(format!("Failed to delete signal participant: {e}"))
@@ -959,16 +1553,53 @@ impl SecureStorage {
         first_inbox_secret: &str,
         peer_nostr_pubkey: &str,
     ) -> Result<()> {
+        self.save_pending_fr_for_identity(
+            "",
+            request_id,
+            device_id,
+            identity_public,
+            identity_private,
+            registration_id,
+            signed_prekey_id,
+            signed_prekey_record,
+            prekey_id,
+            prekey_record,
+            kyber_prekey_id,
+            kyber_prekey_record,
+            first_inbox_secret,
+            peer_nostr_pubkey,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_pending_fr_for_identity(
+        &self,
+        my_pubkey: &str,
+        request_id: &str,
+        device_id: u32,
+        identity_public: &[u8],
+        identity_private: &[u8],
+        registration_id: u32,
+        signed_prekey_id: u32,
+        signed_prekey_record: &[u8],
+        prekey_id: u32,
+        prekey_record: &[u8],
+        kyber_prekey_id: u32,
+        kyber_prekey_record: &[u8],
+        first_inbox_secret: &str,
+        peer_nostr_pubkey: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO pending_friend_requests \
-                 (request_id, device_id, identity_public, identity_private, \
+                 (request_id, my_pubkey, device_id, identity_public, identity_private, \
                   registration_id, signed_prekey_id, signed_prekey_record, \
                   prekey_id, prekey_record, kyber_prekey_id, kyber_prekey_record, \
                   first_inbox_secret, peer_nostr_pubkey, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s','now'))",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, strftime('%s','now'))",
                 rusqlite::params![
                     request_id,
+                    my_pubkey,
                     device_id,
                     identity_public,
                     identity_private,
@@ -1013,33 +1644,68 @@ impl SecureStorage {
             String,
         )>,
     > {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT device_id, identity_public, identity_private, registration_id, \
+        self.load_pending_fr_for_identity("", request_id, false)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn load_pending_fr_for_identity(
+        &self,
+        my_pubkey: &str,
+        request_id: &str,
+        include_legacy: bool,
+    ) -> Result<
+        Option<(
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+            u32,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            String,
+            String,
+        )>,
+    > {
+        let sql = if include_legacy {
+            "SELECT device_id, identity_public, identity_private, registration_id, \
                  signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, \
                  kyber_prekey_id, kyber_prekey_record, first_inbox_secret, peer_nostr_pubkey \
-                 FROM pending_friend_requests WHERE request_id = ?1",
-            )
+                 FROM pending_friend_requests WHERE request_id = ?1 AND (my_pubkey = ?2 OR my_pubkey = '') \
+                 ORDER BY CASE WHEN my_pubkey = ?2 THEN 0 ELSE 1 END LIMIT 1"
+        } else {
+            "SELECT device_id, identity_public, identity_private, registration_id, \
+                 signed_prekey_id, signed_prekey_record, prekey_id, prekey_record, \
+                 kyber_prekey_id, kyber_prekey_record, first_inbox_secret, peer_nostr_pubkey \
+                 FROM pending_friend_requests WHERE request_id = ?1 AND my_pubkey = ?2"
+        };
+        let mut stmt = self
+            .conn
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![request_id], |row: &rusqlite::Row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, u32>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                    row.get::<_, u32>(6)?,
-                    row.get::<_, Vec<u8>>(7)?,
-                    row.get::<_, u32>(8)?,
-                    row.get::<_, Vec<u8>>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
-                ))
-            })
+            .query_row(
+                rusqlite::params![request_id, my_pubkey],
+                |row: &rusqlite::Row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, u32>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, u32>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, u32>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                    ))
+                },
+            )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load pending FR: {e}")))?;
 
@@ -1079,13 +1745,28 @@ impl SecureStorage {
 
     /// List all pending friend request IDs.
     pub fn list_pending_frs(&self) -> Result<Vec<String>> {
+        self.list_pending_frs_for_identity("", false)
+    }
+
+    pub fn list_pending_frs_for_identity(
+        &self,
+        my_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<Vec<String>> {
+        let sql = if include_legacy {
+            "SELECT request_id FROM pending_friend_requests WHERE my_pubkey = ?1 OR my_pubkey = ''"
+        } else {
+            "SELECT request_id FROM pending_friend_requests WHERE my_pubkey = ?1"
+        };
         let mut stmt = self
             .conn
-            .prepare("SELECT request_id FROM pending_friend_requests")
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .query_map(rusqlite::params![my_pubkey], |row: &rusqlite::Row| {
+                row.get(0)
+            })
             .map_err(|e| KeychatError::Storage(format!("Failed to list pending FRs: {e}")))?;
 
         let mut results = Vec::new();
@@ -1103,33 +1784,65 @@ impl SecureStorage {
         peer_signal_hex: &str,
         first_inbox_pubkey: &str,
     ) -> Result<()> {
+        self.save_pending_first_inbox_for_identity("", peer_signal_hex, first_inbox_pubkey)
+    }
+
+    pub fn save_pending_first_inbox_for_identity(
+        &self,
+        my_pubkey: &str,
+        peer_signal_hex: &str,
+        first_inbox_pubkey: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO pending_first_inbox (peer_signal_hex, first_inbox_pubkey) \
-                 VALUES (?1, ?2)",
-                rusqlite::params![peer_signal_hex, first_inbox_pubkey],
+                "INSERT OR REPLACE INTO pending_first_inbox (my_pubkey, peer_signal_hex, first_inbox_pubkey) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![my_pubkey, peer_signal_hex, first_inbox_pubkey],
             )
             .map_err(|e| KeychatError::Storage(format!("save pending_first_inbox: {e}")))?;
         Ok(())
     }
 
     pub fn delete_pending_first_inbox(&self, peer_signal_hex: &str) -> Result<()> {
+        self.delete_pending_first_inbox_for_identity("", peer_signal_hex)
+    }
+
+    pub fn delete_pending_first_inbox_for_identity(
+        &self,
+        my_pubkey: &str,
+        peer_signal_hex: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM pending_first_inbox WHERE peer_signal_hex = ?1",
-                rusqlite::params![peer_signal_hex],
+                "DELETE FROM pending_first_inbox WHERE my_pubkey = ?1 AND peer_signal_hex = ?2",
+                rusqlite::params![my_pubkey, peer_signal_hex],
             )
             .map_err(|e| KeychatError::Storage(format!("delete pending_first_inbox: {e}")))?;
         Ok(())
     }
 
     pub fn load_all_pending_first_inboxes(&self) -> Result<Vec<(String, String)>> {
+        self.load_all_pending_first_inboxes_for_identity("", false)
+    }
+
+    pub fn load_all_pending_first_inboxes_for_identity(
+        &self,
+        my_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<Vec<(String, String)>> {
+        let sql = if include_legacy {
+            "SELECT peer_signal_hex, first_inbox_pubkey FROM pending_first_inbox WHERE my_pubkey = ?1 OR my_pubkey = ''"
+        } else {
+            "SELECT peer_signal_hex, first_inbox_pubkey FROM pending_first_inbox WHERE my_pubkey = ?1"
+        };
         let mut stmt = self
             .conn
-            .prepare("SELECT peer_signal_hex, first_inbox_pubkey FROM pending_first_inbox")
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("prepare pending_first_inbox: {e}")))?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(rusqlite::params![my_pubkey], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .map_err(|e| KeychatError::Storage(format!("query pending_first_inbox: {e}")))?;
         let mut results = Vec::new();
         for row in rows {
@@ -1142,11 +1855,20 @@ impl SecureStorage {
 
     /// Save a SignalGroup (serialized as JSON).
     pub fn save_group(&self, group_id: &str, data_json: &str) -> Result<()> {
+        self.save_group_for_identity("", group_id, data_json)
+    }
+
+    pub fn save_group_for_identity(
+        &self,
+        my_pubkey: &str,
+        group_id: &str,
+        data_json: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO signal_groups (group_id, data_json, updated_at) \
-                 VALUES (?1, ?2, strftime('%s','now'))",
-                rusqlite::params![group_id, data_json],
+                "INSERT OR REPLACE INTO signal_groups (my_pubkey, group_id, data_json, updated_at) \
+                 VALUES (?1, ?2, ?3, strftime('%s','now'))",
+                rusqlite::params![my_pubkey, group_id, data_json],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save group: {e}")))?;
         Ok(())
@@ -1154,15 +1876,31 @@ impl SecureStorage {
 
     /// Load a SignalGroup by group_id.
     pub fn load_group(&self, group_id: &str) -> Result<Option<String>> {
+        self.load_group_for_identity("", group_id, false)
+    }
+
+    pub fn load_group_for_identity(
+        &self,
+        my_pubkey: &str,
+        group_id: &str,
+        include_legacy: bool,
+    ) -> Result<Option<String>> {
+        let sql = if include_legacy {
+            "SELECT data_json FROM signal_groups WHERE group_id = ?1 AND (my_pubkey = ?2 OR my_pubkey = '') \
+             ORDER BY CASE WHEN my_pubkey = ?2 THEN 0 ELSE 1 END LIMIT 1"
+        } else {
+            "SELECT data_json FROM signal_groups WHERE group_id = ?1 AND my_pubkey = ?2"
+        };
         let mut stmt = self
             .conn
-            .prepare("SELECT data_json FROM signal_groups WHERE group_id = ?1")
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![group_id], |row: &rusqlite::Row| {
-                row.get(0)
-            })
+            .query_row(
+                rusqlite::params![group_id, my_pubkey],
+                |row: &rusqlite::Row| row.get(0),
+            )
             .optional()
             .map_err(|e| KeychatError::Storage(format!("Failed to load group: {e}")))?;
 
@@ -1171,13 +1909,27 @@ impl SecureStorage {
 
     /// Load all SignalGroups.
     pub fn load_all_groups(&self) -> Result<Vec<(String, String)>> {
+        self.load_all_groups_for_identity("", false)
+    }
+
+    pub fn load_all_groups_for_identity(
+        &self,
+        my_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<Vec<(String, String)>> {
+        let sql = if include_legacy {
+            "SELECT group_id, data_json FROM signal_groups WHERE my_pubkey = '' OR my_pubkey = ?1 \
+             ORDER BY CASE WHEN my_pubkey = '' THEN 0 ELSE 1 END"
+        } else {
+            "SELECT group_id, data_json FROM signal_groups WHERE my_pubkey = ?1"
+        };
         let mut stmt = self
             .conn
-            .prepare("SELECT group_id, data_json FROM signal_groups")
+            .prepare(sql)
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row: &rusqlite::Row| {
+            .query_map(rusqlite::params![my_pubkey], |row: &rusqlite::Row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|e| KeychatError::Storage(format!("Failed to load groups: {e}")))?;
@@ -1192,10 +1944,14 @@ impl SecureStorage {
 
     /// Delete a SignalGroup.
     pub fn delete_group(&self, group_id: &str) -> Result<()> {
+        self.delete_group_for_identity("", group_id)
+    }
+
+    pub fn delete_group_for_identity(&self, my_pubkey: &str, group_id: &str) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM signal_groups WHERE group_id = ?1",
-                rusqlite::params![group_id],
+                "DELETE FROM signal_groups WHERE my_pubkey = ?1 AND group_id = ?2",
+                rusqlite::params![my_pubkey, group_id],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete group: {e}")))?;
         Ok(())
@@ -1329,12 +2085,35 @@ impl SecureStorage {
         message_json: &str,
         payload_json: &str,
     ) -> Result<()> {
+        self.save_inbound_fr_for_identity(
+            "",
+            request_id,
+            sender_pubkey_hex,
+            message_json,
+            payload_json,
+        )
+    }
+
+    pub fn save_inbound_fr_for_identity(
+        &self,
+        my_pubkey: &str,
+        request_id: &str,
+        sender_pubkey_hex: &str,
+        message_json: &str,
+        payload_json: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO inbound_friend_requests \
-                 (request_id, sender_pubkey_hex, message_json, payload_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
-                rusqlite::params![request_id, sender_pubkey_hex, message_json, payload_json],
+                 (my_pubkey, request_id, sender_pubkey_hex, message_json, payload_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))",
+                rusqlite::params![
+                    my_pubkey,
+                    request_id,
+                    sender_pubkey_hex,
+                    message_json,
+                    payload_json
+                ],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to save inbound FR: {e}")))?;
         Ok(())
@@ -1343,16 +2122,24 @@ impl SecureStorage {
     /// Load a received (inbound) friend request.
     /// Returns (sender_pubkey_hex, message_json, payload_json).
     pub fn load_inbound_fr(&self, request_id: &str) -> Result<Option<(String, String, String)>> {
+        self.load_inbound_fr_for_identity("", request_id)
+    }
+
+    pub fn load_inbound_fr_for_identity(
+        &self,
+        my_pubkey: &str,
+        request_id: &str,
+    ) -> Result<Option<(String, String, String)>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT sender_pubkey_hex, message_json, payload_json \
-                 FROM inbound_friend_requests WHERE request_id = ?1",
+                 FROM inbound_friend_requests WHERE my_pubkey = ?1 AND request_id = ?2",
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let result = stmt
-            .query_row(rusqlite::params![request_id], |row| {
+            .query_row(rusqlite::params![my_pubkey, request_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1367,13 +2154,19 @@ impl SecureStorage {
 
     /// List all inbound friend request IDs.
     pub fn list_inbound_frs(&self) -> Result<Vec<String>> {
+        self.list_inbound_frs_for_identity("")
+    }
+
+    pub fn list_inbound_frs_for_identity(&self, my_pubkey: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT request_id FROM inbound_friend_requests")
+            .prepare("SELECT request_id FROM inbound_friend_requests WHERE my_pubkey = ?1")
             .map_err(|e| KeychatError::Storage(format!("Failed to prepare query: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row: &rusqlite::Row| row.get(0))
+            .query_map(rusqlite::params![my_pubkey], |row: &rusqlite::Row| {
+                row.get(0)
+            })
             .map_err(|e| KeychatError::Storage(format!("Failed to list inbound FRs: {e}")))?;
 
         let mut results = Vec::new();
@@ -1386,10 +2179,14 @@ impl SecureStorage {
 
     /// Delete an inbound friend request (after accept or reject).
     pub fn delete_inbound_fr(&self, request_id: &str) -> Result<()> {
+        self.delete_inbound_fr_for_identity("", request_id)
+    }
+
+    pub fn delete_inbound_fr_for_identity(&self, my_pubkey: &str, request_id: &str) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM inbound_friend_requests WHERE request_id = ?1",
-                rusqlite::params![request_id],
+                "DELETE FROM inbound_friend_requests WHERE my_pubkey = ?1 AND request_id = ?2",
+                rusqlite::params![my_pubkey, request_id],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete inbound FR: {e}")))?;
         Ok(())
@@ -1400,11 +2197,19 @@ impl SecureStorage {
         &self,
         sender_pubkey_hex: &str,
     ) -> Result<Option<String>> {
+        self.get_inbound_fr_request_id_by_sender_for_identity("", sender_pubkey_hex)
+    }
+
+    pub fn get_inbound_fr_request_id_by_sender_for_identity(
+        &self,
+        my_pubkey: &str,
+        sender_pubkey_hex: &str,
+    ) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT request_id FROM inbound_friend_requests WHERE sender_pubkey_hex = ?1 LIMIT 1"
+            "SELECT request_id FROM inbound_friend_requests WHERE my_pubkey = ?1 AND sender_pubkey_hex = ?2 LIMIT 1"
         ).map_err(|e| KeychatError::Storage(format!("prepare get_inbound_fr_by_sender: {e}")))?;
 
-        let result = stmt.query_row(rusqlite::params![sender_pubkey_hex], |row| {
+        let result = stmt.query_row(rusqlite::params![my_pubkey, sender_pubkey_hex], |row| {
             row.get::<_, String>(0)
         });
 
@@ -1450,35 +2255,325 @@ impl SecureStorage {
         })
     }
 
+    /// Delete protocol data scoped to one local Nostr identity.
+    ///
+    pub fn delete_identity_data(&self, my_pubkey: &str) -> Result<()> {
+        self.transaction(|conn| {
+            conn.execute(
+                "DELETE FROM signal_sessions WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete signal_sessions: {e}")))?;
+            conn.execute(
+                "DELETE FROM pre_keys WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete pre_keys: {e}")))?;
+            conn.execute(
+                "DELETE FROM signed_pre_keys WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete signed_pre_keys: {e}")))?;
+            conn.execute(
+                "DELETE FROM kyber_pre_keys WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete kyber_pre_keys: {e}")))?;
+            conn.execute(
+                "DELETE FROM identity_keys WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete identity_keys: {e}")))?;
+            conn.execute(
+                "DELETE FROM peer_addresses WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete peer_addresses: {e}")))?;
+            conn.execute(
+                "DELETE FROM peer_mappings WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete peer_mappings: {e}")))?;
+            conn.execute(
+                "DELETE FROM signal_participants WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete signal_participants: {e}")))?;
+            conn.execute(
+                "DELETE FROM pending_friend_requests WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete pending_friend_requests: {e}")))?;
+            conn.execute(
+                "DELETE FROM inbound_friend_requests WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete inbound_friend_requests: {e}")))?;
+            conn.execute(
+                "DELETE FROM pending_first_inbox WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete pending_first_inbox: {e}")))?;
+            conn.execute(
+                "DELETE FROM signal_groups WHERE my_pubkey = ?1",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete signal_groups: {e}")))?;
+            Ok(())
+        })
+    }
+
+    /// Move legacy rows written before identity scoping into the active identity scope.
+    pub fn claim_legacy_identity_data(&self, my_pubkey: &str) -> Result<()> {
+        if my_pubkey.trim().is_empty() {
+            return Ok(());
+        }
+
+        self.transaction(|conn| {
+            conn.execute(
+                "DELETE FROM signal_sessions
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM signal_sessions scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.address = signal_sessions.address
+                         AND scoped.device_id = signal_sessions.device_id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signal_sessions: {e}")))?;
+            conn.execute(
+                "UPDATE signal_sessions SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signal_sessions: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM pre_keys
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM pre_keys scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.id = pre_keys.id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim pre_keys: {e}")))?;
+            conn.execute(
+                "UPDATE pre_keys SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim pre_keys: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM signed_pre_keys
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM signed_pre_keys scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.id = signed_pre_keys.id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signed_pre_keys: {e}")))?;
+            conn.execute(
+                "UPDATE signed_pre_keys SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signed_pre_keys: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM kyber_pre_keys
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM kyber_pre_keys scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.id = kyber_pre_keys.id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim kyber_pre_keys: {e}")))?;
+            conn.execute(
+                "UPDATE kyber_pre_keys SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim kyber_pre_keys: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM identity_keys
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM identity_keys scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.address = identity_keys.address
+                         AND scoped.is_own = identity_keys.is_own
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim identity_keys: {e}")))?;
+            conn.execute(
+                "UPDATE identity_keys SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim identity_keys: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM peer_addresses
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM peer_addresses scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.peer_signal_id = peer_addresses.peer_signal_id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim peer_addresses: {e}")))?;
+            conn.execute(
+                "UPDATE peer_addresses SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim peer_addresses: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM peer_mappings
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM peer_mappings scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.nostr_pubkey = peer_mappings.nostr_pubkey
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim peer_mappings: {e}")))?;
+            conn.execute(
+                "UPDATE peer_mappings SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim peer_mappings: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM signal_participants
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM signal_participants scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.peer_signal_id = signal_participants.peer_signal_id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signal_participants: {e}")))?;
+            conn.execute(
+                "UPDATE signal_participants SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signal_participants: {e}")))?;
+
+            conn.execute(
+                "UPDATE pending_friend_requests SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim pending_friend_requests: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM inbound_friend_requests
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM inbound_friend_requests scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.request_id = inbound_friend_requests.request_id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim inbound_friend_requests: {e}")))?;
+            conn.execute(
+                "UPDATE inbound_friend_requests SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim inbound_friend_requests: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM pending_first_inbox
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM pending_first_inbox scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.peer_signal_hex = pending_first_inbox.peer_signal_hex
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim pending_first_inbox: {e}")))?;
+            conn.execute(
+                "UPDATE pending_first_inbox SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim pending_first_inbox: {e}")))?;
+
+            conn.execute(
+                "DELETE FROM signal_groups
+                 WHERE my_pubkey = ''
+                   AND EXISTS (
+                       SELECT 1 FROM signal_groups scoped
+                       WHERE scoped.my_pubkey = ?1
+                         AND scoped.group_id = signal_groups.group_id
+                   )",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signal_groups: {e}")))?;
+            conn.execute(
+                "UPDATE signal_groups SET my_pubkey = ?1 WHERE my_pubkey = ''",
+                rusqlite::params![my_pubkey],
+            )
+            .map_err(|e| KeychatError::Storage(format!("claim signal_groups: {e}")))?;
+
+            Ok(())
+        })
+    }
+
     /// Delete all data for a single peer (1:1 room).
     pub fn delete_peer_data(&self, signal_id: &str, nostr_pubkey: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM signal_sessions WHERE address = ?1",
-                rusqlite::params![signal_id],
+        self.delete_peer_data_for_identity("", signal_id, nostr_pubkey)
+    }
+
+    /// Delete all data for a single peer scoped to one local identity.
+    pub fn delete_peer_data_for_identity(
+        &self,
+        my_pubkey: &str,
+        signal_id: &str,
+        nostr_pubkey: &str,
+    ) -> Result<()> {
+        self.transaction(|conn| {
+            conn.execute(
+                "DELETE FROM signal_sessions WHERE my_pubkey = ?1 AND address = ?2",
+                rusqlite::params![my_pubkey, signal_id],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete sessions: {e}")))?;
-        self.conn
-            .execute(
-                "DELETE FROM signal_participants WHERE peer_signal_id = ?1",
-                rusqlite::params![signal_id],
+            conn.execute(
+                "DELETE FROM signal_participants
+                 WHERE my_pubkey = ?1 AND peer_signal_id = ?2",
+                rusqlite::params![my_pubkey, signal_id],
             )
             .map_err(|e| {
                 KeychatError::Storage(format!("Failed to delete signal participant: {e}"))
             })?;
-        self.conn
-            .execute(
-                "DELETE FROM peer_mappings WHERE nostr_pubkey = ?1",
-                rusqlite::params![nostr_pubkey],
+            conn.execute(
+                "DELETE FROM peer_mappings WHERE my_pubkey = ?1 AND nostr_pubkey = ?2",
+                rusqlite::params![my_pubkey, nostr_pubkey],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete peer mapping: {e}")))?;
-        self.conn
-            .execute(
-                "DELETE FROM peer_addresses WHERE peer_signal_id = ?1",
-                rusqlite::params![signal_id],
+            conn.execute(
+                "DELETE FROM peer_addresses WHERE my_pubkey = ?1 AND peer_signal_id = ?2",
+                rusqlite::params![my_pubkey, signal_id],
             )
             .map_err(|e| KeychatError::Storage(format!("Failed to delete peer addresses: {e}")))?;
-        Ok(())
+            conn.execute(
+                "DELETE FROM pending_first_inbox WHERE my_pubkey = ?1 AND peer_signal_hex = ?2",
+                rusqlite::params![my_pubkey, signal_id],
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("Failed to delete pending first inbox: {e}"))
+            })?;
+            Ok(())
+        })
     }
 }
 
@@ -1569,6 +2664,54 @@ mod tests {
         // Remaining
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_signal_sessions_are_scoped_by_identity() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store
+            .save_session_for_identity("alice-nostr", "shared-signal-peer", 1, b"alice-session")
+            .unwrap();
+        store
+            .save_session_for_identity("bob-nostr", "shared-signal-peer", 1, b"bob-session")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .load_session_for_identity("alice-nostr", "shared-signal-peer", 1)
+                .unwrap(),
+            Some(b"alice-session".to_vec())
+        );
+        assert_eq!(
+            store
+                .load_session_for_identity("bob-nostr", "shared-signal-peer", 1)
+                .unwrap(),
+            Some(b"bob-session".to_vec())
+        );
+        assert_eq!(
+            store.list_sessions_for_identity("alice-nostr").unwrap(),
+            vec![("shared-signal-peer".to_string(), 1)]
+        );
+        assert_eq!(
+            store.list_sessions_for_identity("bob-nostr").unwrap(),
+            vec![("shared-signal-peer".to_string(), 1)]
+        );
+
+        store
+            .delete_session_for_identity("alice-nostr", "shared-signal-peer", 1)
+            .unwrap();
+
+        assert!(store
+            .load_session_for_identity("alice-nostr", "shared-signal-peer", 1)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .load_session_for_identity("bob-nostr", "shared-signal-peer", 1)
+                .unwrap(),
+            Some(b"bob-session".to_vec())
+        );
     }
 
     #[test]
@@ -2028,6 +3171,398 @@ mod tests {
         assert_eq!(mgr2.group_count(), 0);
         let all = store.load_all_groups().unwrap();
         assert!(all.is_empty());
+    }
+
+    #[test]
+    fn test_group_persistence_is_scoped_by_identity() {
+        use crate::group::{GroupManager, GroupMember, SignalGroup};
+        use std::collections::{HashMap, HashSet};
+
+        fn group(name: &str) -> SignalGroup {
+            let mut members = HashMap::new();
+            members.insert(
+                "signal-alice".to_string(),
+                GroupMember {
+                    signal_id: "signal-alice".into(),
+                    nostr_pubkey: "npub-alice".into(),
+                    name: "Alice".into(),
+                    is_admin: true,
+                },
+            );
+            let mut admins = HashSet::new();
+            admins.insert("signal-alice".to_string());
+            SignalGroup {
+                group_id: "shared-group".into(),
+                name: name.into(),
+                members,
+                my_signal_id: "signal-alice".into(),
+                admins,
+            }
+        }
+
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+        let mut id_a_groups = GroupManager::new();
+        let mut id_b_groups = GroupManager::new();
+        id_a_groups.add_group(group("Identity A"));
+        id_b_groups.add_group(group("Identity B"));
+
+        id_a_groups
+            .save_group_for_identity("shared-group", &store, "id-a")
+            .unwrap();
+        id_b_groups
+            .save_group_for_identity("shared-group", &store, "id-b")
+            .unwrap();
+
+        let mut restored_a = GroupManager::new();
+        restored_a
+            .load_all_for_identity(&store, "id-a", false)
+            .unwrap();
+        let mut restored_b = GroupManager::new();
+        restored_b
+            .load_all_for_identity(&store, "id-b", false)
+            .unwrap();
+
+        assert_eq!(
+            restored_a.get_group("shared-group").unwrap().name,
+            "Identity A"
+        );
+        assert_eq!(
+            restored_b.get_group("shared-group").unwrap().name,
+            "Identity B"
+        );
+
+        restored_a
+            .remove_group_persistent_for_identity("shared-group", &store, "id-a")
+            .unwrap();
+        assert!(store
+            .load_group_for_identity("id-a", "shared-group", false)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .load_group_for_identity("id-b", "shared-group", false)
+                .unwrap()
+                .unwrap(),
+            serde_json::to_string(restored_b.get_group("shared-group").unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_delete_identity_data_removes_only_scoped_protocol_rows() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store
+            .save_peer_mapping_for_identity("id-a", "nostr-a", "signal-a", "Alice")
+            .unwrap();
+        store
+            .save_peer_mapping_for_identity("id-b", "nostr-b", "signal-b", "Bob")
+            .unwrap();
+        store
+            .save_pending_first_inbox_for_identity("id-a", "signal-a", "inbox-a")
+            .unwrap();
+        store
+            .save_pending_first_inbox_for_identity("id-b", "signal-b", "inbox-b")
+            .unwrap();
+        store
+            .save_group_for_identity("id-a", "group-a", "{\"name\":\"A\"}")
+            .unwrap();
+        store
+            .save_group_for_identity("id-b", "group-b", "{\"name\":\"B\"}")
+            .unwrap();
+        store
+            .save_session_for_identity("id-a", "shared-signal", 1, b"session-a")
+            .unwrap();
+        store
+            .save_session_for_identity("id-b", "shared-signal", 1, b"session-b")
+            .unwrap();
+
+        store.delete_identity_data("id-a").unwrap();
+
+        assert!(store
+            .load_session_for_identity("id-a", "shared-signal", 1)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_peer_by_nostr_for_identity("id-a", "nostr-a", false)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_all_pending_first_inboxes_for_identity("id-a", false)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .load_all_groups_for_identity("id-a", false)
+            .unwrap()
+            .is_empty());
+
+        assert!(store
+            .load_peer_by_nostr_for_identity("id-b", "nostr-b", false)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .load_all_pending_first_inboxes_for_identity("id-b", false)
+                .unwrap(),
+            vec![("signal-b".to_string(), "inbox-b".to_string())]
+        );
+        assert_eq!(
+            store
+                .load_group_for_identity("id-b", "group-b", false)
+                .unwrap(),
+            Some("{\"name\":\"B\"}".to_string())
+        );
+        assert_eq!(
+            store
+                .load_session_for_identity("id-b", "shared-signal", 1)
+                .unwrap(),
+            Some(b"session-b".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_delete_identity_data_removes_scoped_key_material_and_inbound_requests_only() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store
+            .save_pre_key_for_identity("id-a", 1, b"pre-a")
+            .unwrap();
+        store
+            .save_pre_key_for_identity("id-b", 1, b"pre-b")
+            .unwrap();
+        store
+            .save_signed_pre_key_for_identity("id-a", 2, b"signed-a")
+            .unwrap();
+        store
+            .save_signed_pre_key_for_identity("id-b", 2, b"signed-b")
+            .unwrap();
+        store
+            .save_kyber_pre_key_for_identity("id-a", 3, b"kyber-a")
+            .unwrap();
+        store
+            .save_kyber_pre_key_for_identity("id-b", 3, b"kyber-b")
+            .unwrap();
+        store
+            .save_identity_key_for_identity("id-a", "self", b"pub-a", b"priv-a")
+            .unwrap();
+        store
+            .save_identity_key_for_identity("id-b", "self", b"pub-b", b"priv-b")
+            .unwrap();
+        store
+            .save_peer_identity_for_identity("id-a", "peer", b"peer-a")
+            .unwrap();
+        store
+            .save_peer_identity_for_identity("id-b", "peer", b"peer-b")
+            .unwrap();
+        store
+            .save_inbound_fr_for_identity("id-a", "fr-shared", "sender-a", "{}", "{}")
+            .unwrap();
+        store
+            .save_inbound_fr_for_identity("id-b", "fr-shared", "sender-b", "{}", "{}")
+            .unwrap();
+
+        store.delete_identity_data("id-a").unwrap();
+
+        assert!(store
+            .load_pre_key_for_identity("id-a", 1)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_signed_pre_key_for_identity("id-a", 2)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_kyber_pre_key_for_identity("id-a", 3)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_identity_key_for_identity("id-a", "self")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_peer_identity_for_identity("id-a", "peer")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_inbound_fr_for_identity("id-a", "fr-shared")
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            store.load_pre_key_for_identity("id-b", 1).unwrap(),
+            Some(b"pre-b".to_vec())
+        );
+        assert_eq!(
+            store.load_signed_pre_key_for_identity("id-b", 2).unwrap(),
+            Some(b"signed-b".to_vec())
+        );
+        assert_eq!(
+            store.load_kyber_pre_key_for_identity("id-b", 3).unwrap(),
+            Some(b"kyber-b".to_vec())
+        );
+        assert_eq!(
+            store
+                .load_identity_key_for_identity("id-b", "self")
+                .unwrap(),
+            Some((b"pub-b".to_vec(), b"priv-b".to_vec()))
+        );
+        assert_eq!(
+            store
+                .load_peer_identity_for_identity("id-b", "peer")
+                .unwrap(),
+            Some(b"peer-b".to_vec())
+        );
+        assert_eq!(
+            store
+                .load_inbound_fr_for_identity("id-b", "fr-shared")
+                .unwrap(),
+            Some(("sender-b".to_string(), "{}".to_string(), "{}".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_delete_peer_data_for_identity_preserves_other_identity_rows() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store
+            .save_peer_mapping_for_identity("id-a", "nostr-shared", "signal-shared", "Alice")
+            .unwrap();
+        store
+            .save_peer_mapping_for_identity("id-b", "nostr-shared", "signal-shared", "Bob")
+            .unwrap();
+        store
+            .save_session_for_identity("id-a", "signal-shared", 1, b"session-a")
+            .unwrap();
+        store
+            .save_session_for_identity("id-b", "signal-shared", 1, b"session-b")
+            .unwrap();
+
+        store
+            .delete_peer_data_for_identity("id-a", "signal-shared", "nostr-shared")
+            .unwrap();
+
+        assert!(store
+            .load_peer_by_nostr_for_identity("id-a", "nostr-shared", false)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_session_for_identity("id-a", "signal-shared", 1)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .load_peer_by_nostr_for_identity("id-b", "nostr-shared", false)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .load_session_for_identity("id-b", "signal-shared", 1)
+                .unwrap(),
+            Some(b"session-b".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_claim_legacy_identity_data_moves_empty_scope_rows() {
+        let store = SecureStorage::open_in_memory(TEST_KEY).unwrap();
+
+        store
+            .save_peer_mapping("nostr-legacy", "signal-legacy", "Legacy")
+            .unwrap();
+        store
+            .save_session("signal-legacy", 1, b"legacy-session")
+            .unwrap();
+        store
+            .save_group("group-legacy", "{\"name\":\"Legacy\"}")
+            .unwrap();
+        store
+            .save_pending_first_inbox("signal-legacy", "inbox-legacy")
+            .unwrap();
+        store.save_pre_key(1, b"legacy-pre").unwrap();
+        store.save_signed_pre_key(2, b"legacy-signed").unwrap();
+        store.save_kyber_pre_key(3, b"legacy-kyber").unwrap();
+        store
+            .save_identity_key("self-legacy", b"legacy-pub", b"legacy-priv")
+            .unwrap();
+        store
+            .save_peer_identity("peer-legacy", b"legacy-peer")
+            .unwrap();
+        store
+            .save_inbound_fr(
+                "fr-legacy",
+                "sender-legacy",
+                "{\"message\":true}",
+                "{\"payload\":true}",
+            )
+            .unwrap();
+
+        store.claim_legacy_identity_data("id-a").unwrap();
+
+        assert!(store
+            .load_peer_by_nostr_for_identity("id-a", "nostr-legacy", false)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .load_session_for_identity("id-a", "signal-legacy", 1)
+                .unwrap(),
+            Some(b"legacy-session".to_vec())
+        );
+        assert_eq!(
+            store
+                .load_group_for_identity("id-a", "group-legacy", false)
+                .unwrap(),
+            Some("{\"name\":\"Legacy\"}".to_string())
+        );
+        assert_eq!(
+            store
+                .load_all_pending_first_inboxes_for_identity("id-a", false)
+                .unwrap(),
+            vec![("signal-legacy".to_string(), "inbox-legacy".to_string())]
+        );
+        assert_eq!(
+            store.load_pre_key_for_identity("id-a", 1).unwrap(),
+            Some(b"legacy-pre".to_vec())
+        );
+        assert_eq!(
+            store.load_signed_pre_key_for_identity("id-a", 2).unwrap(),
+            Some(b"legacy-signed".to_vec())
+        );
+        assert_eq!(
+            store.load_kyber_pre_key_for_identity("id-a", 3).unwrap(),
+            Some(b"legacy-kyber".to_vec())
+        );
+        assert_eq!(
+            store
+                .load_identity_key_for_identity("id-a", "self-legacy")
+                .unwrap(),
+            Some((b"legacy-pub".to_vec(), b"legacy-priv".to_vec()))
+        );
+        assert_eq!(
+            store
+                .load_peer_identity_for_identity("id-a", "peer-legacy")
+                .unwrap(),
+            Some(b"legacy-peer".to_vec())
+        );
+        assert_eq!(
+            store
+                .load_inbound_fr_for_identity("id-a", "fr-legacy")
+                .unwrap(),
+            Some((
+                "sender-legacy".to_string(),
+                "{\"message\":true}".to_string(),
+                "{\"payload\":true}".to_string()
+            ))
+        );
+
+        assert!(store.list_peers().unwrap().is_empty());
+        assert!(store.load_session("signal-legacy", 1).unwrap().is_none());
+        assert!(store.load_all_groups().unwrap().is_empty());
+        assert!(store.load_all_pending_first_inboxes().unwrap().is_empty());
+        assert!(store.load_pre_key(1).unwrap().is_none());
+        assert!(store.load_signed_pre_key(2).unwrap().is_none());
+        assert!(store.load_kyber_pre_key(3).unwrap().is_none());
+        assert!(store.load_identity_key("self-legacy").unwrap().is_none());
+        assert!(store.load_peer_identity("peer-legacy").unwrap().is_none());
+        assert!(store.load_inbound_fr("fr-legacy").unwrap().is_none());
     }
 
     #[test]

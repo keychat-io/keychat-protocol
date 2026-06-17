@@ -31,6 +31,78 @@ impl AppClient {
             .map_err(|e| se!("delete_identity", e))
     }
 
+    pub async fn delete_identity(&self, pubkey_hex: String) -> AppResult<()> {
+        let (next_identity, should_refresh) = {
+            let mut inner = self.inner.write().await;
+            let cached_identity = self.cached_identity_pubkey();
+            let was_active = inner
+                .protocol
+                .identity()
+                .map(|identity| identity.pubkey_hex() == pubkey_hex)
+                .unwrap_or(false)
+                || cached_identity == pubkey_hex;
+
+            inner.protocol.remove_identity(&pubkey_hex);
+
+            {
+                let storage = inner
+                    .protocol
+                    .storage()
+                    .lock()
+                    .map_err(|e| se!("delete_identity protocol storage lock", e))?;
+                storage
+                    .delete_identity_data(&pubkey_hex)
+                    .map_err(|e| se!("delete_identity protocol data", e))?;
+            }
+
+            let remaining = {
+                let app_storage = lock_app_storage_result(&inner.app_storage)?;
+                app_storage
+                    .delete_app_identity(&pubkey_hex)
+                    .map_err(|e| se!("delete_identity app data", e))?;
+                app_storage
+                    .get_app_identities()
+                    .map_err(|e| se!("delete_identity list remaining", e))?
+            };
+
+            let next_identity = if was_active {
+                remaining
+                    .iter()
+                    .find(|identity| identity.is_default)
+                    .or_else(|| remaining.first())
+                    .map(|identity| identity.nostr_pubkey_hex.clone())
+            } else {
+                if cached_identity.is_empty() {
+                    None
+                } else {
+                    Some(cached_identity)
+                }
+            };
+
+            if let Some(next_identity) = &next_identity {
+                if inner.protocol.identity_state(next_identity).is_some() {
+                    inner
+                        .protocol
+                        .set_active_identity(next_identity)
+                        .map_err(|e| se!("delete_identity set active", e))?;
+                }
+            } else {
+                inner.protocol.set_identity(None);
+            }
+
+            (next_identity, inner.protocol.has_transport())
+        };
+
+        self.set_cached_identity_pubkey(next_identity.unwrap_or_default());
+
+        if should_refresh {
+            let mut inner = self.inner.write().await;
+            inner.protocol.refresh_subscriptions().await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn save_app_room(
         &self,
         to_main_pubkey: String,
@@ -150,10 +222,15 @@ impl AppClient {
     }
 
     pub async fn is_app_message_duplicate(&self, event_id: String) -> AppResult<bool> {
-        let _inner = self.inner.read().await;
-        let s = lock_app_storage_result(&_inner.app_storage)?;
-        s.is_app_message_duplicate(&event_id)
-            .map_err(|e| se!("is_duplicate", e))
+        let identity_pubkey = self.cached_identity_pubkey();
+        let inner = self.inner.read().await;
+        let s = lock_app_storage_result(&inner.app_storage)?;
+        let result = if identity_pubkey.is_empty() {
+            s.is_app_message_duplicate(&event_id)
+        } else {
+            s.is_app_message_duplicate_for_identity(&identity_pubkey, &event_id)
+        };
+        result.map_err(|e| se!("is_duplicate", e))
     }
 
     pub async fn save_app_contact_record(

@@ -163,28 +163,54 @@ impl GroupManager {
         group_id: &str,
         storage: &crate::storage::SecureStorage,
     ) -> Result<()> {
+        self.save_group_for_identity(group_id, storage, "")
+    }
+
+    pub fn save_group_for_identity(
+        &self,
+        group_id: &str,
+        storage: &crate::storage::SecureStorage,
+        my_pubkey: &str,
+    ) -> Result<()> {
         let group = self
             .groups
             .get(group_id)
             .ok_or_else(|| KeychatError::Signal(format!("group not found: {group_id}")))?;
         let json = serde_json::to_string(group)
             .map_err(|e| KeychatError::Storage(format!("Failed to serialize group: {e}")))?;
-        storage.save_group(group_id, &json)
+        storage.save_group_for_identity(my_pubkey, group_id, &json)
     }
 
     /// Save all groups to SecureStorage.
     pub fn save_all(&self, storage: &crate::storage::SecureStorage) -> Result<()> {
+        self.save_all_for_identity(storage, "")
+    }
+
+    pub fn save_all_for_identity(
+        &self,
+        storage: &crate::storage::SecureStorage,
+        my_pubkey: &str,
+    ) -> Result<()> {
         for (group_id, group) in &self.groups {
             let json = serde_json::to_string(group)
                 .map_err(|e| KeychatError::Storage(format!("Failed to serialize group: {e}")))?;
-            storage.save_group(group_id, &json)?;
+            storage.save_group_for_identity(my_pubkey, group_id, &json)?;
         }
         Ok(())
     }
 
     /// Load all groups from SecureStorage, replacing in-memory state.
     pub fn load_all(&mut self, storage: &crate::storage::SecureStorage) -> Result<()> {
-        let rows = storage.load_all_groups()?;
+        self.load_all_for_identity(storage, "", false)
+    }
+
+    pub fn load_all_for_identity(
+        &mut self,
+        storage: &crate::storage::SecureStorage,
+        my_pubkey: &str,
+        include_legacy: bool,
+    ) -> Result<()> {
+        let rows = storage.load_all_groups_for_identity(my_pubkey, include_legacy)?;
         self.groups.clear();
         for (group_id, json) in rows {
             let group: SignalGroup = serde_json::from_str(&json).map_err(|e| {
@@ -201,7 +227,16 @@ impl GroupManager {
         group_id: &str,
         storage: &crate::storage::SecureStorage,
     ) -> Result<Option<SignalGroup>> {
-        storage.delete_group(group_id)?;
+        self.remove_group_persistent_for_identity(group_id, storage, "")
+    }
+
+    pub fn remove_group_persistent_for_identity(
+        &mut self,
+        group_id: &str,
+        storage: &crate::storage::SecureStorage,
+        my_pubkey: &str,
+    ) -> Result<Option<SignalGroup>> {
+        storage.delete_group_for_identity(my_pubkey, group_id)?;
         Ok(self.groups.remove(group_id))
     }
 }

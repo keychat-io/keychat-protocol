@@ -40,7 +40,7 @@ impl KeychatClient {
     }
     pub async fn delete_app_identity_ffi(&self, pubkey_hex: String) -> Result<(), KeychatUniError> {
         self.app
-            .delete_app_identity(pubkey_hex)
+            .delete_identity(pubkey_hex)
             .await
             .map_err(Into::into)
     }
