@@ -140,7 +140,7 @@ impl AppStorage {
 
     // ─── Migrations ──────────────────────────────────────
 
-    const SCHEMA_VERSION: u32 = 3;
+    const SCHEMA_VERSION: u32 = 4;
 
     fn run_migrations(conn: &Connection) -> Result<()> {
         let current: u32 = conn
@@ -160,6 +160,9 @@ impl AppStorage {
         }
         if current < 3 {
             Self::migrate_v2_to_v3(conn)?;
+        }
+        if current < 4 {
+            Self::migrate_v3_to_v4(conn)?;
         }
         Ok(())
     }
@@ -201,7 +204,7 @@ impl AppStorage {
 
             CREATE TABLE IF NOT EXISTS app_messages (
                 msgid TEXT PRIMARY KEY,
-                event_id TEXT UNIQUE,
+                event_id TEXT,
                 room_id TEXT NOT NULL,
                 identity_pubkey TEXT NOT NULL,
                 sender_pubkey TEXT NOT NULL,
@@ -220,6 +223,9 @@ impl AppStorage {
             CREATE INDEX IF NOT EXISTS idx_app_messages_room ON app_messages(room_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_app_messages_unread ON app_messages(room_id, is_read) WHERE is_read = 0;
             CREATE INDEX IF NOT EXISTS idx_app_messages_failed ON app_messages(is_me_send, status) WHERE is_me_send = 1 AND status = 2;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_app_messages_identity_event
+                ON app_messages(identity_pubkey, event_id)
+                WHERE event_id IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS app_contacts (
                 id TEXT PRIMARY KEY,
@@ -297,6 +303,63 @@ impl AppStorage {
         .map_err(|e| KeychatError::Storage(format!("app migration v2→v3 failed: {e}")))?;
 
         tracing::info!("app migration v2 → v3 complete");
+        Ok(())
+    }
+
+    fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
+        tracing::info!(
+            "running app migration v3 → v4: scope message event_id uniqueness by identity"
+        );
+        conn.execute_batch(
+            "BEGIN;
+
+            ALTER TABLE app_messages RENAME TO app_messages_v3;
+            CREATE TABLE app_messages (
+                msgid TEXT PRIMARY KEY,
+                event_id TEXT,
+                room_id TEXT NOT NULL,
+                identity_pubkey TEXT NOT NULL,
+                sender_pubkey TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                is_me_send INTEGER NOT NULL DEFAULT 0,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL DEFAULT 0,
+                reply_to_event_id TEXT,
+                reply_to_content TEXT,
+                payload_json TEXT,
+                nostr_event_json TEXT,
+                relay_status_json TEXT,
+                local_file_path TEXT,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                local_meta TEXT
+            );
+            INSERT INTO app_messages (
+                msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
+                is_me_send, is_read, status, reply_to_event_id, reply_to_content,
+                payload_json, nostr_event_json, relay_status_json, local_file_path,
+                created_at, local_meta
+            )
+            SELECT
+                msgid, event_id, room_id, identity_pubkey, sender_pubkey, content,
+                is_me_send, is_read, status, reply_to_event_id, reply_to_content,
+                payload_json, nostr_event_json, relay_status_json, local_file_path,
+                created_at, local_meta
+            FROM app_messages_v3;
+            DROP TABLE app_messages_v3;
+
+            CREATE INDEX IF NOT EXISTS idx_app_messages_room ON app_messages(room_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_app_messages_unread ON app_messages(room_id, is_read) WHERE is_read = 0;
+            CREATE INDEX IF NOT EXISTS idx_app_messages_failed ON app_messages(is_me_send, status) WHERE is_me_send = 1 AND status = 2;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_app_messages_identity_event
+                ON app_messages(identity_pubkey, event_id)
+                WHERE event_id IS NOT NULL;
+
+            PRAGMA user_version = 4;
+            COMMIT;",
+        )
+        .map_err(|e| KeychatError::Storage(format!("app migration v3→v4 failed: {e}")))?;
+
+        tracing::info!("app migration v3 → v4 complete");
         Ok(())
     }
 
@@ -436,15 +499,45 @@ impl AppStorage {
     pub fn delete_app_identity(&self, pubkey_hex: &str) -> Result<()> {
         self.transaction(|conn| {
             conn.execute(
-                "DELETE FROM app_messages WHERE room_id IN (SELECT id FROM app_rooms WHERE identity_pubkey = ?1)",
+                "DELETE FROM file_attachments
+                 WHERE msgid IN (SELECT msgid FROM app_messages WHERE identity_pubkey = ?1)",
                 rusqlite::params![pubkey_hex],
-            ).map_err(|e| KeychatError::Storage(format!("delete_app_identity messages: {e}")))?;
-            conn.execute("DELETE FROM app_rooms WHERE identity_pubkey = ?1", rusqlite::params![pubkey_hex])
-                .map_err(|e| KeychatError::Storage(format!("delete_app_identity rooms: {e}")))?;
-            conn.execute("DELETE FROM app_contacts WHERE identity_pubkey = ?1", rusqlite::params![pubkey_hex])
-                .map_err(|e| KeychatError::Storage(format!("delete_app_identity contacts: {e}")))?;
-            conn.execute("DELETE FROM app_identities WHERE nostr_pubkey_hex = ?1", rusqlite::params![pubkey_hex])
-                .map_err(|e| KeychatError::Storage(format!("delete_app_identity: {e}")))?;
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_app_identity attachments: {e}")))?;
+            conn.execute(
+                "DELETE FROM app_messages WHERE identity_pubkey = ?1",
+                rusqlite::params![pubkey_hex],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_app_identity messages: {e}")))?;
+            conn.execute(
+                "DELETE FROM app_rooms WHERE identity_pubkey = ?1 AND parent_room_id IS NOT NULL",
+                rusqlite::params![pubkey_hex],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_app_identity child rooms: {e}")))?;
+            conn.execute(
+                "DELETE FROM app_rooms WHERE identity_pubkey = ?1",
+                rusqlite::params![pubkey_hex],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_app_identity rooms: {e}")))?;
+            conn.execute(
+                "DELETE FROM app_contacts WHERE identity_pubkey = ?1",
+                rusqlite::params![pubkey_hex],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_app_identity contacts: {e}")))?;
+            conn.execute(
+                "DELETE FROM app_identities WHERE nostr_pubkey_hex = ?1",
+                rusqlite::params![pubkey_hex],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_app_identity: {e}")))?;
+            conn.execute(
+                "DELETE FROM app_settings
+                 WHERE key = ?1 OR key LIKE ?2",
+                rusqlite::params![
+                    format!("identity_secret_hex:{pubkey_hex}"),
+                    format!("identity:{pubkey_hex}:%")
+                ],
+            )
+            .map_err(|e| KeychatError::Storage(format!("delete_app_identity settings: {e}")))?;
             Ok(())
         })
     }
@@ -834,6 +927,27 @@ impl AppStorage {
                 |row| row.get(0),
             )
             .map_err(|e| KeychatError::Storage(format!("is_app_message_duplicate: {e}")))?;
+        Ok(exists)
+    }
+
+    pub fn is_app_message_duplicate_for_identity(
+        &self,
+        identity_pubkey: &str,
+        event_id: &str,
+    ) -> Result<bool> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM app_messages
+                    WHERE identity_pubkey = ?1 AND event_id = ?2
+                )",
+                rusqlite::params![identity_pubkey, event_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                KeychatError::Storage(format!("is_app_message_duplicate_for_identity: {e}"))
+            })?;
         Ok(exists)
     }
 
@@ -1290,6 +1404,118 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_app_identity_removes_owned_rooms_messages_attachments_contacts_and_settings() {
+        let s = test_storage();
+        s.save_app_identity("hex1", "npub1", "Alice", 0, true)
+            .unwrap();
+        s.save_app_identity("hex2", "npub2", "Bob", 1, false)
+            .unwrap();
+
+        let parent = s
+            .save_app_room("parent", "hex1", 1, 0, Some("Parent"), None, None)
+            .unwrap();
+        let child = s
+            .save_app_room("child", "hex1", 1, 1, Some("Child"), None, Some(&parent))
+            .unwrap();
+        let other = s
+            .save_app_room("other", "hex2", 1, 0, Some("Other"), None, None)
+            .unwrap();
+
+        s.save_app_message(
+            "msg-parent",
+            None,
+            &parent,
+            "hex1",
+            "peer",
+            "parent",
+            false,
+            0,
+            1,
+        )
+        .unwrap();
+        s.save_app_message(
+            "msg-child",
+            None,
+            &child,
+            "hex1",
+            "peer",
+            "child",
+            false,
+            0,
+            2,
+        )
+        .unwrap();
+        s.save_app_message(
+            "msg-other",
+            None,
+            &other,
+            "hex2",
+            "peer",
+            "other",
+            false,
+            0,
+            3,
+        )
+        .unwrap();
+        s.upsert_attachment("msg-parent", "hash-parent", &parent, Some("p"), 2)
+            .unwrap();
+        s.upsert_attachment("msg-child", "hash-child", &child, Some("c"), 2)
+            .unwrap();
+        s.upsert_attachment("msg-other", "hash-other", &other, Some("o"), 2)
+            .unwrap();
+        s.save_app_contact("peer1", "npub-peer1", "hex1", Some("Peer 1"))
+            .unwrap();
+        s.save_app_contact("peer2", "npub-peer2", "hex2", Some("Peer 2"))
+            .unwrap();
+        s.set_setting("identity_secret_hex:hex1", "secret-a")
+            .unwrap();
+        s.set_setting("identity_secret_hex:hex2", "secret-b")
+            .unwrap();
+        s.set_setting("identity:hex1:theme", "dark").unwrap();
+        s.set_setting("global-theme", "light").unwrap();
+
+        s.delete_app_identity("hex1").unwrap();
+
+        assert!(s.get_app_rooms("hex1").unwrap().is_empty());
+        assert_eq!(s.get_app_rooms("hex2").unwrap().len(), 1);
+        assert_eq!(s.get_app_messages(&parent, 50, 0).unwrap().len(), 0);
+        assert_eq!(s.get_app_messages(&child, 50, 0).unwrap().len(), 0);
+        assert_eq!(s.get_app_messages(&other, 50, 0).unwrap().len(), 1);
+        assert_eq!(
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM file_attachments WHERE msgid IN ('msg-parent', 'msg-child')",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM file_attachments WHERE msgid = 'msg-other'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(s.get_app_contacts("hex1").unwrap().is_empty());
+        assert_eq!(s.get_app_contacts("hex2").unwrap().len(), 1);
+        assert!(s.get_setting("identity_secret_hex:hex1").unwrap().is_none());
+        assert!(s.get_setting("identity:hex1:theme").unwrap().is_none());
+        assert_eq!(
+            s.get_setting("identity_secret_hex:hex2").unwrap(),
+            Some("secret-b".to_string())
+        );
+        assert_eq!(
+            s.get_setting("global-theme").unwrap(),
+            Some("light".to_string())
+        );
+    }
+
+    #[test]
     fn test_room_crud() {
         let s = test_storage();
         let id = s
@@ -1384,6 +1610,53 @@ mod tests {
 
         s.delete_app_message("m1").unwrap();
         assert!(s.get_app_message_by_msgid("m1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_message_event_id_duplicate_is_scoped_by_identity() {
+        let s = test_storage();
+        s.save_app_room("bob", "alice", 1, 0, None, None, None)
+            .unwrap();
+        s.save_app_room("alice", "bob", 1, 0, None, None, None)
+            .unwrap();
+
+        s.save_app_message(
+            "event-1",
+            Some("event-1"),
+            "bob:alice",
+            "alice",
+            "alice",
+            "outgoing from alice",
+            true,
+            1,
+            1000,
+        )
+        .unwrap();
+        assert!(s
+            .is_app_message_duplicate_for_identity("alice", "event-1")
+            .unwrap());
+        assert!(!s
+            .is_app_message_duplicate_for_identity("bob", "event-1")
+            .unwrap());
+
+        s.save_app_message(
+            "recv-bob-event-1",
+            Some("event-1"),
+            "alice:bob",
+            "bob",
+            "alice",
+            "incoming to bob",
+            false,
+            1,
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(s.get_app_messages("bob:alice", 50, 0).unwrap().len(), 1);
+        assert_eq!(s.get_app_messages("alice:bob", 50, 0).unwrap().len(), 1);
+        assert!(s
+            .is_app_message_duplicate_for_identity("bob", "event-1")
+            .unwrap());
     }
 
     #[test]

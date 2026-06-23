@@ -37,11 +37,22 @@ fn lock_storage(
 #[derive(Clone)]
 pub struct PersistentSessionStore {
     storage: Arc<Mutex<SecureStorage>>,
+    my_pubkey: String,
 }
 
 impl PersistentSessionStore {
     pub fn new(storage: Arc<Mutex<SecureStorage>>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            my_pubkey: String::new(),
+        }
+    }
+
+    pub fn for_identity(storage: Arc<Mutex<SecureStorage>>, my_pubkey: impl Into<String>) -> Self {
+        Self {
+            storage,
+            my_pubkey: my_pubkey.into(),
+        }
     }
 }
 
@@ -49,13 +60,23 @@ impl PersistentSessionStore {
 impl libsignal_protocol::SessionStore for PersistentSessionStore {
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>> {
         let db = lock_storage(&self.storage)?;
-        let bytes = db
-            .load_session(address.name(), u32::from(address.device_id()))
+        let mut bytes = db
+            .load_session_for_identity(
+                &self.my_pubkey,
+                address.name(),
+                u32::from(address.device_id()),
+            )
             .map_err(to_signal_err)?;
+        if bytes.is_none() && !self.my_pubkey.is_empty() {
+            bytes = db
+                .load_session(address.name(), u32::from(address.device_id()))
+                .map_err(to_signal_err)?;
+        }
         match bytes {
             None => {
                 tracing::debug!(
-                    "PersistentSessionStore::load_session({}.{}) → None",
+                    "PersistentSessionStore::load_session({}:{}.{}) → None",
+                    &self.my_pubkey[..16.min(self.my_pubkey.len())],
                     &address.name()[..16.min(address.name().len())],
                     u32::from(address.device_id()),
                 );
@@ -63,7 +84,8 @@ impl libsignal_protocol::SessionStore for PersistentSessionStore {
             }
             Some(ref b) => {
                 tracing::debug!(
-                    "PersistentSessionStore::load_session({}.{}) → {} bytes",
+                    "PersistentSessionStore::load_session({}:{}.{}) → {} bytes",
+                    &self.my_pubkey[..16.min(self.my_pubkey.len())],
                     &address.name()[..16.min(address.name().len())],
                     u32::from(address.device_id()),
                     b.len(),
@@ -80,14 +102,20 @@ impl libsignal_protocol::SessionStore for PersistentSessionStore {
     ) -> Result<()> {
         let bytes = record.serialize()?;
         tracing::debug!(
-            "PersistentSessionStore::store_session({}.{}) → {} bytes",
+            "PersistentSessionStore::store_session({}:{}.{}) → {} bytes",
+            &self.my_pubkey[..16.min(self.my_pubkey.len())],
             &address.name()[..16.min(address.name().len())],
             u32::from(address.device_id()),
             bytes.len(),
         );
         let db = lock_storage(&self.storage)?;
-        db.save_session(address.name(), u32::from(address.device_id()), &bytes)
-            .map_err(to_signal_err)?;
+        db.save_session_for_identity(
+            &self.my_pubkey,
+            address.name(),
+            u32::from(address.device_id()),
+            &bytes,
+        )
+        .map_err(to_signal_err)?;
         Ok(())
     }
 }
@@ -97,11 +125,22 @@ impl libsignal_protocol::SessionStore for PersistentSessionStore {
 #[derive(Clone)]
 pub struct PersistentPreKeyStore {
     storage: Arc<Mutex<SecureStorage>>,
+    my_pubkey: String,
 }
 
 impl PersistentPreKeyStore {
     pub fn new(storage: Arc<Mutex<SecureStorage>>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            my_pubkey: String::new(),
+        }
+    }
+
+    pub fn for_identity(storage: Arc<Mutex<SecureStorage>>, my_pubkey: impl Into<String>) -> Self {
+        Self {
+            storage,
+            my_pubkey: my_pubkey.into(),
+        }
     }
 }
 
@@ -110,7 +149,7 @@ impl libsignal_protocol::PreKeyStore for PersistentPreKeyStore {
     async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord> {
         let db = lock_storage(&self.storage)?;
         let bytes = db
-            .load_pre_key(u32::from(prekey_id))
+            .load_pre_key_for_identity(&self.my_pubkey, u32::from(prekey_id))
             .map_err(to_signal_err)?
             .ok_or(SignalProtocolError::InvalidPreKeyId)?;
         PreKeyRecord::deserialize(&bytes)
@@ -119,14 +158,14 @@ impl libsignal_protocol::PreKeyStore for PersistentPreKeyStore {
     async fn save_pre_key(&mut self, prekey_id: PreKeyId, record: &PreKeyRecord) -> Result<()> {
         let bytes = record.serialize()?;
         let db = lock_storage(&self.storage)?;
-        db.save_pre_key(u32::from(prekey_id), &bytes)
+        db.save_pre_key_for_identity(&self.my_pubkey, u32::from(prekey_id), &bytes)
             .map_err(to_signal_err)?;
         Ok(())
     }
 
     async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<()> {
         let db = lock_storage(&self.storage)?;
-        db.remove_pre_key(u32::from(prekey_id))
+        db.remove_pre_key_for_identity(&self.my_pubkey, u32::from(prekey_id))
             .map_err(to_signal_err)?;
         Ok(())
     }
@@ -137,11 +176,22 @@ impl libsignal_protocol::PreKeyStore for PersistentPreKeyStore {
 #[derive(Clone)]
 pub struct PersistentSignedPreKeyStore {
     storage: Arc<Mutex<SecureStorage>>,
+    my_pubkey: String,
 }
 
 impl PersistentSignedPreKeyStore {
     pub fn new(storage: Arc<Mutex<SecureStorage>>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            my_pubkey: String::new(),
+        }
+    }
+
+    pub fn for_identity(storage: Arc<Mutex<SecureStorage>>, my_pubkey: impl Into<String>) -> Self {
+        Self {
+            storage,
+            my_pubkey: my_pubkey.into(),
+        }
     }
 }
 
@@ -153,7 +203,7 @@ impl libsignal_protocol::SignedPreKeyStore for PersistentSignedPreKeyStore {
     ) -> Result<SignedPreKeyRecord> {
         let db = lock_storage(&self.storage)?;
         let bytes = db
-            .load_signed_pre_key(u32::from(signed_prekey_id))
+            .load_signed_pre_key_for_identity(&self.my_pubkey, u32::from(signed_prekey_id))
             .map_err(to_signal_err)?
             .ok_or(SignalProtocolError::InvalidSignedPreKeyId)?;
         SignedPreKeyRecord::deserialize(&bytes)
@@ -166,7 +216,7 @@ impl libsignal_protocol::SignedPreKeyStore for PersistentSignedPreKeyStore {
     ) -> Result<()> {
         let bytes = record.serialize()?;
         let db = lock_storage(&self.storage)?;
-        db.save_signed_pre_key(u32::from(signed_prekey_id), &bytes)
+        db.save_signed_pre_key_for_identity(&self.my_pubkey, u32::from(signed_prekey_id), &bytes)
             .map_err(to_signal_err)?;
         Ok(())
     }
@@ -177,11 +227,22 @@ impl libsignal_protocol::SignedPreKeyStore for PersistentSignedPreKeyStore {
 #[derive(Clone)]
 pub struct PersistentKyberPreKeyStore {
     storage: Arc<Mutex<SecureStorage>>,
+    my_pubkey: String,
 }
 
 impl PersistentKyberPreKeyStore {
     pub fn new(storage: Arc<Mutex<SecureStorage>>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            my_pubkey: String::new(),
+        }
+    }
+
+    pub fn for_identity(storage: Arc<Mutex<SecureStorage>>, my_pubkey: impl Into<String>) -> Self {
+        Self {
+            storage,
+            my_pubkey: my_pubkey.into(),
+        }
     }
 }
 
@@ -190,7 +251,7 @@ impl libsignal_protocol::KyberPreKeyStore for PersistentKyberPreKeyStore {
     async fn get_kyber_pre_key(&self, kyber_prekey_id: KyberPreKeyId) -> Result<KyberPreKeyRecord> {
         let db = lock_storage(&self.storage)?;
         let bytes = db
-            .load_kyber_pre_key(u32::from(kyber_prekey_id))
+            .load_kyber_pre_key_for_identity(&self.my_pubkey, u32::from(kyber_prekey_id))
             .map_err(to_signal_err)?
             .ok_or(SignalProtocolError::InvalidKyberPreKeyId)?;
         KyberPreKeyRecord::deserialize(&bytes)
@@ -203,7 +264,7 @@ impl libsignal_protocol::KyberPreKeyStore for PersistentKyberPreKeyStore {
     ) -> Result<()> {
         let bytes = record.serialize()?;
         let db = lock_storage(&self.storage)?;
-        db.save_kyber_pre_key(u32::from(kyber_prekey_id), &bytes)
+        db.save_kyber_pre_key_for_identity(&self.my_pubkey, u32::from(kyber_prekey_id), &bytes)
             .map_err(to_signal_err)?;
         Ok(())
     }
@@ -216,7 +277,7 @@ impl libsignal_protocol::KyberPreKeyStore for PersistentKyberPreKeyStore {
     ) -> Result<()> {
         // One-time keys: remove after use.
         let db = lock_storage(&self.storage)?;
-        db.remove_kyber_pre_key(u32::from(kyber_prekey_id))
+        db.remove_kyber_pre_key_for_identity(&self.my_pubkey, u32::from(kyber_prekey_id))
             .map_err(to_signal_err)?;
         Ok(())
     }
@@ -227,6 +288,7 @@ impl libsignal_protocol::KyberPreKeyStore for PersistentKyberPreKeyStore {
 #[derive(Clone)]
 pub struct PersistentIdentityKeyStore {
     storage: Arc<Mutex<SecureStorage>>,
+    my_pubkey: String,
     key_pair: IdentityKeyPair,
     registration_id: u32,
 }
@@ -237,8 +299,18 @@ impl PersistentIdentityKeyStore {
         key_pair: IdentityKeyPair,
         registration_id: u32,
     ) -> Self {
+        Self::for_identity(storage, "", key_pair, registration_id)
+    }
+
+    pub fn for_identity(
+        storage: Arc<Mutex<SecureStorage>>,
+        my_pubkey: impl Into<String>,
+        key_pair: IdentityKeyPair,
+        registration_id: u32,
+    ) -> Self {
         Self {
             storage,
+            my_pubkey: my_pubkey.into(),
             key_pair,
             registration_id,
         }
@@ -279,7 +351,7 @@ impl libsignal_protocol::IdentityKeyStore for PersistentIdentityKeyStore {
     async fn get_identity(&self, address: &ProtocolAddress) -> Result<Option<IdentityKey>> {
         let db = lock_storage(&self.storage)?;
         let bytes = db
-            .load_peer_identity(address.name())
+            .load_peer_identity_for_identity(&self.my_pubkey, address.name())
             .map_err(to_signal_err)?;
         match bytes {
             None => Ok(None),

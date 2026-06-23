@@ -287,6 +287,7 @@ impl SignalParticipant {
         storage: Arc<Mutex<SecureStorage>>,
     ) -> Result<Self> {
         let mut store = SignalProtocolStoreBundle::persistent(
+            name.clone(),
             storage,
             keys.identity_key_pair,
             keys.registration_id,
@@ -339,8 +340,12 @@ impl SignalParticipant {
         registration_id: u32,
         storage: Arc<Mutex<SecureStorage>>,
     ) -> Result<Self> {
-        let store =
-            SignalProtocolStoreBundle::persistent(storage, identity_key_pair, registration_id);
+        let store = SignalProtocolStoreBundle::persistent(
+            name.clone(),
+            storage,
+            identity_key_pair,
+            registration_id,
+        );
 
         tracing::info!(
             "signal session restored (persistent): name={}",

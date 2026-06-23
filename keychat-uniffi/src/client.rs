@@ -518,13 +518,45 @@ impl KeychatClient {
         Ok(pubkey_hex)
     }
 
+    pub async fn add_identity(
+        &self,
+        mnemonic: String,
+        account: u32,
+    ) -> Result<String, KeychatUniError> {
+        let pubkey_hex = self.app.add_identity(mnemonic, account).await?;
+        tracing::info!("identity added: {}", &pubkey_hex[..16]);
+        Ok(pubkey_hex)
+    }
+
+    pub async fn add_identity_from_secret_hex(
+        &self,
+        secret_hex: String,
+    ) -> Result<String, KeychatUniError> {
+        let pubkey_hex = self.app.add_identity_from_secret_hex(secret_hex).await?;
+        tracing::info!("identity added from secret hex: {}", &pubkey_hex[..16]);
+        Ok(pubkey_hex)
+    }
+
+    pub async fn add_identity_from_nsec(&self, nsec: String) -> Result<String, KeychatUniError> {
+        let pubkey_hex = self.app.add_identity_from_nsec(nsec).await?;
+        tracing::info!("identity added from nsec: {}", &pubkey_hex[..16]);
+        Ok(pubkey_hex)
+    }
+
+    pub async fn list_identity_pubkeys(&self) -> Result<Vec<String>, KeychatUniError> {
+        self.app.list_identity_pubkeys().await.map_err(Into::into)
+    }
+
+    pub async fn set_active_identity(&self, identity_hex: String) -> Result<(), KeychatUniError> {
+        self.app
+            .set_active_identity(identity_hex)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Return the cached identity pubkey hex, or empty string if not yet imported.
     pub(crate) fn cached_identity_pubkey(&self) -> String {
-        self.app
-            .identity_pubkey_hex
-            .get()
-            .cloned()
-            .unwrap_or_default()
+        self.app.cached_identity_pubkey()
     }
 
     pub async fn debug_state_summary(&self) -> Result<String, KeychatUniError> {
@@ -548,13 +580,7 @@ impl KeychatClient {
     }
 
     pub async fn get_pubkey_hex(&self) -> Result<String, KeychatUniError> {
-        self.app
-            .identity_pubkey_hex
-            .get()
-            .cloned()
-            .ok_or(KeychatUniError::NotInitialized {
-                msg: "no identity set".into(),
-            })
+        self.app.get_pubkey_hex().await.map_err(Into::into)
     }
 
     pub async fn connect(&self, relay_urls: Vec<String>) -> Result<(), KeychatUniError> {

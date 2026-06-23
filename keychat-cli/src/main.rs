@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use keychat_app_core::AppClient;
-use keychat_cli::{agent_daemon, commands, daemon, repl, tui};
+use keychat_cli::{agent_config, agent_daemon, commands, daemon, repl, tui};
 
 #[derive(Parser)]
 #[command(
@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&db_dir)?;
 
     let db_path = format!("{}/protocol.db", db_dir);
-    let db_key = commands::get_or_create_db_key(&db_dir)?;
+    let db_key = agent_config::resolve_db_key(&db_dir)?;
 
     let client = Arc::new(AppClient::new(db_path, db_key)?);
 

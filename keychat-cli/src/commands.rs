@@ -77,6 +77,11 @@ pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
 // ─── Identity Restore ───────────────────────────────────────────
 
 pub const SETTING_MNEMONIC: &str = "identity_mnemonic";
+pub const SETTING_IDENTITY_SEED_MNEMONIC: &str = "identity_seed_mnemonic";
+
+pub fn setting_identity_secret_hex(pubkey: &str) -> String {
+    format!("identity_secret_hex:{pubkey}")
+}
 
 /// Restore identity from saved mnemonic in DB. Shared by all modes.
 /// Returns the pubkey hex if successful.
@@ -97,6 +102,63 @@ pub async fn restore_identity(client: &Arc<AppClient>) -> Option<String> {
     client.get_pubkey_hex().await.ok()
 }
 
+/// Restore all persisted CLI identities and activate the default identity.
+pub async fn restore_identities(client: &Arc<AppClient>) -> Result<Option<String>, AppError> {
+    let identities = client.get_identities().await?;
+    if identities.is_empty() {
+        let restored = restore_identity(client).await;
+        if let Some(pubkey) = restored.as_ref() {
+            let npub = keychat_app_core::npub_from_hex(pubkey.clone()).unwrap_or_default();
+            if let Err(e) = client
+                .save_app_identity(pubkey.clone(), npub, "CLI User".to_string(), 0, true)
+                .await
+            {
+                tracing::warn!("failed to migrate legacy identity row: {e}");
+            }
+        }
+        return Ok(restored);
+    }
+
+    let seed = client
+        .get_setting(SETTING_IDENTITY_SEED_MNEMONIC.to_string())
+        .await?
+        .or(client.get_setting(SETTING_MNEMONIC.to_string()).await?);
+
+    for identity in &identities {
+        let pubkey = &identity.nostr_pubkey_hex;
+        if let Some(secret_hex) = client
+            .get_setting(setting_identity_secret_hex(pubkey))
+            .await?
+        {
+            if let Err(e) = client.add_identity_from_secret_hex(secret_hex).await {
+                tracing::warn!("restore identity from secret failed for {pubkey}: {e}");
+            }
+            continue;
+        }
+
+        if let Some(seed) = seed.as_ref() {
+            if let Err(e) = client
+                .add_identity(seed.clone(), identity.index.max(0) as u32)
+                .await
+            {
+                tracing::warn!("restore derived identity failed for {pubkey}: {e}");
+            }
+        }
+    }
+
+    let active = identities
+        .iter()
+        .find(|identity| identity.is_default)
+        .or_else(|| identities.first())
+        .map(|identity| identity.nostr_pubkey_hex.clone());
+
+    if let Some(active) = active.as_ref() {
+        client.set_active_identity(active.clone()).await?;
+    }
+
+    Ok(active)
+}
+
 /// Save mnemonic to DB so identity persists across restarts.
 pub async fn save_mnemonic(client: &AppClient, mnemonic: &str) {
     if let Err(e) = client
@@ -107,11 +169,141 @@ pub async fn save_mnemonic(client: &AppClient, mnemonic: &str) {
     }
 }
 
+pub async fn save_seed_mnemonic(client: &AppClient, mnemonic: &str) {
+    if let Err(e) = client
+        .set_setting(
+            SETTING_IDENTITY_SEED_MNEMONIC.to_string(),
+            mnemonic.to_string(),
+        )
+        .await
+    {
+        tracing::warn!("Failed to save identity seed mnemonic: {e}");
+    }
+}
+
 /// Delete saved mnemonic from DB (used on identity reset/delete).
 pub async fn delete_mnemonic(client: &AppClient) {
     if let Err(e) = client.delete_setting(SETTING_MNEMONIC.to_string()).await {
         tracing::warn!("Failed to delete mnemonic: {e}");
     }
+}
+
+async fn resolve_identity_hex(
+    client: &AppClient,
+    identity_hex_or_index: &str,
+) -> Result<String, AppError> {
+    let needle = identity_hex_or_index.trim();
+    let identities = client.get_identities().await?;
+    identities
+        .iter()
+        .find(|identity| {
+            identity.nostr_pubkey_hex == needle
+                || identity.index.to_string() == needle
+                || identity.npub == needle
+        })
+        .map(|identity| identity.nostr_pubkey_hex.clone())
+        .ok_or_else(|| AppError::InvalidArgument(format!("identity not found: {needle}")))
+}
+
+pub async fn switch_identity(
+    client: &AppClient,
+    identity_hex_or_index: &str,
+) -> Result<String, AppError> {
+    let pubkey = resolve_identity_hex(client, identity_hex_or_index).await?;
+    client.set_active_identity(pubkey.clone()).await?;
+    client
+        .update_app_identity(pubkey.clone(), None, None, Some(true))
+        .await?;
+    client.restore_sessions().await?;
+    Ok(pubkey)
+}
+
+pub async fn create_additional_identity(
+    client: &AppClient,
+    display_name: &str,
+) -> Result<(String, String), AppError> {
+    let identities = client.get_identities().await?;
+    if identities.is_empty() {
+        let (pubkey, npub, mnemonic) = create_identity(client, display_name).await?;
+        save_seed_mnemonic(client, &mnemonic).await;
+        return Ok((pubkey, npub));
+    }
+
+    let seed = client
+        .get_setting(SETTING_IDENTITY_SEED_MNEMONIC.to_string())
+        .await?
+        .or(client.get_setting(SETTING_MNEMONIC.to_string()).await?)
+        .ok_or_else(|| AppError::NotInitialized("identity seed mnemonic not found".into()))?;
+    let next_index = identities
+        .iter()
+        .map(|identity| identity.index)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+    let pubkey = client.add_identity(seed, next_index as u32).await?;
+    let npub = keychat_app_core::npub_from_hex(pubkey.clone()).unwrap_or_default();
+    client
+        .save_app_identity(
+            pubkey.clone(),
+            npub.clone(),
+            display_name.to_string(),
+            next_index,
+            false,
+        )
+        .await?;
+    Ok((pubkey, npub))
+}
+
+pub async fn import_identity_from_nsec(
+    client: &AppClient,
+    nsec: &str,
+    display_name: &str,
+) -> Result<(String, String), AppError> {
+    let identity = libkeychat::Identity::from_nsec(nsec)
+        .map_err(|e| AppError::Identity(format!("invalid nsec: {e}")))?;
+    let secret_hex = identity.secret_hex();
+    let identities = client.get_identities().await?;
+    let next_index = identities
+        .iter()
+        .map(|identity| identity.index)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+    let pubkey = client
+        .add_identity_from_secret_hex(secret_hex.clone())
+        .await?;
+    let npub = keychat_app_core::npub_from_hex(pubkey.clone()).unwrap_or_default();
+    client
+        .save_app_identity(
+            pubkey.clone(),
+            npub.clone(),
+            display_name.to_string(),
+            next_index,
+            identities.is_empty(),
+        )
+        .await?;
+    client
+        .set_setting(setting_identity_secret_hex(&pubkey), secret_hex)
+        .await?;
+    if identities.is_empty() {
+        client.set_active_identity(pubkey.clone()).await?;
+    }
+    Ok((pubkey, npub))
+}
+
+pub async fn delete_identity(
+    client: &AppClient,
+    identity_hex_or_index: &str,
+) -> Result<String, AppError> {
+    let pubkey = resolve_identity_hex(client, identity_hex_or_index).await?;
+    client.delete_identity(pubkey.clone()).await?;
+    if client.get_identities().await?.is_empty() {
+        delete_mnemonic(client).await;
+        let _ = client
+            .delete_setting(SETTING_IDENTITY_SEED_MNEMONIC.to_string())
+            .await;
+    }
+    Ok(pubkey)
 }
 
 // ─── Shared Business Logic ───────────────────────────────────────
@@ -519,6 +711,7 @@ pub async fn create_identity(
 
     // Persist mnemonic for auto-restore on next startup
     save_mnemonic(client, &result.mnemonic).await;
+    save_seed_mnemonic(client, &result.mnemonic).await;
 
     Ok((result.pubkey_hex, npub, result.mnemonic))
 }
@@ -527,7 +720,18 @@ pub async fn create_identity(
 /// Returns pubkey_hex.
 pub async fn import_identity(client: &AppClient, mnemonic: &str) -> Result<String, AppError> {
     let pubkey = client.import_identity(mnemonic.to_string()).await?;
+    let npub = keychat_app_core::npub_from_hex(pubkey.clone()).unwrap_or_default();
+    client
+        .save_app_identity(
+            pubkey.clone(),
+            npub,
+            "Imported Identity".to_string(),
+            0,
+            true,
+        )
+        .await?;
     save_mnemonic(client, mnemonic).await;
+    save_seed_mnemonic(client, mnemonic).await;
 
     // Restore sessions after import
     match client.restore_sessions().await {
@@ -583,7 +787,14 @@ pub async fn init_and_connect(
     client: &Arc<AppClient>,
     relay_urls: Vec<String>,
 ) -> Option<(String, u32)> {
-    let pubkey = restore_identity(client).await?;
+    let pubkey = match restore_identities(client).await {
+        Ok(Some(pubkey)) => pubkey,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("restore_identities failed: {e}");
+            return None;
+        }
+    };
 
     let session_count = match client.restore_sessions().await {
         Ok(n) => {

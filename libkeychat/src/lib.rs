@@ -141,7 +141,9 @@ pub use libsignal_protocol::{
     PreKeyId, PreKeyRecord, PreKeySignalMessage, PrivateKey as SignalPrivateKey, ProtocolAddress,
     SignedPreKeyId, SignedPreKeyRecord,
 };
-pub use orchestrator::{FriendRequestContext, Nip17DmContext, ProtocolClient, SendResult};
+pub use orchestrator::{
+    FriendRequestContext, IdentityState, Nip17DmContext, ProtocolClient, SendResult,
+};
 pub use storage::{
     DerivedAddressSerialized, PeerAddressStateSerialized, PeerMapping, SecureStorage,
 };

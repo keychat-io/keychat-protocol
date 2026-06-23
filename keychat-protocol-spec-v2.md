@@ -1,6 +1,6 @@
 # Keychat Protocol Specification v2
 
-> **Version**: 2.0 Draft — 2026-03-13
+> **Version**: 2.0 Draft — 2026-06-17
 > **Purpose**: Everything a developer needs to implement a fully interoperable Keychat client.
 
 ---
@@ -105,7 +105,54 @@ The BIP-39 mnemonic and derived private key (nsec) are the **root of all identit
 
 > **Rationale**: The mnemonic is equivalent to the user's identity. Unlike Signal Protocol keys (which are ephemeral and per-peer), the Nostr keypair is permanent — its compromise cannot be remediated by session reset. It requires the same protection level as a cryptocurrency seed phrase.
 
-### 2.2 Multi-Agent Identity Isolation
+### 2.2 Multi-Identity Client Runtime
+
+Human clients MAY manage multiple local Nostr identities in one runtime and one encrypted local database. This is a **local runtime and persistence concern**, not a wire-protocol change: every Keychat message, Nostr event, Signal session, and MLS operation still belongs to exactly one Nostr identity at the moment it is sent or received.
+
+Definitions:
+
+- **Registered identity**: A local Nostr keypair known to the client, either derived from a mnemonic account index or imported from a secret key (`nsec`/hex).
+- **Active identity**: The registered identity used for new user actions such as sending friend requests, creating rooms, sending messages, and creating Signal or MLS groups.
+- **Enabled identity**: A registered identity whose relay subscriptions and inbound decryption/routing are active.
+
+Implementations that support multiple local identities **MUST**:
+
+1. Maintain a registry of registered identities keyed by Nostr pubkey.
+2. Keep exactly one active identity for foreground user actions.
+3. Support switching the active identity without losing in-memory protocol state for other registered identities.
+4. Route inbound events across all enabled identities by subscribing to each enabled identity's npub plus that identity's active first-inbox, ratchet-derived, public-agent, and MLS-derived receiving addresses.
+5. Treat each identity's peer list, Signal sessions, address manager state, pending friend requests, Signal groups, and MLS state as independent from every other identity.
+
+#### Local State Ownership
+
+All persistent protocol state that can affect decryption, routing, peer lookup, group membership, or message delivery **MUST** be scoped by the owning local Nostr identity. A database may use a `my_pubkey`, `identity_id`, or equivalent owner column, but lookups and deletes MUST include the owner scope.
+
+At minimum, these protocol records are owner-scoped:
+
+- Signal sessions
+- Peer mappings between peer Nostr pubkeys and peer Signal identities
+- Peer address-manager state
+- Signal participant records and pending friend requests
+- Pending first-inbox addresses
+- Signal group records
+- MLS signer and MLS group state, where MLS is implemented
+
+Application-layer state such as rooms, messages, contacts, attachments, settings, and per-identity UI metadata SHOULD also be scoped by the owning local identity. The same peer pubkey, peer Signal identity, group id, or message id may validly appear under more than one local identity; implementations MUST NOT assume these identifiers are globally unique across all identities in a local database.
+
+Deletion operations MUST be owner-scoped:
+
+- Deleting a 1:1 room or session deletes only the active or explicitly targeted identity's peer mapping, session rows, address state, and first-inbox state.
+- Deleting a Signal group deletes only the active or explicitly targeted identity's group record.
+- Deleting an identity deletes only that identity's protocol and app-layer state and MUST NOT delete other identities' state.
+- Shared configuration such as relay URLs MAY remain global unless the implementation explicitly models it as per-identity.
+
+#### Legacy Ownerless Rows
+
+Databases created before multi-identity support may contain ownerless protocol rows. On the first multi-identity restore, implementations **MUST** assign those legacy rows to the first restored identity for backward compatibility with existing single-identity clients.
+
+After assignment, implementations SHOULD rewrite the rows with the owner scope instead of continuing to treat ownerless rows as a shared fallback. New writes MUST always include an owner scope. If an ownerless legacy row conflicts with an already-scoped row for the first restored identity, the scoped row takes precedence and the duplicate ownerless row MAY be discarded.
+
+### 2.3 Multi-Agent Identity Isolation
 
 Each agent instance MUST have its own **independent identity** — its own BIP-39 mnemonic, its own Nostr keypair (npub/nsec), its own Signal sessions, and its own encrypted database. There is no shared key material between agents.
 
@@ -125,7 +172,7 @@ This ensures:
 
 All Signal Protocol key material (Curve25519 identity keys, signed prekeys, one-time prekeys, Kyber KEM keys) belongs to the **encryption layer** and is **ephemeral, per-peer, and disposable**. A new Signal identity is generated for every contact; it is discarded and regenerated on session reset. Signal identities are not part of a user's identity — they are internal encryption state that the user never sees or manages.
 
-### 2.3 Owner Management (Agent Mode Only)
+### 2.4 Owner Management (Agent Mode Only)
 
 > **Scope**: This section applies only to **agent deployments** (AI agents running as daemons). Human Keychat clients do not have an "owner" concept — the user controls their own identity directly.
 
@@ -1450,6 +1497,7 @@ derive_receiving_address(private_key: [u8; 32], public_key: [u8; 33]) -> String:
 
 ### Phase 1: Identity & Transport
 - [ ] Generate/import Nostr identity from BIP-39 mnemonic
+- [ ] Support multiple local identities and active identity switching, if the client manages more than one identity
 - [ ] Connect to Nostr relays via WebSocket
 - [ ] Subscribe to events by pubkey filter (kind 1059)
 - [ ] Publish events to relay (with optional ecash stamp)
@@ -1506,6 +1554,9 @@ derive_receiving_address(private_key: [u8; 32], public_key: [u8; 33]) -> String:
 ### Phase 8: Robustness
 - [ ] Persist Signal session state (ratchet keys survive restarts)
 - [ ] Persist receiving/sending addresses in DB
+- [ ] Scope protocol and app persistence by owning local Nostr identity
+- [ ] Migrate legacy ownerless rows to the first restored identity
+- [ ] Delete rooms, sessions, groups, and identities using owner-scoped queries only
 - [ ] Event deduplication (track processed event IDs)
 - [ ] Retry logic for relay publish failures
 - [ ] Handle session reset (new friend request)
@@ -1519,7 +1570,7 @@ derive_receiving_address(private_key: [u8; 32], public_key: [u8; 33]) -> String:
 |-------|------|-------------|
 | `id` | `int` | Auto-increment primary key |
 | `toMainPubkey` | `string` | Peer's Nostr pubkey (1:1) or group pubkey (group) |
-| `identityId` | `int` | Owner's Nostr identity |
+| `identityId` | `int` | Owning local Nostr identity |
 | `type` | `RoomType` | `common` (1:1) or `group` |
 | `groupType` | `GroupType?` | `sendAll` (Signal Group), `mls` (MLS Group) |
 | `status` | `RoomStatus` | Lifecycle state (see below) |
@@ -1573,7 +1624,7 @@ derive_receiving_address(private_key: [u8; 32], public_key: [u8; 33]) -> String:
 
 6. **Listen on firstInbox after sending friend request** — The peer's first reply goes to your firstInbox. Missing this subscription means missing their response entirely.
 
-7. **Never delete the Signal DB** — It contains ratchet state. Losing it permanently destroys all sessions.
+7. **Never delete the whole Signal DB for a room/session reset** — It contains ratchet state for every local identity. Routine room, session, group, and identity deletes must be owner-scoped.
 
 8. **Address rotation is directional** — `new_receiving_addr` after encrypt is YOUR address. `bobAddress` after decrypt is the PEER's address. Don't mix them up.
 
@@ -1584,3 +1635,5 @@ derive_receiving_address(private_key: [u8; 32], public_key: [u8; 33]) -> String:
 11. **All kind 1059 events use real timestamps** — Unlike standard NIP-17, Keychat does not use random timestamp offsets on any kind 1059 event (including Gift Wraps). Relays filter by `since` — tweaked timestamps may make events invisible.
 
 12. **mlsTempInbox must rotate after every Commit** — Failing to call `replaceListenPubkey()` after processing an MLS Commit will cause the member to miss subsequent group messages.
+
+13. **Multi-identity state is local-owner scoped** — A peer pubkey, peer Signal identity, group id, or message id can exist under multiple local identities. Always include the owning local identity in persistence lookups and deletes.

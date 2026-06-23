@@ -76,7 +76,10 @@ impl AppClient {
             let gid = group.group_id.clone();
             inner.protocol.group_manager_mut().add_group(group);
             if let Ok(store) = inner.protocol.storage().clone().lock() {
-                let _ = inner.protocol.group_manager_mut().save_group(&gid, &store);
+                let _ = inner
+                    .protocol
+                    .group_manager_mut()
+                    .save_group_for_identity(&gid, &store, &my_nostr);
             }
         }
 
@@ -394,5 +397,57 @@ impl AppClient {
             nostr_event_json: None,
             relay_status_json: Some(initial_relay_json),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(name: &str) -> String {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("keychat-app-core-{name}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("protocol.db").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn create_signal_group_persists_under_active_identity() {
+        std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client =
+                    AppClient::new(temp_db_path("group-scope"), "test-key".into()).unwrap();
+                let identity = client.create_identity().await.unwrap();
+
+                let group = client
+                    .create_signal_group("Scoped Group".into(), Vec::new())
+                    .await
+                    .unwrap();
+
+                let storage = {
+                    let inner = client.inner.read().await;
+                    inner.protocol.storage().clone()
+                };
+                let store = storage.lock().unwrap();
+                assert!(store
+                    .load_group_for_identity(&identity.pubkey_hex, &group.group_id, false)
+                    .unwrap()
+                    .is_some());
+                assert!(store.load_group(&group.group_id).unwrap().is_none());
+
+                tokio::task::spawn_blocking(move || drop(client))
+                    .await
+                    .unwrap();
+            });
+        })
+        .join()
+        .unwrap();
     }
 }

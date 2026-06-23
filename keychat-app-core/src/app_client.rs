@@ -21,7 +21,7 @@
 //! - Lightweight agents use only `libkeychat::ProtocolClient` (skip app-core entirely)
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, RwLock};
 
 use libkeychat::{
     AddressManager, ChatSession, DeviceId, EphemeralKeypair, FriendRequestState, GroupManager,
@@ -220,8 +220,8 @@ pub struct AppClient {
     /// Base directory for file storage: {app_support}/files/
     pub files_dir: String,
     pub relay_tracker: Mutex<RelaySendTracker>,
-    /// Cached identity pubkey hex — set once in import_identity(), never changes.
-    pub identity_pubkey_hex: tokio::sync::OnceCell<String>,
+    /// Active identity pubkey hex.
+    pub identity_pubkey_hex: RwLock<String>,
     /// MLS participant — separate from inner because MlsProvider contains non-Send RefCell.
     /// Wrapped in std::sync::Mutex for thread safety.
     #[cfg(feature = "mls")]
@@ -282,15 +282,24 @@ impl AppClient {
             db_path,
             files_dir,
             relay_tracker: Mutex::new(RelaySendTracker::new()),
-            identity_pubkey_hex: tokio::sync::OnceCell::new(),
+            identity_pubkey_hex: RwLock::new(String::new()),
             #[cfg(feature = "mls")]
             mls_participant: Mutex::new(None),
         })
     }
 
     /// Get the cached identity pubkey hex.
-    pub(crate) fn cached_identity_pubkey(&self) -> String {
-        self.identity_pubkey_hex.get().cloned().unwrap_or_default()
+    pub fn cached_identity_pubkey(&self) -> String {
+        self.identity_pubkey_hex
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_cached_identity_pubkey(&self, pubkey_hex: String) {
+        if let Ok(mut guard) = self.identity_pubkey_hex.write() {
+            *guard = pubkey_hex;
+        }
     }
 
     /// Derive the MLS database path from the main database path.
@@ -334,7 +343,7 @@ impl AppClient {
         inner.protocol.set_identity(Some(result.identity));
         drop(inner);
 
-        let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
+        self.set_cached_identity_pubkey(pubkey_hex.clone());
 
         #[cfg(feature = "mls")]
         self.init_mls_participant(&pubkey_hex);
@@ -353,7 +362,7 @@ impl AppClient {
         inner.protocol.set_identity(Some(identity));
         drop(inner);
 
-        let _ = self.identity_pubkey_hex.set(pubkey_hex.clone());
+        self.set_cached_identity_pubkey(pubkey_hex.clone());
 
         #[cfg(feature = "mls")]
         self.init_mls_participant(&pubkey_hex);
@@ -361,11 +370,66 @@ impl AppClient {
         Ok(pubkey_hex)
     }
 
+    pub async fn add_identity(&self, mnemonic: String, account: u32) -> AppResult<String> {
+        let identity = Identity::from_mnemonic_with_account_str(&mnemonic, account)?;
+        let pubkey_hex = identity.pubkey_hex();
+
+        let mut inner = self.inner.write().await;
+        inner.protocol.add_identity(identity);
+
+        Ok(pubkey_hex)
+    }
+
+    pub async fn add_identity_from_secret_hex(&self, secret_hex: String) -> AppResult<String> {
+        let identity = Identity::from_secret_hex(&secret_hex)?;
+        let pubkey_hex = identity.pubkey_hex();
+
+        let mut inner = self.inner.write().await;
+        inner.protocol.add_identity(identity);
+
+        Ok(pubkey_hex)
+    }
+
+    pub async fn add_identity_from_nsec(&self, nsec: String) -> AppResult<String> {
+        let identity = Identity::from_nsec(&nsec)?;
+        let pubkey_hex = identity.pubkey_hex();
+
+        let mut inner = self.inner.write().await;
+        inner.protocol.add_identity(identity);
+
+        Ok(pubkey_hex)
+    }
+
+    pub async fn list_identity_pubkeys(&self) -> AppResult<Vec<String>> {
+        let inner = self.inner.read().await;
+        Ok(inner
+            .protocol
+            .list_identities()
+            .into_iter()
+            .map(|identity| identity.pubkey_hex())
+            .collect())
+    }
+
+    pub async fn set_active_identity(&self, identity_hex: String) -> AppResult<()> {
+        let mut inner = self.inner.write().await;
+        inner.protocol.set_active_identity(&identity_hex)?;
+        drop(inner);
+
+        self.set_cached_identity_pubkey(identity_hex.clone());
+
+        #[cfg(feature = "mls")]
+        self.init_mls_participant(&identity_hex);
+
+        Ok(())
+    }
+
     pub async fn get_pubkey_hex(&self) -> AppResult<String> {
-        self.identity_pubkey_hex
-            .get()
-            .cloned()
-            .ok_or(AppError::NotInitialized("no identity set".into()))
+        let pubkey_hex = self.cached_identity_pubkey();
+        if pubkey_hex.is_empty() {
+            Err(AppError::NotInitialized("no identity set".into()))
+        } else {
+            Ok(pubkey_hex)
+        }
     }
 
     // ─── Session Restore & Storage ──────────────────────────────
@@ -786,6 +850,7 @@ impl AppClient {
             let mut inner = self.inner.write().await;
             if let Some(t) = inner.protocol.take_transport() {
                 let _ = t.disconnect().await;
+                let _ = tokio::task::spawn_blocking(move || drop(t)).await;
             }
         }
 
@@ -809,6 +874,7 @@ impl AppClient {
                 .delete_all_data()
                 .map_err(|e| AppError::Storage(format!("delete_all_app_data: {e}")))?;
         }
+        self.set_cached_identity_pubkey(String::new());
 
         tracing::info!("remove_identity: done");
         Ok(())
@@ -816,6 +882,7 @@ impl AppClient {
 
     pub async fn remove_room(&self, room_id: String) -> AppResult<()> {
         let storage = self.inner.read().await.protocol.storage().clone();
+        let identity_pubkey = self.cached_identity_pubkey();
         let mut found = false;
 
         // Try as 1:1 peer first
@@ -825,7 +892,11 @@ impl AppClient {
                 drop(inner);
 
                 if let Ok(store) = storage.lock() {
-                    let _ = store.delete_peer_data(&signal_id, &room_id);
+                    let _ = if identity_pubkey.is_empty() {
+                        store.delete_peer_data(&signal_id, &room_id)
+                    } else {
+                        store.delete_peer_data_for_identity(&identity_pubkey, &signal_id, &room_id)
+                    };
                 }
                 tracing::info!(
                     "remove_room: removed 1:1 peer {}",
@@ -840,10 +911,21 @@ impl AppClient {
             let mut inner = self.inner.write().await;
             if inner.protocol.group_manager().get_group(&room_id).is_some() {
                 if let Ok(store) = storage.lock() {
-                    let _ = inner
-                        .protocol
-                        .group_manager_mut()
-                        .remove_group_persistent(&room_id, &store);
+                    let _ = if identity_pubkey.is_empty() {
+                        inner
+                            .protocol
+                            .group_manager_mut()
+                            .remove_group_persistent(&room_id, &store)
+                    } else {
+                        inner
+                            .protocol
+                            .group_manager_mut()
+                            .remove_group_persistent_for_identity(
+                                &room_id,
+                                &store,
+                                &identity_pubkey,
+                            )
+                    };
                 } else {
                     inner.protocol.group_manager_mut().remove_group(&room_id);
                 }
@@ -867,7 +949,6 @@ impl AppClient {
         }
 
         // Clean up app_* tables
-        let identity_pubkey = self.cached_identity_pubkey();
         if !identity_pubkey.is_empty() {
             let app_room_id = make_room_id(&room_id, &identity_pubkey);
             let app_storage = self.inner.read().await.app_storage.clone();
@@ -889,6 +970,7 @@ impl AppClient {
 
     pub async fn remove_session(&self, peer_pubkey: String) -> AppResult<()> {
         let storage = self.inner.read().await.protocol.storage().clone();
+        let identity_pubkey = self.cached_identity_pubkey();
 
         {
             let mut inner = self.inner.write().await;
@@ -896,7 +978,15 @@ impl AppClient {
                 drop(inner);
 
                 if let Ok(store) = storage.lock() {
-                    let _ = store.delete_peer_data(&signal_id, &peer_pubkey);
+                    let _ = if identity_pubkey.is_empty() {
+                        store.delete_peer_data(&signal_id, &peer_pubkey)
+                    } else {
+                        store.delete_peer_data_for_identity(
+                            &identity_pubkey,
+                            &signal_id,
+                            &peer_pubkey,
+                        )
+                    };
                 }
                 tracing::info!(
                     "remove_session: removed session for peer {}",
@@ -910,7 +1000,6 @@ impl AppClient {
             }
         }
 
-        let identity_pubkey = self.cached_identity_pubkey();
         if !identity_pubkey.is_empty() {
             let app_storage = self.inner.read().await.app_storage.clone();
             {
@@ -1202,13 +1291,129 @@ impl AppClient {
 
     pub async fn get_inbound_request_id(&self, sender_pubkey: String) -> AppResult<Option<String>> {
         let inner = self.inner.read().await;
+        let identity_pubkey = inner
+            .protocol
+            .identity()
+            .map(|identity| identity.pubkey_hex())
+            .unwrap_or_else(|| self.cached_identity_pubkey());
         let store = inner
             .protocol
             .storage()
             .lock()
             .map_err(|e| AppError::Storage(format!("storage lock: {e}")))?;
         store
-            .get_inbound_fr_request_id_by_sender(&sender_pubkey)
+            .get_inbound_fr_request_id_by_sender_for_identity(&identity_pubkey, &sender_pubkey)
             .map_err(|e| AppError::Storage(format!("get_inbound_request_id: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(name: &str) -> String {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("keychat-app-client-{name}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("protocol.db").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn remove_identity_clears_cached_pubkey() {
+        std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client =
+                    AppClient::new(temp_db_path("remove-identity-cache"), "test-key".into())
+                        .unwrap();
+                let identity = client.create_identity().await.unwrap();
+                assert_eq!(client.get_pubkey_hex().await.unwrap(), identity.pubkey_hex);
+
+                client.remove_identity().await.unwrap();
+
+                assert!(client.get_pubkey_hex().await.is_err());
+                tokio::task::spawn_blocking(move || drop(client))
+                    .await
+                    .unwrap();
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn duplicate_check_uses_cached_active_identity() {
+        std::thread::spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client =
+                    AppClient::new(temp_db_path("scoped-duplicate-check"), "test-key".into())
+                        .unwrap();
+
+                client
+                    .save_app_room(
+                        "peer".to_string(),
+                        "id-a".to_string(),
+                        RoomStatus::Enabled,
+                        RoomType::Dm,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                client
+                    .save_app_room(
+                        "peer".to_string(),
+                        "id-b".to_string(),
+                        RoomStatus::Enabled,
+                        RoomType::Dm,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                client
+                    .save_app_message_record(
+                        "msg-a".to_string(),
+                        Some("event-shared".to_string()),
+                        "peer:id-a".to_string(),
+                        "id-a".to_string(),
+                        "peer".to_string(),
+                        "hello id-a".to_string(),
+                        false,
+                        MessageStatus::Success,
+                        100,
+                    )
+                    .await
+                    .unwrap();
+
+                client.set_cached_identity_pubkey("id-b".to_string());
+                assert!(!client
+                    .is_app_message_duplicate("event-shared".to_string())
+                    .await
+                    .unwrap());
+
+                client.set_cached_identity_pubkey("id-a".to_string());
+                assert!(client
+                    .is_app_message_duplicate("event-shared".to_string())
+                    .await
+                    .unwrap());
+
+                tokio::task::spawn_blocking(move || drop(client))
+                    .await
+                    .unwrap();
+            });
+        })
+        .join()
+        .unwrap();
     }
 }

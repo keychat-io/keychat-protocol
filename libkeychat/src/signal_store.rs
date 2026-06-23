@@ -141,9 +141,11 @@ impl CapturingSessionStore {
     }
 
     /// Create a persistent session store backed by SecureStorage.
-    pub fn persistent(storage: Arc<Mutex<SecureStorage>>) -> Self {
+    pub fn persistent(storage: Arc<Mutex<SecureStorage>>, my_pubkey: impl Into<String>) -> Self {
         Self {
-            inner: SessionStoreBackend::Persistent(PersistentSessionStore::new(storage)),
+            inner: SessionStoreBackend::Persistent(PersistentSessionStore::for_identity(
+                storage, my_pubkey,
+            )),
             bob_addresses: Arc::new(Mutex::new(BTreeMap::new())),
             my_receiver_addresses: Arc::new(Mutex::new(BTreeMap::new())),
             snapshots: Arc::new(Mutex::new(BTreeMap::new())),
@@ -284,26 +286,31 @@ impl SignalProtocolStoreBundle {
 
     /// Create a persistent store bundle backed by SecureStorage (SQLCipher).
     pub fn persistent(
+        my_pubkey: String,
         storage: Arc<Mutex<SecureStorage>>,
         identity_key_pair: libsignal_protocol::IdentityKeyPair,
         registration_id: u32,
     ) -> Self {
         Self {
-            session_store: CapturingSessionStore::persistent(storage.clone()),
-            pre_key_store: PreKeyStoreBackend::Persistent(PersistentPreKeyStore::new(
+            session_store: CapturingSessionStore::persistent(storage.clone(), my_pubkey.clone()),
+            pre_key_store: PreKeyStoreBackend::Persistent(PersistentPreKeyStore::for_identity(
                 storage.clone(),
+                my_pubkey.clone(),
             )),
             signed_pre_key_store: SignedPreKeyStoreBackend::Persistent(
-                PersistentSignedPreKeyStore::new(storage.clone()),
+                PersistentSignedPreKeyStore::for_identity(storage.clone(), my_pubkey.clone()),
             ),
             kyber_pre_key_store: KyberPreKeyStoreBackend::Persistent(
-                PersistentKyberPreKeyStore::new(storage.clone()),
+                PersistentKyberPreKeyStore::for_identity(storage.clone(), my_pubkey.clone()),
             ),
-            identity_store: IdentityStoreBackend::Persistent(PersistentIdentityKeyStore::new(
-                storage,
-                identity_key_pair,
-                registration_id,
-            )),
+            identity_store: IdentityStoreBackend::Persistent(
+                PersistentIdentityKeyStore::for_identity(
+                    storage,
+                    my_pubkey,
+                    identity_key_pair,
+                    registration_id,
+                ),
+            ),
         }
     }
 }

@@ -222,10 +222,13 @@ impl AppClient {
     ) {
         // Step 1: Try friend request
         {
-            let inner = self.inner.read().await;
-            if let Some(ctx) = inner.protocol.try_decrypt_friend_request(event) {
+            let mut inner = self.inner.write().await;
+            if let Some((identity_pubkey, ctx)) =
+                inner.protocol.try_decrypt_friend_request_any(event)
+            {
                 drop(inner);
-                self.on_friend_request_app_persist(ctx, event).await;
+                self.on_friend_request_app_persist(identity_pubkey, ctx, event)
+                    .await;
                 return;
             }
         }
@@ -233,9 +236,16 @@ impl AppClient {
         // Step 2: Try pending outbound (friend approve/reject)
         {
             let mut inner = self.inner.write().await;
-            if let Some((request_id, msg, decrypt_result)) =
-                inner.protocol.try_decrypt_pending_outbound(event)
+            if let Some((identity_pubkey, request_id, msg, decrypt_result)) =
+                inner.protocol.try_decrypt_pending_outbound_any(event)
             {
+                let previous_identity = inner
+                    .protocol
+                    .identity()
+                    .map(|identity| identity.pubkey_hex());
+                let _ = inner.protocol.set_active_identity(&identity_pubkey);
+                let mut rejected_peer_pubkey = None;
+
                 if msg.kind == libkeychat::KCMessageKind::FriendApprove {
                     // Complete session creation with ratchet address registration
                     match inner
@@ -255,6 +265,17 @@ impl AppClient {
                     }
                 } else if msg.kind == libkeychat::KCMessageKind::FriendReject {
                     // Don't remove yet — on_friend_approve_app_persist reads peer_pubkey from it
+                    rejected_peer_pubkey = inner
+                        .protocol
+                        .get_pending_outbound(&request_id)
+                        .map(|s| s.peer_nostr_pubkey.clone());
+                    inner.protocol.remove_pending_outbound(&request_id);
+                }
+
+                if let Some(previous_identity) = previous_identity {
+                    if previous_identity != identity_pubkey {
+                        let _ = inner.protocol.set_active_identity(&previous_identity);
+                    }
                 }
                 // Drop write lock BEFORE async subscribe (critical for deadlock prevention)
                 drop(inner);
@@ -268,24 +289,80 @@ impl AppClient {
                     drop(inner);
                 }
 
-                self.on_friend_approve_app_persist(&request_id, &msg, event)
-                    .await;
+                self.on_friend_approve_app_persist(
+                    identity_pubkey,
+                    &request_id,
+                    &msg,
+                    event,
+                    rejected_peer_pubkey,
+                )
+                .await;
                 return;
             }
         }
 
         // Step 3: Try session message
         let step3 = {
-            let inner = self.inner.read().await;
-            inner.protocol.try_decrypt_session_message(event).await
+            let mut inner = self.inner.write().await;
+            let previous_identity = inner
+                .protocol
+                .identity()
+                .map(|identity| identity.pubkey_hex());
+            let step3 = inner.protocol.try_decrypt_session_message_any(event).await;
+            if let Some((
+                identity_pubkey,
+                peer_signal_hex,
+                msg,
+                metadata,
+                addr_update,
+                session_mutex,
+            )) = step3
+            {
+                let _ = inner.protocol.set_active_identity(&identity_pubkey);
+                let sender_nostr_pubkey = inner
+                    .protocol
+                    .signal_to_nostr(&peer_signal_hex)
+                    .cloned()
+                    .unwrap_or_else(|| peer_signal_hex.clone());
+                if let Some(previous_identity) = previous_identity {
+                    if previous_identity != identity_pubkey {
+                        let _ = inner.protocol.set_active_identity(&previous_identity);
+                    }
+                }
+                Some((
+                    identity_pubkey,
+                    peer_signal_hex,
+                    msg,
+                    metadata,
+                    addr_update,
+                    session_mutex,
+                    sender_nostr_pubkey,
+                ))
+            } else {
+                None
+            }
         };
-        if let Some((peer_signal_hex, msg, metadata, addr_update, session_mutex)) = step3 {
+        if let Some((
+            identity_pubkey,
+            peer_signal_hex,
+            msg,
+            metadata,
+            addr_update,
+            session_mutex,
+            sender_nostr_pubkey,
+        )) = step3
+        {
             // Update address state + reverse index, and observe dual p-tag
             // upgrade (spec §3.6 端 B: if we're a Public Agent and this peer
             // just addressed us via dual p-tag, they no longer need ratchet
             // fallback subscription).
             let peer_upgraded = {
                 let mut inner = self.inner.write().await;
+                let previous_identity = inner
+                    .protocol
+                    .identity()
+                    .map(|identity| identity.pubkey_hex());
+                let _ = inner.protocol.set_active_identity(&identity_pubkey);
                 inner
                     .protocol
                     .update_addresses_after_decrypt(&peer_signal_hex, &session_mutex, &addr_update)
@@ -296,9 +373,15 @@ impl AppClient {
                     &peer_signal_hex,
                     &metadata.received_on_address,
                 );
-                inner
+                let peer_upgraded = inner
                     .protocol
-                    .mark_peer_upgraded_if_dual_tag(&peer_signal_hex, &metadata.p_tags)
+                    .mark_peer_upgraded_if_dual_tag(&peer_signal_hex, &metadata.p_tags);
+                if let Some(previous_identity) = previous_identity {
+                    if previous_identity != identity_pubkey {
+                        let _ = inner.protocol.set_active_identity(&previous_identity);
+                    }
+                }
+                peer_upgraded
             }; // write lock dropped
             if peer_upgraded {
                 let mut inner = self.inner.write().await;
@@ -357,16 +440,8 @@ impl AppClient {
                 }
             }
 
-            let sender_nostr_pubkey = {
-                let inner = self.inner.read().await;
-                inner
-                    .protocol
-                    .signal_to_nostr(&peer_signal_hex)
-                    .cloned()
-                    .unwrap_or_else(|| peer_signal_hex.clone())
-            };
-
             self.on_message_app_persist(
+                identity_pubkey,
                 msg,
                 metadata,
                 sender_nostr_pubkey,
@@ -498,12 +573,13 @@ impl AppClient {
 
         // Step 4: Try NIP-17 DM
         {
-            let inner = self.inner.read().await;
-            if let Some(mut ctx) = inner.protocol.try_decrypt_nip17_dm(event) {
+            let mut inner = self.inner.write().await;
+            if let Some((identity_pubkey, mut ctx)) = inner.protocol.try_decrypt_nip17_dm_any(event)
+            {
                 ctx.nostr_event_json = nostr_event_json;
                 ctx.relay_url = relay_url;
                 drop(inner);
-                self.on_nip17_dm_app_persist(ctx).await;
+                self.on_nip17_dm_app_persist(identity_pubkey, ctx).await;
                 return;
             }
         }
@@ -513,10 +589,10 @@ impl AppClient {
 
     async fn on_friend_request_app_persist(
         &self,
+        identity_pubkey: String,
         ctx: libkeychat::FriendRequestContext,
         _event: &libkeychat::Event,
     ) {
-        let identity_pubkey = self.cached_identity_pubkey();
         if identity_pubkey.is_empty() {
             return;
         }
@@ -529,7 +605,7 @@ impl AppClient {
             let app_storage = self.inner.read().await.app_storage.clone();
             let store = lock_app_storage(&app_storage);
             if store
-                .is_app_message_duplicate(&ctx.event_id)
+                .is_app_message_duplicate_for_identity(&identity_pubkey, &ctx.event_id)
                 .unwrap_or(false)
             {
                 None
@@ -615,12 +691,15 @@ impl AppClient {
         .await;
 
         // Auto-approve if this is a re-key from an existing friend
-        if is_existing_friend {
+        if is_existing_friend && self.cached_identity_pubkey() == identity_pubkey {
             let my_name = self
                 .get_identities()
                 .await
                 .ok()
-                .and_then(|ids| ids.into_iter().next())
+                .and_then(|ids| {
+                    ids.into_iter()
+                        .find(|id| id.nostr_pubkey_hex == identity_pubkey)
+                })
                 .map(|id| id.name)
                 .unwrap_or_default();
             match self
@@ -635,9 +714,11 @@ impl AppClient {
 
     async fn on_friend_approve_app_persist(
         &self,
+        identity_pubkey: String,
         request_id: &str,
         msg: &libkeychat::KCMessage,
         event: &libkeychat::Event,
+        rejected_peer_pubkey: Option<String>,
     ) {
         if msg.kind == libkeychat::KCMessageKind::FriendApprove {
             let peer_name = msg
@@ -661,7 +742,6 @@ impl AppClient {
                 peer_signal_id
             };
 
-            let identity_pubkey = self.cached_identity_pubkey();
             if !identity_pubkey.is_empty() {
                 let peer_npub = npub_from_hex(peer_nostr_id.clone()).unwrap_or_default();
                 let msgid = format!("fr-accept-{}", request_id);
@@ -675,7 +755,7 @@ impl AppClient {
                     let app_storage = self.inner.read().await.app_storage.clone();
                     let store = lock_app_storage(&app_storage);
                     if store
-                        .is_app_message_duplicate(&event_id_hex)
+                        .is_app_message_duplicate_for_identity(&identity_pubkey, &event_id_hex)
                         .unwrap_or(false)
                     {
                         None
@@ -739,16 +819,8 @@ impl AppClient {
             })
             .await;
         } else if msg.kind == libkeychat::KCMessageKind::FriendReject {
-            let peer_pubkey = {
-                let inner = self.inner.read().await;
-                inner
-                    .protocol
-                    .get_pending_outbound(request_id)
-                    .map(|s| s.peer_nostr_pubkey.clone())
-                    .unwrap_or_default()
-            };
+            let peer_pubkey = rejected_peer_pubkey.unwrap_or_default();
 
-            let identity_pubkey = self.cached_identity_pubkey();
             if !identity_pubkey.is_empty() {
                 let room_id = make_room_id(&peer_pubkey, &identity_pubkey);
                 {
@@ -769,14 +841,47 @@ impl AppClient {
             self.emit_event(ClientEvent::FriendRequestRejected { peer_pubkey })
                 .await;
 
-            // Now remove from pending_outbound (deferred from Step 2)
-            let mut inner = self.inner.write().await;
-            inner.protocol.remove_pending_outbound(request_id);
+            // pending_outbound was removed in Step 2 while the matched identity was active.
         }
+    }
+
+    async fn mutate_protocol_as_identity<R>(
+        &self,
+        identity_pubkey: &str,
+        f: impl FnOnce(&mut ProtocolClient, Option<&libkeychat::SecureStorage>) -> R,
+    ) -> R {
+        let mut inner = self.inner.write().await;
+        let previous_identity = inner.protocol.identity().map(|id| id.pubkey_hex());
+        let should_switch =
+            !identity_pubkey.is_empty() && previous_identity.as_deref() != Some(identity_pubkey);
+
+        if should_switch {
+            if let Err(e) = inner.protocol.set_active_identity(identity_pubkey) {
+                tracing::warn!("set active identity for protocol mutation failed: {e}");
+            }
+        }
+
+        let storage = inner.protocol.storage().clone();
+        let result = match storage.lock() {
+            Ok(store) => f(&mut inner.protocol, Some(&store)),
+            Err(e) => {
+                tracing::warn!("protocol storage lock failed: {e}");
+                f(&mut inner.protocol, None)
+            }
+        };
+
+        if should_switch {
+            if let Some(previous_identity) = previous_identity {
+                let _ = inner.protocol.set_active_identity(&previous_identity);
+            }
+        }
+
+        result
     }
 
     async fn on_message_app_persist(
         &self,
+        identity_pubkey: String,
         msg: libkeychat::KCMessage,
         metadata: libkeychat::MessageMetadata,
         sender_nostr_pubkey: String,
@@ -786,8 +891,6 @@ impl AppClient {
         relay_url: Option<String>,
         nostr_event_json: Option<String>,
     ) {
-        let identity_pubkey = self.cached_identity_pubkey();
-
         // ── Group-specific message dispatch ──────────────────────────
         match msg.kind {
             libkeychat::KCMessageKind::SignalGroupInvite => {
@@ -807,12 +910,19 @@ impl AppClient {
                         );
                         // Store in GroupManager + persist
                         {
-                            let mut inner = self.inner.write().await;
                             let gid = group.group_id.clone();
-                            inner.protocol.group_manager_mut().add_group(group);
-                            if let Ok(store) = inner.protocol.storage().clone().lock() {
-                                let _ = inner.protocol.group_manager_mut().save_group(&gid, &store);
-                            }
+                            self.mutate_protocol_as_identity(
+                                &identity_pubkey,
+                                |protocol, store| {
+                                    protocol.group_manager_mut().add_group(group);
+                                    if let Some(store) = store {
+                                        let _ = protocol
+                                            .group_manager_mut()
+                                            .save_group_for_identity(&gid, store, &identity_pubkey);
+                                    }
+                                },
+                            )
+                            .await;
                         }
                         // Persist group room to app storage
                         if !identity_pubkey.is_empty() {
@@ -864,16 +974,19 @@ impl AppClient {
                     removed_member
                 );
                 if let Some(ref member_id) = removed_member {
-                    let mut inner = self.inner.write().await;
-                    if let Some(g) = inner.protocol.group_manager_mut().get_group_mut(&group_id) {
-                        g.remove_member(member_id);
-                    }
-                    if let Ok(store) = inner.protocol.storage().clone().lock() {
-                        let _ = inner
-                            .protocol
-                            .group_manager_mut()
-                            .save_group(&group_id, &store);
-                    }
+                    self.mutate_protocol_as_identity(&identity_pubkey, |protocol, store| {
+                        if let Some(g) = protocol.group_manager_mut().get_group_mut(&group_id) {
+                            g.remove_member(member_id);
+                        }
+                        if let Some(store) = store {
+                            let _ = protocol.group_manager_mut().save_group_for_identity(
+                                &group_id,
+                                store,
+                                &identity_pubkey,
+                            );
+                        }
+                    })
+                    .await;
                 }
                 let full_room_id = make_room_id(&group_id, &identity_pubkey);
                 self.emit_data_change(DataChange::RoomUpdated {
@@ -904,16 +1017,19 @@ impl AppClient {
                     left_member
                 );
                 if let Some(ref member_id) = left_member {
-                    let mut inner = self.inner.write().await;
-                    if let Some(g) = inner.protocol.group_manager_mut().get_group_mut(&group_id) {
-                        g.remove_member(member_id);
-                    }
-                    if let Ok(store) = inner.protocol.storage().clone().lock() {
-                        let _ = inner
-                            .protocol
-                            .group_manager_mut()
-                            .save_group(&group_id, &store);
-                    }
+                    self.mutate_protocol_as_identity(&identity_pubkey, |protocol, store| {
+                        if let Some(g) = protocol.group_manager_mut().get_group_mut(&group_id) {
+                            g.remove_member(member_id);
+                        }
+                        if let Some(store) = store {
+                            let _ = protocol.group_manager_mut().save_group_for_identity(
+                                &group_id,
+                                store,
+                                &identity_pubkey,
+                            );
+                        }
+                    })
+                    .await;
                 }
                 let full_room_id = make_room_id(&group_id, &identity_pubkey);
                 self.emit_data_change(DataChange::RoomUpdated {
@@ -937,19 +1053,25 @@ impl AppClient {
                     &group_id[..16.min(group_id.len())]
                 );
                 let app_storage_clone = {
-                    let mut inner = self.inner.write().await;
-                    if let Ok(store) = inner.protocol.storage().clone().lock() {
-                        if let Err(e) = inner
-                            .protocol
-                            .group_manager_mut()
-                            .remove_group_persistent(&group_id, &store)
-                        {
-                            tracing::warn!("remove_group_persistent: {e}");
+                    let app_storage = self.inner.read().await.app_storage.clone();
+                    self.mutate_protocol_as_identity(&identity_pubkey, |protocol, store| {
+                        if let Some(store) = store {
+                            if let Err(e) = protocol
+                                .group_manager_mut()
+                                .remove_group_persistent_for_identity(
+                                    &group_id,
+                                    store,
+                                    &identity_pubkey,
+                                )
+                            {
+                                tracing::warn!("remove_group_persistent: {e}");
+                            }
+                        } else {
+                            protocol.group_manager_mut().remove_group(&group_id);
                         }
-                    } else {
-                        inner.protocol.group_manager_mut().remove_group(&group_id);
-                    }
-                    inner.app_storage.clone()
+                    })
+                    .await;
+                    app_storage
                 };
                 {
                     let full_room_id = make_room_id(&group_id, &identity_pubkey);
@@ -981,21 +1103,20 @@ impl AppClient {
                     new_name
                 );
                 if let Some(ref name) = new_name {
-                    let app_storage_clone;
-                    {
-                        let mut inner = self.inner.write().await;
-                        if let Some(g) = inner.protocol.group_manager_mut().get_group_mut(&group_id)
-                        {
+                    let app_storage_clone = self.inner.read().await.app_storage.clone();
+                    self.mutate_protocol_as_identity(&identity_pubkey, |protocol, store| {
+                        if let Some(g) = protocol.group_manager_mut().get_group_mut(&group_id) {
                             g.name = name.clone();
                         }
-                        if let Ok(store) = inner.protocol.storage().clone().lock() {
-                            let _ = inner
-                                .protocol
-                                .group_manager_mut()
-                                .save_group(&group_id, &store);
+                        if let Some(store) = store {
+                            let _ = protocol.group_manager_mut().save_group_for_identity(
+                                &group_id,
+                                store,
+                                &identity_pubkey,
+                            );
                         }
-                        app_storage_clone = inner.app_storage.clone();
-                    }
+                    })
+                    .await;
                     let full_room_id = make_room_id(&group_id, &identity_pubkey);
                     {
                         let app_store = lock_app_storage(&app_storage_clone);
@@ -1118,9 +1239,13 @@ impl AppClient {
             let saved_msgid = {
                 let app_storage = self.inner.read().await.app_storage.clone();
                 let store = lock_app_storage(&app_storage);
-                if store.is_app_message_duplicate(&event_id).unwrap_or(false) {
+                if store
+                    .is_app_message_duplicate_for_identity(&identity_pubkey, &event_id)
+                    .unwrap_or(false)
+                {
                     None
                 } else {
+                    let msgid = format!("recv-{identity_pubkey}-{event_id}");
                     let content_str = content.as_deref().unwrap_or("");
                     let display = if content_str.is_empty() {
                         fallback.as_deref().unwrap_or("[Message]")
@@ -1149,7 +1274,7 @@ impl AppClient {
                                 None,
                             )?;
                             store.save_app_message(
-                                &event_id,
+                                &msgid,
                                 Some(&event_id),
                                 &full_room_id,
                                 &identity_pubkey,
@@ -1160,7 +1285,7 @@ impl AppClient {
                                 created_at,
                             )?;
                             store.update_app_message(
-                                &event_id,
+                                &msgid,
                                 None,
                                 None,
                                 relay_status.as_deref(),
@@ -1177,7 +1302,7 @@ impl AppClient {
                                 Some(created_at),
                             )?;
                             store.increment_app_room_unread(&full_room_id)?;
-                            Ok(event_id.clone())
+                            Ok(msgid)
                         })
                         .ok()
                 }
@@ -1213,8 +1338,11 @@ impl AppClient {
         .await;
     }
 
-    async fn on_nip17_dm_app_persist(&self, ctx: libkeychat::Nip17DmContext) {
-        let identity_pubkey = self.cached_identity_pubkey();
+    async fn on_nip17_dm_app_persist(
+        &self,
+        identity_pubkey: String,
+        ctx: libkeychat::Nip17DmContext,
+    ) {
         if identity_pubkey.is_empty() {
             return;
         }

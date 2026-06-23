@@ -5,7 +5,7 @@
 //! loop themselves and use the `try_decrypt_*` methods plus per-event context
 //! structs to integrate with their own persistence layer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::address::AddressManager;
@@ -79,6 +79,74 @@ pub struct SendResult {
 
 // ─── ProtocolClient ─────────────────────────────────────────────
 
+/// Per-identity protocol state that is swapped in/out of the live fields on
+/// [`ProtocolClient`] when the active identity changes.
+pub struct IdentityState {
+    identity: Identity,
+    pub(crate) sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
+    pub(crate) peer_nostr_to_signal: HashMap<String, String>,
+    pub(crate) peer_signal_to_nostr: HashMap<String, String>,
+    pub(crate) receiving_addr_to_peer: HashMap<String, String>,
+    pub(crate) peer_is_public_agent: HashMap<String, bool>,
+    pub(crate) self_is_public_agent: bool,
+    pub(crate) peer_uses_dual_p_tag: HashMap<String, bool>,
+    pub(crate) pending_outbound: HashMap<String, FriendRequestState>,
+    pub(crate) peer_pending_first_inbox: HashMap<String, String>,
+    pub(crate) group_manager: GroupManager,
+    pub(crate) next_signal_device_id: u32,
+}
+
+impl IdentityState {
+    fn new(identity: Identity) -> Self {
+        Self {
+            identity,
+            sessions: HashMap::new(),
+            peer_nostr_to_signal: HashMap::new(),
+            peer_signal_to_nostr: HashMap::new(),
+            receiving_addr_to_peer: HashMap::new(),
+            peer_is_public_agent: HashMap::new(),
+            self_is_public_agent: false,
+            peer_uses_dual_p_tag: HashMap::new(),
+            pending_outbound: HashMap::new(),
+            peer_pending_first_inbox: HashMap::new(),
+            group_manager: GroupManager::new(),
+            next_signal_device_id: 1,
+        }
+    }
+
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    pub fn sessions_len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peer_nostr_to_signal.len()
+    }
+
+    pub fn pending_outbound_len(&self) -> usize {
+        self.pending_outbound.len()
+    }
+
+    pub fn receiving_addr_count(&self) -> usize {
+        self.receiving_addr_to_peer.len()
+    }
+
+    pub fn get_session(&self, signal_id: &str) -> Option<Arc<tokio::sync::Mutex<ChatSession>>> {
+        self.sessions.get(signal_id).cloned()
+    }
+
+    pub fn nostr_to_signal(&self, nostr_pk: &str) -> Option<&String> {
+        self.peer_nostr_to_signal.get(nostr_pk)
+    }
+
+    pub fn signal_to_nostr(&self, signal_id: &str) -> Option<&String> {
+        self.peer_signal_to_nostr.get(signal_id)
+    }
+}
+
 /// Multi-session protocol client.
 ///
 /// Manages Signal sessions, peer mappings, relay transport, and subscription addresses.
@@ -86,6 +154,7 @@ pub struct SendResult {
 /// App-layer state (rooms, messages, contacts, settings) is NOT part of this struct.
 pub struct ProtocolClient {
     identity: Option<Identity>,
+    identities: HashMap<String, IdentityState>,
     transport: Option<Transport>,
     storage: Arc<Mutex<SecureStorage>>,
     sessions: HashMap<String, Arc<tokio::sync::Mutex<ChatSession>>>,
@@ -119,6 +188,7 @@ pub struct ProtocolClient {
     next_signal_device_id: u32,
     subscription_ids: Vec<String>,
     last_relay_urls: Vec<String>,
+    subscription_identity_filter: Option<HashSet<String>>,
 }
 
 impl ProtocolClient {
@@ -126,6 +196,7 @@ impl ProtocolClient {
     pub fn new(storage: Arc<Mutex<SecureStorage>>) -> Self {
         Self {
             identity: None,
+            identities: HashMap::new(),
             transport: None,
             storage,
             sessions: HashMap::new(),
@@ -141,6 +212,7 @@ impl ProtocolClient {
             next_signal_device_id: 1,
             subscription_ids: Vec::new(),
             last_relay_urls: Vec::new(),
+            subscription_identity_filter: None,
         }
     }
 
@@ -149,8 +221,216 @@ impl ProtocolClient {
     pub fn identity(&self) -> Option<&Identity> {
         self.identity.as_ref()
     }
+
     pub fn set_identity(&mut self, identity: Option<Identity>) {
-        self.identity = identity;
+        match identity {
+            Some(identity) => {
+                let identity_hex = identity.pubkey_hex();
+                if self
+                    .identity
+                    .as_ref()
+                    .map(|active| active.pubkey_hex() == identity_hex)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+
+                self.identities
+                    .entry(identity_hex.clone())
+                    .or_insert_with(|| IdentityState::new(identity));
+                self.checkpoint_active();
+                self.identity = None;
+                let _ = self.activate_identity(&identity_hex);
+            }
+            None => {
+                self.checkpoint_active();
+                self.identity = None;
+            }
+        }
+    }
+
+    fn checkpoint_active(&mut self) {
+        let Some(identity_hex) = self.identity.as_ref().map(|identity| identity.pubkey_hex())
+        else {
+            self.clear_live_identity_state();
+            return;
+        };
+
+        if let Some(state) = self.identities.get_mut(&identity_hex) {
+            state.sessions = std::mem::take(&mut self.sessions);
+            state.peer_nostr_to_signal = std::mem::take(&mut self.peer_nostr_to_signal);
+            state.peer_signal_to_nostr = std::mem::take(&mut self.peer_signal_to_nostr);
+            state.receiving_addr_to_peer = std::mem::take(&mut self.receiving_addr_to_peer);
+            state.peer_is_public_agent = std::mem::take(&mut self.peer_is_public_agent);
+            state.self_is_public_agent = self.self_is_public_agent;
+            state.peer_uses_dual_p_tag = std::mem::take(&mut self.peer_uses_dual_p_tag);
+            state.pending_outbound = std::mem::take(&mut self.pending_outbound);
+            state.peer_pending_first_inbox = std::mem::take(&mut self.peer_pending_first_inbox);
+            state.group_manager = std::mem::replace(&mut self.group_manager, GroupManager::new());
+            state.next_signal_device_id = self.next_signal_device_id;
+        } else {
+            self.clear_live_identity_state();
+        }
+    }
+
+    fn activate_identity(&mut self, identity_hex: &str) -> Result<()> {
+        let state = self.identities.get_mut(identity_hex).ok_or_else(|| {
+            KeychatError::Identity(format!("identity not registered: {identity_hex}"))
+        })?;
+
+        self.identity = Some(state.identity.clone());
+        self.sessions = std::mem::take(&mut state.sessions);
+        self.peer_nostr_to_signal = std::mem::take(&mut state.peer_nostr_to_signal);
+        self.peer_signal_to_nostr = std::mem::take(&mut state.peer_signal_to_nostr);
+        self.receiving_addr_to_peer = std::mem::take(&mut state.receiving_addr_to_peer);
+        self.peer_is_public_agent = std::mem::take(&mut state.peer_is_public_agent);
+        self.self_is_public_agent = state.self_is_public_agent;
+        self.peer_uses_dual_p_tag = std::mem::take(&mut state.peer_uses_dual_p_tag);
+        self.pending_outbound = std::mem::take(&mut state.pending_outbound);
+        self.peer_pending_first_inbox = std::mem::take(&mut state.peer_pending_first_inbox);
+        self.group_manager = std::mem::replace(&mut state.group_manager, GroupManager::new());
+        self.next_signal_device_id = state.next_signal_device_id;
+        Ok(())
+    }
+
+    fn clear_live_identity_state(&mut self) {
+        self.sessions.clear();
+        self.peer_nostr_to_signal.clear();
+        self.peer_signal_to_nostr.clear();
+        self.receiving_addr_to_peer.clear();
+        self.peer_is_public_agent.clear();
+        self.self_is_public_agent = false;
+        self.peer_uses_dual_p_tag.clear();
+        self.pending_outbound.clear();
+        self.peer_pending_first_inbox.clear();
+        self.group_manager = GroupManager::new();
+        self.next_signal_device_id = 1;
+    }
+
+    /// Register an identity without making it active.
+    pub fn add_identity(&mut self, identity: Identity) {
+        let identity_hex = identity.pubkey_hex();
+        self.identities
+            .entry(identity_hex)
+            .or_insert_with(|| IdentityState::new(identity));
+    }
+
+    /// List all registered identities.
+    pub fn list_identities(&self) -> Vec<&Identity> {
+        self.identities
+            .values()
+            .map(|state| state.identity())
+            .collect()
+    }
+
+    pub fn identity_state(&self, identity_hex: &str) -> Option<&IdentityState> {
+        self.identities.get(identity_hex)
+    }
+
+    pub fn identity_state_mut(&mut self, identity_hex: &str) -> Option<&mut IdentityState> {
+        self.identities.get_mut(identity_hex)
+    }
+
+    /// Persistently switch the active identity to an already registered identity.
+    pub fn set_active_identity(&mut self, identity_hex: &str) -> Result<()> {
+        let identity = self
+            .identities
+            .get(identity_hex)
+            .ok_or_else(|| {
+                KeychatError::Identity(format!("identity not registered: {identity_hex}"))
+            })?
+            .identity
+            .clone();
+        self.set_identity(Some(identity));
+        Ok(())
+    }
+
+    /// Temporarily activate an identity for a synchronous operation, then restore the prior one.
+    pub fn with_identity<F, R>(&mut self, identity_hex: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        if !self.identities.contains_key(identity_hex) {
+            return Err(KeychatError::Identity(format!(
+                "identity not registered: {identity_hex}"
+            )));
+        }
+
+        let prior_hex = self.identity.as_ref().map(|identity| identity.pubkey_hex());
+        if prior_hex.as_deref() == Some(identity_hex) {
+            return Ok(f(self));
+        }
+
+        self.checkpoint_active();
+        self.identity = None;
+        self.activate_identity(identity_hex)?;
+        let result = f(self);
+        self.checkpoint_active();
+        self.identity = None;
+        if let Some(prior_hex) = prior_hex {
+            let _ = self.activate_identity(&prior_hex);
+        }
+        Ok(result)
+    }
+
+    pub fn set_subscription_identity_filter(&mut self, enabled_identity_hexes: Vec<String>) {
+        let enabled = enabled_identity_hexes
+            .into_iter()
+            .map(|hex| hex.trim().to_lowercase())
+            .filter(|hex| !hex.is_empty())
+            .collect();
+        self.subscription_identity_filter = Some(enabled);
+    }
+
+    pub fn clear_subscription_identity_filter(&mut self) {
+        self.subscription_identity_filter = None;
+    }
+
+    fn subscription_identity_enabled(&self, identity_hex: &str) -> bool {
+        self.subscription_identity_filter
+            .as_ref()
+            .map(|enabled| enabled.contains(&identity_hex.to_lowercase()))
+            .unwrap_or(true)
+    }
+
+    fn identity_hexes_active_first(&self) -> Vec<String> {
+        let active_hex = self.identity.as_ref().map(|identity| identity.pubkey_hex());
+        let mut hexes = Vec::new();
+        if let Some(active_hex) = &active_hex {
+            if self.identities.contains_key(active_hex) {
+                hexes.push(active_hex.clone());
+            }
+        }
+
+        let mut inactive_hexes: Vec<String> = self
+            .identities
+            .keys()
+            .filter(|hex| Some(hex.as_str()) != active_hex.as_deref())
+            .cloned()
+            .collect();
+        inactive_hexes.sort();
+        hexes.extend(inactive_hexes);
+
+        if hexes.is_empty() {
+            if let Some(active_hex) = active_hex {
+                hexes.push(active_hex);
+            }
+        }
+        hexes
+    }
+
+    /// Remove an identity and its checkpointed protocol state.
+    pub fn remove_identity(&mut self, identity_hex: &str) -> Option<IdentityState> {
+        if self
+            .identity
+            .as_ref()
+            .map(|identity| identity.pubkey_hex() == identity_hex)
+            .unwrap_or(false)
+        {
+            self.clear_live_identity_state();
+            self.identity = None;
+        }
+        self.identities.remove(identity_hex)
     }
 
     pub fn transport(&self) -> Option<&Transport> {
@@ -246,20 +526,12 @@ impl ProtocolClient {
     /// Does NOT clear storage — call storage.delete_all_data() separately.
     pub fn reset(&mut self) {
         self.identity = None;
+        self.identities.clear();
         self.transport = None;
-        self.sessions.clear();
-        self.peer_nostr_to_signal.clear();
-        self.peer_signal_to_nostr.clear();
-        self.receiving_addr_to_peer.clear();
-        self.peer_is_public_agent.clear();
-        self.self_is_public_agent = false;
-        self.peer_uses_dual_p_tag.clear();
-        self.pending_outbound.clear();
-        self.peer_pending_first_inbox.clear();
-        self.group_manager = GroupManager::new();
-        self.next_signal_device_id = 1;
+        self.clear_live_identity_state();
         self.subscription_ids.clear();
         self.last_relay_urls.clear();
+        self.subscription_identity_filter = None;
     }
 
     // ─── Session Restore ────────────────────────────────────────
@@ -268,15 +540,63 @@ impl ProtocolClient {
     ///
     /// Returns the number of active sessions restored.
     pub fn restore_sessions(&mut self) -> Result<u32> {
+        if self.identities.is_empty() {
+            if let Some(identity) = self.identity.clone() {
+                self.add_identity(identity);
+            }
+        }
+
+        let identity_hexes = self.identity_hexes_active_first();
+        if identity_hexes.is_empty() {
+            return Err(KeychatError::Identity("call import_identity first".into()));
+        }
+
+        let prior_hex = self.identity.as_ref().map(|identity| identity.pubkey_hex());
+        let mut total_restored = 0;
+
+        for (index, identity_hex) in identity_hexes.iter().enumerate() {
+            self.set_active_identity(identity_hex)?;
+            total_restored += self.restore_active_identity_sessions(index == 0)?;
+            self.checkpoint_active();
+            self.identity = None;
+        }
+
+        if let Some(prior_hex) = prior_hex {
+            let _ = self.activate_identity(&prior_hex);
+        } else if let Some(first_hex) = identity_hexes.first() {
+            let _ = self.activate_identity(first_hex);
+        }
+
+        Ok(total_restored)
+    }
+
+    fn restore_active_identity_sessions(&mut self, include_legacy: bool) -> Result<u32> {
         let identity = self
             .identity
             .clone()
             .ok_or_else(|| KeychatError::Identity("call import_identity first".into()))?;
+        let my_pubkey = identity.pubkey_hex();
         let storage = self.storage.clone();
+
+        self.sessions.clear();
+        self.peer_nostr_to_signal.clear();
+        self.peer_signal_to_nostr.clear();
+        self.receiving_addr_to_peer.clear();
+        self.peer_is_public_agent.clear();
+        self.peer_uses_dual_p_tag.clear();
+        self.pending_outbound.clear();
+        self.peer_pending_first_inbox.clear();
+        self.group_manager = GroupManager::new();
+        self.next_signal_device_id = 1;
 
         let store = storage
             .lock()
             .map_err(|e| KeychatError::Storage(format!("storage lock: {e}")))?;
+        if include_legacy {
+            store
+                .claim_legacy_identity_data(&my_pubkey)
+                .map_err(|e| KeychatError::Storage(format!("claim legacy identity data: {e}")))?;
+        }
 
         let mut restored_count: u32 = 0;
         let mut max_device_id: u32 = 0;
@@ -304,16 +624,16 @@ impl ProtocolClient {
         let mut fr_rows: Vec<FrRow> = Vec::new();
 
         let peers = store
-            .list_peers()
+            .list_peers_for_identity(&my_pubkey, include_legacy)
             .map_err(|e| KeychatError::Storage(format!("list_peers: {e}")))?;
         let peer_ids = store
-            .list_signal_participants()
+            .list_signal_participants_for_identity(&my_pubkey, include_legacy)
             .map_err(|e| KeychatError::Storage(format!("list_signal_participants: {e}")))?;
         let all_addresses = store
-            .load_all_peer_addresses()
+            .load_all_peer_addresses_for_identity(&my_pubkey, include_legacy)
             .map_err(|e| KeychatError::Storage(format!("load_all_peer_addresses: {e}")))?;
         let fr_ids = store
-            .list_pending_frs()
+            .list_pending_frs_for_identity(&my_pubkey, include_legacy)
             .map_err(|e| KeychatError::Storage(format!("list_pending_frs: {e}")))?;
 
         tracing::info!(
@@ -325,7 +645,11 @@ impl ProtocolClient {
         );
 
         for peer_signal_id in &peer_ids {
-            match store.load_signal_participant(peer_signal_id) {
+            match store.load_signal_participant_for_identity(
+                &my_pubkey,
+                peer_signal_id,
+                include_legacy,
+            ) {
                 Ok(Some((device_id, id_pub, id_priv, reg_id, _spk_id, _spk_rec))) => {
                     participant_rows.push((
                         peer_signal_id.clone(),
@@ -351,7 +675,7 @@ impl ProtocolClient {
         }
 
         for fr_id in &fr_ids {
-            match store.load_pending_fr(fr_id) {
+            match store.load_pending_fr_for_identity(&my_pubkey, fr_id, include_legacy) {
                 Ok(Some((
                     device_id,
                     id_pub,
@@ -509,7 +833,9 @@ impl ProtocolClient {
             let store = storage
                 .lock()
                 .map_err(|e| KeychatError::Storage(format!("storage lock: {e}")))?;
-            if let Ok(entries) = store.load_all_pending_first_inboxes() {
+            if let Ok(entries) =
+                store.load_all_pending_first_inboxes_for_identity(&my_pubkey, include_legacy)
+            {
                 for (peer_signal_hex, fi_pubkey) in entries {
                     self.receiving_addr_to_peer
                         .insert(fi_pubkey.clone(), peer_signal_hex.clone());
@@ -606,10 +932,12 @@ impl ProtocolClient {
             let store = storage
                 .lock()
                 .map_err(|e| KeychatError::Storage(format!("storage lock: {e}")))?;
-            self.group_manager.load_all(&store).map_err(|e| {
-                tracing::error!("restore: load_all groups failed: {e}");
-                KeychatError::Storage(format!("load_all groups: {e}"))
-            })?;
+            self.group_manager
+                .load_all_for_identity(&store, &my_pubkey, include_legacy)
+                .map_err(|e| {
+                    tracing::error!("restore: load_all groups failed: {e}");
+                    KeychatError::Storage(format!("load_all groups: {e}"))
+                })?;
             if self.group_manager.group_count() > 0 {
                 tracing::info!(
                     "restored {} signal groups",
@@ -706,6 +1034,9 @@ impl ProtocolClient {
                 tracing::error!("disconnect failed: {e}");
                 e
             })?;
+            tokio::task::spawn_blocking(move || drop(t))
+                .await
+                .map_err(|e| KeychatError::Transport(format!("drop transport failed: {e}")))?;
         }
         tracing::info!("disconnected");
         Ok(())
@@ -798,28 +1129,78 @@ impl ProtocolClient {
     pub async fn collect_subscribe_pubkeys(
         &self,
     ) -> (Vec<nostr::PublicKey>, Vec<nostr::PublicKey>) {
-        let identity_pk = self
-            .identity
-            .as_ref()
-            .and_then(|id| nostr::PublicKey::from_hex(&id.pubkey_hex()).ok());
-
-        // Identity keys: receive NIP-59 with randomized outer timestamps
-        let mut identity_pubkeys = Vec::new();
-        if let Some(pk) = identity_pk {
-            identity_pubkeys.push(pk);
-        }
-        // Pending outbound first-inbox keys also receive NIP-59 friend request responses
-        for state in self.pending_outbound.values() {
-            if let Ok(pk) = nostr::PublicKey::from_hex(&state.first_inbox_keys.pubkey_hex()) {
-                identity_pubkeys.push(pk);
+        fn push_unique_pubkey(
+            hex: &str,
+            seen: &mut HashSet<String>,
+            out: &mut Vec<nostr::PublicKey>,
+        ) {
+            if let Ok(pk) = nostr::PublicKey::from_hex(hex) {
+                let normalized = pk.to_hex();
+                if seen.insert(normalized) {
+                    out.push(pk);
+                }
             }
         }
-        // Spec §8.3: after friend-approve, keep our first_inbox subscribed
-        // so the peer's follow-up messages arrive until their ratchet takes
-        // over. Cleared on first session decrypt.
-        for fi_hex in self.peer_pending_first_inbox.values() {
-            if let Ok(pk) = nostr::PublicKey::from_hex(fi_hex) {
-                identity_pubkeys.push(pk);
+
+        let active_hex = self.identity.as_ref().map(|identity| identity.pubkey_hex());
+
+        // Identity keys: receive NIP-59 with randomized outer timestamps.
+        let mut identity_pubkeys = Vec::new();
+        let mut seen_identity_pubkeys = HashSet::new();
+
+        for (identity_hex, state) in &self.identities {
+            if !self.subscription_identity_enabled(identity_hex) {
+                continue;
+            }
+            push_unique_pubkey(
+                &state.identity.pubkey_hex(),
+                &mut seen_identity_pubkeys,
+                &mut identity_pubkeys,
+            );
+            if active_hex.as_deref() == Some(identity_hex.as_str()) {
+                continue;
+            }
+            for state in state.pending_outbound.values() {
+                push_unique_pubkey(
+                    &state.first_inbox_keys.pubkey_hex(),
+                    &mut seen_identity_pubkeys,
+                    &mut identity_pubkeys,
+                );
+            }
+            for fi_hex in state.peer_pending_first_inbox.values() {
+                push_unique_pubkey(fi_hex, &mut seen_identity_pubkeys, &mut identity_pubkeys);
+            }
+        }
+
+        if let Some(identity) = &self.identity {
+            let identity_hex = identity.pubkey_hex();
+            if self.subscription_identity_enabled(&identity_hex) {
+                push_unique_pubkey(
+                    &identity_hex,
+                    &mut seen_identity_pubkeys,
+                    &mut identity_pubkeys,
+                );
+            }
+        }
+
+        // Pending outbound first-inbox keys also receive NIP-59 friend request responses
+        if active_hex
+            .as_deref()
+            .map(|hex| self.subscription_identity_enabled(hex))
+            .unwrap_or(true)
+        {
+            for state in self.pending_outbound.values() {
+                push_unique_pubkey(
+                    &state.first_inbox_keys.pubkey_hex(),
+                    &mut seen_identity_pubkeys,
+                    &mut identity_pubkeys,
+                );
+            }
+            // Spec §8.3: after friend-approve, keep our first_inbox subscribed
+            // so the peer's follow-up messages arrive until their ratchet takes
+            // over. Cleared on first session decrypt.
+            for fi_hex in self.peer_pending_first_inbox.values() {
+                push_unique_pubkey(fi_hex, &mut seen_identity_pubkeys, &mut identity_pubkeys);
             }
         }
 
@@ -830,6 +1211,7 @@ impl ProtocolClient {
         // fallback subscription (they'll reach us via our own npub). Legacy
         // peers keep their ratchet addresses until they upgrade.
         let mut ratchet_pubkeys = Vec::new();
+        let mut seen_ratchet_pubkeys = HashSet::new();
         for (signal_hex, session_mutex) in &self.sessions {
             if self.self_is_public_agent
                 && *self.peer_uses_dual_p_tag.get(signal_hex).unwrap_or(&false)
@@ -838,8 +1220,25 @@ impl ProtocolClient {
             }
             let session = session_mutex.lock().await;
             for addr_str in session.addresses.get_all_receiving_address_strings() {
-                if let Ok(pk) = nostr::PublicKey::from_hex(&addr_str) {
-                    ratchet_pubkeys.push(pk);
+                push_unique_pubkey(&addr_str, &mut seen_ratchet_pubkeys, &mut ratchet_pubkeys);
+            }
+        }
+
+        for (identity_hex, state) in &self.identities {
+            if active_hex.as_deref() == Some(identity_hex.as_str())
+                || !self.subscription_identity_enabled(identity_hex)
+            {
+                continue;
+            }
+            for (signal_hex, session_mutex) in &state.sessions {
+                if state.self_is_public_agent
+                    && *state.peer_uses_dual_p_tag.get(signal_hex).unwrap_or(&false)
+                {
+                    continue;
+                }
+                let session = session_mutex.lock().await;
+                for addr_str in session.addresses.get_all_receiving_address_strings() {
+                    push_unique_pubkey(&addr_str, &mut seen_ratchet_pubkeys, &mut ratchet_pubkeys);
                 }
             }
         }
@@ -994,7 +1393,14 @@ impl ProtocolClient {
         // Persist (best-effort) keyed by nostr pubkey.
         if let Some(nostr_pk) = self.peer_signal_to_nostr.get(peer_signal_hex).cloned() {
             if let Ok(store) = self.storage.lock() {
-                if let Err(e) = store.set_peer_uses_dual_p_tag(&nostr_pk, true) {
+                let my_pubkey = self
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.pubkey_hex())
+                    .unwrap_or_default();
+                if let Err(e) =
+                    store.set_peer_uses_dual_p_tag_for_identity(&my_pubkey, &nostr_pk, true)
+                {
                     tracing::warn!("mark_peer_upgraded: persist failed: {e}");
                 }
             }
@@ -1036,7 +1442,16 @@ impl ProtocolClient {
             };
             if let Some(addr_state) = addr_state_opt {
                 if let Ok(store) = self.storage.lock() {
-                    if let Err(e) = store.save_peer_addresses(peer_signal_hex, &addr_state) {
+                    let my_pubkey = self
+                        .identity
+                        .as_ref()
+                        .map(|identity| identity.pubkey_hex())
+                        .unwrap_or_default();
+                    if let Err(e) = store.save_peer_addresses_for_identity(
+                        &my_pubkey,
+                        peer_signal_hex,
+                        &addr_state,
+                    ) {
                         tracing::error!("persist address state failed: {e}");
                     }
                 }
@@ -1071,7 +1486,13 @@ impl ProtocolClient {
             if let Some(fi) = self.peer_pending_first_inbox.remove(peer_signal_hex) {
                 self.receiving_addr_to_peer.remove(&fi);
                 if let Ok(store) = self.storage.lock() {
-                    let _ = store.delete_pending_first_inbox(peer_signal_hex);
+                    let my_pubkey = self
+                        .identity
+                        .as_ref()
+                        .map(|identity| identity.pubkey_hex())
+                        .unwrap_or_default();
+                    let _ =
+                        store.delete_pending_first_inbox_for_identity(&my_pubkey, peer_signal_hex);
                 }
                 tracing::debug!(
                     "cleared pending first_inbox for peer={} (ratchet active)",
@@ -1173,7 +1594,14 @@ impl ProtocolClient {
             };
             if let Some(addr_state) = addr_state_opt {
                 if let Ok(store) = self.storage.lock() {
-                    if let Err(e) = store.save_peer_addresses(&signal_hex, &addr_state) {
+                    let my_pubkey = self
+                        .identity
+                        .as_ref()
+                        .map(|identity| identity.pubkey_hex())
+                        .unwrap_or_default();
+                    if let Err(e) =
+                        store.save_peer_addresses_for_identity(&my_pubkey, &signal_hex, &addr_state)
+                    {
                         tracing::error!("persist address state after send failed: {e}");
                     }
                 }
@@ -1214,6 +1642,7 @@ impl ProtocolClient {
             .id
             .clone()
             .unwrap_or_else(|| format!("fr-{}", event.id.to_hex()));
+        let my_pubkey = identity.pubkey_hex();
         let sender_pubkey = received.sender_pubkey_hex.clone();
         let sender_name = received.payload.name.clone();
         let message = received.payload.message.clone();
@@ -1230,7 +1659,13 @@ impl ProtocolClient {
         let payload_json = serde_json::to_string(&received.payload).ok();
         if let (Some(ref mj), Some(ref pj)) = (&message_json, &payload_json) {
             if let Ok(store) = self.storage.lock() {
-                let _ = store.save_inbound_fr(&request_id, &sender_pubkey, mj, pj);
+                let _ = store.save_inbound_fr_for_identity(
+                    &my_pubkey,
+                    &request_id,
+                    &sender_pubkey,
+                    mj,
+                    pj,
+                );
             }
         }
 
@@ -1244,6 +1679,24 @@ impl ProtocolClient {
             message_json,
             payload_json,
         })
+    }
+
+    pub fn try_decrypt_friend_request_any(
+        &mut self,
+        event: &crate::Event,
+    ) -> Option<(String, FriendRequestContext)> {
+        for identity_hex in self.identity_hexes_active_first() {
+            let ctx = self
+                .with_identity(&identity_hex, |client| {
+                    client.try_decrypt_friend_request(event)
+                })
+                .ok()
+                .flatten();
+            if let Some(ctx) = ctx {
+                return Some((identity_hex, ctx));
+            }
+        }
+        None
     }
 
     // ─── Complex decrypt methods (TODO: move full logic from app-core) ──
@@ -1276,6 +1729,24 @@ impl ProtocolClient {
 
             if let Ok((msg, decrypt_result)) = result {
                 return Some((request_id.clone(), msg, decrypt_result));
+            }
+        }
+        None
+    }
+
+    pub fn try_decrypt_pending_outbound_any(
+        &mut self,
+        event: &crate::Event,
+    ) -> Option<(String, String, crate::KCMessage, crate::SignalDecryptResult)> {
+        for identity_hex in self.identity_hexes_active_first() {
+            let result = self
+                .with_identity(&identity_hex, |client| {
+                    client.try_decrypt_pending_outbound(event)
+                })
+                .ok()
+                .flatten();
+            if let Some((request_id, msg, decrypt_result)) = result {
+                return Some((identity_hex, request_id, msg, decrypt_result));
             }
         }
         None
@@ -1351,6 +1822,57 @@ impl ProtocolClient {
         Some((peer_id, msg, metadata, addr_update, session_arc))
     }
 
+    pub async fn try_decrypt_session_message_any(
+        &mut self,
+        event: &crate::Event,
+    ) -> Option<(
+        String,
+        String,
+        crate::KCMessage,
+        crate::MessageMetadata,
+        crate::address::AddressUpdate,
+        Arc<tokio::sync::Mutex<crate::ChatSession>>,
+    )> {
+        let prior_hex = self.identity.as_ref().map(|identity| identity.pubkey_hex());
+
+        for identity_hex in self.identity_hexes_active_first() {
+            let was_active = prior_hex.as_deref() == Some(identity_hex.as_str());
+            if !was_active {
+                self.checkpoint_active();
+                self.identity = None;
+                if self.activate_identity(&identity_hex).is_err() {
+                    if let Some(prior_hex) = &prior_hex {
+                        let _ = self.activate_identity(prior_hex);
+                    }
+                    continue;
+                }
+            }
+
+            let result = self.try_decrypt_session_message(event).await;
+
+            if !was_active {
+                self.checkpoint_active();
+                self.identity = None;
+                if let Some(prior_hex) = &prior_hex {
+                    let _ = self.activate_identity(prior_hex);
+                }
+            }
+
+            if let Some((peer_signal_hex, msg, metadata, addr_update, session_arc)) = result {
+                return Some((
+                    identity_hex,
+                    peer_signal_hex,
+                    msg,
+                    metadata,
+                    addr_update,
+                    session_arc,
+                ));
+            }
+        }
+
+        None
+    }
+
     /// Try to unwrap as NIP-17 DM (Step 4 fallback).
     pub fn try_decrypt_nip17_dm(&self, event: &crate::Event) -> Option<Nip17DmContext> {
         let identity = self.identity.as_ref()?;
@@ -1364,6 +1886,22 @@ impl ProtocolClient {
             nostr_event_json: None,
             relay_url: None,
         })
+    }
+
+    pub fn try_decrypt_nip17_dm_any(
+        &mut self,
+        event: &crate::Event,
+    ) -> Option<(String, Nip17DmContext)> {
+        for identity_hex in self.identity_hexes_active_first() {
+            let ctx = self
+                .with_identity(&identity_hex, |client| client.try_decrypt_nip17_dm(event))
+                .ok()
+                .flatten();
+            if let Some(ctx) = ctx {
+                return Some((identity_hex, ctx));
+            }
+        }
+        None
     }
 
     // ─── Friend Request Protocol ────────────────────────────────
@@ -1404,7 +1942,8 @@ impl ProtocolClient {
 
         // Persist pending FR to SecureStorage
         if let Ok(store) = self.storage.lock() {
-            store.save_pending_fr(
+            store.save_pending_fr_for_identity(
+                &identity.pubkey_hex(),
                 &request_id,
                 signal_device_id,
                 &id_pub,
@@ -1509,7 +2048,8 @@ impl ProtocolClient {
         // Persist pending FR to SecureStorage so that a restart can still
         // decrypt the eventual reply (same contract as send_friend_request_protocol).
         if let Ok(store) = self.storage.lock() {
-            store.save_pending_fr(
+            store.save_pending_fr_for_identity(
+                &identity.pubkey_hex(),
                 &request_id,
                 signal_device_id,
                 &id_pub,
@@ -1629,6 +2169,7 @@ impl ProtocolClient {
             let _ = addresses.on_encrypt(&peer_signal_hex, accepted.sender_address.as_deref());
         }
         let recv_addrs = addresses.get_all_receiving_address_strings();
+        let my_pubkey = identity.pubkey_hex();
         let session = crate::ChatSession::new(accepted.signal_participant, addresses, identity);
 
         // Persist — critical: if these fail the session is lost on restart.
@@ -1637,7 +2178,8 @@ impl ProtocolClient {
                 .storage
                 .lock()
                 .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
-            store.save_signal_participant(
+            store.save_signal_participant_for_identity(
+                &my_pubkey,
                 &peer_signal_hex,
                 signal_device_id,
                 &id_pub,
@@ -1646,9 +2188,18 @@ impl ProtocolClient {
                 spk_id,
                 &spk_rec,
             )?;
-            store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
+            store.save_peer_mapping_for_identity(
+                &my_pubkey,
+                &peer_nostr_hex,
+                &peer_signal_hex,
+                &peer_name,
+            )?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                if let Err(e) = store.save_peer_addresses_for_identity(
+                    &my_pubkey,
+                    &peer_signal_hex,
+                    &addr_state,
+                ) {
                     tracing::error!("persist address state failed: {e}");
                 }
             }
@@ -1691,6 +2242,7 @@ impl ProtocolClient {
             .identity
             .clone()
             .ok_or_else(|| KeychatError::Identity("no identity".into()))?;
+        let my_pubkey = identity.pubkey_hex();
 
         // Load inbound FR
         let (sender_pubkey_hex, message_json, payload_json) = {
@@ -1698,9 +2250,11 @@ impl ProtocolClient {
                 .storage
                 .lock()
                 .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
-            store.load_inbound_fr(request_id)?.ok_or_else(|| {
-                KeychatError::FriendRequest(format!("no inbound FR: {request_id}"))
-            })?
+            store
+                .load_inbound_fr_for_identity(&my_pubkey, request_id)?
+                .ok_or_else(|| {
+                    KeychatError::FriendRequest(format!("no inbound FR: {request_id}"))
+                })?
         };
 
         let message: crate::KCMessage = serde_json::from_str(&message_json)?;
@@ -1765,7 +2319,8 @@ impl ProtocolClient {
                 .storage
                 .lock()
                 .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
-            store.save_signal_participant(
+            store.save_signal_participant_for_identity(
+                &my_pubkey,
                 &peer_signal_hex,
                 signal_device_id,
                 &id_pub,
@@ -1774,13 +2329,22 @@ impl ProtocolClient {
                 spk_id,
                 &spk_rec,
             )?;
-            store.save_peer_mapping(&peer_nostr_hex, &peer_signal_hex, &peer_name)?;
+            store.save_peer_mapping_for_identity(
+                &my_pubkey,
+                &peer_nostr_hex,
+                &peer_signal_hex,
+                &peer_name,
+            )?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                if let Err(e) = store.save_peer_addresses_for_identity(
+                    &my_pubkey,
+                    &peer_signal_hex,
+                    &addr_state,
+                ) {
                     tracing::error!("persist address state failed: {e}");
                 }
             }
-            if let Err(e) = store.delete_inbound_fr(request_id) {
+            if let Err(e) = store.delete_inbound_fr_for_identity(&my_pubkey, request_id) {
                 tracing::warn!("delete inbound FR failed: {e}");
             }
         }
@@ -1940,7 +2504,9 @@ impl ProtocolClient {
         let gid = group.group_id.clone();
         self.group_manager.add_group(group);
         if let Ok(store) = self.storage.lock() {
-            let _ = self.group_manager.save_group(&gid, &store);
+            let _ = self
+                .group_manager
+                .save_group_for_identity(&gid, &store, &my_nostr);
         }
 
         Ok((group_id, group_name, member_count))
@@ -1986,6 +2552,11 @@ impl ProtocolClient {
 
     /// Leave a group: send self-leave msg + remove from manager.
     pub async fn leave_group_protocol(&mut self, group_id: &str) -> Result<()> {
+        let my_nostr = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?
+            .pubkey_hex();
         let group = self
             .group_manager
             .get_group(group_id)
@@ -1999,7 +2570,9 @@ impl ProtocolClient {
         );
         self.send_admin_to_all_protocol(&group, &msg).await?;
         if let Ok(store) = self.storage.lock() {
-            let _ = self.group_manager.remove_group_persistent(group_id, &store);
+            let _ = self
+                .group_manager
+                .remove_group_persistent_for_identity(group_id, &store, &my_nostr);
         } else {
             self.group_manager.remove_group(group_id);
         }
@@ -2008,6 +2581,11 @@ impl ProtocolClient {
 
     /// Dissolve a group: send dissolve msg + remove from manager.
     pub async fn dissolve_group_protocol(&mut self, group_id: &str) -> Result<()> {
+        let my_nostr = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?
+            .pubkey_hex();
         let group = self
             .group_manager
             .get_group(group_id)
@@ -2021,7 +2599,9 @@ impl ProtocolClient {
         );
         self.send_admin_to_all_protocol(&group, &msg).await?;
         if let Ok(store) = self.storage.lock() {
-            let _ = self.group_manager.remove_group_persistent(group_id, &store);
+            let _ = self
+                .group_manager
+                .remove_group_persistent_for_identity(group_id, &store, &my_nostr);
         } else {
             self.group_manager.remove_group(group_id);
         }
@@ -2034,6 +2614,11 @@ impl ProtocolClient {
         group_id: &str,
         member_nostr_pubkey: &str,
     ) -> Result<()> {
+        let my_nostr = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?
+            .pubkey_hex();
         let group = self
             .group_manager
             .get_group(group_id)
@@ -2058,13 +2643,20 @@ impl ProtocolClient {
             g.remove_member(&removed_signal_id);
         }
         if let Ok(store) = self.storage.lock() {
-            let _ = self.group_manager.save_group(group_id, &store);
+            let _ = self
+                .group_manager
+                .save_group_for_identity(group_id, &store, &my_nostr);
         }
         Ok(())
     }
 
     /// Rename a group: send name-changed msg + update group.
     pub async fn rename_group_protocol(&mut self, group_id: &str, new_name: &str) -> Result<()> {
+        let my_nostr = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| KeychatError::Identity("no identity".into()))?
+            .pubkey_hex();
         let group = self
             .group_manager
             .get_group(group_id)
@@ -2079,6 +2671,11 @@ impl ProtocolClient {
         self.send_admin_to_all_protocol(&group, &msg).await?;
         if let Some(g) = self.group_manager.get_group_mut(group_id) {
             g.name = new_name.to_string();
+        }
+        if let Ok(store) = self.storage.lock() {
+            let _ = self
+                .group_manager
+                .save_group_for_identity(group_id, &store, &my_nostr);
         }
         Ok(())
     }
@@ -2171,6 +2768,7 @@ impl ProtocolClient {
         }
 
         let recv_addrs = addresses.get_all_receiving_address_strings();
+        let my_pubkey = identity.pubkey_hex();
         let session = crate::ChatSession::new(state.signal_participant, addresses, identity);
 
         // Persist to SecureStorage — critical for session survival.
@@ -2191,7 +2789,8 @@ impl ProtocolClient {
                 .private_key()
                 .serialize()
                 .to_vec();
-            store.save_signal_participant(
+            store.save_signal_participant_for_identity(
+                &my_pubkey,
                 &peer_signal_hex,
                 u32::from(session.signal.address().device_id()),
                 &id_pub,
@@ -2200,9 +2799,18 @@ impl ProtocolClient {
                 0,
                 &[],
             )?;
-            store.save_peer_mapping(&peer_nostr_id, &peer_signal_hex, &peer_name)?;
+            store.save_peer_mapping_for_identity(
+                &my_pubkey,
+                &peer_nostr_id,
+                &peer_signal_hex,
+                &peer_name,
+            )?;
             if let Some(addr_state) = session.addresses.to_serialized(&peer_signal_hex) {
-                if let Err(e) = store.save_peer_addresses(&peer_signal_hex, &addr_state) {
+                if let Err(e) = store.save_peer_addresses_for_identity(
+                    &my_pubkey,
+                    &peer_signal_hex,
+                    &addr_state,
+                ) {
                     tracing::error!("persist address state failed: {e}");
                 }
             }
@@ -2221,7 +2829,9 @@ impl ProtocolClient {
 
         if peer_is_public_agent {
             if let Ok(store) = self.storage.lock() {
-                if let Err(e) = store.set_peer_public_agent(&peer_nostr_id, true) {
+                if let Err(e) =
+                    store.set_peer_public_agent_for_identity(&my_pubkey, &peer_nostr_id, true)
+                {
                     tracing::warn!(
                         "complete_friend_approve: persist public_agent flag failed: {e}"
                     );
@@ -2257,7 +2867,11 @@ impl ProtocolClient {
         self.peer_pending_first_inbox
             .insert(peer_signal_hex.clone(), own_first_inbox_hex.clone());
         if let Ok(store) = self.storage.lock() {
-            let _ = store.save_pending_first_inbox(&peer_signal_hex, &own_first_inbox_hex);
+            let _ = store.save_pending_first_inbox_for_identity(
+                &my_pubkey,
+                &peer_signal_hex,
+                &own_first_inbox_hex,
+            );
         }
 
         tracing::info!(
@@ -2271,15 +2885,20 @@ impl ProtocolClient {
 
     /// Reject a friend request: delete from SecureStorage.
     pub fn reject_friend_request_protocol(&self, request_id: &str) -> Result<String> {
+        let my_pubkey = self
+            .identity
+            .as_ref()
+            .map(|identity| identity.pubkey_hex())
+            .unwrap_or_default();
         let store = self
             .storage
             .lock()
             .map_err(|e| KeychatError::Storage(format!("lock: {e}")))?;
         let sender = store
-            .load_inbound_fr(request_id)?
+            .load_inbound_fr_for_identity(&my_pubkey, request_id)?
             .map(|(pubkey, _, _)| pubkey)
             .unwrap_or_default();
-        store.delete_inbound_fr(request_id)?;
+        store.delete_inbound_fr_for_identity(&my_pubkey, request_id)?;
         Ok(sender)
     }
 
@@ -2421,5 +3040,95 @@ mod tests {
             ratchet_pks.is_empty(),
             "upgraded peer contributes no ratchet addresses in agent mode"
         );
+    }
+
+    #[test]
+    fn switching_identities_preserves_separate_peer_state() {
+        let mut c = make_client();
+        let first = c.identity().unwrap().clone();
+        let first_hex = first.pubkey_hex();
+        let second = Identity::generate().unwrap().identity;
+        let second_hex = second.pubkey_hex();
+
+        c.peer_nostr_to_signal
+            .insert("nostr-first".into(), "signal-first".into());
+        c.peer_signal_to_nostr
+            .insert("signal-first".into(), "nostr-first".into());
+
+        c.set_identity(Some(second));
+        assert_eq!(c.identity().unwrap().pubkey_hex(), second_hex);
+        assert_eq!(c.peer_count(), 0);
+
+        c.peer_nostr_to_signal
+            .insert("nostr-second".into(), "signal-second".into());
+        c.peer_signal_to_nostr
+            .insert("signal-second".into(), "nostr-second".into());
+
+        c.set_active_identity(&first_hex).unwrap();
+        assert_eq!(c.identity().unwrap().pubkey_hex(), first_hex);
+        assert_eq!(
+            c.nostr_to_signal("nostr-first"),
+            Some(&"signal-first".into())
+        );
+        assert!(c.nostr_to_signal("nostr-second").is_none());
+
+        c.set_active_identity(&second_hex).unwrap();
+        assert_eq!(
+            c.nostr_to_signal("nostr-second"),
+            Some(&"signal-second".into())
+        );
+        assert!(c.nostr_to_signal("nostr-first").is_none());
+    }
+
+    #[test]
+    fn with_identity_restores_previous_active_identity() {
+        let mut c = make_client();
+        let first_hex = c.identity().unwrap().pubkey_hex();
+        let second = Identity::generate().unwrap().identity;
+        let second_hex = second.pubkey_hex();
+        c.add_identity(second);
+
+        let seen = c
+            .with_identity(&second_hex, |client| {
+                client.identity().unwrap().pubkey_hex()
+            })
+            .unwrap();
+
+        assert_eq!(seen, second_hex);
+        assert_eq!(c.identity().unwrap().pubkey_hex(), first_hex);
+    }
+
+    #[tokio::test]
+    async fn collect_subscribe_pubkeys_includes_all_registered_identities() {
+        use std::collections::HashSet;
+
+        let mut c = make_client();
+        let first_hex = c.identity().unwrap().pubkey_hex();
+        let second = Identity::generate().unwrap().identity;
+        let second_hex = second.pubkey_hex();
+        c.add_identity(second);
+
+        let (identity_pks, ratchet_pks) = c.collect_subscribe_pubkeys().await;
+        let identity_hexes: HashSet<String> =
+            identity_pks.into_iter().map(|pk| pk.to_hex()).collect();
+
+        assert!(identity_hexes.contains(&first_hex));
+        assert!(identity_hexes.contains(&second_hex));
+        assert!(ratchet_pks.is_empty());
+    }
+
+    #[test]
+    fn remove_active_identity_clears_live_state() {
+        let mut c = make_client();
+        let identity_hex = c.identity().unwrap().pubkey_hex();
+        c.peer_nostr_to_signal
+            .insert("nostr-first".into(), "signal-first".into());
+
+        let removed = c.remove_identity(&identity_hex);
+
+        assert!(removed.is_some());
+        assert!(c.identity().is_none());
+        assert_eq!(c.peer_count(), 0);
+        assert!(c.list_identities().is_empty());
     }
 }
